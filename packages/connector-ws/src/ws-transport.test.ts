@@ -3,6 +3,7 @@ import { Buffer } from 'node:buffer';
 import { randomBytes } from 'node:crypto';
 import net from 'node:net';
 
+import { createJsonLogger } from 'mud-framework-core';
 import type {
   TransportConnection,
   TransportHandlers,
@@ -10,6 +11,34 @@ import type {
 
 import { WsTransport } from './ws-transport.ts';
 import type { WsTransportOptions } from './ws-transport.ts';
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** JSON logger writing into an array, so emitted events can be asserted. */
+function captureLogger(): {
+  logger: ReturnType<typeof createJsonLogger>;
+  entries: () => Record<string, unknown>[];
+} {
+  const lines: string[] = [];
+  const logger = createJsonLogger({
+    sink: (line) => {
+      lines.push(line);
+    },
+  });
+  return {
+    logger,
+    entries: () =>
+      lines.map((line) => {
+        const parsed: unknown = JSON.parse(line);
+        if (!isRecord(parsed)) {
+          throw new Error(`log line is not a JSON object: ${line}`);
+        }
+        return parsed;
+      }),
+  };
+}
 
 interface Recorded {
   connected: TransportConnection[];
@@ -510,6 +539,42 @@ describe('WsTransport', () => {
       expect(timedOut.length).toBeGreaterThanOrEqual(1);
       const after = await rejectionOf(first(recorded.connected).send('later'));
       expect(after.message).toMatch(/not open|closed/);
+    } finally {
+      socket.destroy();
+      await safeStop(transport);
+    }
+  });
+
+  test('logs a send timeout at warn with the timeout and queue depth', async () => {
+    const { logger, entries } = captureLogger();
+    const { transport, recorded } = await startTransport({
+      sendTimeoutMs: 250,
+      logger,
+    });
+    const port = transport.port;
+    if (port === undefined) {
+      throw new Error('expected the transport to bind a port');
+    }
+    const socket = await rawClient(port);
+    try {
+      await until(() => recorded.connected.length === 1, 'onConnect');
+      const connectionId = first(recorded.connected).id;
+      floodConnection(first(recorded.connected));
+      await settle();
+
+      await until(() => recorded.disconnected.length === 1, 'onDisconnect');
+
+      const warnings = entries().filter(
+        (entry) => entry.msg === 'send timed out; terminating connection',
+      );
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toMatchObject({
+        level: 'warn',
+        transport: 'ws',
+        connectionId,
+        sendTimeoutMs: 250,
+      });
+      expect(typeof warnings[0]?.queueDepth).toBe('number');
     } finally {
       socket.destroy();
       await safeStop(transport);

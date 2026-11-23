@@ -2,6 +2,7 @@ import { Database } from 'bun:sqlite';
 import type { SQLQueryBindings } from 'bun:sqlite';
 
 import type {
+  Logger,
   StorageBackend,
   StorageCapabilities,
   StorageTransaction,
@@ -14,6 +15,11 @@ export interface SqliteBackendOptions {
   journalMode?: 'wal' | 'memory';
   busyTimeoutMs?: number;
   maxTransactionDurationMs?: number;
+  /**
+   * Optional: this package depends on core's types only, never on a logger
+   * implementation, so the caller supplies one. Without it nothing is logged.
+   */
+  logger?: Logger;
 }
 
 interface JournalModeRow {
@@ -41,6 +47,7 @@ export class SqliteBackend implements StorageBackend {
   private readonly declared: StorageCapabilities;
   private readonly requestedJournalMode: 'wal' | 'memory';
   private readonly busyTimeoutMs: number;
+  private readonly logger: Logger | undefined;
   private closing = false;
   private closed = false;
   private unusableReason: string | undefined;
@@ -51,11 +58,15 @@ export class SqliteBackend implements StorageBackend {
     declared: StorageCapabilities,
     requestedJournalMode: 'wal' | 'memory',
     busyTimeoutMs: number,
+    logger: Logger | undefined,
   ) {
     this.db = db;
     this.declared = declared;
     this.requestedJournalMode = requestedJournalMode;
     this.busyTimeoutMs = busyTimeoutMs;
+    // Bound once here, not per call: a rollback failure is rare but a PRAGMA
+    // check is startup-only, so both may build the binding lazily.
+    this.logger = logger?.child({ backend: 'sqlite' });
   }
 
   static open(options: SqliteBackendOptions = {}): SqliteBackend {
@@ -85,6 +96,7 @@ export class SqliteBackend implements StorageBackend {
       },
       journalMode,
       busyTimeoutMs,
+      options.logger,
     );
 
     try {
@@ -170,6 +182,14 @@ export class SqliteBackend implements StorageBackend {
       .query<JournalModeRow, []>('PRAGMA journal_mode')
       .get();
     if (journal?.journal_mode.toLowerCase() !== this.requestedJournalMode) {
+      this.logger?.error(
+        {
+          pragma: 'journal_mode',
+          expected: this.requestedJournalMode,
+          actual: String(journal?.journal_mode),
+        },
+        'PRAGMA verification failed',
+      );
       throw new Error(
         `SQLite journal_mode is ${String(journal?.journal_mode)} but ` +
           `${this.requestedJournalMode} was requested`,
@@ -180,6 +200,14 @@ export class SqliteBackend implements StorageBackend {
     const timeout = this.db.query<TimeoutRow, []>('PRAGMA busy_timeout').get();
     // Readback key is `timeout`, not `busy_timeout`.
     if (timeout?.timeout !== this.busyTimeoutMs) {
+      this.logger?.error(
+        {
+          pragma: 'busy_timeout',
+          expected: this.busyTimeoutMs,
+          actual: String(timeout?.timeout),
+        },
+        'PRAGMA verification failed',
+      );
       throw new Error(
         `SQLite busy_timeout is ${String(timeout?.timeout)} but ` +
           `${this.busyTimeoutMs} was requested`,
@@ -191,6 +219,14 @@ export class SqliteBackend implements StorageBackend {
       .query<ForeignKeysRow, []>('PRAGMA foreign_keys')
       .get();
     if (foreignKeys?.foreign_keys !== 1) {
+      this.logger?.error(
+        {
+          pragma: 'foreign_keys',
+          expected: 1,
+          actual: String(foreignKeys?.foreign_keys),
+        },
+        'PRAGMA verification failed',
+      );
       throw new Error('SQLite foreign_keys could not be enabled');
     }
   }
@@ -202,6 +238,12 @@ export class SqliteBackend implements StorageBackend {
       // The connection is still inside a transaction we cannot unwind, so no
       // further statement may run on it.
       this.unusableReason = `rollback failed: ${messageOf(error)}`;
+      // error, not warn: the backend is now unusable and every later request
+      // fails, which is a failure rather than a degradation (SPEC 7.1).
+      this.logger?.error(
+        { unusableReason: this.unusableReason },
+        'ROLLBACK failed; backend marked unusable',
+      );
     }
   }
 

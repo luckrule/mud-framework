@@ -1,6 +1,36 @@
 import { describe, expect, test } from 'bun:test';
 
+import { createJsonLogger } from 'mud-framework-core';
+
 import { SqliteBackend } from './sqlite-backend.ts';
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** JSON logger writing into an array, so emitted events can be asserted. */
+function captureLogger(): {
+  logger: ReturnType<typeof createJsonLogger>;
+  entries: () => Record<string, unknown>[];
+} {
+  const lines: string[] = [];
+  const logger = createJsonLogger({
+    sink: (line) => {
+      lines.push(line);
+    },
+  });
+  return {
+    logger,
+    entries: () =>
+      lines.map((line) => {
+        const parsed: unknown = JSON.parse(line);
+        if (!isRecord(parsed)) {
+          throw new Error(`log line is not a JSON object: ${line}`);
+        }
+        return parsed;
+      }),
+  };
+}
 
 interface Deferred {
   promise: Promise<void>;
@@ -210,5 +240,50 @@ describe('SqliteBackend', () => {
 
     expect(error.message).toMatch(/UNIQUE/i);
     expect(errorCode(error)?.startsWith('SQLITE_CONSTRAINT')).toBe(true);
+  });
+
+  test('logs a PRAGMA verification failure with expected and actual values', () => {
+    const { logger, entries } = captureLogger();
+
+    // An in-memory database cannot use WAL, so the readback disagrees.
+    expect(() =>
+      SqliteBackend.open({ filename: ':memory:', journalMode: 'wal', logger }),
+    ).toThrow(/journal_mode/);
+
+    const failures = entries().filter(
+      (entry) => entry.msg === 'PRAGMA verification failed',
+    );
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatchObject({
+      level: 'error',
+      backend: 'sqlite',
+      pragma: 'journal_mode',
+      expected: 'wal',
+      actual: 'memory',
+    });
+  });
+
+  test('logs a failed ROLLBACK and the reason the backend went unusable', async () => {
+    const { logger, entries } = captureLogger();
+    const backend = SqliteBackend.open({ logger });
+
+    await rejectionOf(
+      backend.transaction(async (tx) => {
+        await tx.execute('CREATE TABLE t (v TEXT)');
+        // Committing behind the backend's back makes its ROLLBACK fail.
+        await tx.execute('COMMIT');
+        throw new Error('handler failed after the commit');
+      }),
+    );
+
+    const failures = entries().filter(
+      (entry) => entry.msg === 'ROLLBACK failed; backend marked unusable',
+    );
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatchObject({ level: 'error', backend: 'sqlite' });
+    expect(String(failures[0]?.unusableReason)).toMatch(/rollback failed/);
+    expect(() => backend.transaction(async () => undefined)).toThrow(
+      /unusable/,
+    );
   });
 });

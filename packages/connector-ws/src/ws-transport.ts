@@ -2,6 +2,7 @@ import { Buffer } from 'node:buffer';
 import { randomUUID } from 'node:crypto';
 
 import type {
+  Logger,
   Transport,
   TransportCapabilities,
   TransportConnection,
@@ -25,6 +26,11 @@ export interface WsTransportOptions {
    * `send` rejects and the connection is dropped. `Infinity` disables it.
    */
   sendTimeoutMs?: number;
+  /**
+   * Optional: this package depends on core's types only, never on a logger
+   * implementation, so the caller supplies one. Without it nothing is logged.
+   */
+  logger?: Logger;
 }
 
 interface WsData {
@@ -35,6 +41,8 @@ interface WsData {
 interface ConnectionState {
   readonly connection: TransportConnection;
   readonly queue: SendQueue;
+  /** Bound to `connectionId`; every per-connection event logs through it. */
+  readonly logger: Logger | undefined;
   ws: Bun.ServerWebSocket<WsData> | undefined;
   open: boolean;
 }
@@ -64,6 +72,7 @@ export class WsTransport implements Transport {
   private readonly declared: TransportCapabilities;
   private readonly connections = new Map<string, ConnectionState>();
   private readonly pending = new Set<Promise<void>>();
+  private readonly logger: Logger | undefined;
   private status: Status = 'idle';
   private handlers: TransportHandlers | undefined;
   private server: Bun.Server<WsData> | undefined;
@@ -88,6 +97,7 @@ export class WsTransport implements Transport {
       orderedDelivery: true,
       heartbeat: 'protocol',
     };
+    this.logger = options.logger?.child({ transport: 'ws' });
   }
 
   /** The port actually bound, or `undefined` before `start` and after `stop`. */
@@ -117,7 +127,7 @@ export class WsTransport implements Transport {
           message: (ws, message) => this.handleMessage(ws, message),
           drain: (ws) => this.handleDrain(ws),
           close: (ws, code, reason) => this.handleClose(ws, code, reason),
-          error: (error) => this.handleError(error),
+          error: (error, ws) => this.handleError(error, ws),
         },
         fetch: (request, server) => this.handleFetch(request, server),
       });
@@ -163,6 +173,7 @@ export class WsTransport implements Transport {
       return new Response('websocket upgrade required', { status: 426 });
     }
     const id = randomUUID();
+    const connectionLogger = this.logger?.child({ connectionId: id });
     const queue = new SendQueue(id, this.settings.sendTimeoutMs, {
       // The socket only exists after the upgrade, so look it up per write.
       write: (payload) => {
@@ -179,6 +190,7 @@ export class WsTransport implements Transport {
     const state: ConnectionState = {
       connection: this.createConnection(id, queue),
       queue,
+      logger: connectionLogger,
       ws: undefined,
       open: false,
     };
@@ -260,6 +272,16 @@ export class WsTransport implements Transport {
       return;
     }
     state.open = false;
+    // warn: the connection is dropped but the transport keeps serving others,
+    // which is a degradation rather than a request failure (SPEC 7.1).
+    state.logger?.warn(
+      {
+        sendTimeoutMs: this.settings.sendTimeoutMs,
+        queueDepth: state.queue.depth,
+        reason: cause.message,
+      },
+      'send timed out; terminating connection',
+    );
     state.queue.fail(
       new Error(`connection "${id}" closed after a send timeout`, {
         cause,
@@ -268,7 +290,13 @@ export class WsTransport implements Transport {
     state.ws?.terminate();
   }
 
-  private handleError(error: Error): void {
+  private handleError(error: Error, ws: Bun.ServerWebSocket<WsData>): void {
+    this.connections
+      .get(ws.data.id)
+      ?.logger?.error(
+        { code: 'TRANSPORT_ERROR', reason: error.message },
+        'websocket handler failed',
+      );
     // Bun calls this only for synchronous handler throws. Rethrowing inline
     // would re-enter this handler, so surface it as an uncaught exception
     // instead of swallowing it.

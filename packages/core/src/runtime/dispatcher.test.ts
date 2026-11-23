@@ -1,7 +1,43 @@
 import { describe, expect, test } from 'bun:test';
 
+import { createJsonLogger } from '../logging/json-logger.ts';
+import type { Logger, LoggerFactory } from '../logging/types.ts';
 import { MemoryStorageBackend } from '../storage/memory.ts';
 import { Dispatcher, FrameworkTimeoutError } from './dispatcher.ts';
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Parsed log lines, in emission order. */
+function parseLines(lines: readonly string[]): Record<string, unknown>[] {
+  return lines.map((line) => {
+    const parsed: unknown = JSON.parse(line);
+    if (!isRecord(parsed)) {
+      throw new Error(`log line is not a JSON object: ${line}`);
+    }
+    return parsed;
+  });
+}
+
+/** Dispatcher whose logs go to `lines` instead of stdout. */
+function quietDispatcher(
+  options: ConstructorParameters<typeof Dispatcher>[0],
+  lines: string[] = [],
+): { dispatcher: Dispatcher; lines: string[] } {
+  const logger: Logger = createJsonLogger({
+    sink: (line) => {
+      lines.push(line);
+    },
+  });
+  const loggerFactory: LoggerFactory = {
+    create: (loggerOptions) => logger.child(loggerOptions?.bindings ?? {}),
+  };
+  return {
+    dispatcher: new Dispatcher({ ...options, loggerFactory }),
+    lines,
+  };
+}
 
 function deferred<T>(): {
   promise: Promise<T>;
@@ -61,16 +97,21 @@ describe('Dispatcher', () => {
 
   test('rejects unknown handler names instead of returning undefined', async () => {
     const backend = new MemoryStorageBackend();
-    const dispatcher = new Dispatcher({ backend, timeoutMs: 1000 });
+    const { dispatcher, lines } = quietDispatcher({ backend, timeoutMs: 1000 });
 
     const error = await rejectionOf(dispatcher.dispatch('missing', null));
 
     expect(error.message).toMatch(/no handler registered/);
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0] ?? '')).toMatchObject({
+      level: 'warn',
+      method: 'missing',
+    });
   });
 
   test('fails the request at the timeout and invalidates later writes', async () => {
     const backend = new MemoryStorageBackend();
-    const dispatcher = new Dispatcher({ backend, timeoutMs: 10 });
+    const { dispatcher } = quietDispatcher({ backend, timeoutMs: 10 });
     const handlerDone = deferred<void>();
     let lateWriteError = '';
 
@@ -135,5 +176,175 @@ describe('Dispatcher', () => {
     expect(() => backend.capabilities()).toThrow(/closed/);
     const error = await rejectionOf(dispatcher.dispatch('anything', null));
     expect(error.message).toMatch(/closed/);
+  });
+
+  test('generates a request id with the default factory', async () => {
+    const backend = new MemoryStorageBackend();
+    const dispatcher = new Dispatcher({ backend, timeoutMs: 1000 });
+    let seen = '';
+    dispatcher.register('inspect', async (ctx) => {
+      seen = ctx.requestId;
+      return null;
+    });
+
+    await dispatcher.dispatch('inspect', null);
+
+    expect(seen).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  test('uses an injected request id factory', async () => {
+    const backend = new MemoryStorageBackend();
+    const { dispatcher } = quietDispatcher({
+      backend,
+      timeoutMs: 1000,
+      createRequestId: () => 'fixed-id',
+    });
+    let seen = '';
+    dispatcher.register('inspect', async (ctx) => {
+      seen = ctx.requestId;
+      return null;
+    });
+
+    await dispatcher.dispatch('inspect', null);
+
+    expect(seen).toBe('fixed-id');
+  });
+
+  test('prefers meta.requestId so a replay keeps the original id', async () => {
+    const backend = new MemoryStorageBackend();
+    const { dispatcher } = quietDispatcher({
+      backend,
+      timeoutMs: 1000,
+      createRequestId: () => 'fresh-id',
+    });
+    const seen: string[] = [];
+    dispatcher.register('inspect', async (ctx) => {
+      seen.push(ctx.requestId);
+      return null;
+    });
+
+    await dispatcher.dispatch('inspect', null, { requestId: 'original-id' });
+    await dispatcher.dispatch('inspect', null);
+
+    expect(seen).toEqual(['original-id', 'fresh-id']);
+  });
+
+  test('carries connection, client request and session ids into the context', async () => {
+    const backend = new MemoryStorageBackend();
+    const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });
+    let seen: Record<string, unknown> = {};
+    dispatcher.register('inspect', async (ctx) => {
+      seen = {
+        connectionId: ctx.connectionId,
+        clientRequestId: ctx.clientRequestId,
+        sessionId: ctx.sessionId,
+      };
+      return null;
+    });
+
+    await dispatcher.dispatch('inspect', null, {
+      connectionId: 'c1',
+      clientRequestId: 'client-1',
+      sessionId: 's1',
+    });
+
+    expect(seen).toEqual({
+      connectionId: 'c1',
+      clientRequestId: 'client-1',
+      sessionId: 's1',
+    });
+  });
+
+  test('defaults connection and client ids to empty strings when absent', async () => {
+    const backend = new MemoryStorageBackend();
+    const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });
+    let seen: Record<string, unknown> = {};
+    dispatcher.register('inspect', async (ctx) => {
+      seen = {
+        connectionId: ctx.connectionId,
+        clientRequestId: ctx.clientRequestId,
+        sessionId: ctx.sessionId,
+      };
+      return null;
+    });
+
+    await dispatcher.dispatch('inspect', null);
+
+    expect(seen).toEqual({
+      connectionId: '',
+      clientRequestId: '',
+      sessionId: undefined,
+    });
+  });
+
+  test('binds the request ids onto ctx.logger', async () => {
+    const backend = new MemoryStorageBackend();
+    const lines: string[] = [];
+    const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 }, lines);
+    dispatcher.register('inspect', async (ctx) => {
+      ctx.logger.info({ detail: 'inside handler' }, 'handler ran');
+      return null;
+    });
+
+    await dispatcher.dispatch('inspect', null, {
+      requestId: 'req-9',
+      connectionId: 'c9',
+      clientRequestId: 'client-9',
+    });
+
+    expect(JSON.parse(lines[0] ?? '')).toMatchObject({
+      level: 'info',
+      msg: 'handler ran',
+      requestId: 'req-9',
+      connectionId: 'c9',
+      clientRequestId: 'client-9',
+      detail: 'inside handler',
+    });
+  });
+
+  test('logs a timeout at warn with the effective timeout', async () => {
+    const backend = new MemoryStorageBackend({
+      capabilities: { maxTransactionDurationMs: 5 },
+    });
+    const lines: string[] = [];
+    const { dispatcher } = quietDispatcher(
+      { backend, timeoutMs: 10_000 },
+      lines,
+    );
+    dispatcher.register('slow', async () => {
+      await sleep(40);
+      return 'late';
+    });
+
+    await rejectionOf(dispatcher.dispatch('slow', null, { requestId: 'r1' }));
+
+    const timedOut = parseLines(lines).filter(
+      (entry) => entry.msg === 'request timed out',
+    );
+    expect(timedOut).toHaveLength(1);
+    expect(timedOut[0]).toMatchObject({
+      level: 'warn',
+      requestId: 'r1',
+      method: 'slow',
+      timeoutMs: 5,
+    });
+  });
+
+  test('FrameworkTimeoutError carries the id that was actually used', async () => {
+    const backend = new MemoryStorageBackend();
+    const { dispatcher } = quietDispatcher({ backend, timeoutMs: 10 });
+    dispatcher.register('slow', async () => {
+      await sleep(40);
+      return 'late';
+    });
+
+    const error = await rejectionOf(
+      dispatcher.dispatch('slow', null, { requestId: 'given-id' }),
+    );
+
+    expect(error).toBeInstanceOf(FrameworkTimeoutError);
+    if (error instanceof FrameworkTimeoutError) {
+      expect(error.requestId).toBe('given-id');
+    }
   });
 });

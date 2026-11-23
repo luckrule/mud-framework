@@ -1,9 +1,31 @@
 import { randomUUID } from 'node:crypto';
 
+import { jsonLoggerFactory } from '../logging/json-logger.ts';
+import type { Logger, LoggerFactory } from '../logging/types.ts';
 import type { StorageBackend, StorageTransaction } from '../storage/types.ts';
 
+/**
+ * What the caller knows about a request before it is dispatched. All optional:
+ * a direct `dispatch` has no connection, and a replayed request supplies the
+ * original `requestId` so the id survives the replay (SPEC 7.3).
+ */
+export interface DispatchMeta {
+  requestId?: string;
+  connectionId?: string;
+  sessionId?: string;
+  clientRequestId?: string;
+}
+
 export interface RequestContext {
+  /** Framework-assigned, never client-controlled, stable across replay. */
   requestId: string;
+  /** Empty when the request did not arrive over a transport. */
+  connectionId: string;
+  /** The client's correlation key; empty when the caller supplied none. */
+  clientRequestId: string;
+  sessionId?: string;
+  /** Already bound to the request's ids; handlers never build one. */
+  logger: Logger;
   storage: StorageTransaction;
 }
 
@@ -15,6 +37,10 @@ export type Handler = (
 export interface DispatcherOptions {
   backend: StorageBackend;
   timeoutMs: number;
+  /** Defaults to `randomUUID`; injectable so tests get deterministic ids. */
+  createRequestId?: () => string;
+  /** Defaults to the JSON logger; tests inject a sink-backed one. */
+  loggerFactory?: LoggerFactory;
 }
 
 interface Expiry {
@@ -37,9 +63,27 @@ export class FrameworkTimeoutError extends Error {
   }
 }
 
+/**
+ * A distinct type rather than a bare Error: the connection layer maps it to a
+ * stable wire code, and callers must not have to match on message text to tell
+ * "no such method" apart from a handler that failed (INV-014).
+ */
+export class UnknownHandlerError extends Error {
+  readonly code = 'UNKNOWN_METHOD';
+  readonly method: string;
+
+  constructor(method: string) {
+    super(`no handler registered for "${method}"`);
+    this.name = 'UnknownHandlerError';
+    this.method = method;
+  }
+}
+
 export class Dispatcher {
   private readonly backend: StorageBackend;
   private readonly timeoutMs: number;
+  private readonly createRequestId: () => string;
+  private readonly logger: Logger;
   private readonly handlers = new Map<string, Handler>();
   private closed = false;
 
@@ -53,6 +97,10 @@ export class Dispatcher {
     }
     this.backend = options.backend;
     this.timeoutMs = options.timeoutMs;
+    this.createRequestId = options.createRequestId ?? randomUUID;
+    this.logger = (options.loggerFactory ?? jsonLoggerFactory).create({
+      bindings: { component: 'dispatcher' },
+    });
   }
 
   register(name: string, handler: Handler): void {
@@ -60,14 +108,34 @@ export class Dispatcher {
     this.handlers.set(name, handler);
   }
 
-  async dispatch(name: string, payload: unknown): Promise<unknown> {
+  async dispatch(
+    name: string,
+    payload: unknown,
+    meta: DispatchMeta = {},
+  ): Promise<unknown> {
     this.assertOpen();
+    // The supplied id wins: a replay must keep the id the original request
+    // got on entry (SPEC 7.3), and generating a fresh one would split one
+    // player input across two unrelated log trails.
+    const requestId = meta.requestId ?? this.createRequestId();
+    const connectionId = meta.connectionId ?? '';
+    const clientRequestId = meta.clientRequestId ?? '';
+    const bindings: Record<string, unknown> = {
+      requestId,
+      connectionId,
+      clientRequestId,
+    };
+    if (meta.sessionId !== undefined) {
+      bindings.sessionId = meta.sessionId;
+    }
+    const logger = this.logger.child(bindings);
+
     const handler = this.handlers.get(name);
     if (handler === undefined) {
-      throw new Error(`no handler registered for "${name}"`);
+      logger.warn({ method: name }, 'dispatch rejected: unknown method');
+      throw new UnknownHandlerError(name);
     }
 
-    const requestId = randomUUID();
     const effectiveTimeoutMs = Math.min(
       this.timeoutMs,
       this.backend.capabilities().maxTransactionDurationMs,
@@ -76,12 +144,20 @@ export class Dispatcher {
     const timeout = Promise.withResolvers<never>();
     const timer = setTimeout(() => {
       expiry.expired = true;
+      logger.warn(
+        { method: name, timeoutMs: effectiveTimeoutMs },
+        'request timed out',
+      );
       timeout.reject(new FrameworkTimeoutError(requestId, effectiveTimeoutMs));
     }, effectiveTimeoutMs);
 
     const work = this.backend.transaction(async (tx) => {
       const context: RequestContext = {
         requestId,
+        connectionId,
+        clientRequestId,
+        sessionId: meta.sessionId,
+        logger,
         storage: guard(tx, expiry),
       };
       const result = await handler(context, payload);
