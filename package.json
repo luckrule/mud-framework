@@ -11,9 +11,9 @@
     "fmt:check": "oxfmt --check .",
     "lint": "oxlint --deny-warnings .",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "bun test --parallel --pass-with-no-tests",
-    "test:unit": "bun test tests/unit --pass-with-no-tests",
-    "test:integration": "bun test tests/integration --pass-with-no-tests",
+    "test": "bun test --parallel",
+    "test:unit": "bun test packages",
+    "test:integration": "bun test tests/integration",
     "prepare": "git config core.hooksPath .githooks || true"
   },
   "devDependencies": {

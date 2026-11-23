@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-工程基础设施已就绪（workspace、格式化与静态检查、类型检查、测试入口、本地与 CI 共用的门禁脚本、Git 钩子、GitHub Actions）。核心能力见 `docs/SPEC.md`，尚未实现；仓库中只有一个占位包 `packages/core`，仅用于让格式、lint 与类型检查有真实目标。
+工程基础设施已就绪（workspace、格式化与静态检查、类型检查、测试入口、本地与 CI 共用的门禁脚本、Git 钩子、GitHub Actions）。`packages/` 下已有 core、connector-ws 与 storage-sqlite 三个包，实现存储契约、传输契约与端到端链路；对外契约见 `docs/SPEC.md`。
 
 ## 快速开始
 
@@ -17,9 +17,9 @@ mud-framework/
 ├── .githooks/         pre-commit 与 commit-msg 钩子
 ├── .github/           CI 配置与 PR 模板
 ├── docs/              规格、不变量与协作规范
-├── packages/          包目录（当前仅 core 占位包）
+├── packages/          三个包：core、connector-ws、storage-sqlite
 ├── scripts/           门禁脚本，本地与 CI 共用
-├── tests/             测试目录（当前为空）
+├── tests/             跨包集成测试
 ├── .bun-version       Bun 版本约束
 ├── .gitignore         Git 忽略规则
 ├── .oxfmtrc.json      格式化配置
