@@ -1,7 +1,16 @@
 /**
- * Placeholder entry point.
- *
- * The framework core is not implemented yet; this export exists so the
- * lint and typecheck gates have a real package to inspect.
+ * Framework core public surface. The in-memory backend is deliberately not
+ * exported here: the framework package must not ship backend implementations
+ * (SPEC 4.1, INV-016); tests import it by path instead.
  */
-export const PACKAGE_NAME = 'mud-framework-core';
+export type {
+  StorageBackend,
+  StorageCapabilities,
+  StorageTransaction,
+} from './storage/types.ts';
+export type {
+  DispatcherOptions,
+  Handler,
+  RequestContext,
+} from './runtime/dispatcher.ts';
+export { Dispatcher, FrameworkTimeoutError } from './runtime/dispatcher.ts';
