@@ -1,0 +1,17 @@
+{
+  "printWidth": 80,
+  "singleQuote": true,
+  "sortImports": {
+    "partitionByNewline": true,
+    "newlinesBetween": false
+  },
+  "ignorePatterns": ["node_modules/**"],
+  "overrides": [
+    {
+      "files": ["**/*.{yml,yaml}"],
+      "options": {
+        "singleQuote": false
+      }
+    }
+  ]
+}

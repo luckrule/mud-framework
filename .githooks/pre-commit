@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+cd "$(git rev-parse --show-toplevel)"
+
+if ! sh scripts/ci.sh --skip-install; then
+  echo "门禁未通过" >&2
+  exit 1
+fi

@@ -1,0 +1,12 @@
+{
+  "name": "mud-framework-core",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Placeholder package: framework core is not implemented yet",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}
