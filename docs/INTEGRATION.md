@@ -70,6 +70,8 @@ try {
 }
 ```
 
+`SqliteBackend.open` 不会创建父目录：示例中的 `./data` 必须预先存在，否则 `bun:sqlite` 以 `unable to open database file` 失败。
+
 `runServerProcess` 返回的 Promise 就是退出信号：收到 `shutdown` 并正常收尾时 resolve，启动失败或链路断开时 reject。入口脚本必须把这个差别映射到退出码，否则 Portal 无法区分"正常关闭"与"崩溃"。
 
 ## 硬约束
