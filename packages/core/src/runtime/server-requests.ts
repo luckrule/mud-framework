@@ -173,7 +173,7 @@ export class RequestRunner {
       // throw from becoming an unhandled rejection in the IPC callback.
       this.deps.logger.error(
         {
-          ...requestIds(message),
+          ...this.requestFields(message),
           code: INTERNAL_ERROR,
           reason: messageOf(error),
         },
@@ -219,7 +219,7 @@ export class RequestRunner {
         entry.cancelledCode = message.code;
         this.deps.logger.warn(
           {
-            ...requestIds(entry.message),
+            ...this.requestFields(entry.message),
             code: message.code,
             reason: 'transaction invalidated while the handler runs',
           },
@@ -229,7 +229,7 @@ export class RequestRunner {
       }
       this.deps.logger.debug(
         {
-          ...requestIds(entry.message),
+          ...this.requestFields(entry.message),
           code: message.code,
           reason: 'request reached a terminal state before the cancel',
         },
@@ -239,7 +239,7 @@ export class RequestRunner {
     }
     entry.preStartCancel = message.code;
     this.deps.logger.info(
-      { ...requestIds(entry.message), code: message.code },
+      { ...this.requestFields(entry.message), code: message.code },
       'request cancelled before start',
     );
   }
@@ -317,7 +317,7 @@ export class RequestRunner {
       if (entry.preStartCancel !== undefined) {
         this.deps.logger.info(
           {
-            ...requestIds(message),
+            ...this.requestFields(message),
             code: entry.preStartCancel,
             reason: 'cancelled before the handler started',
           },
@@ -341,7 +341,7 @@ export class RequestRunner {
         // left a real success behind, and suppressing that would hide it.
         this.deps.logger.warn(
           {
-            ...requestIds(message),
+            ...this.requestFields(message),
             code: entry.cancelledCode,
             durationMs: elapsedSince(startedAt),
             reason: 'result suppressed after cancel',

@@ -206,6 +206,74 @@ describe('RequestRunner', () => {
     });
   });
 
+  test('cancel applied to a running handler names the Extension', async () => {
+    const harness = startRunner();
+    const entered = Promise.withResolvers<void>();
+    const gate = Promise.withResolvers<void>();
+    harness.register(
+      'slow',
+      async () => {
+        entered.resolve();
+        await gate.promise;
+        return 'done';
+      },
+      { extension: 'banking' },
+    );
+
+    harness.runner.accept(requestMessage({ method: 'slow' }));
+    await entered.promise;
+    harness.runner.cancel({
+      type: 'cancel',
+      requestId: 'req-1',
+      code: 'FRAMEWORK_TIMEOUT',
+    });
+    gate.resolve();
+    await tick();
+
+    const applied = harness
+      .logs()
+      .filter((line) => line.msg === 'cancel applied to a running handler');
+    expect(applied).toHaveLength(1);
+    expect(applied[0]).toMatchObject({
+      requestId: 'req-1',
+      extension: 'banking',
+    });
+  });
+
+  test('a cancel before start names the Extension in both of its lines', async () => {
+    const harness = startRunner();
+    harness.register('slow', () => Promise.resolve('done'), {
+      extension: 'banking',
+    });
+
+    harness.runner.accept(requestMessage({ method: 'slow' }));
+    // No await in between: the cancel lands inside the pre-start grace period.
+    harness.runner.cancel({
+      type: 'cancel',
+      requestId: 'req-1',
+      code: 'FRAMEWORK_TIMEOUT',
+    });
+    await tick();
+
+    const logs = harness.logs();
+    const beforeStart = logs.filter(
+      (line) => line.msg === 'request cancelled before start',
+    );
+    const skipped = logs.filter(
+      (line) => line.msg === 'cancelled request skipped',
+    );
+    expect(beforeStart).toHaveLength(1);
+    expect(beforeStart[0]).toMatchObject({
+      requestId: 'req-1',
+      extension: 'banking',
+    });
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0]).toMatchObject({
+      requestId: 'req-1',
+      extension: 'banking',
+    });
+  });
+
   test('cancel of an unknown request id is a no-op', () => {
     const harness = startRunner();
 
