@@ -1949,9 +1949,10 @@ describe('ConnectionLayer', () => {
       await layer.start();
       transport.connect('c1');
       await transport.receive('c1', '{"id":"1","method":"bind"}');
-      // Bracket access: the table is private, and shutdown leaves nothing a
-      // client could observe it through (the connection is gone too).
-      const sessions: Map<string, unknown> = layer['sessions'];
+      // Bracket access: both the layer and the router keep the table private,
+      // and shutdown leaves nothing a client could observe it through (the
+      // connection is gone too).
+      const sessions: Map<string, unknown> = layer['router']['routes'];
       expect(sessions.size).toBe(1);
 
       await layer.stop();
