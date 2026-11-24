@@ -104,7 +104,7 @@ interface ConnectionState {
 
 /**
  * Wires a transport to an executor. It owns only what sits between the two:
- * decode, per-connection ordering, error mapping and encode (SPEC 5.4). Session
+ * decode, per-connection ordering, error mapping and encode (SPEC 5.2). Session
  * routing, replay and input buffering are deliberately absent.
  */
 export class ConnectionLayer implements TransportHandlers {
@@ -211,11 +211,9 @@ export class ConnectionLayer implements TransportHandlers {
       );
     }
     if (state.queued >= this.maxQueuedPerConnection) {
-      // SPEC 3.5 refusal policy, chosen over transport backpressure because
-      // backpressure needs `TransportCapabilities.backpressure`, and nothing in
-      // the framework calls `transport.capabilities()` today (SPEC 5.3's
-      // degradation table is unimplemented). Depending on an unimplemented
-      // capability would make the behaviour undefined.
+      // SPEC 3.5 refusal policy. Refusing is the queue's only strategy: it is
+      // the one the queue itself can enforce, and it fails a request visibly
+      // instead of stalling the connection behind a full input buffer.
       this.logger.warn(
         {
           connectionId: connection.id,

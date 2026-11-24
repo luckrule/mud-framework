@@ -173,7 +173,6 @@ function scriptedTransport(order: string[]): ScriptedTransport {
   let stopFailure: Error | undefined;
   return {
     transport: {
-      capabilities: () => new FakeTransport().capabilities(),
       start: () => {
         order.push('transport.start');
         return Promise.resolve();
@@ -812,7 +811,6 @@ describe('ConnectionLayer', () => {
   test('starts the executor before the transport', async () => {
     const order: string[] = [];
     const transport: Transport = {
-      capabilities: () => new FakeTransport().capabilities(),
       start: () => {
         order.push('transport');
         return Promise.resolve();
@@ -841,7 +839,6 @@ describe('ConnectionLayer', () => {
   test('does not start the transport when the executor fails to start', async () => {
     let transportStarted = false;
     const transport: Transport = {
-      capabilities: () => new FakeTransport().capabilities(),
       start: () => {
         transportStarted = true;
         return Promise.resolve();
@@ -867,7 +864,6 @@ describe('ConnectionLayer', () => {
   test('closes the executor when the transport fails to start', async () => {
     let executorClosed = false;
     const transport: Transport = {
-      capabilities: () => new FakeTransport().capabilities(),
       start: () => Promise.reject(new Error('port already in use')),
       stop: () => Promise.resolve(),
     };
@@ -1103,7 +1099,6 @@ describe('ConnectionLayer', () => {
       const order: string[] = [];
       const { executor, closeCalls } = scriptedExecutor(order);
       const transport: Transport = {
-        capabilities: () => new FakeTransport().capabilities(),
         start: () => Promise.reject(new Error('port already in use')),
         stop: () => Promise.resolve(),
       };

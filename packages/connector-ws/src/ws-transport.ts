@@ -4,7 +4,6 @@ import { randomUUID } from 'node:crypto';
 import type {
   Logger,
   Transport,
-  TransportCapabilities,
   TransportConnection,
   TransportHandlers,
 } from 'mud-framework-core';
@@ -55,10 +54,10 @@ const DEFAULT_SEND_TIMEOUT_MS = 30_000;
 
 /**
  * WebSocket carries binary frames, fragments, ordered delivery and protocol
- * ping/pong, so those are declared true. Backpressure is declared true because
- * `ws.send` reports a full buffer and Bun exposes `drain`: a per-connection
- * queue holds payloads and leaves their promises pending until the socket has
- * room again (SPEC 5.2), instead of rejecting or dropping.
+ * ping/pong. Backpressure is handled by a per-connection queue that holds
+ * payloads and leaves their promises pending until the socket has room again
+ * (`ws.send` reports a full buffer and Bun exposes `drain`), instead of
+ * rejecting or dropping.
  */
 export class WsTransport implements Transport {
   private readonly settings: {
@@ -69,7 +68,6 @@ export class WsTransport implements Transport {
     readonly idleTimeoutSeconds: number;
     readonly sendTimeoutMs: number;
   };
-  private readonly declared: TransportCapabilities;
   private readonly connections = new Map<string, ConnectionState>();
   private readonly pending = new Set<Promise<void>>();
   private readonly logger: Logger | undefined;
@@ -89,25 +87,12 @@ export class WsTransport implements Transport {
         options.idleTimeoutSeconds ?? DEFAULT_IDLE_TIMEOUT_SECONDS,
       sendTimeoutMs: options.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS,
     };
-    this.declared = {
-      binaryFrames: true,
-      fragmentation: true,
-      maxMessageBytes,
-      backpressure: true,
-      orderedDelivery: true,
-      heartbeat: 'protocol',
-    };
     this.logger = options.logger?.child({ transport: 'ws' });
   }
 
   /** The port actually bound, or `undefined` before `start` and after `stop`. */
   get port(): number | undefined {
     return this.server?.port;
-  }
-
-  capabilities(): TransportCapabilities {
-    // Static declaration, readable after stop for shutdown ordering (SPEC 6.3).
-    return this.declared;
   }
 
   async start(handlers: TransportHandlers): Promise<void> {

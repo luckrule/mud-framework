@@ -24,7 +24,6 @@ export type {
 } from './storage/types.ts';
 export type {
   Transport,
-  TransportCapabilities,
   TransportConnection,
   TransportHandlers,
 } from './transport/types.ts';

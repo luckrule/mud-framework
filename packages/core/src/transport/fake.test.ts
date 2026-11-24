@@ -40,37 +40,6 @@ async function rejectionOf(promise: Promise<unknown>): Promise<Error> {
 }
 
 describe('FakeTransport', () => {
-  test('declares the weakest honest capabilities by default', () => {
-    const transport = new FakeTransport();
-
-    expect(transport.capabilities()).toEqual({
-      binaryFrames: false,
-      fragmentation: false,
-      maxMessageBytes: 1024,
-      backpressure: false,
-      orderedDelivery: true,
-      heartbeat: 'none',
-    });
-  });
-
-  test('lets tests inject capabilities', () => {
-    const transport = new FakeTransport({
-      capabilities: {
-        binaryFrames: true,
-        maxMessageBytes: 1024,
-        heartbeat: 'protocol',
-      },
-    });
-
-    const declared = transport.capabilities();
-
-    expect(declared.binaryFrames).toBe(true);
-    expect(declared.maxMessageBytes).toBe(1024);
-    expect(declared.heartbeat).toBe('protocol');
-    expect(declared.fragmentation).toBe(false);
-    expect(declared.backpressure).toBe(false);
-  });
-
   test('reports a connection to onConnect after start', async () => {
     const transport = new FakeTransport();
     const { handlers, recorded } = recorder();

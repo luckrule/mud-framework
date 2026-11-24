@@ -1,13 +1,8 @@
 import type {
   Transport,
-  TransportCapabilities,
   TransportConnection,
   TransportHandlers,
 } from './types.ts';
-
-export interface FakeTransportOptions {
-  capabilities?: Partial<TransportCapabilities>;
-}
 
 interface ConnectionState {
   connection: TransportConnection;
@@ -15,26 +10,10 @@ interface ConnectionState {
   open: boolean;
 }
 
-/**
- * Weakest honest declaration: text only, no fragmentation, no backpressure,
- * no heartbeat. `orderedDelivery` stays true because the fake invokes handlers
- * in call order. `maxMessageBytes` is a small finite cap rather than 0: the
- * in-memory fake can carry a message, so claiming 0 would make the framework's
- * own limit check reject everything a test sends (SPEC 5.2).
- */
-const DEFAULT_CAPABILITIES: TransportCapabilities = {
-  binaryFrames: false,
-  fragmentation: false,
-  maxMessageBytes: 1024,
-  backpressure: false,
-  orderedDelivery: true,
-  heartbeat: 'none',
-};
-
 type Status = 'idle' | 'started' | 'stopped';
 
 /**
- * Test double for transports (SPEC 5.5): no socket, no framing. Tests drive the
+ * Test double for transports (SPEC 5.3): no socket, no framing. Tests drive the
  * inbound side and read back what the framework wrote.
  *
  * Handler errors are not swallowed: a synchronous throw propagates out of the
@@ -44,21 +23,10 @@ type Status = 'idle' | 'started' | 'stopped';
  * cannot become an unhandled rejection.
  */
 export class FakeTransport implements Transport {
-  private readonly declared: TransportCapabilities;
   private readonly connections = new Map<string, ConnectionState>();
   private status: Status = 'idle';
   private handlers: TransportHandlers | undefined;
   private events: Promise<unknown> = Promise.resolve();
-
-  constructor(options: FakeTransportOptions = {}) {
-    this.declared = { ...DEFAULT_CAPABILITIES, ...options.capabilities };
-  }
-
-  capabilities(): TransportCapabilities {
-    // The declaration is static and still readable after stop: shutdown
-    // ordering (SPEC 6.3) consults capabilities while tearing down.
-    return this.declared;
-  }
 
   start(handlers: TransportHandlers): Promise<void> {
     // Rejects rather than throws: `start`/`stop` both promise a result, so a

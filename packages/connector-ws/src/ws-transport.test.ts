@@ -253,21 +253,20 @@ async function safeStop(transport: WsTransport): Promise<void> {
 }
 
 describe('WsTransport', () => {
-  test('declares the capabilities WebSocket actually offers', () => {
-    const transport = new WsTransport({ maxMessageBytes: 4096 });
+  test('defaults the message ceiling to one mebibyte', async () => {
+    const { transport, recorded, url } = await startTransport();
+    try {
+      const client = await openClient(url);
+      await until(() => recorded.connected.length === 1, 'onConnect');
 
-    expect(transport.capabilities()).toEqual({
-      binaryFrames: true,
-      fragmentation: true,
-      maxMessageBytes: 4096,
-      backpressure: true,
-      orderedDelivery: true,
-      heartbeat: 'protocol',
-    });
-  });
+      const oversize = new Uint8Array(1024 * 1024 + 1);
+      const error = await rejectionOf(first(recorded.connected).send(oversize));
 
-  test('defaults the message ceiling to one mebibyte', () => {
-    expect(new WsTransport().capabilities().maxMessageBytes).toBe(1024 * 1024);
+      expect(error.message).toMatch(/exceeds the 1048576 byte limit/);
+      client.close();
+    } finally {
+      await safeStop(transport);
+    }
   });
 
   test('has no port before start and a bound port after', async () => {
@@ -431,7 +430,6 @@ describe('WsTransport', () => {
 
       expect(await closed).toBe(1001);
       expect(transport.port).toBeUndefined();
-      expect(transport.capabilities().heartbeat).toBe('protocol');
       const sendError = await rejectionOf(connection.send('x'));
       expect(sendError.message).toMatch(/stopped/);
       const stopError = await rejectionOf(transport.stop());

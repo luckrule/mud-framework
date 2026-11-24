@@ -2,7 +2,7 @@
  * Wire format between a client and the connection layer. Deliberately minimal:
  * an id for correlating the reply, a method naming a handler, and an opaque
  * payload the handler interprets. Session routing and replay sit above this
- * (SPEC 5.4), so they do not appear here.
+ * (SPEC 5.2), so they do not appear here.
  */
 import { isRecord, messageOf } from '../internal/guards.ts';
 

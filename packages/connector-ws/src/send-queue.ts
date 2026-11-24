@@ -22,7 +22,7 @@ interface Entry {
  * full, but it has already accepted that frame, so the entry is held until
  * `drain` proves the buffer emptied: writing it again would duplicate it, and
  * resolving it at once would let an upstream writer outrun a client that never
- * reads (SPEC 5.2 backpressure, SPEC 3.5 bounded queue).
+ * reads (SPEC 3.5 bounded queue).
  *
  * Payloads behind a blocked head are not written at all, so this queue is the
  * buffer and its depth is the backpressure the caller feels.
