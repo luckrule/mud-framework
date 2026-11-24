@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 
 import { createJsonLogger } from '../logging/json-logger.ts';
 import type { Logger } from '../logging/types.ts';
+import { parseLine } from '../test-support/server-process.ts';
 import {
   DEFAULT_MAX_SESSIONS,
   DEFAULT_SESSION_HANDOFF_TIMEOUT_MS,
@@ -14,18 +15,6 @@ interface Harness {
   logs: () => Record<string, unknown>[];
   /** A plain holder: chain already settled, never closes on its own. */
   holder: (connectionId: string) => SessionHolder;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function parseLine(line: string): Record<string, unknown> {
-  const parsed: unknown = JSON.parse(line);
-  if (!isRecord(parsed)) {
-    throw new Error(`log line is not a JSON object: ${line}`);
-  }
-  return parsed;
 }
 
 /**

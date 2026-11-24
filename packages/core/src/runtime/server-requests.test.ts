@@ -6,7 +6,7 @@ import { MemoryStorageBackend } from '../storage/memory.ts';
 import { sleep, tick } from '../test-support/common.ts';
 import { parseLine, requestMessage } from '../test-support/server-process.ts';
 import { Dispatcher } from './dispatcher.ts';
-import type { Handler } from './dispatcher.ts';
+import type { Handler, HandlerOptions } from './dispatcher.ts';
 import { LocalExecutor } from './executor.ts';
 import { RequestRunner } from './server-requests.ts';
 
@@ -16,7 +16,11 @@ interface RunnerHarness {
   readonly sent: IpcMessage[];
   /** Parsed log lines, in emission order; debug lines included. */
   readonly logs: () => Record<string, unknown>[];
-  readonly register: (method: string, handler: Handler) => void;
+  readonly register: (
+    method: string,
+    handler: Handler,
+    options?: HandlerOptions,
+  ) => void;
 }
 
 function startRunner(timeoutMs = 1000): RunnerHarness {
@@ -49,8 +53,8 @@ function startRunner(timeoutMs = 1000): RunnerHarness {
     runner,
     sent,
     logs: () => lines.map(parseLine),
-    register: (method, handler) => {
-      dispatcher.register(method, handler);
+    register: (method, handler, options) => {
+      dispatcher.register(method, handler, options);
     },
   };
 }
@@ -71,6 +75,61 @@ describe('RequestRunner', () => {
       .filter((line) => line.msg === 'request completed');
     expect(completed).toHaveLength(1);
     expect(completed[0]).toMatchObject({ requestId: 'req-1' });
+  });
+
+  test('request completed names the Extension that registered the handler', async () => {
+    const harness = startRunner();
+    harness.register('deposit', (_ctx, payload) => Promise.resolve(payload), {
+      extension: 'banking',
+    });
+
+    harness.runner.accept(requestMessage({ method: 'deposit', payload: 'ok' }));
+    await tick();
+
+    const completed = harness
+      .logs()
+      .filter((line) => line.msg === 'request completed');
+    expect(completed).toHaveLength(1);
+    expect(completed[0]).toMatchObject({
+      requestId: 'req-1',
+      extension: 'banking',
+    });
+  });
+
+  test('request failed names the Extension that registered the handler', async () => {
+    const harness = startRunner();
+    harness.register(
+      'withdraw',
+      () => Promise.reject(new Error('insufficient funds')),
+      { extension: 'banking' },
+    );
+
+    harness.runner.accept(requestMessage({ method: 'withdraw' }));
+    await tick();
+
+    const failed = harness
+      .logs()
+      .filter((line) => line.msg === 'request failed');
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({
+      code: 'INTERNAL_ERROR',
+      extension: 'banking',
+    });
+  });
+
+  test('a handler no Extension registered logs no extension key', async () => {
+    const harness = startRunner();
+    harness.register('echo', (_ctx, payload) => Promise.resolve(payload));
+
+    harness.runner.accept(requestMessage({ payload: 'ping' }));
+    await tick();
+
+    const completed = harness
+      .logs()
+      .filter((line) => line.msg === 'request completed');
+    expect(completed).toHaveLength(1);
+    // An absent field, not `extension: undefined` (SPEC 7.1).
+    expect(completed[0]).not.toHaveProperty('extension');
   });
 
   test('runs a duplicated request id once and logs the duplicate once', async () => {

@@ -176,6 +176,14 @@ export class Dispatcher {
     });
   }
 
+  /**
+   * The Extension that registered `method`, when one did (SPEC 7.1). Used by the
+   * caller that reports request completion, which logs outside this class.
+   */
+  extensionOf(method: string): string | undefined {
+    return this.handlers.get(method)?.extension;
+  }
+
   async dispatch(
     name: string,
     payload: unknown,

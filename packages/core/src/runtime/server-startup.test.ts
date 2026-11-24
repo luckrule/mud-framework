@@ -1,12 +1,15 @@
 import { describe, expect, test } from 'bun:test';
 
-import { isRecord } from '../internal/guards.ts';
 import type { IpcChannel } from '../ipc/channel.ts';
 import { createInMemoryChannelPair } from '../ipc/channel.ts';
-import type { IpcMessage, RequestMessage } from '../ipc/protocol.ts';
-import { parseIpcMessage } from '../ipc/protocol.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import { MemoryStorageBackend } from '../storage/memory.ts';
+import { rejectionOf } from '../test-support/common.ts';
+import {
+  parseLine,
+  received,
+  requestMessage,
+} from '../test-support/server-process.ts';
 import type { Extension } from './extension.ts';
 import type { ServerProcessOptions } from './server-process.ts';
 import {
@@ -15,17 +18,6 @@ import {
   ServerStartupError,
   startServer,
 } from './server-startup.ts';
-
-/** The server validates everything it sends, so parsing proves protocol conformance. */
-function received(messages: readonly unknown[]): IpcMessage[] {
-  return messages.map((raw) => {
-    const parsed = parseIpcMessage(raw);
-    if (!parsed.ok) {
-      throw new Error(`server sent an invalid message: ${parsed.reason}`);
-    }
-    return parsed.message;
-  });
-}
 
 interface Harness {
   /** The Portal end: observes what startup sent. */
@@ -66,42 +58,6 @@ function harness(extensions: readonly Extension[] = []): Harness {
       logger,
       channel,
     }),
-  };
-}
-
-function parseLine(line: string): Record<string, unknown> {
-  const parsed: unknown = JSON.parse(line);
-  if (!isRecord(parsed)) {
-    throw new Error(`log line is not a JSON object: ${line}`);
-  }
-  return parsed;
-}
-
-async function rejectionOf(promise: Promise<unknown>): Promise<Error> {
-  try {
-    await promise;
-  } catch (error) {
-    if (error instanceof Error) {
-      return error;
-    }
-    throw new Error(`non-Error rejection: ${String(error)}`, { cause: error });
-  }
-  throw new Error('expected the promise to reject');
-}
-
-function requestMessage(
-  overrides: Partial<RequestMessage> = {},
-): RequestMessage {
-  return {
-    type: 'request',
-    requestId: 'req-1',
-    connectionId: 'c1',
-    clientRequestId: 'client-1',
-    method: 'echo',
-    payload: 'hi',
-    timeoutMs: 1000,
-    replayCount: 0,
-    ...overrides,
   };
 }
 

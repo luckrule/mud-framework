@@ -49,9 +49,14 @@ export interface StartupDeps {
 
 /**
  * Brings a Server up to the readiness barrier: backend, capability self-check,
- * degradation warnings, dispatcher, extensions, `ready`, and the inbound
- * handlers (SPEC 6.2). Returns only after `ready` was sent, so a caller that
- * starts accepting work afterwards cannot see a half-initialized Server.
+ * degradation warnings, dispatcher, extensions and `ready` (SPEC 6.2). Returns
+ * only after `ready` was sent, so a caller that starts accepting work afterwards
+ * cannot see a half-initialized Server.
+ *
+ * Inbound handlers are deliberately not attached here: the caller attaches them
+ * after this returns, and the channel buffers anything that arrived in between.
+ * That order is the contract — a handler registered inside would deliver
+ * requests before `ready` and let traffic overtake the readiness barrier.
  *
  * Throws `ServerStartupError` and leaves no backend open when any step fails.
  */

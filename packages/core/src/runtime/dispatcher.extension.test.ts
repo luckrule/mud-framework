@@ -39,6 +39,21 @@ describe('Dispatcher handler metadata', () => {
     });
   });
 
+  test('reports the registering Extension for a method, without running it', () => {
+    const backend = new MemoryStorageBackend();
+    const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });
+
+    dispatcher.register('deposit', async () => null, {
+      extension: 'banking',
+    });
+    dispatcher.register('plain', async () => null);
+
+    expect(dispatcher.extensionOf('deposit')).toBe('banking');
+    // Absence is an answer too: the caller writes the field only when one exists.
+    expect(dispatcher.extensionOf('plain')).toBeUndefined();
+    expect(dispatcher.extensionOf('never-registered')).toBeUndefined();
+  });
+
   test('leaves the Extension unset when the handler declares none', async () => {
     const backend = new MemoryStorageBackend();
     const lines: string[] = [];

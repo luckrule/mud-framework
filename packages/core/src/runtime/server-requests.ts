@@ -4,7 +4,7 @@ import type {
   IpcMessage,
   RequestMessage,
 } from '../ipc/protocol.ts';
-import type { Logger } from '../logging/types.ts';
+import type { LogFields, Logger } from '../logging/types.ts';
 import type { ExecutorOutcome } from './executor.ts';
 import type { RequestIdentity } from './identity.ts';
 import type { Runtime } from './server-startup.ts';
@@ -118,7 +118,7 @@ export class RequestRunner {
         this.rememberDuplicate(message.requestId);
         this.deps.logger.warn(
           {
-            ...ids,
+            ...this.requestFields(message),
             code: 'DUPLICATE_REQUEST',
             replayCount: message.replayCount,
             reason: 'request is already in flight',
@@ -135,7 +135,7 @@ export class RequestRunner {
       // spend the whole timeout budget to learn what this line already knows.
       this.deps.logger.warn(
         {
-          ...ids,
+          ...this.requestFields(message),
           code: 'SERVER_SHUTTING_DOWN',
           reason: 'request arrived after shutdown started',
         },
@@ -284,6 +284,21 @@ export class RequestRunner {
   }
 
   /**
+   * Log fields for one request: its ids, plus the Extension that registered the
+   * handler when one did (SPEC 7.1). The registration metadata lives in the
+   * dispatcher, so the lookup goes through it; a method no Extension owns gets
+   * no `extension` key at all rather than an `undefined` one.
+   */
+  private requestFields(message: RequestMessage): LogFields {
+    const fields: LogFields = { ...requestIds(message) };
+    const extension = this.deps.runtime.dispatcher.extensionOf(message.method);
+    if (extension !== undefined) {
+      fields.extension = extension;
+    }
+    return fields;
+  }
+
+  /**
    * Runs one accepted request to a terminal state and reports it. Never
    * rejects: its only caller is the IPC callback, which has no one to hand a
    * failure to, and `run`'s shutdown wait relies on it settling.
@@ -370,10 +385,9 @@ export class RequestRunner {
     outcome: ExecutorOutcome,
     durationMs: number,
   ): void {
-    const ids = requestIds(message);
     if (outcome.ok) {
       const sessionId = outcome.sessionId;
-      const fields: Record<string, unknown> = { ...ids, durationMs };
+      const fields: LogFields = { ...this.requestFields(message), durationMs };
       if (sessionId !== undefined) {
         fields.sessionId = sessionId;
       }
@@ -390,7 +404,7 @@ export class RequestRunner {
     }
     this.deps.logger[failureLogLevel(outcome.error)](
       {
-        ...ids,
+        ...this.requestFields(message),
         code: outcome.error.code,
         reason: outcome.error.message,
         durationMs,
