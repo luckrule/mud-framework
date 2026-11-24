@@ -678,10 +678,17 @@ export class ConnectionLayer implements TransportHandlers {
     // influences it (SPEC 7.3). The executor carries it through rather than
     // minting its own, so both sides log the same id; a replay passes it back in.
     const requestId = this.createRequestId();
+    // The Session this connection already holds, read before the request runs:
+    // a request that binds a Session still runs as unbound, and the binding it
+    // declares is applied only after it succeeds. Every request line carries it
+    // (SPEC 7.1), which is why the logger is built after this lookup.
+    const state = this.connections.get(connection.id);
+    const sessionId = state?.sessionId;
     const logger = this.logger.child({
       requestId,
       connectionId: connection.id,
       clientRequestId,
+      ...(sessionId === undefined ? {} : { sessionId }),
     });
     const startedAt = performance.now();
 
@@ -689,7 +696,6 @@ export class ConnectionLayer implements TransportHandlers {
     // connection closed. Executing it would commit writes for a player who is
     // gone, which is the same defect as running a cancelled request (SPEC 3.6),
     // so it is ended here instead — before it acquires a transaction.
-    const state = this.connections.get(connection.id);
     if (state === undefined) {
       logger.warn(
         { method, code: TRANSPORT_CLOSED, reason: 'connection closed' },
@@ -706,13 +712,19 @@ export class ConnectionLayer implements TransportHandlers {
         requestId,
         connectionId: connection.id,
         clientRequestId,
+        // The Session this connection already holds: the only source of
+        // `RequestContext.sessionId` (SPEC 2) and of the Session ID on every
+        // request line (SPEC 7.1). Read before the call, so a request that
+        // binds a Session still runs as unbound — the binding it declares is
+        // applied only after it succeeds.
+        sessionId: state.sessionId,
         method,
         payload: requestPayload,
       });
       // The guard exists because the executor is outside code: an outcome
       // without `error` would otherwise produce no frame at all, which is the
-      // silent drop SPEC 3.5 forbids. A valid outcome is passed through as is,
-      // so `sessionId` (which only the executor's routing needs) is untouched.
+      // silent drop SPEC 3.5 forbids. A valid outcome is passed through as is;
+      // the guard only checks the shape and rewrites no field.
       outcome = isExecutorOutcome(raw)
         ? raw
         : toFailure(new Error('executor returned a malformed outcome'));

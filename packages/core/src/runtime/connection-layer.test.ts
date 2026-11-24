@@ -11,7 +11,11 @@ import { JsonCodec } from './codec.ts';
 import { ConnectionLayer } from './connection-layer.ts';
 import { Dispatcher } from './dispatcher.ts';
 import { LocalExecutor } from './executor.ts';
-import type { ExecutorOutcome, RequestExecutor } from './executor.ts';
+import type {
+  ExecutorOutcome,
+  ExecutorRequest,
+  RequestExecutor,
+} from './executor.ts';
 
 const sleep = (ms: number): Promise<void> =>
   new Promise<void>((resolve) => {
@@ -219,6 +223,8 @@ interface ControlledExecutor {
   started: string[];
   /** Methods whose execution returned, in order. */
   finished: string[];
+  /** Every `ExecutorRequest` the layer handed over, in call order. */
+  requests: ExecutorRequest[];
   /** Settles every `hang` call that is waiting. */
   release: () => void;
 }
@@ -235,10 +241,12 @@ function controlledExecutor(
 ): ControlledExecutor {
   const started: string[] = [];
   const finished: string[] = [];
+  const requests: ExecutorRequest[] = [];
   const hang = Promise.withResolvers<void>();
   return {
     started,
     finished,
+    requests,
     release: () => {
       hang.resolve();
     },
@@ -246,6 +254,7 @@ function controlledExecutor(
       start: () => Promise.resolve(),
       execute: async (request) => {
         started.push(request.method);
+        requests.push(request);
         if (request.method === 'hang') {
           await hang.promise;
         }
@@ -1816,6 +1825,96 @@ describe('ConnectionLayer', () => {
       expect(
         logs().filter((entry) => entry.msg === 'session bound'),
       ).toHaveLength(1);
+      await layer.stop();
+    });
+
+    test('passes the bound session to the executor on the next request', async () => {
+      const { transport, layer, controlled } = sessionHarness();
+      await layer.start();
+      transport.connect('c1');
+
+      // The binding request itself runs unbound: the binding it declares is
+      // applied only after it succeeds.
+      await transport.receive('c1', '{"id":"1","method":"bind"}');
+      await transport.receive('c1', '{"id":"2","method":"next"}');
+
+      expect(controlled.requests).toHaveLength(2);
+      expect(controlled.requests[0]?.sessionId).toBeUndefined();
+      // SPEC 7.1: the Session is the context's only source, so it must reach
+      // the executor rather than stay in this layer's routing table.
+      expect(controlled.requests[1]?.sessionId).toBe('s1');
+      await layer.stop();
+    });
+
+    test('passes no session on the first request of an unbound connection', async () => {
+      const { transport, layer, controlled } = sessionHarness();
+      await layer.start();
+      transport.connect('c1');
+
+      await transport.receive('c1', '{"id":"1","method":"next"}');
+
+      expect(controlled.requests).toHaveLength(1);
+      expect(controlled.requests[0]?.sessionId).toBeUndefined();
+      await layer.stop();
+    });
+
+    test('carries the session on the lines this layer does emit', async () => {
+      const { transport, layer, logs } = sessionHarness();
+      await layer.start();
+      transport.connect('c1');
+
+      await transport.receive('c1', '{"id":"1","method":"bind"}');
+
+      // SPEC 7.1: request lines name the Session. Successful requests are not
+      // logged here, so the observable line is the binding itself — it belongs
+      // to the request that declared it and carries the id it just bound.
+      const bound = logs().filter((line) => line.msg === 'session bound');
+      expect(bound).toHaveLength(1);
+      expect(bound[0]?.sessionId).toBe('s1');
+      await layer.stop();
+    });
+
+    test('passes the newest session after a rebind', async () => {
+      let bound = 's1';
+      const { transport, layer, controlled } = sessionHarness({
+        sessionOf: (method) => (method === 'bind' ? bound : undefined),
+      });
+      await layer.start();
+      transport.connect('c1');
+
+      await transport.receive('c1', '{"id":"1","method":"bind"}');
+      bound = 's2';
+      await transport.receive('c1', '{"id":"2","method":"bind"}');
+      await transport.receive('c1', '{"id":"3","method":"next"}');
+
+      expect(controlled.requests.map((request) => request.sessionId)).toEqual([
+        undefined,
+        's1',
+        's2',
+      ]);
+      await layer.stop();
+    });
+
+    test('passes the reconnected session to the new connection', async () => {
+      const { transport, layer, controlled } = sessionHarness();
+      await layer.start();
+      transport.connect('c1');
+      await transport.receive('c1', '{"id":"1","method":"bind"}');
+
+      transport.connect('c2');
+      // A new connection starts unbound; the bind it sends is a handoff.
+      await transport.receive('c2', '{"id":"2","method":"next"}');
+      await transport.receive('c2', '{"id":"3","method":"bind"}');
+      await transport.receive('c2', '{"id":"4","method":"next"}');
+
+      expect(controlled.requests.map((request) => request.sessionId)).toEqual([
+        undefined,
+        undefined,
+        // The rebinding request on the new connection runs before its own
+        // binding is applied, exactly like a first bind.
+        undefined,
+        's1',
+      ]);
       await layer.stop();
     });
 
