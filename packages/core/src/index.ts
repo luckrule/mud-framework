@@ -22,6 +22,9 @@ export type {
   StorageCapabilities,
   StorageTransaction,
 } from './storage/types.ts';
+export type { StorageRequirements } from './storage/requirements.ts';
+export { unmetRequirements } from './storage/requirements.ts';
+export type { Extension } from './runtime/extension.ts';
 export type {
   Transport,
   TransportConnection,

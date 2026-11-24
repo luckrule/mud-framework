@@ -12,10 +12,12 @@ import { parseIpcMessage } from '../ipc/protocol.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import type { Logger } from '../logging/types.ts';
 import { checkBackendCapabilities } from '../storage/capabilities.ts';
+import { unmetRequirements } from '../storage/requirements.ts';
 import type { StorageBackend, StorageCapabilities } from '../storage/types.ts';
 import { Dispatcher } from './dispatcher.ts';
 import type { ExecutorOutcome } from './executor.ts';
 import { LocalExecutor } from './executor.ts';
+import type { Extension } from './extension.ts';
 import type { RequestIdentity } from './identity.ts';
 import { settleWithin } from './timeout.ts';
 import {
@@ -27,8 +29,11 @@ import {
 export interface ServerProcessOptions {
   /** Builds the storage backend. Called once per process start. */
   createBackend: () => Promise<StorageBackend> | StorageBackend;
-  /** Registers handlers on the dispatcher. Called after the backend is ready. */
-  register: (dispatcher: Dispatcher) => void | Promise<void>;
+  /**
+   * Extensions in registration order. Each is checked against the backend
+   * before its `register` runs (SPEC 4.3).
+   */
+  extensions: readonly Extension[];
   /** Framework-side request ceiling; effective = min(this, backend max). */
   timeoutMs: number;
   logger?: Logger;
@@ -63,8 +68,9 @@ export interface ServerProcessOptions {
 
 /**
  * The process could not reach the readiness barrier: backend creation, the
- * capability self-check or `register` failed. `ready` was not sent, so Portal
- * must not have started delivering requests.
+ * capability self-check, an Extension's unmet requirements or its `register`
+ * failed. `ready` was not sent, so Portal must not have started delivering
+ * requests.
  */
 export class ServerStartupError extends Error {
   readonly code = 'SERVER_STARTUP_FAILED';
@@ -313,8 +319,21 @@ class ServerProcess {
         capabilities: checked.capabilities,
       };
       this.runtime = runtime;
-      // SPEC 6.2 step 2: handlers exist before Portal can deliver anything.
-      await this.options.register(dispatcher);
+      // SPEC 6.2 step 2: every Extension is checked against the backend and
+      // registered before Portal can deliver anything (INV-010).
+      const skipped = await this.registerExtensions(
+        dispatcher,
+        checked.capabilities,
+      );
+      if (skipped > 0 && skipped === this.options.extensions.length) {
+        // Still ready: a Server with no handlers answers every request with
+        // UNKNOWN_METHOD, which is diagnosable, whereas refusing to start would
+        // take down a process the Portal is waiting on. The line is the signal.
+        this.logger.warn(
+          { total: this.options.extensions.length, skipped },
+          'no extension registered: every extension was skipped',
+        );
+      }
       // SPEC 6.2 step 3: only now is the readiness barrier crossed. Sending it
       // earlier would let the first requests hit a half-initialized Server.
       this.channel.send({
@@ -347,6 +366,46 @@ class ServerProcess {
       await closeQuietly(dispatcher, backend, this.logger);
       throw failure;
     }
+  }
+
+  /**
+   * Checks each Extension against the backend declaration and registers the
+   * ones it satisfies (SPEC 4.3, INV-010). Returns how many were skipped.
+   *
+   * A skipped Extension never has its `register` called, so none of its
+   * handlers exist; one Extension being skipped does not affect the others. A
+   * `required` Extension that fails is different: the process cannot run
+   * without it, so startup is refused before `ready` (SPEC 6.2 step 2).
+   */
+  private async registerExtensions(
+    dispatcher: Dispatcher,
+    capabilities: StorageCapabilities,
+  ): Promise<number> {
+    let skipped = 0;
+    for (const extension of this.options.extensions) {
+      const unmet = unmetRequirements(capabilities, extension.requires ?? {});
+      if (unmet.length === 0) {
+        // oxlint-disable-next-line eslint/no-await-in-loop -- registration order is the contract: a later Extension may rely on an earlier one's handlers
+        await extension.register(dispatcher);
+        this.logger.info({ extension: extension.name }, 'extension registered');
+        continue;
+      }
+      if (extension.required === true) {
+        this.logger.error(
+          { extension: extension.name, unmet },
+          'required extension cannot start',
+        );
+        throw new ServerStartupError(
+          `required extension "${extension.name}" cannot start: ${unmet.join('; ')}`,
+        );
+      }
+      skipped += 1;
+      this.logger.warn(
+        { extension: extension.name, unmet },
+        'extension skipped: storage capabilities unmet',
+      );
+    }
+    return skipped;
   }
 
   private async createBackend(): Promise<StorageBackend> {

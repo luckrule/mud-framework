@@ -53,24 +53,31 @@ if (databasePath === undefined) {
 try {
   await runServerProcess({
     createBackend: () => SqliteBackend.open({ filename: databasePath }),
-    register: (dispatcher) => {
-      dispatcher.register('echo', (_ctx, payload) => Promise.resolve(payload));
-      dispatcher.register('store', async (ctx, payload) => {
-        await ctx.storage.execute(
-          'CREATE TABLE IF NOT EXISTS notes (body TEXT NOT NULL)',
-        );
-        await ctx.storage.execute('INSERT INTO notes (body) VALUES (?)', [
-          String(payload),
-        ]);
-        return { stored: payload };
-      });
-      if (behavior === 'crash') {
-        dispatcher.register('crash', () => {
-          // oxlint-disable-next-line unicorn/no-process-exit -- the crash must land mid-handler; a graceful stop would let the result out and stop exercising replay
-          process.exit(1);
-        });
-      }
-    },
+    extensions: [
+      {
+        name: 'notes',
+        register: (dispatcher) => {
+          dispatcher.register('echo', (_ctx, payload) =>
+            Promise.resolve(payload),
+          );
+          dispatcher.register('store', async (ctx, payload) => {
+            await ctx.storage.execute(
+              'CREATE TABLE IF NOT EXISTS notes (body TEXT NOT NULL)',
+            );
+            await ctx.storage.execute('INSERT INTO notes (body) VALUES (?)', [
+              String(payload),
+            ]);
+            return { stored: payload };
+          });
+          if (behavior === 'crash') {
+            dispatcher.register('crash', () => {
+              // oxlint-disable-next-line unicorn/no-process-exit -- the crash must land mid-handler; a graceful stop would let the result out and stop exercising replay
+              process.exit(1);
+            });
+          }
+        },
+      },
+    ],
     timeoutMs: 2000,
   });
 } catch (error) {

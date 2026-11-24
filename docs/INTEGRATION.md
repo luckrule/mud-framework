@@ -43,15 +43,21 @@ try {
   await runServerProcess({
     createBackend: () =>
       SqliteBackend.open({ filename: './data/world.sqlite' }),
-    register: (dispatcher) => {
-      dispatcher.register('player.create', async (ctx, payload) => {
-        const name = (payload as { name: string }).name;
-        await ctx.storage.execute('INSERT INTO players (name) VALUES (?)', [
-          name,
-        ]);
-        return { created: name };
-      });
-    },
+    extensions: [
+      {
+        name: 'players',
+        requires: { transactions: 'full', uniqueConstraint: true },
+        register: (dispatcher) => {
+          dispatcher.register('player.create', async (ctx, payload) => {
+            const name = (payload as { name: string }).name;
+            await ctx.storage.execute('INSERT INTO players (name) VALUES (?)', [
+              name,
+            ]);
+            return { created: name };
+          });
+        },
+      },
+    ],
     timeoutMs: 5000,
   });
 } catch (error) {

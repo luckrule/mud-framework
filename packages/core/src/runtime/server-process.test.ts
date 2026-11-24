@@ -14,6 +14,7 @@ import type { Logger } from '../logging/types.ts';
 import { MemoryStorageBackend } from '../storage/memory.ts';
 import type { StorageBackend, StorageCapabilities } from '../storage/types.ts';
 import type { Dispatcher } from './dispatcher.ts';
+import type { Extension } from './extension.ts';
 import {
   resolveShutdownBudgetMs,
   runServerProcess,
@@ -76,7 +77,7 @@ function sendRaw(portal: IpcChannel, raw: unknown): void {
 }
 
 interface HarnessOptions {
-  register?: (dispatcher: Dispatcher) => void | Promise<void>;
+  extensions?: readonly Extension[];
   backend?: StorageBackend;
   timeoutMs?: number;
   /** Observes every message Portal receives, for cross-array ordering checks. */
@@ -118,7 +119,7 @@ function startServer(options: HarnessOptions = {}): Harness {
   const backend = options.backend ?? new MemoryStorageBackend();
   const done = runServerProcess({
     createBackend: () => backend,
-    register: options.register ?? (() => undefined),
+    extensions: options.extensions ?? [],
     timeoutMs: options.timeoutMs ?? 1000,
     logger,
     channel: serverChannel,
@@ -217,7 +218,10 @@ describe('runServerProcess startup', () => {
         maxTransactionDurationMs: 250,
       },
     });
-    const harness = startServer({ backend, register: echoRegistration });
+    const harness = startServer({
+      backend,
+      extensions: [{ name: 'echo', register: echoRegistration }],
+    });
     await tick();
 
     const ready = received(harness.messages).filter(
@@ -235,12 +239,17 @@ describe('runServerProcess startup', () => {
   test('sends ready only after register returned', async () => {
     let readyCountDuringRegister: number | undefined;
     const harness = startServer({
-      register: (dispatcher) => {
-        dispatcher.register('echo', (_ctx, payload) =>
-          Promise.resolve(payload),
-        );
-        readyCountDuringRegister = harness.messages.length;
-      },
+      extensions: [
+        {
+          name: 'echo',
+          register: (dispatcher) => {
+            dispatcher.register('echo', (_ctx, payload) =>
+              Promise.resolve(payload),
+            );
+            readyCountDuringRegister = harness.messages.length;
+          },
+        },
+      ],
     });
     await tick();
 
@@ -253,7 +262,10 @@ describe('runServerProcess startup', () => {
     const backend = new MemoryStorageBackend({
       capabilities: { maxTransactionDurationMs: Number.NaN },
     });
-    const harness = startServer({ backend, register: echoRegistration });
+    const harness = startServer({
+      backend,
+      extensions: [{ name: 'echo', register: echoRegistration }],
+    });
 
     const error = await startupFailure(harness.done);
 
@@ -272,7 +284,10 @@ describe('runServerProcess startup', () => {
     const backend = new MemoryStorageBackend({
       capabilities: { maxTransactionDurationMs: 0 },
     });
-    const harness = startServer({ backend, register: echoRegistration });
+    const harness = startServer({
+      backend,
+      extensions: [{ name: 'echo', register: echoRegistration }],
+    });
 
     const error = await startupFailure(harness.done);
 
@@ -292,7 +307,10 @@ describe('runServerProcess startup', () => {
       const backend = new MemoryStorageBackend({
         capabilities: { maxTransactionDurationMs: value },
       });
-      const harness = startServer({ backend, register: echoRegistration });
+      const harness = startServer({
+        backend,
+        extensions: [{ name: 'echo', register: echoRegistration }],
+      });
       harnesses.push(harness);
       pending.push(startupFailure(harness.done));
     }
@@ -311,7 +329,10 @@ describe('runServerProcess startup', () => {
     const backend = new MemoryStorageBackend({
       capabilities: { maxTransactionDurationMs: Number.POSITIVE_INFINITY },
     });
-    const harness = startServer({ backend, register: echoRegistration });
+    const harness = startServer({
+      backend,
+      extensions: [{ name: 'echo', register: echoRegistration }],
+    });
     await tick();
 
     const ready = received(harness.messages).filter(
@@ -329,7 +350,10 @@ describe('runServerProcess startup', () => {
       uniqueConstraint: false,
       maxTransactionDurationMs: 1000,
     });
-    const harness = startServer({ backend, register: echoRegistration });
+    const harness = startServer({
+      backend,
+      extensions: [{ name: 'echo', register: echoRegistration }],
+    });
 
     const error = await startupFailure(harness.done);
 
@@ -339,9 +363,14 @@ describe('runServerProcess startup', () => {
 
   test('fails without ready when register throws', async () => {
     const harness = startServer({
-      register: () => {
-        throw new Error('extension refused');
-      },
+      extensions: [
+        {
+          name: 'refusing',
+          register: () => {
+            throw new Error('extension refused');
+          },
+        },
+      ],
     });
 
     const error = await startupFailure(harness.done);
@@ -351,9 +380,225 @@ describe('runServerProcess startup', () => {
   });
 });
 
+describe('runServerProcess extension capabilities', () => {
+  test('registers an extension whose requirements the backend meets', async () => {
+    const backend = new MemoryStorageBackend({
+      capabilities: { transactions: 'full', concurrency: 'pooled' },
+    });
+    const harness = startServer({
+      backend,
+      extensions: [
+        {
+          name: 'banking',
+          requires: { transactions: 'full' },
+          register: (dispatcher) => {
+            dispatcher.register('deposit', (_ctx, payload) =>
+              Promise.resolve({ deposited: payload }),
+            );
+          },
+        },
+      ],
+    });
+    await tick();
+
+    harness.portal.send(requestMessage({ method: 'deposit' }));
+    await tick();
+
+    expect(results(harness.messages)).toEqual([
+      {
+        type: 'result',
+        requestId: 'req-1',
+        ok: true,
+        result: { deposited: 'hi' },
+      },
+    ]);
+    const registered = harness
+      .logs()
+      .filter((line) => line.msg === 'extension registered');
+    expect(registered).toHaveLength(1);
+    expect(registered[0]).toMatchObject({
+      level: 'info',
+      extension: 'banking',
+    });
+    await harness.stop();
+  });
+
+  test('skips an extension whose requirements are unmet, and none of its handlers exist', async () => {
+    // The defect this covers: a business requiring `transactions: full` ran
+    // silently on a `none` backend (INV-010).
+    const backend = new MemoryStorageBackend({
+      capabilities: { transactions: 'none' },
+    });
+    const harness = startServer({
+      backend,
+      extensions: [
+        {
+          name: 'banking',
+          requires: { transactions: 'full' },
+          register: (dispatcher) => {
+            dispatcher.register('deposit', () => Promise.resolve('deposited'));
+          },
+        },
+      ],
+    });
+    await tick();
+
+    harness.portal.send(requestMessage({ method: 'deposit' }));
+    await tick();
+
+    const [outcome] = results(harness.messages);
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) {
+      throw new Error('expected a failure result');
+    }
+    expect(outcome.error.code).toBe('UNKNOWN_METHOD');
+    const skipped = harness
+      .logs()
+      .filter(
+        (line) => line.msg === 'extension skipped: storage capabilities unmet',
+      );
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0]).toMatchObject({
+      level: 'warn',
+      extension: 'banking',
+      unmet: ['transactions: needs full, backend declares none'],
+    });
+    // The process still started: skipping one extension is not a startup failure.
+    expect(
+      received(harness.messages).filter((message) => message.type === 'ready'),
+    ).toHaveLength(1);
+    await harness.stop();
+  });
+
+  test('a skipped extension does not stop later ones from registering', async () => {
+    const backend = new MemoryStorageBackend({
+      capabilities: { transactions: 'limited' },
+    });
+    const harness = startServer({
+      backend,
+      extensions: [
+        {
+          name: 'banking',
+          requires: { transactions: 'full' },
+          register: (dispatcher) => {
+            dispatcher.register('deposit', () => Promise.resolve('deposited'));
+          },
+        },
+        {
+          name: 'queries',
+          register: echoRegistration,
+        },
+      ],
+    });
+    await tick();
+
+    harness.portal.send(requestMessage({ payload: 'later' }));
+    await tick();
+
+    expect(results(harness.messages)).toEqual([
+      { type: 'result', requestId: 'req-1', ok: true, result: 'later' },
+    ]);
+    await harness.stop();
+  });
+
+  test('a required extension with unmet requirements refuses startup', async () => {
+    const backend = new MemoryStorageBackend({
+      capabilities: { transactions: 'limited' },
+    });
+    const harness = startServer({
+      backend,
+      extensions: [
+        {
+          name: 'banking',
+          requires: { transactions: 'full' },
+          required: true,
+          register: (dispatcher) => {
+            dispatcher.register('deposit', () => Promise.resolve('deposited'));
+          },
+        },
+      ],
+    });
+
+    const error = await startupFailure(harness.done);
+
+    // SPEC 6.2 step 2: the process cannot run without it, so no `ready` and a
+    // ServerStartupError for the caller to map to a non-zero exit.
+    expect(error.reason).toContain('banking');
+    expect(received(harness.messages)).toEqual([]);
+    const failures = harness
+      .logs()
+      .filter((line) => line.msg === 'required extension cannot start');
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatchObject({
+      level: 'error',
+      extension: 'banking',
+      unmet: ['transactions: needs full, backend declares limited'],
+    });
+  });
+
+  test('starts with no extensions at all and warns about it', async () => {
+    const harness = startServer({ extensions: [] });
+    await tick();
+
+    expect(
+      received(harness.messages).filter((message) => message.type === 'ready'),
+    ).toHaveLength(1);
+    // No Extension was declared, so nothing was skipped; the all-skipped line
+    // is about declared-but-refused extensions, not an empty list.
+    expect(
+      harness
+        .logs()
+        .filter(
+          (line) =>
+            line.msg === 'no extension registered: every extension was skipped',
+        ),
+    ).toHaveLength(0);
+    await harness.stop();
+  });
+
+  test('warns when every declared extension was skipped', async () => {
+    const backend = new MemoryStorageBackend({
+      capabilities: { transactions: 'none', concurrency: 'single' },
+    });
+    const harness = startServer({
+      backend,
+      extensions: [
+        {
+          name: 'banking',
+          requires: { transactions: 'full' },
+          register: () => undefined,
+        },
+        {
+          name: 'reporting',
+          requires: { concurrency: 'pooled' },
+          register: () => undefined,
+        },
+      ],
+    });
+    await tick();
+
+    // A Server with zero handlers is useless but must not crash: Portal is
+    // waiting on it, and UNKNOWN_METHOD is a diagnosable answer.
+    expect(
+      received(harness.messages).filter((message) => message.type === 'ready'),
+    ).toHaveLength(1);
+    const warnings = harness
+      .logs()
+      .filter(
+        (line) =>
+          line.msg === 'no extension registered: every extension was skipped',
+      );
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatchObject({ level: 'warn', total: 2, skipped: 2 });
+    await harness.stop();
+  });
+});
+
 describe('runServerProcess requests', () => {
   test('executes a request and answers with a result', async () => {
-    const harness = startServer({ register: echoRegistration });
+    const harness = startServer({
+      extensions: [{ name: 'echo', register: echoRegistration }],
+    });
     await tick();
     harness.portal.send({ type: 'hello', portalGeneration: 1 });
 
@@ -368,14 +613,21 @@ describe('runServerProcess requests', () => {
 
   test('maps a thrown handler error to a failure result with its code', async () => {
     const harness = startServer({
-      register: (dispatcher) => {
-        dispatcher.register('explode', () =>
-          Promise.reject(new Error('business failure')),
-        );
-        dispatcher.register('denied', () =>
-          Promise.reject(new BusinessError('BUSINESS_DENIED', 'not allowed')),
-        );
-      },
+      extensions: [
+        {
+          name: 'failures',
+          register: (dispatcher) => {
+            dispatcher.register('explode', () =>
+              Promise.reject(new Error('business failure')),
+            );
+            dispatcher.register('denied', () =>
+              Promise.reject(
+                new BusinessError('BUSINESS_DENIED', 'not allowed'),
+              ),
+            );
+          },
+        },
+      ],
     });
     await tick();
 
@@ -403,7 +655,9 @@ describe('runServerProcess requests', () => {
   });
 
   test('maps an unknown method to UNKNOWN_METHOD', async () => {
-    const harness = startServer({ register: echoRegistration });
+    const harness = startServer({
+      extensions: [{ name: 'echo', register: echoRegistration }],
+    });
     await tick();
 
     harness.portal.send(requestMessage({ method: 'missing' }));
@@ -420,12 +674,17 @@ describe('runServerProcess requests', () => {
 
   test('carries the session id a handler bound into the result message', async () => {
     const harness = startServer({
-      register: (dispatcher) => {
-        dispatcher.register('login', async (ctx) => {
-          ctx.bindSession('session-1');
-          return 'welcome';
-        });
-      },
+      extensions: [
+        {
+          name: 'auth',
+          register: (dispatcher) => {
+            dispatcher.register('login', async (ctx) => {
+              ctx.bindSession('session-1');
+              return 'welcome';
+            });
+          },
+        },
+      ],
     });
     await tick();
 
@@ -445,7 +704,9 @@ describe('runServerProcess requests', () => {
   });
 
   test('omits the session id from the result when the handler binds nothing', async () => {
-    const harness = startServer({ register: echoRegistration });
+    const harness = startServer({
+      extensions: [{ name: 'echo', register: echoRegistration }],
+    });
     await tick();
 
     harness.portal.send(requestMessage());
@@ -476,12 +737,17 @@ describe('runServerProcess requests', () => {
   test('maps a request timeout to FRAMEWORK_TIMEOUT', async () => {
     const harness = startServer({
       timeoutMs: 10,
-      register: (dispatcher) => {
-        dispatcher.register('slow', async () => {
-          await sleep(40);
-          return 'late';
-        });
-      },
+      extensions: [
+        {
+          name: 'slow',
+          register: (dispatcher) => {
+            dispatcher.register('slow', async () => {
+              await sleep(40);
+              return 'late';
+            });
+          },
+        },
+      ],
     });
     await tick();
 
@@ -503,7 +769,9 @@ describe('runServerProcess requests', () => {
     // Executing is the only way to answer: the protocol has no "not ready"
     // reply, and dropping would leave Portal replaying the request forever.
     // The missing handshake is logged instead of silently tolerated.
-    const harness = startServer({ register: echoRegistration });
+    const harness = startServer({
+      extensions: [{ name: 'echo', register: echoRegistration }],
+    });
     await tick();
 
     harness.portal.send(requestMessage());
@@ -522,7 +790,9 @@ describe('runServerProcess requests', () => {
   test('logs REQUEST_BEFORE_HELLO once, not once per request', async () => {
     // The missing handshake is a timing fault, so it stays diagnosable without
     // letting the log volume track the request rate (SPEC 7.1).
-    const harness = startServer({ register: echoRegistration });
+    const harness = startServer({
+      extensions: [{ name: 'echo', register: echoRegistration }],
+    });
     await tick();
 
     for (let index = 0; index < 5; index += 1) {
@@ -539,7 +809,9 @@ describe('runServerProcess requests', () => {
   });
 
   test('does not repeat REQUEST_BEFORE_HELLO once hello arrives', async () => {
-    const harness = startServer({ register: echoRegistration });
+    const harness = startServer({
+      extensions: [{ name: 'echo', register: echoRegistration }],
+    });
     await tick();
 
     harness.portal.send(requestMessage({ requestId: 'req-1' }));
@@ -560,13 +832,18 @@ describe('runServerProcess requests', () => {
     let calls = 0;
     const gate = Promise.withResolvers<void>();
     const harness = startServer({
-      register: (dispatcher) => {
-        dispatcher.register('slow', async () => {
-          calls += 1;
-          await gate.promise;
-          return 'done';
-        });
-      },
+      extensions: [
+        {
+          name: 'slow',
+          register: (dispatcher) => {
+            dispatcher.register('slow', async () => {
+              calls += 1;
+              await gate.promise;
+              return 'done';
+            });
+          },
+        },
+      ],
     });
     await tick();
 
@@ -588,12 +865,17 @@ describe('runServerProcess requests', () => {
   test('logs DUPLICATE_REQUEST once per request id, not once per replay', async () => {
     const gate = Promise.withResolvers<void>();
     const harness = startServer({
-      register: (dispatcher) => {
-        dispatcher.register('slow', async () => {
-          await gate.promise;
-          return 'done';
-        });
-      },
+      extensions: [
+        {
+          name: 'slow',
+          register: (dispatcher) => {
+            dispatcher.register('slow', async () => {
+              await gate.promise;
+              return 'done';
+            });
+          },
+        },
+      ],
     });
     await tick();
 
@@ -618,12 +900,17 @@ describe('runServerProcess requests', () => {
     // for the rest of the process lifetime.
     let gate = Promise.withResolvers<void>();
     const harness = startServer({
-      register: (dispatcher) => {
-        dispatcher.register('slow', async () => {
-          await gate.promise;
-          return 'done';
-        });
-      },
+      extensions: [
+        {
+          name: 'slow',
+          register: (dispatcher) => {
+            dispatcher.register('slow', async () => {
+              await gate.promise;
+              return 'done';
+            });
+          },
+        },
+      ],
     });
     await tick();
 
@@ -650,12 +937,17 @@ describe('runServerProcess cancel', () => {
   test('skips a handler when the cancel arrives in the same delivery batch', async () => {
     let calls = 0;
     const harness = startServer({
-      register: (dispatcher) => {
-        dispatcher.register('echo', (_ctx, payload) => {
-          calls += 1;
-          return Promise.resolve(payload);
-        });
-      },
+      extensions: [
+        {
+          name: 'echo',
+          register: (dispatcher) => {
+            dispatcher.register('echo', (_ctx, payload) => {
+              calls += 1;
+              return Promise.resolve(payload);
+            });
+          },
+        },
+      ],
     });
     await tick();
 
@@ -676,13 +968,18 @@ describe('runServerProcess cancel', () => {
     let calls = 0;
     const gate = Promise.withResolvers<void>();
     const harness = startServer({
-      register: (dispatcher) => {
-        dispatcher.register('slow', async () => {
-          calls += 1;
-          await gate.promise;
-          return 'done';
-        });
-      },
+      extensions: [
+        {
+          name: 'slow',
+          register: (dispatcher) => {
+            dispatcher.register('slow', async () => {
+              calls += 1;
+              await gate.promise;
+              return 'done';
+            });
+          },
+        },
+      ],
     });
     await tick();
 
@@ -712,21 +1009,26 @@ describe('runServerProcess cancel', () => {
     const backend = new MemoryStorageBackend();
     const harness = startServer({
       backend,
-      register: (dispatcher) => {
-        dispatcher.register('slow', async (ctx) => {
-          await ctx.storage.execute('INSERT 1');
-          entered.resolve();
-          await gate.promise;
-          try {
-            await ctx.storage.execute('INSERT 2');
-            lateWriteError = 'write was accepted';
-          } catch (error) {
-            lateWriteError =
-              error instanceof Error ? error.message : String(error);
-          }
-          return 'done';
-        });
-      },
+      extensions: [
+        {
+          name: 'slow',
+          register: (dispatcher) => {
+            dispatcher.register('slow', async (ctx) => {
+              await ctx.storage.execute('INSERT 1');
+              entered.resolve();
+              await gate.promise;
+              try {
+                await ctx.storage.execute('INSERT 2');
+                lateWriteError = 'write was accepted';
+              } catch (error) {
+                lateWriteError =
+                  error instanceof Error ? error.message : String(error);
+              }
+              return 'done';
+            });
+          },
+        },
+      ],
     });
     await tick();
 
@@ -765,13 +1067,18 @@ describe('runServerProcess cancel', () => {
     const harness = startServer({
       backend,
       timeoutMs: 5000,
-      register: (dispatcher) => {
-        dispatcher.register('slow', async (ctx) => {
-          await ctx.storage.execute('INSERT 1');
-          await sleep(60);
-          return 'late';
-        });
-      },
+      extensions: [
+        {
+          name: 'slow',
+          register: (dispatcher) => {
+            dispatcher.register('slow', async (ctx) => {
+              await ctx.storage.execute('INSERT 1');
+              await sleep(60);
+              return 'late';
+            });
+          },
+        },
+      ],
     });
     await tick();
 
@@ -795,12 +1102,17 @@ describe('runServerProcess cancel', () => {
   test('a request timeoutMs larger than the configuration does not extend it', async () => {
     const harness = startServer({
       timeoutMs: 10,
-      register: (dispatcher) => {
-        dispatcher.register('slow', async () => {
-          await sleep(60);
-          return 'late';
-        });
-      },
+      extensions: [
+        {
+          name: 'slow',
+          register: (dispatcher) => {
+            dispatcher.register('slow', async () => {
+              await sleep(60);
+              return 'late';
+            });
+          },
+        },
+      ],
     });
     await tick();
 
@@ -833,7 +1145,7 @@ describe('runServerProcess lifecycle', () => {
     };
     const harness = startServer({
       backend,
-      register: echoRegistration,
+      extensions: [{ name: 'echo', register: echoRegistration }],
       onPortalMessage: (raw) => {
         const parsed = parseIpcMessage(raw);
         if (parsed.ok) {
@@ -883,7 +1195,9 @@ describe('runServerProcess lifecycle', () => {
   });
 
   test('answers every request that arrives during shutdown with FRAMEWORK_SHUTDOWN', async () => {
-    const harness = startServer({ register: echoRegistration });
+    const harness = startServer({
+      extensions: [{ name: 'echo', register: echoRegistration }],
+    });
     await tick();
 
     harness.portal.send({ type: 'shutdown', timeoutMs: 2000 });
@@ -908,12 +1222,17 @@ describe('runServerProcess lifecycle', () => {
     // real result would then arrive for an id Portal had already settled.
     const gate = Promise.withResolvers<void>();
     const harness = startServer({
-      register: (dispatcher) => {
-        dispatcher.register('slow', async () => {
-          await gate.promise;
-          return 'done';
-        });
-      },
+      extensions: [
+        {
+          name: 'slow',
+          register: (dispatcher) => {
+            dispatcher.register('slow', async () => {
+              await gate.promise;
+              return 'done';
+            });
+          },
+        },
+      ],
     });
     await tick();
 
@@ -942,12 +1261,17 @@ describe('runServerProcess lifecycle', () => {
     const gate = Promise.withResolvers<void>();
     const events: string[] = [];
     const harness = startServer({
-      register: (dispatcher) => {
-        dispatcher.register('slow', async () => {
-          await gate.promise;
-          return 'done';
-        });
-      },
+      extensions: [
+        {
+          name: 'slow',
+          register: (dispatcher) => {
+            dispatcher.register('slow', async () => {
+              await gate.promise;
+              return 'done';
+            });
+          },
+        },
+      ],
       onPortalMessage: (raw) => {
         const parsed = parseIpcMessage(raw);
         if (parsed.ok) {
@@ -976,7 +1300,9 @@ describe('runServerProcess lifecycle', () => {
   });
 
   test('rejects when the link closes without shutdown', async () => {
-    const harness = startServer({ register: echoRegistration });
+    const harness = startServer({
+      extensions: [{ name: 'echo', register: echoRegistration }],
+    });
     await tick();
 
     harness.portal.close('portal gone');
@@ -1005,12 +1331,17 @@ describe('runServerProcess lifecycle', () => {
     const harness = startServer({
       backend,
       timeoutMs: 10,
-      register: (dispatcher) => {
-        dispatcher.register('stuck', async () => {
-          await release.promise;
-          return 'late';
-        });
-      },
+      extensions: [
+        {
+          name: 'stuck',
+          register: (dispatcher) => {
+            dispatcher.register('stuck', async () => {
+              await release.promise;
+              return 'late';
+            });
+          },
+        },
+      ],
     });
     await tick();
 
@@ -1063,12 +1394,17 @@ describe('runServerProcess lifecycle', () => {
       // The request ceiling is far above the declared budget, so the drain
       // cannot settle by the dispatcher's timeout and runs out the budget.
       timeoutMs: 5000,
-      register: (dispatcher) => {
-        dispatcher.register('stuck', async () => {
-          await release.promise;
-          return 'late';
-        });
-      },
+      extensions: [
+        {
+          name: 'stuck',
+          register: (dispatcher) => {
+            dispatcher.register('stuck', async () => {
+              await release.promise;
+              return 'late';
+            });
+          },
+        },
+      ],
     });
     await tick();
 
@@ -1100,7 +1436,9 @@ describe('runServerProcess lifecycle', () => {
   });
 
   test('resends ready when a newer portal generation arrives', async () => {
-    const harness = startServer({ register: echoRegistration });
+    const harness = startServer({
+      extensions: [{ name: 'echo', register: echoRegistration }],
+    });
     await tick();
     harness.portal.send({ type: 'hello', portalGeneration: 1 });
     await tick();
@@ -1118,7 +1456,9 @@ describe('runServerProcess lifecycle', () => {
   });
 
   test('ignores a hello that does not advance the generation', async () => {
-    const harness = startServer({ register: echoRegistration });
+    const harness = startServer({
+      extensions: [{ name: 'echo', register: echoRegistration }],
+    });
     await tick();
     harness.portal.send({ type: 'hello', portalGeneration: 3 });
     await tick();
@@ -1136,7 +1476,9 @@ describe('runServerProcess lifecycle', () => {
   });
 
   test('logs a warning for an invalid message and keeps running', async () => {
-    const harness = startServer({ register: echoRegistration });
+    const harness = startServer({
+      extensions: [{ name: 'echo', register: echoRegistration }],
+    });
     await tick();
 
     sendRaw(harness.portal, { type: 'nonsense' });
@@ -1157,16 +1499,21 @@ describe('runServerProcess lifecycle', () => {
 
   test('logs a business refusal at warn and a framework failure at error', async () => {
     const harness = startServer({
-      register: (dispatcher) => {
-        dispatcher.register('denied', () =>
-          Promise.reject(
-            new BusinessError('PLAYER_NOT_FOUND', 'no such player'),
-          ),
-        );
-        dispatcher.register('explode', () =>
-          Promise.reject(new Error('internal boom')),
-        );
-      },
+      extensions: [
+        {
+          name: 'failures',
+          register: (dispatcher) => {
+            dispatcher.register('denied', () =>
+              Promise.reject(
+                new BusinessError('PLAYER_NOT_FOUND', 'no such player'),
+              ),
+            );
+            dispatcher.register('explode', () =>
+              Promise.reject(new Error('internal boom')),
+            );
+          },
+        },
+      ],
     });
     await tick();
 
@@ -1206,12 +1553,17 @@ describe('runServerProcess lifecycle', () => {
       backend,
       timeoutMs: 60_000,
       abortTimeoutMs: 20,
-      register: (dispatcher) => {
-        dispatcher.register('stuck', async () => {
-          await release.promise;
-          return 'late';
-        });
-      },
+      extensions: [
+        {
+          name: 'stuck',
+          register: (dispatcher) => {
+            dispatcher.register('stuck', async () => {
+              await release.promise;
+              return 'late';
+            });
+          },
+        },
+      ],
     });
     await tick();
 
@@ -1239,7 +1591,7 @@ describe('runServerProcess lifecycle', () => {
     // only signal an orphan gets; without it the process keeps writing.
     let parentPid = 1000;
     const harness = startServer({
-      register: echoRegistration,
+      extensions: [{ name: 'echo', register: echoRegistration }],
       parentCheckIntervalMs: 10,
       readParentPid: () => parentPid,
     });

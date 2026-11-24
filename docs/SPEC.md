@@ -10,7 +10,7 @@
 
 通用 MUD 游戏框架，运行于 Bun + TypeScript。
 
-框架的设计目标是提供让 MUD 业务能安全跑起来的骨架：连接的接入与有序化、请求的事务边界、存储后端的能力协商、业务进程的生命周期与崩溃恢复、可观测的日志与错误码。游戏规则、命令解析、世界模型属于 Extension，不属于框架。上述核心能力已实现；尚未实现的集中在 Extension 机制与中止信号，传输能力协商已从契约中移除。逐节见「当前未实现」标注。
+框架的设计目标是提供让 MUD 业务能安全跑起来的骨架：连接的接入与有序化、请求的事务边界、存储后端的能力协商、业务进程的生命周期与崩溃恢复、可观测的日志与错误码。游戏规则、命令解析、世界模型属于 Extension，不属于框架。上述核心能力已实现；尚未实现的是 Extension 生命周期钩子与中止信号，传输能力协商已从契约中移除。逐节见「当前未实现」标注。
 
 读者是 AI 协作者与未来的维护者。因此本文优先写决策与边界，不写机制教程；机制细节以代码与类型定义为准。
 
@@ -55,6 +55,8 @@ Handler 可以 await，框架的调度建立在 Promise 之上。
 **Handler（处理器）** — 处理单个 Request 的业务函数，可以是 async。输入是已解码的请求与请求上下文；正常返回即表示该请求成功。
 
 **Extension（扩展）** — 业务能力的打包单元，向框架注册 Handler 与生命周期钩子，并声明自己依赖的存储能力。框架核心不含任何游戏规则。
+
+当前形状：`name`（日志中的唯一标识）、`requires`（存储能力最低要求，省略即在任何后端上运行）、`required`（是否为本进程启动所必需）与 `register(dispatcher)`。生命周期钩子尚未实现，见 4.3 与 6.2。
 
 **Storage Backend（存储后端）** — 实现存储契约并给出能力声明的持久化实现，以独立包发布。见 4.1。
 
@@ -193,9 +195,7 @@ interface Capabilities {
 | snapshotRead: false     | 框架不承诺事务内重复读一致                                                       | Extension 自行处理读到变化数据的情况                |
 | uniqueConstraint: false | 框架不提供"检查再写入"的原子性                                                   | 唯一性由单写者或业务侧幂等键保证                    |
 
-Extension 对存储能力的依赖 MUST 显式声明。启动时若后端能力不满足某个 Extension 声明的最低要求，框架 MUST 拒绝注册该 Extension（fail fast），不影响其他 Extension。
-
-当前未实现：没有 Extension 注册机制，`runServerProcess` 的 `register` 回调只拿到一个 `Dispatcher` 供业务注册 handler，没有让 Extension 声明存储能力最低要求的入口。`ServerProcess` 启动时只对后端能力声明做格式自检（字段齐全、取值合法），不做"Extension 要求 vs 后端能力"的比对。后果是 INV-010 当前没有执行者——一个要求 `transactions: full` 的业务可以静默跑在 `transactions: none` 的后端上。这是已知缺口，不是文档过期——条目保留为目标契约。
+Extension 对存储能力的依赖 MUST 显式声明。启动时若后端能力不满足某个 Extension 声明的最低要求，框架 MUST 拒绝注册该 Extension（fail fast），不影响其他 Extension。被拒绝的 Extension 不执行注册，其 Handler 全部不存在；声明 `required` 的 Extension 被拒绝时整个业务进程拒绝启动，因为缺少它的进程不是可用的进程。
 
 依赖声明的粒度是"最低要求"，不是"完整能力清单"。例如银行类 Extension 要求 `transactions: full` 与 `uniqueConstraint: true`；只读查询类 Extension 可以不声明任何存储能力要求，从而在任何后端上运行。
 
@@ -249,7 +249,7 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 ### 6.2 启动顺序
 
 1. 存储后端初始化并自检能力声明。
-2. 业务进程加载 Extension，按 4.3 校验其声明的存储能力；业务进程启动所必需的能力不满足时拒绝启动业务进程。当前未实现：这一步的校验没有执行者，实际顺序是存储后端初始化 → 能力格式自检 → `register` 注册 handler → 发 `ready`，缺口见 4.3。
+2. 业务进程加载 Extension，按 4.3 校验其声明的存储能力；业务进程启动所必需的能力不满足时拒绝启动业务进程。
 3. 连接层开始接受连接。
 
 连接层 MUST NOT 在业务进程就绪之前接受输入。理由：否则第一批玩家会收到"框架正在启动"这类本不该存在的错误。
@@ -286,7 +286,7 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 
 框架日志 MUST 是结构化的（字段而非拼接字符串）。字段名是契约，文案不是。每个 Request 的日志 SHOULD 至少携带：请求标识、Session ID、Connection ID、Extension 名、耗时、结果、错误码。日志级别按语义使用：告警级用于能力降级、重放、队列拒绝这类"能继续运行但需要人知道"的事件；错误级用于请求失败；不得用错误级记录预期内的业务拒绝。
 
-当前未实现：Extension 名不可用——`RequestContext` 没有 Extension 名字段，Extension 注册机制尚未实现（见 §4.3）。这是已知缺口，不是文档过期——本段保留为目标契约。
+当前未实现：Extension 名不可用——`RequestContext` 没有 Extension 名字段，请求日志无法标注所属 Extension。注册与能力校验已实现（见 §4.3），但 handler 与 Extension 的归属关系尚未暴露给请求上下文。这是已知缺口，不是文档过期——本段保留为目标契约。
 
 ### 7.2 错误码
 
