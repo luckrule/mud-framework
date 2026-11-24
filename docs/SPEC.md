@@ -10,7 +10,7 @@
 
 通用 MUD 游戏框架，运行于 Bun + TypeScript。
 
-框架的设计目标是提供让 MUD 业务能安全跑起来的骨架：连接的接入与有序化、请求的事务边界、存储后端的能力协商、业务进程的生命周期与崩溃恢复、可观测的日志与错误码。游戏规则、命令解析、世界模型属于 Extension，不属于框架。上述核心能力已实现；尚未实现的是 Extension 生命周期钩子，传输能力协商已从契约中移除。逐节见「当前未实现」标注。
+框架的设计目标是提供让 MUD 业务能安全跑起来的骨架：连接的接入与有序化、请求的事务边界、存储后端的能力协商、业务进程的生命周期与崩溃恢复、可观测的日志与错误码。游戏规则、命令解析、世界模型属于 Extension，不属于框架。上述核心能力已实现；传输能力协商已从契约中移除（见 §5.1），Extension 生命周期钩子已从 Extension 契约中移除——它既没有语义定义，也没有消费者。
 
 读者是 AI 协作者与未来的维护者。因此本文优先写决策与边界，不写机制教程；机制细节以代码与类型定义为准。
 
@@ -54,9 +54,9 @@ Handler 可以 await，框架的调度建立在 Promise 之上。
 
 **Handler（处理器）** — 处理单个 Request 的业务函数，可以是 async。输入是已解码的请求与请求上下文；正常返回即表示该请求成功。
 
-**Extension（扩展）** — 业务能力的打包单元，向框架注册 Handler 与生命周期钩子，并声明自己依赖的存储能力。框架核心不含任何游戏规则。
+**Extension（扩展）** — 业务能力的打包单元，向框架注册 Handler 并声明自己依赖的存储能力。框架核心不含任何游戏规则。
 
-当前形状：`name`（日志中的唯一标识）、`requires`（存储能力最低要求，省略即在任何后端上运行）、`required`（是否为本进程启动所必需）与 `register(dispatcher)`。生命周期钩子尚未实现，见 4.3 与 6.2。
+当前形状：`name`（日志中的唯一标识）、`requires`（存储能力最低要求，省略即在任何后端上运行）、`required`（是否为本进程启动所必需）与 `register(registrar)`。registrar 由框架提供，自动标注 handler 所属的 Extension，使请求日志能带上它（见 §7.1）；`registrar.register(method, handler, { cancellable: false })` 声明该 handler 不可取消（handler 级，见 §3.6）。
 
 **Storage Backend（存储后端）** — 实现存储契约并给出能力声明的持久化实现，以独立包发布。见 4.1。
 
@@ -141,7 +141,9 @@ Connection 在 Request 处理中关闭时，该 Request MUST 进入终态，不�
 
 例外：Extension 可声明某类 Request 为不可取消（例如已经进入不可回滚的外部副作用）。框架 MUST 允许这种声明，但不可取消的 Request 仍受超时约束，且必须在关闭流程中等待其终态。
 
-当前未实现：没有让 Extension 声明"不可取消"的机制。这是已知缺口，不是文档过期——条目保留为目标契约。取消的实际语义是：中止信号触发、使后续写入失效、让结果不再送达，但不保证 handler 停止（JS 无法抢占执行中的代码，见 3.4），也不保证事务已回滚（见 3.3 与 ADR-0004）。
+已实现：handler 通过 `ExtensionRegistrar.register(method, handler, { cancellable: false })` 声明不可取消，粒度是 handler 而非 Extension。不可取消的请求收到 cancel 时，框架 MUST NOT 置事务失效、MUST NOT 触发中止信号、MUST NOT 回失败结果；请求继续执行并以其真实结果结束。理由：业务已声明副作用不可回滚，回滚一次可能已经生效的操作比让它跑完更糟。该声明不改变超时约束：超时定时器照常触发并把请求置为框架失败（见 3.4）。
+
+关闭流程同样等待其终态：请求仍在执行集合中，`drain` 天然覆盖；等待有上限——正常关闭受 Portal 声明的关闭预算约束，链路中断后的 abort 路径受 `ABORT_TIMEOUT_MS` 约束，超时只放弃等待（见 6.3）。对可取消的请求，取消的实际语义是：中止信号触发、使后续写入失效、让结果不再送达，但不保证 handler 停止（JS 无法抢占执行中的代码，见 3.4），也不保证事务已回滚（见 3.3 与 ADR-0004）。
 
 断线不等于 Session 结束。Session 状态在业务进程侧保留一段时间（由配置决定），期间重连可恢复；超时未重连则按业务规则结束。
 
@@ -286,7 +288,7 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 
 框架日志 MUST 是结构化的（字段而非拼接字符串）。字段名是契约，文案不是。每个 Request 的日志 SHOULD 至少携带：请求标识、Session ID、Connection ID、Extension 名、耗时、结果、错误码。日志级别按语义使用：告警级用于能力降级、重放、队列拒绝这类"能继续运行但需要人知道"的事件；错误级用于请求失败；不得用错误级记录预期内的业务拒绝。
 
-当前未实现：Extension 名不可用——`RequestContext` 没有 Extension 名字段，请求日志无法标注所属 Extension。注册与能力校验已实现（见 §4.3），但 handler 与 Extension 的归属关系尚未暴露给请求上下文。这是已知缺口，不是文档过期——本段保留为目标契约。
+已实现：`RequestContext.extension` 由 handler 的注册元数据填充。通过 `ExtensionRegistrar` 注册的 handler 自动带上所属 Extension 名，请求日志的 bindings 仅在存在该名时写入 `extension` 字段；不属于任何 Extension 的 handler 不带该字段。
 
 ### 7.2 错误码
 

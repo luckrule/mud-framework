@@ -231,17 +231,9 @@ export class RequestRunner {
         // SPEC 3.6: the business declared the side effect irreversible, so the
         // transaction stays valid and the result is still owed. Nothing is
         // recorded on the entry, or the late result would be suppressed. The
-        // dispatcher already logged the refusal; this line states what it means
-        // for the request the runner is tracking.
-        this.deps.logger.warn(
-          {
-            ...requestIds(entry.message),
-            code: message.code,
-            method: entry.message.method,
-            reason: 'declared non-cancellable',
-          },
-          'cancel refused',
-        );
+        // refusal is already logged by the dispatcher's request-bound logger,
+        // which carries the same ids; a second line here would report the same
+        // event twice.
         return;
       }
       // `not-in-flight`: the request went terminal in between; the outcome is

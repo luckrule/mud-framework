@@ -189,9 +189,14 @@ describe('RequestRunner', () => {
     expect(harness.sent).toEqual([
       { type: 'result', requestId: 'req-1', ok: true, result: 'done' },
     ]);
+    // The refusal is one event. The dispatcher's request-bound logger reports
+    // it, so the runner must not add a second line for the same cancel.
     const refused = harness
       .logs()
-      .filter((line) => line.msg === 'cancel refused');
+      .filter(
+        (line) =>
+          line.msg === 'cancel refused: handler declared non-cancellable',
+      );
     expect(refused).toHaveLength(1);
     expect(refused[0]).toMatchObject({
       level: 'warn',
@@ -200,6 +205,9 @@ describe('RequestRunner', () => {
       reason: 'declared non-cancellable',
       requestId: 'req-1',
     });
+    expect(
+      harness.logs().filter((line) => line.msg === 'cancel refused'),
+    ).toHaveLength(0);
     expect(
       harness
         .logs()
