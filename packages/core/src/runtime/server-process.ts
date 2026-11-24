@@ -266,12 +266,21 @@ class ServerProcess {
     // Inbound plumbing goes last: a message that arrives before these
     // handlers are attached is buffered by the channel and delivered at
     // registration, so none is lost and none is handled before `ready`.
-    this.channel.onMessage((raw) => {
-      this.onMessage(runtime, runner, raw);
-    });
-    this.channel.onClose((reason) => {
-      this.onChannelClose(runtime, runner, reason);
-    });
+    try {
+      this.channel.onMessage((raw) => {
+        this.onMessage(runtime, runner, raw);
+      });
+      this.channel.onClose((reason) => {
+        this.onChannelClose(runtime, runner, reason);
+      });
+    } catch (error) {
+      // The channel is outside code: a registration that throws must not leave
+      // the backend open, which is what the pre-split `start` guarded with its
+      // own catch. The original error is the one worth reporting, so a failure
+      // to close does not replace it.
+      await runtime.executor.close().catch(() => undefined);
+      throw error;
+    }
   }
 
   private onMessage(

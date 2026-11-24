@@ -6,11 +6,7 @@ import type { Handler } from './dispatcher.ts';
  * automatically so request logs can name it (SPEC 7.1).
  */
 export interface ExtensionRegistrar {
-  register(
-    method: string,
-    handler: Handler,
-    options?: { cancellable?: boolean },
-  ): void;
+  register(method: string, handler: Handler): void;
 }
 
 /**

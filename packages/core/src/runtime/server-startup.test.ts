@@ -185,41 +185,6 @@ describe('startServer', () => {
     await runtime.executor.close();
   });
 
-  test('passes a non-cancellable declaration through to the dispatcher', async () => {
-    const entered = Promise.withResolvers<void>();
-    const release = Promise.withResolvers<void>();
-    const test1 = harness([
-      {
-        name: 'banking',
-        register: (registrar) => {
-          registrar.register(
-            'charge',
-            async () => {
-              entered.resolve();
-              await release.promise;
-              return 'charged';
-            },
-            { cancellable: false },
-          );
-        },
-      },
-    ]);
-
-    const { runtime } = await startServer(test1.deps());
-    const pending = runtime.dispatcher.dispatch('charge', null, {
-      requestId: 'req-nc',
-    });
-    await entered.promise;
-
-    expect(runtime.dispatcher.cancel('req-nc', 'TRANSPORT_CLOSED')).toBe(
-      'not-cancellable',
-    );
-    release.resolve();
-
-    expect(await pending).toEqual({ result: 'charged' });
-    await runtime.executor.close();
-  });
-
   test('leaves inbound handlers unattached so messages stay buffered', async () => {
     // The readiness barrier is `ready`; the caller attaches `onMessage` after
     // `startServer` returns, and the channel buffers anything that arrived in

@@ -47,8 +47,8 @@ try {
       {
         name: 'players',
         requires: { transactions: 'full', uniqueConstraint: true },
-        register: (dispatcher) => {
-          dispatcher.register('player.create', async (ctx, payload) => {
+        register: (registrar) => {
+          registrar.register('player.create', async (ctx, payload) => {
             const name = (payload as { name: string }).name;
             await ctx.storage.execute('INSERT INTO players (name) VALUES (?)', [
               name,

@@ -56,7 +56,7 @@ Handler 可以 await，框架的调度建立在 Promise 之上。
 
 **Extension（扩展）** — 业务能力的打包单元，向框架注册 Handler 并声明自己依赖的存储能力。框架核心不含任何游戏规则。
 
-当前形状：`name`（日志中的唯一标识）、`requires`（存储能力最低要求，省略即在任何后端上运行）、`required`（是否为本进程启动所必需）与 `register(registrar)`。registrar 由框架提供，自动标注 handler 所属的 Extension，使请求日志能带上它（见 §7.1）；`registrar.register(method, handler, { cancellable: false })` 声明该 handler 不可取消（handler 级，见 §3.6）。
+当前形状：`name`（日志中的唯一标识）、`requires`（存储能力最低要求，省略即在任何后端上运行）、`required`（是否为本进程启动所必需）与 `register(registrar)`。registrar 由框架提供，自动标注 handler 所属的 Extension，使请求日志能带上它（见 §7.1）。
 
 **Storage Backend（存储后端）** — 实现存储契约并给出能力声明的持久化实现，以独立包发布。见 4.1。
 
@@ -139,13 +139,13 @@ Handler 内 MUST NOT 开启新事务。需要多段原子性的业务应拆成�
 
 Connection 在 Request 处理中关闭时，该 Request MUST 进入终态，不得无限期挂起。
 
-默认策略是取消：中止信号触发，事务回滚，Request 以框架错误结束。选择"取消"而非"继续执行"的理由是：玩家已经看不到结果，继续写入只会产生无法解释的状态变更。
+策略是取消，没有例外：中止信号触发，事务回滚，Request 以框架错误结束。选择"取消"而非"继续执行"的理由是：玩家已经看不到结果，继续写入只会产生无法解释的状态变更。
 
-例外：Extension 可声明某类 Request 为不可取消（例如已经进入不可回滚的外部副作用）。框架 MUST 允许这种声明，但不可取消的 Request 仍受超时约束，且必须在关闭流程中等待其终态。
+本 SPEC 曾要求框架 MUST 允许 Extension 把某类 Request 声明为不可取消（例如已经进入不可回滚的外部副作用）。该承诺已撤回，当前不提供。撤回的原因在结构上：跨进程拆分让"不取消"无法安全兑现。Portal 在连接断开时先删除该连接持有的 Session 路由，再向 Server 发出取消；若 Server 拒绝取消并继续写入，Portal 并不知道——它已经把请求结算为失败。玩家此后重连并绑定同一 Session ID 时，路由已删，这次绑定被当作首次绑定，不触发重连顺序门（见 3.2），新连接上的请求会与仍在写存储的旧 handler 并发执行，违反 INV-004（同一 Session 在同一时刻只有一条处理线）。要正确支持不可取消，取消结果必须跨进程可见：Server 明确回复取消被拒绝，Portal 在收到该回复前不得结算请求、也不得让同一 Session 的新连接开始处理。这是未实现的协议扩展。因此不可取消声明连同三态 `cancel` 返回值一起撤出类型与实现：`HandlerOptions` 不再有 `cancellable`，`ExtensionRegistrar.register` 不再接收 options，`Dispatcher.cancel` 返回布尔。
 
-已实现：handler 通过 `ExtensionRegistrar.register(method, handler, { cancellable: false })` 声明不可取消，粒度是 handler 而非 Extension。不可取消的请求收到 cancel 时，框架 MUST NOT 置事务失效、MUST NOT 触发中止信号、MUST NOT 回失败结果；请求继续执行并以其真实结果结束。理由：业务已声明副作用不可回滚，回滚一次可能已经生效的操作比让它跑完更糟。该声明不改变超时约束：超时定时器照常触发并把请求置为框架失败（见 3.4）。
+当前策略的边界：连接断开时一律取消。需要不可回滚副作用的业务应把该副作用放在请求之外（例如独立的幂等作业，由其自行保证重试安全），或接受超时、断线与重连竞争之间的不确定性。这不是替代方案的建议，而是框架当前的真实行为。
 
-关闭流程同样等待其终态：请求仍在执行集合中，`drain` 天然覆盖；等待有上限——正常关闭受 Portal 声明的关闭预算约束，链路中断后的 abort 路径受 `ABORT_TIMEOUT_MS` 约束，超时只放弃等待（见 6.3）。对可取消的请求，取消的实际语义是：中止信号触发、使后续写入失效、让结果不再送达，但不保证 handler 停止（JS 无法抢占执行中的代码，见 3.4），也不保证事务已回滚（见 3.3 与 ADR-0004）。
+关闭流程等待在途请求的终态：请求仍在执行集合中，`drain` 天然覆盖；等待有上限——正常关闭受 Portal 声明的关闭预算约束，链路中断后的 abort 路径受 `ABORT_TIMEOUT_MS` 约束，超时只放弃等待（见 6.3）。取消的实际语义是：中止信号触发、使后续写入失效、让结果不再送达，但不保证 handler 停止（JS 无法抢占执行中的代码，见 3.4），也不保证事务已回滚（见 3.3 与 ADR-0004）。
 
 断线不等于 Session 结束。Session 状态在业务进程侧保留一段时间（由配置决定），期间重连可恢复；超时未重连则按业务规则结束。
 

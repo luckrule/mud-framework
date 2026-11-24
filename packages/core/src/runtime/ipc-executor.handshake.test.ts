@@ -132,4 +132,32 @@ describe('IpcExecutor handshake', () => {
     });
     await h.executor.close();
   });
+
+  test('reports a full buffer ahead of a duplicate requestId', async () => {
+    const h = harness({ timeoutMs: 5000, maxPending: 2 });
+    // Started but never ready, so nothing is delivered and the buffer fills.
+    void h.executor.start().catch(() => undefined);
+    await flushTicks();
+
+    void h.executor.execute(request({ requestId: 'req-1' }));
+    void h.executor.execute(request({ requestId: 'req-2' }));
+    // Both conditions hold at once: the buffer is full and `req-1` is already
+    // in flight. The cap is what refused this request, so the code must be the
+    // cap's, not the duplicate's (the pre-extraction order).
+    const refused = await h.executor.execute(request({ requestId: 'req-1' }));
+
+    expect(failureOf(refused).code).toBe('FRAMEWORK_QUEUE_FULL');
+    expect(
+      h
+        .logs()
+        .some(
+          (line) =>
+            line.msg === 'request refused: pending buffer is full' &&
+            line.code === 'FRAMEWORK_QUEUE_FULL' &&
+            line.pending === 2 &&
+            line.limit === 2,
+        ),
+    ).toBe(true);
+    await h.executor.close();
+  });
 });

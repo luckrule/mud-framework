@@ -210,12 +210,12 @@ export class RequestRunner {
       // SPEC 3.3/3.6: a running handler cannot be preempted, but its
       // transaction can be invalidated. Every later write is rejected and the
       // transaction rolls back when the handler returns, so a cancel really
-      // cancels instead of merely muting the answer.
-      const outcome = this.deps.runtime.dispatcher.cancel(
-        message.requestId,
-        message.code,
-      );
-      if (outcome === 'cancelled') {
+      // cancels instead of merely muting the answer. A `false` return means the
+      // request went terminal in between; the outcome is then already owed or
+      // already answered, so nothing is recorded.
+      if (
+        this.deps.runtime.dispatcher.cancel(message.requestId, message.code)
+      ) {
         entry.cancelledCode = message.code;
         this.deps.logger.warn(
           {
@@ -227,17 +227,6 @@ export class RequestRunner {
         );
         return;
       }
-      if (outcome === 'not-cancellable') {
-        // SPEC 3.6: the business declared the side effect irreversible, so the
-        // transaction stays valid and the result is still owed. Nothing is
-        // recorded on the entry, or the late result would be suppressed. The
-        // refusal is already logged by the dispatcher's request-bound logger,
-        // which carries the same ids; a second line here would report the same
-        // event twice.
-        return;
-      }
-      // `not-in-flight`: the request went terminal in between; the outcome is
-      // already owed or already answered, so nothing is recorded.
       this.deps.logger.debug(
         {
           ...requestIds(entry.message),

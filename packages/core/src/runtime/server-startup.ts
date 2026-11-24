@@ -162,12 +162,9 @@ async function registerExtensions(
       // The Extension never sees the dispatcher, so it cannot forget (or
       // override) the name its handlers are logged under (SPEC 7.1).
       const registrar: ExtensionRegistrar = {
-        register: (method, handler, options) => {
+        register: (method, handler) => {
           dispatcher.register(method, handler, {
             extension: extension.name,
-            ...(options?.cancellable === undefined
-              ? {}
-              : { cancellable: options.cancellable }),
           });
         },
       };

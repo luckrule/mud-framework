@@ -30,7 +30,6 @@ export type {
   TransportHandlers,
 } from './transport/types.ts';
 export type {
-  CancelOutcome,
   DispatchMeta,
   DispatchResult,
   DispatcherOptions,

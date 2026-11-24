@@ -359,6 +359,14 @@ export class IpcExecutor implements RequestExecutor {
         failure(FRAMEWORK_SHUTDOWN, 'ipc executor is shutting down'),
       );
     }
+    // Capacity before duplicate id, matching the order the admission checks had
+    // before the buffer was extracted: a request refused because the buffer is
+    // full reports the cap, even when its id is also in flight. Reversing them
+    // would answer "caller bug" to a request the executor refused by policy.
+    // `PendingBuffer.add` keeps its own check as a backstop.
+    if (this.buffer.size >= this.buffer.maxPending) {
+      return this.refuseQueueFull(request);
+    }
     if (this.buffer.get(request.requestId) !== undefined) {
       // Request ids are minted by the connection layer and a replay goes
       // through the buffer, so a second execute() for the same id is a caller
@@ -390,25 +398,10 @@ export class IpcExecutor implements RequestExecutor {
       tightenTimeout(this.effectiveTimeoutMs, request.timeoutMs),
     );
     if (pending === undefined) {
-      // warn, not error: a full buffer is a refusal by policy, and the caller
-      // gets a stable code rather than a request that waits out its deadline.
-      this.logger.warn(
-        {
-          requestId: request.requestId,
-          connectionId: request.connectionId,
-          clientRequestId: request.clientRequestId,
-          code: FRAMEWORK_QUEUE_FULL,
-          pending: this.buffer.size,
-          limit: this.buffer.maxPending,
-        },
-        'request refused: pending buffer is full',
-      );
-      return Promise.resolve(
-        failure(
-          FRAMEWORK_QUEUE_FULL,
-          `ipc executor pending buffer is full (${this.buffer.maxPending} unacknowledged)`,
-        ),
-      );
+      // Unreachable after the pre-check above, but `add` owns the cap and may
+      // still refuse; sharing the refusal keeps the code, message and log in
+      // one place.
+      return this.refuseQueueFull(request);
     }
     this.armTimer(pending);
     try {
@@ -428,6 +421,32 @@ export class IpcExecutor implements RequestExecutor {
       this.settle(pending, failure(INTERNAL_ERROR, messageOf(error)));
     }
     return deferred.promise;
+  }
+
+  /**
+   * Refuses a request because the unacknowledged buffer is at its cap.
+   *
+   * warn, not error: a full buffer is a refusal by policy, and the caller gets a
+   * stable code rather than a request that waits out its deadline.
+   */
+  private refuseQueueFull(request: ExecutorRequest): Promise<ExecutorOutcome> {
+    this.logger.warn(
+      {
+        requestId: request.requestId,
+        connectionId: request.connectionId,
+        clientRequestId: request.clientRequestId,
+        code: FRAMEWORK_QUEUE_FULL,
+        pending: this.buffer.size,
+        limit: this.buffer.maxPending,
+      },
+      'request refused: pending buffer is full',
+    );
+    return Promise.resolve(
+      failure(
+        FRAMEWORK_QUEUE_FULL,
+        `ipc executor pending buffer is full (${this.buffer.maxPending} unacknowledged)`,
+      ),
+    );
   }
 
   close(): Promise<void> {
