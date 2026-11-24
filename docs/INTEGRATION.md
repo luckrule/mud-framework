@@ -85,15 +85,15 @@ Portal 侧 `IpcExecutor` 的 `timeoutMs` 决定请求何时在 Portal 结算；�
 ## 部署检查清单
 
 - **Portal 崩溃**：Server 的 IPC 链路断开，`createProcessChannel` 收到 `disconnect`，日志出现 `IPC_CHANNEL_CLOSED`（`reason: process disconnected`）；Server 排空在途请求、关闭后端，`runServerProcess` 以 `ServerChannelClosedError` reject。进程是否随之退出由入口脚本决定——上例把它映射为非零退出码，这是让 Portal 的崩溃处理看见"异常结束"而不是"正常关闭"的必要一步。它不会变成孤儿继续写存储。未确认输入随 Portal 一起丢失，这是 SPEC 6.1 允许的。
-- **`stop()` 的语义**：Portal 先停止接受输入，再排空已接收的请求（受 `ConnectionLayer.shutdownTimeoutMs` 约束），然后让 `IpcExecutor` 发送 `shutdown`；Server 停止接受、排空在途请求、关闭存储、回 `closed`；Portal 收到 `closed` 后等进程真正退出，超时则 `SIGKILL`。`stop()` resolve 时子进程通常已经退出，但这个保证是有界的：进程若卡在不可中断状态，Portal 等 2 秒后记录 `server process did not exit within the wait; it may still be running` 并继续返回。关闭执行器那一步的预算取 `ConnectionLayer.shutdownTimeoutMs` 与 `IpcExecutor.closeBudgetMs`（`shutdownTimeoutMs * 2 + 2000`）的较大者，所以默认配置下外层不会先于执行器放弃等待。
+- **`stop()` 的语义**：Portal 先停止接受输入，再排空已接收的请求（受 `ConnectionLayer.shutdownTimeoutMs` 约束），然后让 `IpcExecutor` 发送 `shutdown`；Server 停止接受、排空在途请求、关闭存储、回 `closed`；Portal 收到 `closed` 后等进程真正退出，超时则 `SIGKILL`。`stop()` resolve 时子进程通常已经退出，但这个保证是有界的：进程若卡在不可中断状态，Portal 等过一次有界的退出等待后记录 `server process did not exit within the wait; it may still be running` 并继续返回（默认值见 ADR-0004）。关闭执行器那一步的预算取 `ConnectionLayer.shutdownTimeoutMs` 与 `IpcExecutor` 声明的关闭预算（`closeBudgetMs`，公式见 ADR-0004）的较大者，所以默认配置下外层不会先于执行器放弃等待。
 - **确认没有孤儿进程**：`process.kill(pid, 0)` 抛 `ESRCH` 即进程已消失。`pid` 来自 Server 的 `ready` 消息（`IpcExecutor` 会把它记进 `server ready` 日志行的 `pid` 字段）。关闭后如果该 pid 仍存活，先看是否有 `server process did not exit within the wait` 或 `server did not finish shutting down; killing it` 日志——前者说明进程不可中断，后者说明优雅关闭超时后已发 `SIGKILL`。
-- **`maxPending`**：Portal 未确认缓冲的硬上限（默认 10000），超出后请求以 `FRAMEWORK_QUEUE_FULL` 拒绝。它兜住的是"Server 长期不可用而客户端持续写入"这一种 deadline 管不住的情况。
+- **`maxPending`**：Portal 未确认缓冲的硬上限（默认值见 ADR-0004），超出后请求以 `FRAMEWORK_QUEUE_FULL` 拒绝。它兜住的是"Server 长期不可用而客户端持续写入"这一种 deadline 管不住的情况。
 
 ## 常见错误
 
 **入口脚本路径写错**：子进程以 `Module not found` 退出（退出码 1，错误在 stderr），Portal 看到的是 `ipc channel disconnected` 加一次 `server process lost`。随后按退避重试，直到 `startTimeoutMs`（默认 `max(10s, restartBackoffMs * 10)`）耗尽，`start()` reject 并停止重试。表现为"启动很慢然后失败"，不是立即失败；缩短 `startTimeoutMs` 可以让配置错误更快暴露。
 
-**Server 起来就崩**：退避是首次立即、之后 100、200、400、800…ms，上限 5000ms。崩溃计数只在 Server 稳定运行超过 `stableResetMs`（默认 `max(30s, timeoutMs)`）后才清零，所以"起来、接第一个请求、崩"会持续计入同一条崩溃链，不会退回零退避。同一条请求的重放上限是 3 次（`maxReplays`），耗尽后以 `FRAMEWORK_REPLAY_EXHAUSTED` 结束，Portal 继续服务其他请求。
+**Server 起来就崩**：退避从短间隔起倍增到上限，重置条件是稳定运行超过一个远大于退避上限与请求超时的窗口（默认值见 ADR-0004）。所以"起来、接第一个请求、崩"会持续计入同一条崩溃链，不会退回零退避。同一条请求的重放有上限（`maxReplays`，默认值见 ADR-0004），耗尽后以 `FRAMEWORK_REPLAY_EXHAUSTED` 结束，Portal 继续服务其他请求。
 
 **Portal 里直接开了存储**：不会立刻报错，但恢复语义失效——Portal 崩溃时已写入而 Server 未确认的部分无法重放也无法回滚（INV-002）。存储只能出现在 Server 的 `createBackend` 里。
 

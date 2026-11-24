@@ -15,7 +15,7 @@
 - Portal 进程：持有 Transport 连接、Session 路由、每连接的 Input Queue 与未确认输入缓冲。不执行 Handler，不访问存储。
 - Server 进程：持有 Extension、Handler 执行与存储写入权，是存储的唯一写者。
 
-两者通过 IPC 通信，进程由 `Bun.spawn` 拉起。Request 在 Portal 侧分配标识并保持到重放，跨进程投递与重放不换标识（见 SPEC 7.3）。Server 崩溃后 Portal 发现进程不在、重启并重放未确认输入，顺序与原始接收顺序一致。
+两者通过 IPC 通信，进程由 `Bun.spawn` 拉起。Request 在 Portal 侧分配标识并保持到重放，跨进程投递与重放不换标识（见 SPEC 7.3）。Server 崩溃后 Portal 发现进程不在、重启并重放未确认输入，顺序与同连接的原始接收顺序一致。
 
 恢复语义为 at-least-once：重放缓冲的移除条件是确认，不是终态（见 SPEC §2 与 6.4）。
 
@@ -26,7 +26,7 @@
 代价与必须接受的限制：
 
 - 每个 Request 多一次跨进程投递与序列化，IPC 是热路径上的固定成本；`Bun.spawn` 的 IPC 仅与其他 Bun 进程兼容，跨 Node 需退化为 JSON 序列化，类型与二进制载荷受限。
-- 需要实现恢复屏障（Server 就绪前 Portal 不投递）与重放去重所需的元数据，Portal 与 Server 的生命周期必须联合管理，启动与关闭顺序受 SPEC 6.2、6.3 约束。
+- 需要实现恢复屏障（Server 就绪前 Portal 不投递）与重放顺序所需的元数据（每连接的接收序号），Portal 与 Server 的生命周期必须联合管理，启动与关闭顺序受 SPEC 6.2、6.3 约束。
 - 调试从单进程断点变为双进程，请求标识与日志字段是唯一的关联手段。
 - 幂等必须由业务负责，框架不提供去重。同一 Request 可能被执行多次，扣钱、发物品、唯一命名这类效果必须由 Extension 用幂等键实现（INV-011）。
 - Portal 不得直接访问存储，否则恢复语义失效——崩溃时 Portal 已写入而 Server 未确认的部分无法重放，也无法回滚。
