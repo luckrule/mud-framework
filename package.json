@@ -14,10 +14,14 @@
     "test": "bun test --parallel",
     "test:unit": "bun test packages --parallel",
     "test:integration": "bun test tests/integration --parallel",
+    "smoke:package": "bun run scripts/package-smoke.ts",
     "prepare": "git config core.hooksPath .githooks || true"
   },
   "devDependencies": {
     "bun-types": "1.4.5",
+    "mud-framework-connector-ws": "workspace:*",
+    "mud-framework-core": "workspace:*",
+    "mud-framework-storage-sqlite": "workspace:*",
     "oxfmt": "0.79.0",
     "oxlint": "1.94.0",
     "oxlint-tsgolint": "7.0.2008",
