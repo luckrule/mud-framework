@@ -3,120 +3,18 @@ import { describe, expect, test } from 'bun:test';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import type { Logger } from '../logging/types.ts';
 import { MemoryStorageBackend } from '../storage/memory.ts';
-import type {
-  StorageBackend,
-  StorageCapabilities,
-  StorageTransaction,
-} from '../storage/types.ts';
+import { rejectionOf, sleep } from '../test-support/common.ts';
+import {
+  SlowCommitBackend,
+  deferred,
+  parseLines,
+  quietDispatcher,
+} from '../test-support/dispatcher.ts';
 import {
   Dispatcher,
   FrameworkTimeoutError,
   RequestCancelledError,
 } from './dispatcher.ts';
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-/** Parsed log lines, in emission order. */
-function parseLines(lines: readonly string[]): Record<string, unknown>[] {
-  return lines.map((line) => {
-    const parsed: unknown = JSON.parse(line);
-    if (!isRecord(parsed)) {
-      throw new Error(`log line is not a JSON object: ${line}`);
-    }
-    return parsed;
-  });
-}
-
-/** Dispatcher whose logs go to `lines` instead of stdout. */
-function quietDispatcher(
-  options: ConstructorParameters<typeof Dispatcher>[0],
-  lines: string[] = [],
-): { dispatcher: Dispatcher; lines: string[] } {
-  const logger: Logger = createJsonLogger({
-    sink: (line) => {
-      lines.push(line);
-    },
-  });
-  return {
-    dispatcher: new Dispatcher({ ...options, logger }),
-    lines,
-  };
-}
-
-function deferred<T>(): {
-  promise: Promise<T>;
-  resolve: (value: T) => void;
-} {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((res) => {
-    resolve = res;
-  });
-  return { promise, resolve };
-}
-
-const sleep = (ms: number): Promise<void> =>
-  new Promise<void>((resolve) => {
-    setTimeout(resolve, ms);
-  });
-
-/**
- * A backend whose COMMIT lands a macrotask after the handler returns, like a
- * real database flushing its log. `MemoryStorageBackend` commits in the same
- * turn, which hides the window where a cancel arrives too late to roll back.
- */
-class SlowCommitBackend implements StorageBackend {
-  private committed = 0;
-  private rolledBack = 0;
-
-  capabilities(): StorageCapabilities {
-    return {
-      transactions: 'full',
-      concurrency: 'pooled',
-      snapshotRead: true,
-      uniqueConstraint: false,
-      maxTransactionDurationMs: Number.POSITIVE_INFINITY,
-    };
-  }
-
-  async transaction<T>(fn: (tx: StorageTransaction) => Promise<T>): Promise<T> {
-    const tx: StorageTransaction = {
-      query: <R>(): Promise<R[]> => Promise.resolve([]),
-      execute: (): Promise<void> => Promise.resolve(),
-    };
-    let result: T;
-    try {
-      result = await fn(tx);
-    } catch (error) {
-      this.rolledBack += 1;
-      throw error;
-    }
-    await sleep(0);
-    this.committed += 1;
-    return result;
-  }
-
-  close(): Promise<void> {
-    return Promise.resolve();
-  }
-
-  stats(): { committed: number; rolledBack: number } {
-    return { committed: this.committed, rolledBack: this.rolledBack };
-  }
-}
-
-async function rejectionOf(promise: Promise<unknown>): Promise<Error> {
-  try {
-    await promise;
-  } catch (error) {
-    if (error instanceof Error) {
-      return error;
-    }
-    throw new Error(`non-Error rejection: ${String(error)}`, { cause: error });
-  }
-  throw new Error('expected the promise to reject');
-}
 
 describe('Dispatcher', () => {
   test('runs a handler inside a transaction and returns its result', async () => {

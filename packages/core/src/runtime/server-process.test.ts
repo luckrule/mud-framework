@@ -1,192 +1,32 @@
 import { describe, expect, test } from 'bun:test';
 
 import { createProcessChannel } from '../ipc/bun-child.ts';
-import type { IpcChannel } from '../ipc/channel.ts';
-import { createInMemoryChannelPair } from '../ipc/channel.ts';
-import type {
-  IpcMessage,
-  RequestMessage,
-  ResultMessage,
-} from '../ipc/protocol.ts';
 import { parseIpcMessage } from '../ipc/protocol.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
-import type { Logger } from '../logging/types.ts';
 import { MemoryStorageBackend } from '../storage/memory.ts';
-import type { StorageBackend, StorageCapabilities } from '../storage/types.ts';
-import type { Dispatcher } from './dispatcher.ts';
-import type { Extension } from './extension.ts';
+import type { StorageBackend } from '../storage/types.ts';
+import { isRecord, rejectionOf, sleep, tick } from '../test-support/common.ts';
+import type { Harness } from '../test-support/server-process.ts';
+import {
+  brokenBackend,
+  degradationWarnings,
+  echoRegistration,
+  numberField,
+  parseLine,
+  received,
+  requestMessage,
+  results,
+  sendRaw,
+  silentLogger,
+  startServer,
+  startupFailure,
+} from '../test-support/server-process.ts';
 import {
   resolveShutdownBudgetMs,
-  runServerProcess,
   ServerChannelClosedError,
 } from './server-process.ts';
-import { ServerStartupError } from './server-startup.ts';
+import type { ServerStartupError } from './server-startup.ts';
 import { BusinessError } from './wire-codes.ts';
-
-const sleep = (ms: number): Promise<void> =>
-  new Promise<void>((resolve) => {
-    setTimeout(resolve, ms);
-  });
-
-/** Flushes the microtasks an accepted request needs before it reports. */
-const tick = (): Promise<void> => sleep(0);
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function requestMessage(
-  overrides: Partial<RequestMessage> = {},
-): RequestMessage {
-  return {
-    type: 'request',
-    requestId: 'req-1',
-    connectionId: 'c1',
-    clientRequestId: 'client-1',
-    method: 'echo',
-    payload: 'hi',
-    timeoutMs: 1000,
-    replayCount: 0,
-    ...overrides,
-  };
-}
-
-/**
- * The server validates everything it sends, so a test that parses its outbound
- * messages also proves they stay within the protocol.
- */
-function received(messages: readonly unknown[]): IpcMessage[] {
-  return messages.map((raw) => {
-    const parsed = parseIpcMessage(raw);
-    if (!parsed.ok) {
-      throw new Error(`server sent an invalid message: ${parsed.reason}`);
-    }
-    return parsed.message;
-  });
-}
-
-function results(messages: readonly unknown[]): ResultMessage[] {
-  return received(messages).filter(
-    (message): message is ResultMessage => message.type === 'result',
-  );
-}
-
-function sendRaw(portal: IpcChannel, raw: unknown): void {
-  portal.send(raw as IpcMessage);
-}
-
-interface HarnessOptions {
-  extensions?: readonly Extension[];
-  backend?: StorageBackend;
-  timeoutMs?: number;
-  /** Observes every message Portal receives, for cross-array ordering checks. */
-  onPortalMessage?: (raw: unknown) => void;
-  /** Overrides the abort budget so a test need not wait the real 5s. */
-  abortTimeoutMs?: number;
-  /** Enables the parent-liveness poll; off by default (no real parent here). */
-  parentCheckIntervalMs?: number;
-  /** Lets a test pretend the process was reparented. */
-  readParentPid?: () => number;
-}
-
-interface Harness {
-  portal: IpcChannel;
-  /** Raw messages Portal received, in arrival order. */
-  messages: unknown[];
-  /** Parsed log lines, in emission order. */
-  logs: () => Record<string, unknown>[];
-  /** Settles when the server process finishes or fails. */
-  done: Promise<void>;
-  backend: StorageBackend;
-  /** Closes the link and waits for the server to settle. */
-  stop: () => Promise<void>;
-}
-
-function startServer(options: HarnessOptions = {}): Harness {
-  const [portal, serverChannel] = createInMemoryChannelPair();
-  const messages: unknown[] = [];
-  portal.onMessage((raw) => {
-    messages.push(raw);
-    options.onPortalMessage?.(raw);
-  });
-  const lines: string[] = [];
-  const logger = createJsonLogger({
-    sink: (line) => {
-      lines.push(line);
-    },
-  });
-  const backend = options.backend ?? new MemoryStorageBackend();
-  const done = runServerProcess({
-    createBackend: () => backend,
-    extensions: options.extensions ?? [],
-    timeoutMs: options.timeoutMs ?? 1000,
-    logger,
-    channel: serverChannel,
-    abortTimeoutMs: options.abortTimeoutMs,
-    // The in-memory channel has no real parent to watch, and a background timer
-    // would keep the test process alive.
-    parentCheckIntervalMs: options.parentCheckIntervalMs ?? 0,
-    readParentPid: options.readParentPid,
-  });
-  return {
-    portal,
-    messages,
-    logs: () => lines.map(parseLine),
-    done,
-    backend,
-    async stop(): Promise<void> {
-      portal.close('test finished');
-      await done.catch(() => undefined);
-    },
-  };
-}
-
-function parseLine(line: string): Record<string, unknown> {
-  const parsed: unknown = JSON.parse(line);
-  if (!isRecord(parsed)) {
-    throw new Error(`log line is not a JSON object: ${line}`);
-  }
-  return parsed;
-}
-
-/** Reads a numeric log field, failing loudly when it is missing or not a number. */
-function numberField(
-  line: Record<string, unknown> | undefined,
-  field: string,
-): number {
-  const value = line?.[field];
-  if (typeof value !== 'number') {
-    throw new Error(`log field "${field}" is not a number: ${String(value)}`);
-  }
-  return value;
-}
-
-async function rejectionOf(promise: Promise<unknown>): Promise<Error> {
-  try {
-    await promise;
-  } catch (error) {
-    if (error instanceof Error) {
-      return error;
-    }
-    throw new Error(`non-Error rejection: ${String(error)}`, { cause: error });
-  }
-  throw new Error('expected the promise to reject');
-}
-
-function echoRegistration(dispatcher: Dispatcher): void {
-  dispatcher.register('echo', (_ctx, payload) => Promise.resolve(payload));
-}
-
-/** Narrows the rejection without an unchecked cast, so a wrong type fails loudly. */
-async function startupFailure(
-  promise: Promise<unknown>,
-): Promise<ServerStartupError> {
-  const error = await rejectionOf(promise);
-  if (!(error instanceof ServerStartupError)) {
-    throw new Error(`expected ServerStartupError, got ${error.name}`);
-  }
-  return error;
-}
 
 describe('createProcessChannel singleton', () => {
   test('refuses a second channel in the same process', () => {
@@ -200,11 +40,6 @@ describe('createProcessChannel singleton', () => {
     );
   });
 });
-
-/** A logger that keeps the singleton test's warning out of the output. */
-function silentLogger(): Logger {
-  return createJsonLogger({ sink: () => undefined });
-}
 
 describe('runServerProcess startup', () => {
   test('sends ready with the backend declaration', async () => {
@@ -591,13 +426,6 @@ describe('runServerProcess extension capabilities', () => {
     await harness.stop();
   });
 });
-
-/** SPEC 4.3 lines only, so unrelated warns do not change the counts. */
-function degradationWarnings(
-  logs: readonly Record<string, unknown>[],
-): Record<string, unknown>[] {
-  return logs.filter((line) => line.msg === 'storage capability degraded');
-}
 
 describe('runServerProcess capability degradation warnings', () => {
   test('a full-strength declaration produces no degradation warning', async () => {
@@ -1739,16 +1567,3 @@ describe('resolveShutdownBudgetMs', () => {
     });
   });
 });
-
-/**
- * A backend whose declaration is deliberately invalid. The cast is the test's
- * only way to hand an unusable declaration to the self-check.
- */
-function brokenBackend(declared: unknown): StorageBackend {
-  return {
-    capabilities: (): StorageCapabilities => declared as StorageCapabilities,
-    transaction: <T>(): Promise<T> =>
-      Promise.reject(new Error('broken backend must not run transactions')),
-    close: (): Promise<void> => Promise.resolve(),
-  };
-}

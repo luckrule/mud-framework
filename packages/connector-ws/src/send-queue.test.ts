@@ -36,11 +36,14 @@ async function settle(): Promise<void> {
   });
 }
 
-function tracked(promise: Promise<void>): {
-  promise: Promise<void>;
+interface Tracked {
+  readonly promise: Promise<void>;
   state: () => 'pending' | 'resolved' | 'rejected';
   error: () => Error | undefined;
-} {
+}
+
+/** Observes a promise without letting its rejection go unhandled. */
+function tracked(promise: Promise<void>): Tracked {
   let state: 'pending' | 'resolved' | 'rejected' = 'pending';
   let error: Error | undefined;
   void promise.then(
@@ -50,7 +53,10 @@ function tracked(promise: Promise<void>): {
     },
     (rejection: unknown) => {
       state = 'rejected';
-      error = rejection instanceof Error ? rejection : new Error('non-Error');
+      error =
+        rejection instanceof Error
+          ? rejection
+          : new Error(`non-Error rejection: ${String(rejection)}`);
       return undefined;
     },
   );
