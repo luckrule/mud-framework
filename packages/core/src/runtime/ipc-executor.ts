@@ -259,6 +259,7 @@ export class IpcExecutor implements RequestExecutor {
     this.failAllPending(
       INTERNAL_ERROR,
       `ipc executor failed to start: server did not become ready within ${this.startTimeoutMs}ms`,
+      'executor failed to start',
     );
     this.rejectStart(
       new Error(
@@ -351,6 +352,16 @@ export class IpcExecutor implements RequestExecutor {
     if (this.isTerminal) {
       // `failed` is included here but unreachable: the branch above returns for
       // it first, with a message specific to a start that never succeeded.
+      // warn, not error: an orderly shutdown refusal is expected, and the
+      // connection layer records the failed outcome at error level already.
+      this.warnSafely(
+        {
+          ...requestFields(request),
+          code: FRAMEWORK_SHUTDOWN,
+          reason: `executor ${this.status}`,
+        },
+        'request rejected',
+      );
       return Promise.resolve(
         failure(FRAMEWORK_SHUTDOWN, 'ipc executor is shutting down'),
       );
@@ -502,6 +513,17 @@ export class IpcExecutor implements RequestExecutor {
         server.closed ||
         pending.sentOn === undefined
       ) {
+        // Per-request line: this is the only trace of why the request ended,
+        // since no Server result or deadline will ever reach it.
+        this.warnSafely(
+          {
+            ...requestFields(pending.request),
+            code: FRAMEWORK_SHUTDOWN,
+            reason: 'executor closing before delivery',
+            durationMs: Date.now() - pending.startedAt,
+          },
+          'pending request failed',
+        );
         this.settle(
           pending,
           failure(FRAMEWORK_SHUTDOWN, 'ipc executor is closing'),
@@ -523,17 +545,22 @@ export class IpcExecutor implements RequestExecutor {
     // timeout. Treating a rejection as a timeout would fail every buffered
     // request with a message about a deadline that was never reached.
     if (drained.status === 'timeout') {
-      this.logger.warn(
+      this.warnSafely(
         { timeoutMs: this.shutdownTimeoutMs, pending: this.buffer.size },
         'pending requests did not settle before the shutdown timeout',
       );
       this.failAllPending(
         FRAMEWORK_SHUTDOWN,
         'ipc executor closed before the request settled',
+        'shutdown drain timed out',
       );
     }
     await this.shutdownServer();
-    this.failAllPending(FRAMEWORK_SHUTDOWN, 'ipc executor closed');
+    this.failAllPending(
+      FRAMEWORK_SHUTDOWN,
+      'ipc executor closed',
+      'executor closed',
+    );
     this.status = 'closed';
     // A start() still waiting for `ready` must not be told "ready" by a close.
     this.rejectStart(
@@ -1002,6 +1029,7 @@ export class IpcExecutor implements RequestExecutor {
       this.failAllPending(
         FRAMEWORK_SHUTDOWN,
         'server process exited during shutdown',
+        'server lost during shutdown',
       );
       return;
     }
@@ -1173,7 +1201,7 @@ export class IpcExecutor implements RequestExecutor {
     pending.timer = undefined;
     // warn, not error: the connection layer records the failed outcome at error
     // level, and one request failure should not produce two error lines.
-    this.logger.warn(
+    this.warnSafely(
       {
         ...requestFields(pending.request),
         code: FRAMEWORK_TIMEOUT,
@@ -1238,8 +1266,38 @@ export class IpcExecutor implements RequestExecutor {
     }
   }
 
-  private failAllPending(code: string, message: string): void {
+  /**
+   * A warn the caller survives. The logger is injectable, so its sink is
+   * arbitrary code: a throw there must never abort a settlement loop and leave
+   * the remaining requests pending forever. A failed log must not block
+   * settlement.
+   */
+  private warnSafely(fields: LogFields, message: string): void {
+    try {
+      this.logger.warn(fields, message);
+    } catch {
+      // Observability is best effort; the request outcome is the contract.
+    }
+  }
+
+  /**
+   * Settles every buffered request with one failure. `message` is the outcome
+   * text the caller sees; `reason` is log-only and names the call site, because
+   * several paths share a code and would otherwise look identical in the logs.
+   */
+  private failAllPending(code: string, message: string, reason: string): void {
     for (const pending of this.buffer.values()) {
+      // warn, not error: the connection layer records the failed outcome at
+      // error level, and one request failure should not produce two error lines.
+      this.warnSafely(
+        {
+          ...requestFields(pending.request),
+          code,
+          reason,
+          durationMs: Date.now() - pending.startedAt,
+        },
+        'pending request failed',
+      );
       this.settle(pending, failure(code, message));
     }
   }

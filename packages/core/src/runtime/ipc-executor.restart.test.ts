@@ -168,6 +168,36 @@ describe('IpcExecutor restart', () => {
     await h.executor.close();
   });
 
+  test('fails buffered requests when the start timeout fires', async () => {
+    const h = harness({ timeoutMs: 5000, startTimeoutMs: 50 });
+    const startPromise = h.executor.start();
+    const outcomePromise = h.executor.execute(
+      request({ requestId: 'queued', sessionId: 's-queued' }),
+    );
+
+    await rejectionOf(startPromise);
+
+    // A request buffered while the Server was starting cannot complete once
+    // the restart loop is stopped; it is failed instead of waiting out its
+    // deadline with no Server coming.
+    expect(failureOf(await outcomePromise).code).toBe('INTERNAL_ERROR');
+    const failed = h
+      .logs()
+      .filter((line) => line.msg === 'pending request failed');
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({
+      level: 'warn',
+      code: 'INTERNAL_ERROR',
+      reason: 'executor failed to start',
+      requestId: 'queued',
+      connectionId: 'c1',
+      clientRequestId: 'client-1',
+      sessionId: 's-queued',
+    });
+    expect(typeof failed[0]?.durationMs).toBe('number');
+    await h.executor.close();
+  });
+
   test('execute fails immediately after a failed start instead of buffering', async () => {
     const h = harness({ timeoutMs: 5000, startTimeoutMs: 20 });
     await rejectionOf(h.executor.start());

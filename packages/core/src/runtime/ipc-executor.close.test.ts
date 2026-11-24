@@ -1,6 +1,8 @@
 import { describe, expect, jest, test } from 'bun:test';
 
+import { createJsonLogger } from '../logging/json-logger.ts';
 import {
+  FakeServerProcess,
   failureOf,
   flushMicrotasks,
   flushTicks,
@@ -12,6 +14,7 @@ import {
   serverAt,
   started,
 } from '../test-support/ipc-executor.ts';
+import { IpcExecutor } from './ipc-executor.ts';
 
 describe('IpcExecutor close', () => {
   test('close sends shutdown and waits for closed', async () => {
@@ -75,8 +78,100 @@ describe('IpcExecutor close', () => {
     const outcome = await h.executor.execute(request({ requestId: 'late' }));
 
     expect(failureOf(outcome).code).toBe('FRAMEWORK_SHUTDOWN');
+    const rejected = h.logs().filter((line) => line.msg === 'request rejected');
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]).toMatchObject({
+      level: 'warn',
+      code: 'FRAMEWORK_SHUTDOWN',
+      reason: 'executor closed',
+      requestId: 'late',
+      connectionId: 'c1',
+      clientRequestId: 'client-1',
+    });
+    expect(rejected[0]).not.toHaveProperty('sessionId');
     // Idempotent: a second close resolves rather than throwing.
     await h.executor.close();
+  });
+
+  test('rejects requests that arrive while closing and says which state', async () => {
+    const h = harness({ timeoutMs: 5000 });
+    await started(h);
+
+    // `close()` flips the status synchronously; the shutdown handshake follows.
+    const closing = h.executor.close();
+    const outcome = await h.executor.execute(
+      request({ requestId: 'mid-close', sessionId: 's-close' }),
+    );
+    await closing;
+
+    expect(failureOf(outcome).code).toBe('FRAMEWORK_SHUTDOWN');
+    const rejected = h.logs().filter((line) => line.msg === 'request rejected');
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]).toMatchObject({
+      level: 'warn',
+      code: 'FRAMEWORK_SHUTDOWN',
+      reason: 'executor closing',
+      requestId: 'mid-close',
+      connectionId: 'c1',
+      clientRequestId: 'client-1',
+      sessionId: 's-close',
+    });
+  });
+
+  test('a throwing sink does not change the rejection while closing or closed', async () => {
+    // `execute()` is not async: a throw from the injected sink would escape as
+    // an exception instead of the failure outcome, and the connection layer
+    // would report INTERNAL_ERROR where the contract says FRAMEWORK_SHUTDOWN.
+    const spawned: FakeServerProcess[] = [];
+    const lines: string[] = [];
+    let sinkThrows = 0;
+    const executor = new IpcExecutor({
+      spawn: () => {
+        const server = new FakeServerProcess({ autoCloseOnShutdown: true });
+        spawned.push(server);
+        return server.handle;
+      },
+      timeoutMs: 5000,
+      logger: createJsonLogger({
+        level: 'debug',
+        sink: (line) => {
+          lines.push(line);
+          if (line.includes('"msg":"request rejected"')) {
+            sinkThrows += 1;
+            throw new Error('sink exploded');
+          }
+        },
+      }),
+    });
+    const startPromise = executor.start();
+    const server = spawned[0];
+    if (server === undefined) {
+      throw new Error('server was never spawned');
+    }
+    server.send(readyMessage());
+    await startPromise;
+
+    // `close()` flips the status synchronously, so this call sees `closing`.
+    const closing = executor.close();
+    const whileClosing = await executor.execute(
+      request({ requestId: 'while-closing' }),
+    );
+    await closing;
+    const afterClose = await executor.execute(request({ requestId: 'late' }));
+
+    expect(failureOf(whileClosing).code).toBe('FRAMEWORK_SHUTDOWN');
+    expect(failureOf(afterClose).code).toBe('FRAMEWORK_SHUTDOWN');
+    // The reason names the state, which proves both branches ran rather than
+    // the same one twice.
+    expect(
+      lines.some((line) => line.includes('"reason":"executor closing"')),
+    ).toBe(true);
+    expect(
+      lines.some((line) => line.includes('"reason":"executor closed"')),
+    ).toBe(true);
+    // Proves the sink really threw; a renamed message would let the outcome
+    // assertions pass without exercising the guarded path.
+    expect(sinkThrows).toBeGreaterThanOrEqual(1);
   });
 
   test('close fails a request that never reached a server', async () => {
@@ -90,13 +185,130 @@ describe('IpcExecutor close', () => {
 
     expect(failureOf(await outcomePromise).code).toBe('FRAMEWORK_SHUTDOWN');
     expect(requestIds(serverAt(h, 0))).toEqual([]);
+    // Exactly one per-request line: a request failed before delivery must say
+    // why it ended, and no other path may claim the same failure.
+    const failed = h
+      .logs()
+      .filter((line) => line.msg === 'pending request failed');
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({
+      level: 'warn',
+      code: 'FRAMEWORK_SHUTDOWN',
+      reason: 'executor closing before delivery',
+      requestId: 'queued',
+      connectionId: 'c1',
+      clientRequestId: 'client-1',
+    });
+    expect(typeof failed[0]?.durationMs).toBe('number');
+    expect(failed[0]).not.toHaveProperty('sessionId');
+  });
+
+  test('a throwing logger sink does not block settlement', async () => {
+    // The logger is injectable, so its sink is arbitrary code. A throw on the
+    // first failed request must not abort the loop and strand the ones after it.
+    const spawned: FakeServerProcess[] = [];
+    let sinkThrows = 0;
+    const executor = new IpcExecutor({
+      spawn: () => {
+        const server = new FakeServerProcess({ autoCloseOnShutdown: true });
+        spawned.push(server);
+        return server.handle;
+      },
+      timeoutMs: 5000,
+      shutdownTimeoutMs: 20,
+      logger: createJsonLogger({
+        level: 'debug',
+        sink: (line) => {
+          if (line.includes('"msg":"pending request failed"')) {
+            sinkThrows += 1;
+            throw new Error('sink exploded');
+          }
+        },
+      }),
+    });
+    const startPromise = executor.start();
+    const server = spawned[0];
+    if (server === undefined) {
+      throw new Error('server was never spawned');
+    }
+    server.send(readyMessage());
+    await startPromise;
+
+    // Delivered but never answered: the drain times out and fails both, which
+    // is where a throwing sink used to cut the settlement loop short.
+    const first = executor.execute(request({ requestId: 'req-a' }));
+    const second = executor.execute(request({ requestId: 'req-b' }));
+    await executor.close();
+
+    expect(failureOf(await first).code).toBe('FRAMEWORK_SHUTDOWN');
+    expect(failureOf(await second).code).toBe('FRAMEWORK_SHUTDOWN');
+    // Proves the sink really threw: if the log message is ever renamed, the
+    // settlement assertions above could pass because the sink never fired.
+    expect(sinkThrows).toBeGreaterThanOrEqual(1);
+  });
+
+  test('a throwing sink on the drain timeout summary still closes', async () => {
+    // The summary sits before failAllPending, shutdownServer(), status =
+    // 'closed' and rejectStart: a throw there would skip all of them and leave
+    // the Server holding storage (INV-002).
+    const spawned: FakeServerProcess[] = [];
+    const lines: string[] = [];
+    let sinkThrows = 0;
+    const executor = new IpcExecutor({
+      spawn: () => {
+        const server = new FakeServerProcess({ autoCloseOnShutdown: true });
+        spawned.push(server);
+        return server.handle;
+      },
+      timeoutMs: 5000,
+      shutdownTimeoutMs: 20,
+      logger: createJsonLogger({
+        level: 'debug',
+        sink: (line) => {
+          lines.push(line);
+          if (
+            line.includes(
+              '"msg":"pending requests did not settle before the shutdown timeout"',
+            )
+          ) {
+            sinkThrows += 1;
+            throw new Error('sink exploded');
+          }
+        },
+      }),
+    });
+    const startPromise = executor.start();
+    const server = spawned[0];
+    if (server === undefined) {
+      throw new Error('server was never spawned');
+    }
+    server.send(readyMessage());
+    await startPromise;
+
+    // Delivered but never answered: the drain runs into its 20ms budget.
+    const first = executor.execute(request({ requestId: 'req-a' }));
+    const second = executor.execute(request({ requestId: 'req-b' }));
+    await executor.close();
+
+    expect(sinkThrows).toBeGreaterThanOrEqual(1);
+    expect(failureOf(await first).code).toBe('FRAMEWORK_SHUTDOWN');
+    expect(failureOf(await second).code).toBe('FRAMEWORK_SHUTDOWN');
+    // The late rejection says `closed`: the throw did not leave the executor
+    // stuck in `closing`.
+    const late = await executor.execute(request({ requestId: 'late' }));
+    expect(failureOf(late).code).toBe('FRAMEWORK_SHUTDOWN');
+    expect(
+      lines.some((line) => line.includes('"reason":"executor closed"')),
+    ).toBe(true);
   });
 
   test('does not restart while closing when the server dies', async () => {
     const h = harness({ timeoutMs: 5000, autoClose: false });
     const server = await started(h);
 
-    const outcomePromise = h.executor.execute(request({ requestId: 'req-1' }));
+    const outcomePromise = h.executor.execute(
+      request({ requestId: 'req-1', sessionId: 's-crash' }),
+    );
     const closing = h.executor.close();
     await flushMicrotasks();
 
@@ -107,6 +319,20 @@ describe('IpcExecutor close', () => {
 
     expect(h.servers).toHaveLength(1);
     expect(failureOf(await outcomePromise).code).toBe('FRAMEWORK_SHUTDOWN');
+    const failed = h
+      .logs()
+      .filter((line) => line.msg === 'pending request failed');
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({
+      level: 'warn',
+      code: 'FRAMEWORK_SHUTDOWN',
+      reason: 'server lost during shutdown',
+      requestId: 'req-1',
+      connectionId: 'c1',
+      clientRequestId: 'client-1',
+      sessionId: 's-crash',
+    });
+    expect(typeof failed[0]?.durationMs).toBe('number');
     // Already gone: killing a corpse would be a no-op at best, and the point
     // is that the shutdown path noticed the exit instead of waiting 5s.
     expect(server.killCount).toBe(0);
@@ -231,5 +457,18 @@ describe('IpcExecutor close', () => {
     expect(Date.now() - startedAt).toBeLessThan(3000);
     expect(failureOf(await outcomePromise).code).toBe('FRAMEWORK_SHUTDOWN');
     expect(server.killCount).toBe(1);
+    const failed = h
+      .logs()
+      .filter((line) => line.msg === 'pending request failed');
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({
+      level: 'warn',
+      code: 'FRAMEWORK_SHUTDOWN',
+      reason: 'shutdown drain timed out',
+      requestId: 'req-1',
+      connectionId: 'c1',
+      clientRequestId: 'client-1',
+    });
+    expect(typeof failed[0]?.durationMs).toBe('number');
   });
 });
