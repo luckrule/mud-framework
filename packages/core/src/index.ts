@@ -20,6 +20,11 @@
  * `safeLogger` is exported so every component that accepts an injected logger
  * (in this package or another) wraps it the same way, keeping a logging fault
  * out of framework control flow (SPEC 7.1).
+ *
+ * `unmetRequirements` is exported so a caller can pre-check an Extension's
+ * storage requirements against backend capabilities without starting a Server
+ * (SPEC 4.3), using the same comparison the Server applies at startup. That
+ * comparison must exist in one place only; a second copy would drift.
  */
 export type {
   StorageBackend,
@@ -27,6 +32,7 @@ export type {
   StorageTransaction,
 } from './storage/types.ts';
 export type { StorageRequirements } from './storage/requirements.ts';
+export { unmetRequirements } from './storage/requirements.ts';
 export type { Extension, ExtensionRegistrar } from './runtime/extension.ts';
 export type {
   Transport,
