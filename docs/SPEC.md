@@ -68,7 +68,7 @@ Handler 可以 await，框架的调度建立在 Promise 之上。
 
 **Input Queue（输入队列）** — 每个 Connection 上的有界请求队列，保证同连接内请求有序。见 3.5。
 
-**Request Context（请求上下文）** — 随 Request 传入 Handler 的框架侧上下文，携带 Session ID、Connection ID、请求标识、事务句柄、中止信号与日志器。Handler 的存储调用与日志调用 SHOULD 经由它，框架据此统一归属日志、统一判定事务是否仍有效。
+**Request Context（请求上下文）** — 随 Request 传入 Handler 的框架侧上下文，携带 Session ID、Connection ID、请求标识、事务句柄、中止信号、日志器与 Extension 名。Handler 的存储调用与日志调用 SHOULD 经由它，框架据此统一归属日志、统一判定事务是否仍有效。
 
 中止信号是标准 `AbortSignal`，在 Request 进入终态（超时、取消、断线）时 abort，`reason` 说明触发原因。它是通知而非抢占：handler 可把它传给 `fetch`、`Bun.sleep` 等接受信号的操作以提前停下，但忽略它也不会让写入生效——写入失效由事务句柄的检查保证，两者并存（见 3.6）。
 
