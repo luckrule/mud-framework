@@ -40,7 +40,13 @@ ADR-0002 决定了拆成两个进程，但没定两件事：两个进程之间�
 
 重放顺序：按 `connectionId` 分组，组内按接收序号升序（SPEC 6.5）。已知代价是一个坏请求会饿死同连接上的后续请求，直到它的重放预算耗尽。这是顺序约束的必然代价，不是漏发：顺序保证与"跳过坏请求继续后面"不可兼得。
 
-关闭预算：`IpcExecutor` 自己声明关闭的最坏耗时 `closeBudgetMs = shutdownTimeoutMs * 2 + 退出等待上限 * 2`（`shutdownTimeoutMs` 默认 5000，退出等待上限默认 2000，故默认 14000）。外层 `ConnectionLayer` 关闭执行器时取自身 `shutdownTimeoutMs` 与该预算的较大者，再加少量余量，而不是各用一个独立超时。理由是这几段等待必须串起来算：先受 `shutdownTimeoutMs` 约束排空未确认请求，再受同一个值约束等 Server 回 `closed`，然后两次有界的退出等待（第二次是第一次放弃后发 `SIGKILL` 再等）。外层若只按自己的 `shutdownTimeoutMs` 计时，`stop()` 会在 Server 仍在写存储时返回，接着重开存储就是两个写者（INV-002）。
+关闭预算：`IpcExecutor` 自己声明关闭的最坏耗时 `closeBudgetMs`，是四段串行等待之和，不能压成一个乘式：排空未确认请求（`shutdownTimeoutMs`）、等 Server 回 `closed`（`shutdownTimeoutMs + SHUTDOWN_ACK_SLACK_MS`）、等进程退出（`EXIT_WAIT_TIMEOUT_MS`）、`SIGKILL` 后再等一次（`EXIT_WAIT_TIMEOUT_MS`）。`shutdownTimeoutMs` 默认 5000、`EXIT_WAIT_TIMEOUT_MS` 2000、`SHUTDOWN_ACK_SLACK_MS` 250，默认预算 14250。外层 `ConnectionLayer` 关闭执行器时取自身 `shutdownTimeoutMs` 与该预算加少量余量的较大者，而不是各用一个独立超时。理由是这几段等待必须串起来算：外层若只按自己的 `shutdownTimeoutMs` 计时，`stop()` 会在 Server 仍在写存储时返回，接着重开存储就是两个写者（INV-002）。
+
+预算单向派生：`shutdown` 消息携带 `timeoutMs`，由 Portal 声明自己愿意等 `closed` 多久；Server 的排空与关闭存储共享这一个 deadline，不再各自乘一次 `timeoutMs`，也不从自己的 `shutdownTimeoutMs` 推导。只有消息未带声明时才回退到 `4 × timeoutMs` 并记 `SHUTDOWN_BUDGET_UNDECLARED`。因此 Server 侧配置的 `timeoutMs` 不再拉长或缩短关闭时长。
+
+`SHUTDOWN_ACK_SLACK_MS` 是对齐而非余量：Server 的计时从收到 `shutdown` 开始，比 Portal 的 `waitForClosed` 晚一个 IPC 跳。两侧取同一值时 Portal 的定时器总是先到，Server 用满预算就会被杀在正常关闭途中。
+
+这段的旧公式是 `shutdownTimeoutMs × 2 + 退出等待上限 × 2`，与 Server 侧按 `4 × timeoutMs` 推导的预算不等；Server 的 `timeoutMs` 配得较大时，Portal 会 kill 一个正在正常关闭的 Server。这是修掉的真缺陷，不是可以简化的冗余：不要把这四段等待重新压回一个乘式。
 
 ### 确认的边界：框架做不到什么
 
