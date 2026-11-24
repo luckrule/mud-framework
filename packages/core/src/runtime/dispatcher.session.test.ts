@@ -11,7 +11,7 @@ import {
 } from '../test-support/dispatcher.ts';
 import { Dispatcher, FrameworkTimeoutError } from './dispatcher.ts';
 
-describe('Dispatcher.bindSession', () => {
+describe('Dispatcher.session', () => {
   test('reports the session id the handler bound', async () => {
     const backend = new MemoryStorageBackend();
     const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });

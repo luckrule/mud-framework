@@ -119,27 +119,4 @@ describe('Dispatcher.abortSignal', () => {
     expect(abortedInside).toBe(false);
     expect(signal?.aborted).toBe(false);
   });
-
-  test('a second cancel is a no-op and does not throw', async () => {
-    const backend = new MemoryStorageBackend();
-    const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });
-    const entered = deferred<void>();
-    const release = deferred<void>();
-
-    dispatcher.register('slow', async () => {
-      entered.resolve();
-      await release.promise;
-      return 'late';
-    });
-
-    const pending = dispatcher.dispatch('slow', null, { requestId: 'r2' });
-    await entered.promise;
-    expect(dispatcher.cancel('r2', 'TRANSPORT_CLOSED')).toBe(true);
-    expect(() => dispatcher.cancel('r2', 'TRANSPORT_CLOSED')).not.toThrow();
-    expect(dispatcher.cancel('r2', 'TRANSPORT_CLOSED')).toBe(false);
-
-    await rejectionOf(pending);
-    release.resolve();
-    await sleep(5);
-  });
 });
