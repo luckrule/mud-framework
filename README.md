@@ -36,6 +36,7 @@ mud-framework/
 
 - `docs/SPEC.md`：框架的对外契约，含五条承诺、执行模型、存储契约、传输契约与生命周期。
 - `docs/INVARIANTS.md`：产品承诺的不变量清单，违反即为 bug。
+- `docs/INTEGRATION.md`：双进程装配指南，含最小可运行代码、硬约束与部署检查清单。操作文档，不是契约。
 - `docs/CONTRIBUTING.md`：协作流程，含开发环境、门禁命令、提交规范与 PR 流程。
 
 ## 许可证
