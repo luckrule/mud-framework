@@ -31,7 +31,7 @@ process.once('SIGTERM', () => {
 });
 ```
 
-Portal 不碰存储：这里没有任何 backend。`layer.start()` 会先拉起 Server 并等到 `ready`，再开始接受连接（SPEC 6.2）。
+Portal 不碰存储：这里没有任何 backend。`layer.start()` 会先拉起 Server，等它回 `prepared` 后自动发 `activate`，再等到 `ready` 才开始接受连接（SPEC 6.2，两阶段见 ADR-0007）。
 
 ### Server
 
@@ -123,9 +123,9 @@ await runServerProcess({
 
 回显与告警：
 
-- Server 在 `ready` 中回显自己声明的版本。Portal 配置了版本、且 `ready` 带了不同的版本时记 warn（`expectedCodeVersion`、`actualCodeVersion`、`pid`）；它仍然接受这个 Server，不据此拒绝启动或重启。
+- Server 在 `ready` 中回显自己声明的版本，`prepared` 携带同一个值。Portal 配置了版本、且 `ready` 带了不同的版本时记 warn（`expectedCodeVersion`、`actualCodeVersion`、`pid`）；它仍然接受这个 Server，不据此拒绝启动或重启。
 - Portal 在接受请求时把版本写入 `request.codeVersion`，重放沿用接受时的值，不会替换成当前 Server 的版本。Server 处理 `replayCount > 0` 的请求、且请求版本与自身版本都存在且不同时记 warn（请求标识字段、`requestCodeVersion`、`serverCodeVersion`、`replayCount`）。
-- 任一侧未声明版本时不算"不同"，不记 warn；缺失字段是旧对端的正常形态。
+- 任一侧未声明版本时不算"不同"，不记 warn；缺失字段表示该部署未声明版本。
 - 版本不匹配只影响可观测性：框架不据此拒绝、取消、路由请求或改变重放策略。跨版本重放仍按 at-least-once 执行，行为兼容不在承诺内；是否允许带版本热修、如何发布，由部署方决定。
 
 ## 硬约束
@@ -149,7 +149,7 @@ Portal 侧 `IpcExecutor` 的 `timeoutMs` 决定请求何时在 Portal 结算；�
 ## 部署检查清单
 
 - **Portal 崩溃**：Server 的 IPC 链路断开，`createProcessChannel` 收到 `disconnect`，日志出现 `IPC_CHANNEL_CLOSED`（`reason: process disconnected`）；Server 排空在途请求、关闭后端，`runServerProcess` 以 `ServerChannelClosedError` reject。进程是否随之退出由入口脚本决定——上例把它映射为非零退出码，这是让 Portal 的崩溃处理看见"异常结束"而不是"正常关闭"的必要一步。它不会变成孤儿继续写存储。未确认输入随 Portal 一起丢失，这是 SPEC 6.1 允许的。
-- **`stop()` 的语义**：Portal 先停止接受输入，再排空已接收的请求（受 `ConnectionLayer.shutdownTimeoutMs` 约束），然后让 `IpcExecutor` 发送 `shutdown`；Server 停止接受、排空在途请求、关闭存储、回 `closed`；Portal 收到 `closed` 后等进程真正退出，超时则 `SIGKILL`。`stop()` resolve 时子进程通常已经退出，但这个保证是有界的：进程若卡在不可中断状态，Portal 等过一次有界的退出等待后记录 `server process did not exit within the wait; it may still be running` 并继续返回（默认值见 ADR-0004）。关闭执行器那一步的预算取 `ConnectionLayer.shutdownTimeoutMs` 与 `IpcExecutor` 声明的关闭预算（`closeBudgetMs`，公式见 ADR-0004）的较大者，所以默认配置下外层不会先于执行器放弃等待。Server 侧服从 Portal 在 `shutdown` 消息中声明的预算，把 Server 的 `timeoutMs` 配得比 Portal 大不再延长关闭时长（只在消息未带声明时才回退到按 `timeoutMs` 推导）。整条关闭路径因此有确定上界（`closeBudgetMs` 加少量余量），可以据此设置 systemd `TimeoutStopSec` 一类的外部强杀时限，并让它长于框架自己的等待，避免外部先杀掉一个正在正常关闭的 Server。
+- **`stop()` 的语义**：Portal 先停止接受输入，再排空已接收的请求（受 `ConnectionLayer.shutdownTimeoutMs` 约束），然后让 `IpcExecutor` 发送 `shutdown`；Server 停止接受、排空在途请求、关闭存储、回 `closed`；Portal 收到 `closed` 后等进程真正退出，超时则 `SIGKILL`。`stop()` resolve 时子进程通常已经退出，但这个保证是有界的：进程若卡在不可中断状态，Portal 等过一次有界的退出等待后记录 `server process did not exit within the wait; it may still be running` 并继续返回（默认值见 ADR-0004）。关闭执行器那一步的预算取 `ConnectionLayer.shutdownTimeoutMs` 与 `IpcExecutor` 声明的关闭预算（`closeBudgetMs`，公式见 ADR-0004）的较大者，所以默认配置下外层不会先于执行器放弃等待。Server 侧服从 Portal 在 `shutdown` 消息中声明的预算，把 Server 的 `timeoutMs` 配得比 Portal 大不再延长关闭时长。整条关闭路径因此有确定上界（`closeBudgetMs` 加少量余量），可以据此设置 systemd `TimeoutStopSec` 一类的外部强杀时限，并让它长于框架自己的等待，避免外部先杀掉一个正在正常关闭的 Server。
 - **确认没有孤儿进程**：`process.kill(pid, 0)` 抛 `ESRCH` 即进程已消失。`pid` 来自 Server 的 `ready` 消息（`IpcExecutor` 会把它记进 `server ready` 日志行的 `pid` 字段）。关闭后如果该 pid 仍存活，先看是否有 `server process did not exit within the wait` 或 `server did not finish shutting down; killing it` 日志——前者说明进程不可中断，后者说明优雅关闭超时后已发 `SIGKILL`。
 - **`maxPending`**：Portal 未确认缓冲的硬上限（默认值见 ADR-0004），超出后请求以 `FRAMEWORK_QUEUE_FULL` 拒绝。它兜住的是"Server 长期不可用而客户端持续写入"这一种 deadline 管不住的情况。
 

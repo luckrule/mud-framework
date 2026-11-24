@@ -6,6 +6,7 @@ import type { Harness } from '../test-support/server-process.ts';
 import {
   brokenBackend,
   echoRegistration,
+  messageTypes,
   received,
   startServer,
   startupFailure,
@@ -42,7 +43,7 @@ describe('runServerProcess startup', () => {
   });
 
   test('sends ready only after register returned', async () => {
-    let readyCountDuringRegister: number | undefined;
+    let readiesDuringRegister: number | undefined;
     const harness = startServer({
       extensions: [
         {
@@ -51,15 +52,21 @@ describe('runServerProcess startup', () => {
             dispatcher.register('echo', (_ctx, payload) =>
               Promise.resolve(payload),
             );
-            readyCountDuringRegister = harness.messages.length;
+            readiesDuringRegister = received(harness.messages).filter(
+              (message) => message.type === 'ready',
+            ).length;
           },
         },
       ],
     });
     await tick();
 
-    expect(readyCountDuringRegister).toBe(0);
-    expect(received(harness.messages)).toHaveLength(1);
+    expect(readiesDuringRegister).toBe(0);
+    // `prepared` precedes the activation; `ready` is the last message.
+    expect(received(harness.messages).map((message) => message.type)).toEqual([
+      'prepared',
+      'ready',
+    ]);
     await harness.stop();
   });
 
@@ -75,7 +82,7 @@ describe('runServerProcess startup', () => {
     const error = await startupFailure(harness.done);
 
     expect(error.reason).toContain('maxTransactionDurationMs');
-    expect(received(harness.messages)).toEqual([]);
+    expect(messageTypes(harness.messages)).toEqual(['prepared']);
     const failures = harness
       .logs()
       .filter((line) => line.code === 'SERVER_STARTUP_FAILED');
@@ -97,7 +104,7 @@ describe('runServerProcess startup', () => {
     const error = await startupFailure(harness.done);
 
     expect(error.reason).toContain('maxTransactionDurationMs');
-    expect(received(harness.messages)).toEqual([]);
+    expect(messageTypes(harness.messages)).toEqual(['prepared']);
     const failures = harness
       .logs()
       .filter((line) => line.code === 'SERVER_STARTUP_FAILED');
@@ -126,7 +133,7 @@ describe('runServerProcess startup', () => {
       expect(error.reason).toContain('maxTransactionDurationMs');
     }
     for (const harness of harnesses) {
-      expect(received(harness.messages)).toEqual([]);
+      expect(messageTypes(harness.messages)).toEqual(['prepared']);
     }
   });
 
@@ -163,7 +170,7 @@ describe('runServerProcess startup', () => {
     const error = await startupFailure(harness.done);
 
     expect(error.reason).toContain('transactions');
-    expect(received(harness.messages)).toEqual([]);
+    expect(messageTypes(harness.messages)).toEqual(['prepared']);
   });
 
   test('fails without ready when register throws', async () => {
@@ -181,6 +188,6 @@ describe('runServerProcess startup', () => {
     const error = await startupFailure(harness.done);
 
     expect(error.reason).toContain('extension refused');
-    expect(received(harness.messages)).toEqual([]);
+    expect(messageTypes(harness.messages)).toEqual(['prepared']);
   });
 });

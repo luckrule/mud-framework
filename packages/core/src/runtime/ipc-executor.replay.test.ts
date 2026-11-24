@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
 import {
-  expectOnlyHello,
+  expectHandshake,
   failureOf,
   flushTicks,
   harness,
@@ -30,7 +30,7 @@ describe('IpcExecutor replay', () => {
 
     expect(h.servers).toHaveLength(2);
     const second = serverAt(h, 1);
-    expectOnlyHello(second);
+    expectHandshake(second);
 
     second.send(readyMessage());
     await flushTicks();

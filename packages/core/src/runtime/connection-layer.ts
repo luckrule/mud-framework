@@ -485,7 +485,7 @@ export class ConnectionLayer implements TransportHandlers {
     if (stopped.status === 'rejected') {
       // The sequence is complete, but the transport never confirmed it closed:
       // that is the caller's to handle, so it is rethrown rather than logged
-      // away (the old contract, preserved).
+      // away.
       throw toError(stopped.error);
     }
   }

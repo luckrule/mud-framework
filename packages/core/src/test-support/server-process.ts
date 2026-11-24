@@ -1,4 +1,8 @@
-import { parseJsonLine, rejectionOf } from 'mud-framework-test-support';
+import {
+  isRecord,
+  parseJsonLine,
+  rejectionOf,
+} from 'mud-framework-test-support';
 
 import type { IpcChannel } from '../ipc/channel.ts';
 import { createInMemoryChannelPair } from '../ipc/channel.ts';
@@ -52,6 +56,24 @@ export function results(messages: readonly unknown[]): ResultMessage[] {
   );
 }
 
+/**
+ * The readiness barriers a Server sent, for tests that count them across
+ * generations. A startup-failure assertion should use `messageTypes` instead:
+ * "no `ready`" alone would accept a stray `closed` or `result`.
+ */
+export function readies(messages: readonly unknown[]): IpcMessage[] {
+  return received(messages).filter((message) => message.type === 'ready');
+}
+
+/**
+ * The message types Portal received, in order. Used where the exact shape
+ * matters, e.g. a failed startup that must have sent `prepared` and nothing
+ * else: asserting only "no `ready`" would accept a stray `closed` or `result`.
+ */
+export function messageTypes(messages: readonly unknown[]): string[] {
+  return received(messages).map((message) => message.type);
+}
+
 export function sendRaw(portal: IpcChannel, raw: unknown): void {
   // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- the fake peer must be able to put a non-message on the wire; that is the case under test
   portal.send(raw as IpcMessage);
@@ -72,6 +94,12 @@ export interface HarnessOptions {
   parentCheckIntervalMs?: number;
   /** Lets a test pretend the process was reparented. */
   readParentPid?: () => number;
+  /**
+   * Drives `hello` and, once `prepared` arrives, `activate`. On by default so a
+   * test that only cares about the started Server does not repeat the two-phase
+   * handshake. Off for the tests that own the handshake themselves.
+   */
+  autoHandshake?: boolean;
 }
 
 export interface Harness {
@@ -89,10 +117,14 @@ export interface Harness {
 
 export function startServer(options: HarnessOptions = {}): Harness {
   const [portal, serverChannel] = createInMemoryChannelPair();
+  const autoHandshake = options.autoHandshake ?? true;
   const messages: unknown[] = [];
   portal.onMessage((raw) => {
     messages.push(raw);
     options.onPortalMessage?.(raw);
+    if (autoHandshake && isRecord(raw) && raw.type === 'prepared') {
+      portal.send({ type: 'activate' });
+    }
   });
   const lines: string[] = [];
   const logger =
@@ -116,6 +148,9 @@ export function startServer(options: HarnessOptions = {}): Harness {
     parentCheckIntervalMs: options.parentCheckIntervalMs ?? 0,
     readParentPid: options.readParentPid,
   });
+  if (autoHandshake) {
+    portal.send({ type: 'hello', portalGeneration: 1 });
+  }
   return {
     portal,
     messages,

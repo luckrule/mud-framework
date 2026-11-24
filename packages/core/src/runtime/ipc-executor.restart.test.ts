@@ -116,7 +116,7 @@ describe('IpcExecutor restart', () => {
     // spawned ~275 processes in 300ms.
     const h = harness({
       timeoutMs: 1000,
-      crashOnHello: true,
+      crashOnActivate: true,
       restartBackoffMs: 200,
     });
     void h.executor.start().catch(() => undefined);

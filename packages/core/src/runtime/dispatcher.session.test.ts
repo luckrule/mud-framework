@@ -9,7 +9,8 @@ import {
   parseLines,
   quietDispatcher,
 } from '../test-support/dispatcher.ts';
-import { Dispatcher, FrameworkTimeoutError } from './dispatcher.ts';
+import { Dispatcher } from './dispatcher.ts';
+import { FrameworkTimeoutError } from './wire-codes.ts';
 
 describe('Dispatcher.session', () => {
   test('reports the session id the handler bound', async () => {

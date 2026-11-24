@@ -1,20 +1,17 @@
 import { describe, expect, test } from 'bun:test';
 
 import { parseIpcMessage } from '../ipc/protocol.ts';
-import { createJsonLogger } from '../logging/json-logger.ts';
 import { MemoryStorageBackend } from '../storage/memory.ts';
 import type { StorageBackend } from '../storage/types.ts';
 import { tick } from '../test-support/common.ts';
 import {
   echoRegistration,
   numberField,
-  parseLine,
   received,
   requestMessage,
   results,
   startServer,
 } from '../test-support/server-process.ts';
-import { resolveShutdownBudgetMs } from './server-process.ts';
 
 describe('runServerProcess shutdown', () => {
   test('stops accepting, closes the backend, then sends closed', async () => {
@@ -47,8 +44,9 @@ describe('runServerProcess shutdown', () => {
 
     // The accepted request still reports before `closed`, the late one is
     // refused with a stable code, and the backend is closed before the
-    // announcement.
+    // announcement. `prepared` is the two-phase handshake (ADR-0007).
     expect(events).toEqual([
+      'message.prepared',
       'message.ready',
       'message.result',
       'message.result',
@@ -177,6 +175,7 @@ describe('runServerProcess shutdown', () => {
     await harness.done;
 
     expect(events).toEqual([
+      'message.prepared',
       'message.ready',
       'message.result',
       'message.closed',
@@ -302,40 +301,5 @@ describe('runServerProcess shutdown', () => {
     expect(closeBudget).toBeGreaterThan(0);
     release.resolve();
     await tick();
-  });
-});
-
-describe('resolveShutdownBudgetMs', () => {
-  test('uses the budget the Portal declared', () => {
-    const lines: string[] = [];
-    const logger = createJsonLogger({
-      sink: (line) => {
-        lines.push(line);
-      },
-    });
-
-    expect(resolveShutdownBudgetMs(1500, 5000, logger)).toBe(1500);
-    // No degradation, so nothing to report.
-    expect(lines).toEqual([]);
-  });
-
-  test('falls back to 4 * timeoutMs and warns when no budget was declared', () => {
-    // The wire parser requires the field, so this is the legacy-peer path: it
-    // still has to close, but the larger, unrelated budget must be visible.
-    const lines: string[] = [];
-    const logger = createJsonLogger({
-      sink: (line) => {
-        lines.push(line);
-      },
-    });
-
-    expect(resolveShutdownBudgetMs(undefined, 5000, logger)).toBe(20_000);
-    const warnings = lines.map(parseLine);
-    expect(warnings).toHaveLength(1);
-    expect(warnings[0]).toMatchObject({
-      level: 'warn',
-      code: 'SHUTDOWN_BUDGET_UNDECLARED',
-      timeoutMs: 20_000,
-    });
   });
 });

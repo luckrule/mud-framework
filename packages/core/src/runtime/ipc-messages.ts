@@ -1,4 +1,8 @@
-import type { ReadyMessage, RequestMessage } from '../ipc/protocol.ts';
+import type {
+  PreparedMessage,
+  ReadyMessage,
+  RequestMessage,
+} from '../ipc/protocol.ts';
 import type { StorageCapabilities } from '../storage/types.ts';
 import type { ExecutorOutcome, ExecutorRequest } from './executor.ts';
 
@@ -33,9 +37,20 @@ export function failure(code: string, message: string): ExecutorOutcome {
 }
 
 /**
+ * Builds the handshake answer that starts the two-phase activation (ADR-0007).
+ * Same rule as `ready`: an absent version stays absent.
+ */
+export function preparedMessage(
+  pid: number,
+  codeVersion: string | undefined,
+): PreparedMessage {
+  const base = { type: 'prepared' as const, pid };
+  return codeVersion === undefined ? base : { ...base, codeVersion };
+}
+
+/**
  * Builds the readiness barrier. `codeVersion` is omitted when the deployment
- * declared none, so a peer that predates the field sees the same shape it
- * always did (SPEC 6.4).
+ * declared none, rather than sent as `undefined` (SPEC 6.4).
  */
 export function readyMessage(
   pid: number,

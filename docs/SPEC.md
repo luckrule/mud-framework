@@ -243,7 +243,7 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 
 请求是 `Envelope`：`{id, method, payload}`。`id` 是客户端提供的关联标识，响应原样回填；`method` 命名一个 Handler；`payload` 交给 Handler 解释。响应是 `ResponseEnvelope`：`{id} & ({ok: true, result} | {ok: false, error: {code, message}})`。`payload` 与 `result` 对框架不透明——框架不解析、不改写。客户端的 `id` 不是 §7.3 的请求标识：后者由框架在入口分配，不出现在客户端线格式中。
 
-`ok` 是必需的判别字段，不能由可选字段的组合代替：`{"id":"x","ok":true}` 让"成功且无返回值"成为显式判别分支；JSON 编码会丢弃值为 `undefined` 的字段，省略 `ok` 后该响应与缺少 `ok` 的旧格式或非法帧无法区分。失败分支的 `error` 只有 `code` 与 `message`，`code` 的取值见 §7.2，`message` 是供人阅读的说明而非稳定契约。
+`ok` 是必需的判别字段，不能由可选字段的组合代替：`{"id":"x","ok":true}` 让"成功且无返回值"成为显式判别分支；JSON 编码会丢弃值为 `undefined` 的字段，省略 `ok` 后该响应与缺少 `ok` 的非法帧无法区分。失败分支的 `error` 只有 `code` 与 `message`，`code` 的取值见 §7.2，`message` 是供人阅读的说明而非稳定契约。
 
 默认 `JsonCodec` 的入站校验：解码结果必须是对象，`id` 与 `method` 必须是非空字符串；其余校验细节由 `Codec` 实现决定。
 
@@ -271,6 +271,8 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 
 连接层 MUST NOT 在业务进程就绪之前接受输入。理由：否则第一批玩家会收到"框架正在启动"这类本不该存在的错误。
 
+就绪由两阶段握手表达（ADR-0007）：业务进程收到 `hello` 后先回 `prepared`，此时 MUST NOT 打开存储、注册 Extension 或执行 Handler；只有收到 `activate` 才执行第 1、2 步并安装请求处理器，然后发 `ready`。连接层在收到 `ready` 之后才开始接受连接。边界：`prepared` 只表示进程活着且等待激活，不表示可用；连接层不得向 prepared 的业务进程投递 Request，切换场景中旧进程关闭与新进程 `activate` 的先后由调用方保证（INV-002）。
+
 ### 6.3 关闭顺序
 
 1. 连接层停止接受新连接。
@@ -291,7 +293,7 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 
 理由：at-least-once 是"连接保活"这一承诺的直接代价——只要允许重放，重复执行就无法在框架层排除。这也是双进程架构存在的理由：单进程崩溃会同时带走连接与状态，无从重放。
 
-代码版本只回显，不判兼容：`ready` 与 `request` 上的 `codeVersion` 是应用提供的 opaque 非空字符串。两侧各记一种 warn：Portal 在 `ready.codeVersion` 与自身配置不同时记（`expectedCodeVersion`、`actualCodeVersion`、`pid`）；Server 在 `replayCount > 0`、请求版本与自身版本都存在且不同时记（请求标识字段、`requestCodeVersion`、`serverCodeVersion`、`replayCount`）。两者都不据此改变路由、重放策略或请求结局。跨版本重放只保证 at-least-once 与可观测，不保证行为兼容；是否允许带版本热修、如何发布，由部署方决定。
+代码版本只回显，不判兼容：`prepared`、`ready` 与 `request` 上的 `codeVersion` 是应用提供的 opaque 非空字符串。`prepared` 与 `ready` 报告同一个值——该 Server 正在运行的代码版本；`request` 记录 Portal 接受该请求时的版本，重放沿用该值而不是替换 Server 的版本。Portal 在自身配置了版本、且 `ready` 带了一个不同版本时记 warn（`expectedCodeVersion`、`actualCodeVersion`、`pid`）；Server 在处理 `replayCount > 0` 的请求、且请求版本与自身版本都存在且不同时记 warn（请求标识字段、`requestCodeVersion`、`serverCodeVersion`、`replayCount`）。两侧都不因不匹配失败、拒绝、取消请求或改变重放策略。跨版本重放只保证 at-least-once 与可观测，不保证行为兼容；是否允许带版本热修、如何发布，由部署方决定。
 
 ### 6.5 重放的顺序约束
 
@@ -311,7 +313,7 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 
 边界：`extension` 字段只有 Server 侧在 handler 注册元数据可知时填充。Portal 不持有 handler 注册信息，其请求级日志（例如拒绝、队列满、超时、取消、重放）无法获知 Extension，不能按该字段过滤 Portal 日志；这些日志与 Server 侧日志依靠请求标识与 Connection ID 关联。
 
-边界：请求结算之后产生的日志（如 `late result discarded`）依靠结果消息恢复 Session ID。结果消息回显请求进入框架时的入口 Session ID（`requestSessionId`，成功与失败结果都携带；入口无 Session 时不带），迟到结果用它填 `sessionId`；结果消息的 `sessionId` 仍只表示 handler 在本次请求内新绑定的 Session。只有旧对端不回显 `requestSessionId` 时，已结算的日志才退回用稳定的请求标识（§7.3）与同一请求的其它日志行关联。
+边界：请求结算之后产生的日志（如 `late result discarded`）依靠结果消息恢复 Session ID。结果消息回显请求进入框架时的入口 Session ID（`requestSessionId`，成功与失败结果都携带；入口无 Session 时不带），迟到结果用它填 `sessionId`；结果消息的 `sessionId` 仍只表示 handler 在本次请求内新绑定的 Session。结果未带 `requestSessionId` 时，已结算的日志退回用稳定的请求标识（§7.3）与同一请求的其它日志行关联。
 
 ### 7.2 错误码
 
@@ -341,7 +343,7 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 
 **仅日志诊断字段** 出现在日志的 `code` 字段里，用于定位，不发给客户端，也不构成 wire 契约：`CANCEL_LOST_TO_COMMIT`、`IPC_CHANNEL_CLOSED`、`SERVER_STARTUP_FAILED`、`DUPLICATE_REQUEST`、`INVALID_IPC_MESSAGE` 等。日志里的 `code` 只是一个字段名，取值不受本节约束——把它当成错误码清单会误判哪些码是契约。
 
-`FRAMEWORK_` 前缀是示例惯例，不是强制格式。`INVALID_ENVELOPE`、`UNKNOWN_METHOD`、`INTERNAL_ERROR`、`TRANSPORT_SEND_FAILED` 没有该前缀，是既有实现；改名等于换码，会打断依赖旧码的下游（INV-014），因此保留。这是文档补正，不是代码缺陷。
+`FRAMEWORK_` 前缀是示例惯例，不是强制格式。`INVALID_ENVELOPE`、`UNKNOWN_METHOD`、`INTERNAL_ERROR`、`TRANSPORT_SEND_FAILED` 没有该前缀；错误码只增不删（INV-014），改名等于换码，所以这些名字保持不变。
 
 业务错误码由 Extension 用 `BusinessError` 显式定义，框架原样透传，不改写、不吞掉。只有 `BusinessError` 的 `code` 与框架自身错误码进入 wire：驱动或运行时的偶然 `code`（如 `ENOENT`、`SQLITE_CONSTRAINT_UNIQUE`）不透传，统一降级为 `INTERNAL_ERROR`。否则第三方库升级会静默改变对外契约（INV-014）。
 

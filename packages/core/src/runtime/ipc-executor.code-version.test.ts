@@ -40,7 +40,7 @@ describe('IpcExecutor code version', () => {
     const outcome = h.executor.execute(request({ requestId: 'req-1' }));
 
     const [delivered] = requestMessages(server);
-    expect(delivered).not.toHaveProperty('codeVersion');
+    expect(delivered?.codeVersion).toBeUndefined();
 
     server.send(successMessage('req-1', 'ok'));
     expect(await outcome).toEqual({ ok: true, result: 'ok' });
@@ -187,8 +187,8 @@ describe('IpcExecutor code version', () => {
     const startPromise = h.executor.start();
     const server = serverAt(h, 0);
 
-    // A peer that predates the field says nothing about its version; silence is
-    // not the same as a different version.
+    // A deployment that declared no version says nothing; silence is not the
+    // same as a different version.
     server.send(readyMessage());
     await startPromise;
 

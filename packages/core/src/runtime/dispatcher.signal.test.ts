@@ -3,7 +3,7 @@ import { describe, expect, test } from 'bun:test';
 import { MemoryStorageBackend } from '../storage/memory.ts';
 import { rejectionOf, sleep } from '../test-support/common.ts';
 import { deferred, quietDispatcher } from '../test-support/dispatcher.ts';
-import { FrameworkTimeoutError } from './dispatcher.ts';
+import { FrameworkTimeoutError } from './wire-codes.ts';
 
 describe('Dispatcher.abortSignal', () => {
   test('hands the handler an unaborted AbortSignal', async () => {

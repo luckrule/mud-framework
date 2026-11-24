@@ -7,7 +7,8 @@ import {
   parseLines,
   quietDispatcher,
 } from '../test-support/dispatcher.ts';
-import { Dispatcher, FrameworkTimeoutError } from './dispatcher.ts';
+import { Dispatcher } from './dispatcher.ts';
+import { FrameworkTimeoutError } from './wire-codes.ts';
 
 describe('Dispatcher.timeout', () => {
   test('fails the request at the timeout and invalidates later writes', async () => {

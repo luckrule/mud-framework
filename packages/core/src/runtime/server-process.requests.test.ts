@@ -15,8 +15,8 @@ describe('runServerProcess requests', () => {
     const harness = startServer({
       extensions: [{ name: 'echo', register: echoRegistration }],
     });
+    // `startServer` already drove the handshake, so the Server is ready here.
     await tick();
-    harness.portal.send({ type: 'hello', portalGeneration: 1 });
 
     harness.portal.send(requestMessage({ payload: 'ping' }));
     await tick();
@@ -28,12 +28,17 @@ describe('runServerProcess requests', () => {
   });
 
   test('resends ready with the code version for a new portal generation', async () => {
+    // The generation sequence is the point here, so this test drives the
+    // handshake itself: the automatic generation 1 would make an explicit one
+    // stale.
     const harness = startServer({
+      autoHandshake: false,
       codeVersion: 'build-1',
       extensions: [{ name: 'echo', register: echoRegistration }],
     });
     await tick();
     harness.portal.send({ type: 'hello', portalGeneration: 1 });
+    harness.portal.send({ type: 'activate' });
     await tick();
     harness.portal.send({ type: 'hello', portalGeneration: 2 });
     await tick();
@@ -204,65 +209,67 @@ describe('runServerProcess requests', () => {
     await harness.stop();
   });
 
-  test('executes a request that arrives before hello', async () => {
-    // Executing is the only way to answer: the protocol has no "not ready"
-    // reply, and dropping would leave Portal replaying the request forever.
-    // The missing handshake is logged instead of silently tolerated.
+  test('ignores a request that arrives before hello', async () => {
+    // ADR-0007: nothing can run before `ready`, and a Portal that delivers
+    // early is out of protocol (SPEC 6.2). The fault is logged instead of
+    // silently tolerated.
     const harness = startServer({
+      autoHandshake: false,
       extensions: [{ name: 'echo', register: echoRegistration }],
     });
-    await tick();
 
     harness.portal.send(requestMessage());
     await tick();
 
-    expect(results(harness.messages)).toEqual([
-      { type: 'result', requestId: 'req-1', ok: true, result: 'hi' },
-    ]);
+    expect(results(harness.messages)).toEqual([]);
     const warnings = harness
       .logs()
-      .filter((line) => line.code === 'REQUEST_BEFORE_HELLO');
+      .filter((line) => line.code === 'REQUEST_BEFORE_READY');
     expect(warnings).toHaveLength(1);
     await harness.stop();
   });
 
-  test('logs REQUEST_BEFORE_HELLO once, not once per request', async () => {
-    // The missing handshake is a timing fault, so it stays diagnosable without
-    // letting the log volume track the request rate (SPEC 7.1).
+  test('logs REQUEST_BEFORE_READY once, not once per request', async () => {
+    // The timing fault stays diagnosable without letting the log volume track
+    // the request rate (SPEC 7.1).
     const harness = startServer({
+      autoHandshake: false,
       extensions: [{ name: 'echo', register: echoRegistration }],
     });
-    await tick();
 
     for (let index = 0; index < 5; index += 1) {
       harness.portal.send(requestMessage({ requestId: `req-${index}` }));
     }
     await tick();
 
-    expect(results(harness.messages)).toHaveLength(5);
+    expect(results(harness.messages)).toEqual([]);
     const warnings = harness
       .logs()
-      .filter((line) => line.code === 'REQUEST_BEFORE_HELLO');
+      .filter((line) => line.code === 'REQUEST_BEFORE_READY');
     expect(warnings).toHaveLength(1);
     await harness.stop();
   });
 
-  test('does not repeat REQUEST_BEFORE_HELLO once hello arrives', async () => {
+  test('starts executing requests once ready, without a second warning', async () => {
     const harness = startServer({
+      autoHandshake: false,
       extensions: [{ name: 'echo', register: echoRegistration }],
     });
-    await tick();
 
     harness.portal.send(requestMessage({ requestId: 'req-1' }));
     await tick();
     harness.portal.send({ type: 'hello', portalGeneration: 1 });
+    harness.portal.send({ type: 'activate' });
     await tick();
     harness.portal.send(requestMessage({ requestId: 'req-2' }));
     await tick();
 
+    expect(results(harness.messages)).toEqual([
+      { type: 'result', requestId: 'req-2', ok: true, result: 'hi' },
+    ]);
     const warnings = harness
       .logs()
-      .filter((line) => line.code === 'REQUEST_BEFORE_HELLO');
+      .filter((line) => line.code === 'REQUEST_BEFORE_READY');
     expect(warnings).toHaveLength(1);
     await harness.stop();
   });

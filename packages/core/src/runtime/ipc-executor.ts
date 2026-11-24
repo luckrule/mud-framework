@@ -133,9 +133,13 @@ interface ServerState {
  *
  * The recovery barrier is the handshake: nothing is delivered before `ready`
  * (SPEC 6.2), so a Request that arrives while the Server is starting or being
- * restarted waits instead of failing. A crash does not fail in-flight Requests
- * either — they are replayed to the next process, in the order they were
- * received on their connection (SPEC 6.5), until the replay budget runs out.
+ * restarted waits instead of failing. The handshake itself is two-phase
+ * (ADR-0007): `hello` is answered with `prepared`, and `activate` is what opens
+ * the Server's storage. This class activates immediately after `prepared`; the
+ * ordering that retires a previous process first belongs to a switching caller.
+ * A crash does not fail in-flight Requests either — they are replayed to the
+ * next process, in the order they were received on their connection (SPEC 6.5),
+ * until the replay budget runs out.
  *
  * `execute` never throws and always settles by the request deadline, because
  * the connection layer advances a connection's ordered chain on settlement and
@@ -933,6 +937,9 @@ export class IpcExecutor implements RequestExecutor {
     }
     const message = parsed.message;
     switch (message.type) {
+      case 'prepared':
+        this.onPrepared(server, message.pid);
+        return;
       case 'ready':
         this.onReady(
           server,
@@ -962,12 +969,53 @@ export class IpcExecutor implements RequestExecutor {
       case 'request':
       case 'cancel':
       case 'shutdown':
+      case 'activate':
         // Valid shape, wrong direction: a Server must not send these.
         this.logger.warn(
           { pid: server.pid, reason: `unexpected "${message.type}" message` },
           'ipc message rejected',
         );
     }
+  }
+
+  /**
+   * The Server accepted the handshake and is waiting for activation (ADR-0007):
+   * it holds no storage yet, so the only thing that can happen now is opening
+   * it. Sending `activate` at once is the ordinary-start path; the ordering
+   * that retires an old process first belongs to the caller that has one.
+   */
+  private onPrepared(server: ServerState, pid: number): void {
+    if (this.server !== server || server.closed) {
+      this.logger.debug(
+        { pid },
+        'prepared from a server generation already given up',
+      );
+      return;
+    }
+    if (server.ready) {
+      // Out of order: this generation already opened its storage.
+      this.logger.warn({ pid }, 'prepared received after ready; ignored');
+      return;
+    }
+    if (this.isTerminal) {
+      // Nothing may open storage while the Portal is closing: there would be
+      // nowhere to drain it. The shutdown path kills this process.
+      this.logger.debug({ pid }, 'prepared ignored while closing');
+      return;
+    }
+    server.pid = pid;
+    try {
+      server.channel.send({ type: 'activate' });
+    } catch (error) {
+      this.onServerLost(
+        server,
+        null,
+        null,
+        `activate failed: ${messageOf(error)}`,
+      );
+      return;
+    }
+    this.logger.debug({ pid }, 'server prepared; activating');
   }
 
   private onReady(
@@ -991,8 +1039,8 @@ export class IpcExecutor implements RequestExecutor {
     server.pid = pid;
     // Reported, not enforced: a Server built from different code may still be
     // the only process available, and refusing it would turn a deployment
-    // mismatch into an outage (SPEC 6.4). A peer that omits the field says
-    // nothing about its version, so silence is not a mismatch.
+    // mismatch into an outage (SPEC 6.4). A deployment that declared no version
+    // says nothing, so silence is not a mismatch.
     if (
       this.codeVersion !== undefined &&
       actualCodeVersion !== undefined &&
@@ -1055,20 +1103,15 @@ export class IpcExecutor implements RequestExecutor {
       // A result for a request that already reached a Portal-decided terminal
       // state. Expected, not an error (SPEC 7.3 keeps the id stable, so the
       // correlation still works — there is just nothing left to settle).
-      // The pending entry is gone, so the Session comes from the result: the
-      // Server echoes the entry Session on every result, including failures.
-      // A Server that predates the echo only names a Session it just bound, and
-      // only on success. `requestId` is stable (SPEC 7.3) and the connection
-      // layer records the entry session on its request line, so even then the
-      // log stays correlatable by that id.
+      // The pending entry is gone, so the Session comes from the result's echo
+      // of the entry Session, which the Server sends on every result including
+      // failures.
       const fields: LogFields = {
         requestId: message.requestId,
         reason: 'request is no longer buffered',
       };
-      const sessionId =
-        requestSessionId ?? (message.ok ? message.sessionId : undefined);
-      if (sessionId !== undefined) {
-        fields.sessionId = sessionId;
+      if (requestSessionId !== undefined) {
+        fields.sessionId = requestSessionId;
       }
       this.logger.debug(fields, 'late result discarded');
       return;
@@ -1078,16 +1121,9 @@ export class IpcExecutor implements RequestExecutor {
       durationMs: Date.now() - pending.startedAt,
     };
     // A fresh binding wins over the entry Session the connection layer already
-    // knew. The echo fallback is defensive: a compliant Server echoes the same
-    // entry Session the pending request holds, so it only serves a peer that
-    // resolves the entry Session itself or one that is non-compliant.
+    // knew.
     if (message.ok && message.sessionId !== undefined) {
       fields.sessionId = message.sessionId;
-    } else if (
-      fields.sessionId === undefined &&
-      requestSessionId !== undefined
-    ) {
-      fields.sessionId = requestSessionId;
     }
     this.logger.debug(fields, 'result received');
     this.settle(pending, outcome);

@@ -2,8 +2,10 @@ import { messageOf } from '../internal/guards.ts';
 import { createProcessChannel } from '../ipc/bun-child.ts';
 import type { IpcChannel } from '../ipc/channel.ts';
 import type {
+  CancelMessage,
   HelloMessage,
   IpcMessage,
+  RequestMessage,
   ShutdownMessage,
 } from '../ipc/protocol.ts';
 import { parseIpcMessage } from '../ipc/protocol.ts';
@@ -12,11 +14,14 @@ import { safeLogger } from '../logging/safe-logger.ts';
 import type { Logger } from '../logging/types.ts';
 import type { StorageBackend } from '../storage/types.ts';
 import type { Extension } from './extension.ts';
-import type { RequestIdentity } from './identity.ts';
-import { readyMessage } from './ipc-messages.ts';
-import { RequestRunner } from './server-requests.ts';
+import { preparedMessage, readyMessage } from './ipc-messages.ts';
+import { RequestRunner, requestIds } from './server-requests.ts';
 import type { Runtime } from './server-startup.ts';
-import { startServer } from './server-startup.ts';
+import {
+  assertCodeVersion,
+  ServerStartupError,
+  startServer,
+} from './server-startup.ts';
 import { settleWithin } from './timeout.ts';
 
 export interface ServerProcessOptions {
@@ -82,23 +87,12 @@ export class ServerChannelClosedError extends Error {
 }
 
 /**
- * Multiplier applied to `timeoutMs` when bounding the shutdown as a whole, on
- * the fallback path only (a Portal that did not declare a budget). The
- * dispatcher answers every request at `timeoutMs` even if its handler is still
- * running (SPEC 3.4), so a close that has not finished within twice that budget
- * is stuck on something the framework cannot stop waiting for. It is a total,
- * not a per-step value: drain and backend close share one deadline.
- */
-const DRAIN_LIMIT_MULTIPLIER = 2;
-
-/**
  * Budget for each step of an abort (Portal died, nobody can read a result).
- * Deliberately a fixed value unrelated to `timeoutMs`: the `4 * timeoutMs`
- * fallback used on the orderly path is 4 minutes at `timeoutMs = 60s`, which is
- * indistinguishable from waiting forever, and every second of it is a second
- * this orphaned process keeps writing to storage beside the next Server
- * (INV-002). Nobody is waiting for this process, so a short cap is the right
- * trade: a handler that cannot finish in 5s is abandoned rather than honoured.
+ * Deliberately a fixed value unrelated to `timeoutMs`: nobody is waiting for
+ * this process, and every second of a long wait is a second this orphaned
+ * process keeps writing to storage beside the next Server (INV-002). A short
+ * cap is the right trade: a handler that cannot finish in 5s is abandoned
+ * rather than honoured.
  */
 const ABORT_TIMEOUT_MS = 5000;
 
@@ -111,8 +105,25 @@ const ABORT_TIMEOUT_MS = 5000;
 const PARENT_CHECK_INTERVAL_MS = 500;
 
 /**
+ * Where the two-phase activation has got to (ADR-0007). Only `active` may run
+ * requests; `shutting-down` is terminal for the rest of the process's life.
+ */
+type Phase =
+  | 'awaiting-hello'
+  | 'preparing'
+  | 'starting'
+  | 'active'
+  | 'shutting-down';
+
+/**
  * The Server side of the two-process split (ADR-0002): it owns Extensions,
  * handler execution and the only storage writer (INV-002).
+ *
+ * Startup is two-phase (ADR-0007): `hello` is answered with `prepared` while no
+ * storage exists, and only `activate` runs `startServer` (backend, capability
+ * self-check, Extensions, `ready`). A Portal that never activates never makes
+ * this process a writer, which is what lets a replacement Server be spawned
+ * before the old one released storage.
  *
  * A library function rather than an entry point, because the Extension and the
  * backend belong to the business and the framework ships neither (INV-016,
@@ -123,8 +134,9 @@ const PARENT_CHECK_INTERVAL_MS = 500;
  * `process.exit` and a caller needs something observable to map to an exit code:
  *
  * - resolves after an orderly `shutdown` (the last message is `closed`, the
- *   backend is closed and the link is closed): exit 0;
- * - rejects with `ServerStartupError` when the process never became ready, and
+ *   backend is closed and the link is closed): exit 0. A `shutdown` before
+ *   activation resolves without ever opening storage;
+ * - rejects with `ServerStartupError` when activation never reached `ready`, and
  *   with `ServerChannelClosedError` when the link died without `shutdown`: exit
  *   non-zero so the Portal restart policy sees a failure.
  */
@@ -137,20 +149,21 @@ class ServerProcess {
   private readonly logger: Logger;
   private readonly channel: IpcChannel;
   private readonly completion = Promise.withResolvers<void>();
+  /**
+   * Resolves true once the Server is ready and the request handlers are
+   * attached, false when an orderly shutdown ended the process before that
+   * possibly happened, and rejects when startup failed.
+   */
+  private readonly activation = Promise.withResolvers<boolean>();
   private portalGeneration: number | undefined;
+  private phase: Phase = 'awaiting-hello';
   /**
-   * `accepting` until shutdown begins, then `shutting-down` for the rest of the
-   * process's life. One field rather than two booleans because they only ever
-   * changed together, and every read asks the same question: "may this process
-   * still take new work?".
+   * True once input that arrived before `ready` has been reported for this
+   * Portal. A request or a cancel before the barrier means the timing is broken,
+   * and logging every one of them would scale the log volume with the request
+   * rate (SPEC 7.1). One flag for both: they are the same fault.
    */
-  private phase: 'accepting' | 'shutting-down' = 'accepting';
-  /**
-   * True once the missing handshake has been reported for this Portal. A request
-   * before `hello` means the timing is broken, and logging every one of them
-   * would scale the log volume with the request rate (SPEC 7.1).
-   */
-  private missingHelloLogged = false;
+  private preReadyInputLogged = false;
   /** Set while the parent-liveness poll is installed; cleared on completion. */
   private parentTimer: ReturnType<typeof setInterval> | undefined;
   /**
@@ -163,6 +176,20 @@ class ServerProcess {
    * reason: the parent-liveness poll reaches the drain through `abort`.
    */
   private runner: RequestRunner | undefined;
+  /** A `shutdown` that arrived while `startServer` was still running. */
+  private pendingShutdown: ShutdownMessage | undefined;
+  /**
+   * The link died before activation. Recorded because the readiness barrier may
+   * only be crossed later, and a startup that finishes after the death must
+   * close the storage it just opened instead of announcing readiness.
+   */
+  private channelClosedReason: string | undefined;
+  /**
+   * The parent was seen gone while a start was in flight. Same reason as
+   * `channelClosedReason`: the start owns the close and must not announce
+   * readiness to a Portal that no longer exists.
+   */
+  private parentGoneReason: string | undefined;
 
   constructor(options: ServerProcessOptions) {
     this.options = options;
@@ -175,19 +202,21 @@ class ServerProcess {
     // A startup failure throws out of `run` before it awaits the completion,
     // so a later rejection there must not surface as an unhandled rejection.
     void this.completion.promise.catch(() => undefined);
+    void this.activation.promise.catch(() => undefined);
   }
 
   async run(): Promise<void> {
     try {
-      await this.start();
+      await this.begin();
     } catch (error) {
       this.stopParentWatch();
+      // The failure is already reported. Marking the close as ours keeps the
+      // early `onClose` handler from logging a second, misleading
+      // `IPC_CHANNEL_CLOSED` for the link this line closes.
+      this.phase = 'shutting-down';
       this.channel.close('startup failed');
       throw error;
     }
-    // Installed after the readiness barrier: before it there is no storage open
-    // that an orphan could write to, and a failed start is already reported.
-    this.startParentWatch();
     try {
       await this.completion.promise;
     } finally {
@@ -195,6 +224,30 @@ class ServerProcess {
       // would keep the process alive after the caller already got its answer.
       this.stopParentWatch();
     }
+  }
+
+  /**
+   * Waits for the handshake and then for activation (ADR-0007). The channel
+   * may buffer what arrived before registration, so the handlers go in first.
+   *
+   * The parent watch goes in here rather than after `ready`: a prepared Server
+   * holds no storage, but it can still be the process a `SIGKILL`ed Portal left
+   * behind, and nothing else would ever tell it to stop. It is unref'd, so it
+   * does not keep the process alive on its own.
+   */
+  private async begin(): Promise<void> {
+    // Checked before the handshake answers: `prepared` carries the version, and
+    // the wire parser accepts only a non-empty string, so an invalid value
+    // would produce a message no Portal can read.
+    assertCodeVersion(this.options.codeVersion, this.logger);
+    this.channel.onMessage((raw) => {
+      this.onMessage(raw);
+    });
+    this.channel.onClose((reason) => {
+      this.onChannelClose(reason);
+    });
+    this.startParentWatch();
+    await this.activation.promise;
   }
 
   /**
@@ -231,74 +284,201 @@ class ServerProcess {
   }
 
   private onParentGone(): void {
-    if (this.phase === 'shutting-down') {
+    const previous = this.phase;
+    if (previous === 'shutting-down') {
       return;
     }
     this.phase = 'shutting-down';
+    this.parentGoneReason = 'the parent process is gone';
     this.logger.error(
       { code: 'IPC_PARENT_GONE', reason: 'the parent process is gone' },
       'parent process gone; server stopping',
     );
     const runtime = this.runtime;
     const runner = this.runner;
-    if (runtime === undefined || runner === undefined) {
-      this.completion.reject(
-        new ServerChannelClosedError('the parent process is gone'),
-      );
+    if (runtime !== undefined && runner !== undefined) {
+      void this.abort(runtime, runner, 'the parent process is gone');
       return;
     }
-    void this.abort(runtime, runner, 'the parent process is gone');
+    if (previous === 'starting') {
+      // `startServer` is mid-flight and owns what it opened: it closes the
+      // backend and rejects the activation when it finishes, so rejecting here
+      // would let the caller exit the process while that close is in flight.
+      return;
+    }
+    // ADR-0007: before activation there is no storage to drain, but `run()` is
+    // parked on `activation.promise`, so rejecting it is what makes the process
+    // return instead of outliving the Portal that started it. Closing the link
+    // is what lets the event loop empty; without it an orphan lingers.
+    this.activation.reject(
+      new ServerChannelClosedError('the parent process is gone'),
+    );
+    this.channel.close('the parent process is gone');
   }
 
   /**
-   * Crosses the readiness barrier through `startServer` (SPEC 6.2) and only
-   * then attaches the inbound handlers: the channel buffers messages that
-   * arrive before registration, so nothing is lost and nothing is handled
-   * before `ready`. Attaching them earlier would break that contract.
+   * Answers the handshake without touching storage (ADR-0007). Nothing that
+   * can write exists at this point, which is what keeps a prepared Server from
+   * competing with the one it is meant to replace (INV-002).
    */
-  private async start(): Promise<void> {
-    const { runtime } = await startServer({
-      options: this.options,
-      logger: this.logger,
-      channel: this.channel,
-    });
+  private beginPrepare(): void {
+    this.phase = 'preparing';
+    this.logger.info(
+      { pid: process.pid, codeVersion: this.options.codeVersion },
+      'server prepared; waiting for activation',
+    );
+    this.sendPrepared();
+  }
+
+  private sendPrepared(): void {
+    try {
+      this.sendBarrier(
+        preparedMessage(process.pid, this.options.codeVersion),
+        'prepared',
+      );
+    } catch (error) {
+      // No storage exists yet, so there is nothing to close: failing the
+      // activation is what makes `run()` return instead of parking on a Portal
+      // that will never send `activate`.
+      this.phase = 'shutting-down';
+      this.activation.reject(error);
+    }
+  }
+
+  /**
+   * Whether the process has begun closing. Reads the field through a method so
+   * a phase set inside a synchronously delivered handler is not narrowed away
+   * by the compiler.
+   */
+  private isShuttingDown(): boolean {
+    return this.phase === 'shutting-down';
+  }
+
+  /**
+   * Runs once `activate` arrives: opens the runtime through `startServer`
+   * (SPEC 6.2), attaches the request handlers, marks the process active and
+   * only then sends `ready`. The pre-activation handlers stay installed until
+   * the new ones are in place, so a request that arrives during the start is
+   * ignored instead of meeting a half-built Server.
+   */
+  private async startAndServe(): Promise<void> {
+    this.phase = 'starting';
+    let runtime: Runtime;
+    try {
+      ({ runtime } = await startServer({
+        options: this.options,
+        logger: this.logger,
+      }));
+    } catch (error) {
+      // `startServer` closed whatever it opened. A link that died during the
+      // start is reported as what it is: the peer is gone, not that the
+      // configuration was refused. The same holds for a parent that vanished
+      // mid-start.
+      const gone = this.channelClosedReason ?? this.parentGoneReason;
+      throw gone === undefined ? error : new ServerChannelClosedError(gone);
+    }
     const runner = new RequestRunner({
       runtime,
       logger: this.logger,
       codeVersion: this.options.codeVersion,
       send: (message, what) => this.sendQuietly(message, what),
-      // The phase and the handshake flag stay in this class: `shutdown` and
-      // `hello` own them, and the runner only asks.
-      accepting: () => this.phase === 'accepting',
-      noteRequestBeforeHello: (ids) => this.noteRequestBeforeHello(ids),
+      // The phase stays in this class: `shutdown` owns it, and the runner only
+      // asks.
+      accepting: () => this.phase === 'active',
     });
     this.runtime = runtime;
     this.runner = runner;
-    // Inbound plumbing goes last: a message that arrives before these
-    // handlers are attached is buffered by the channel and delivered at
-    // registration, so none is lost and none is handled before `ready`.
     try {
       this.channel.onMessage((raw) => {
-        this.onMessage(runtime, runner, raw);
+        this.onMessage(raw);
       });
       this.channel.onClose((reason) => {
-        this.onChannelClose(runtime, runner, reason);
+        this.onChannelClose(reason);
       });
     } catch (error) {
       // The channel is outside code: a registration that throws must not leave
-      // the backend open, which is what the pre-split `start` guarded with its
-      // own catch. The original error is the one worth reporting, so a failure
-      // to close does not replace it.
+      // the backend open. The original error is the one worth reporting, so a
+      // failure to close does not replace it.
       await runtime.executor.close().catch(() => undefined);
       throw error;
     }
+    // Registration above can deliver what arrived while this was starting. A
+    // dead link wins over a parked shutdown: nobody can receive `closed`, so
+    // the close has to be an abort. Both are applied before the phase check,
+    // because a shutdown parked during `startServer` already set the phase and
+    // would otherwise be left without a drain.
+    if (this.channelClosedReason !== undefined) {
+      this.phase = 'shutting-down';
+      this.activation.resolve(false);
+      void this.abort(runtime, runner, this.channelClosedReason);
+      return;
+    }
+    if (this.parentGoneReason !== undefined) {
+      // The poll fired during the start. Nobody is left to announce readiness
+      // to, and the backend this start just opened must be closed here: the
+      // poll could not do it because the runtime did not exist yet.
+      this.phase = 'shutting-down';
+      this.activation.resolve(false);
+      void this.abort(runtime, runner, this.parentGoneReason);
+      return;
+    }
+    const pendingShutdown = this.pendingShutdown;
+    if (pendingShutdown !== undefined) {
+      this.activation.resolve(false);
+      this.beginShutdown(runtime, runner, pendingShutdown);
+      return;
+    }
+    if (this.isShuttingDown()) {
+      // A `shutdown` delivered at registration found the runtime and started
+      // its own drain; there is nothing left to begin.
+      this.activation.resolve(false);
+      return;
+    }
+    // SPEC 6.2 step 3, in this order and no other: the handler is installed, the
+    // phase says requests may run, and only then is the barrier crossed. A
+    // Portal is entitled to deliver the instant it sees `ready`, so anything
+    // sent before this point would arrive with nowhere to go and be dropped.
+    this.phase = 'active';
+    try {
+      this.sendBarrier(
+        readyMessage(
+          process.pid,
+          runtime.capabilities,
+          this.options.codeVersion,
+        ),
+        'ready',
+      );
+    } catch (error) {
+      // The barrier was never crossed, so this process is not a Server anyone
+      // can use: leaving the backend open would keep a writer alive beside the
+      // replacement (INV-002), and leaving the phase `active` would promise work
+      // this process cannot deliver. Rejecting the activation is what makes
+      // `run()` end as a startup failure instead of parking forever.
+      //
+      // The drain is here for the channel that delivers `ready` and only then
+      // throws: a request flushed by that delivery may already be running, and
+      // the backend must not close under it. One deadline covers both steps,
+      // like `abort`.
+      this.phase = 'shutting-down';
+      const limitMs = this.options.abortTimeoutMs ?? ABORT_TIMEOUT_MS;
+      const deadlineAt = performance.now() + limitMs;
+      await runner.drain(limitMs);
+      await this.closeStorage(
+        runtime,
+        runner,
+        Math.max(1, deadlineAt - performance.now()),
+      );
+      this.activation.reject(error);
+      return;
+    }
+    this.logger.info(
+      { pid: process.pid, capabilities: runtime.capabilities },
+      'server process ready',
+    );
+    this.activation.resolve(true);
   }
 
-  private onMessage(
-    runtime: Runtime,
-    runner: RequestRunner,
-    raw: unknown,
-  ): void {
+  private onMessage(raw: unknown): void {
     const parsed = parseIpcMessage(raw);
     if (!parsed.ok) {
       // warn, not error: one unreadable message is a rejected input, and
@@ -312,17 +492,21 @@ class ServerProcess {
     const message = parsed.message;
     switch (message.type) {
       case 'hello':
-        this.onHello(runtime, runner, message);
+        this.onHello(message);
+        return;
+      case 'activate':
+        this.onActivate();
         return;
       case 'request':
-        runner.accept(message);
+        this.onRequest(message);
         return;
       case 'cancel':
-        runner.cancel(message);
+        this.onCancel(message);
         return;
       case 'shutdown':
-        this.onShutdown(runtime, runner, message);
+        this.onShutdown(message);
         return;
+      case 'prepared':
       case 'ready':
       case 'result':
       case 'closed':
@@ -337,13 +521,9 @@ class ServerProcess {
     }
   }
 
-  private onHello(
-    runtime: Runtime,
-    runner: RequestRunner,
-    message: HelloMessage,
-  ): void {
+  private onHello(message: HelloMessage): void {
     if (this.phase === 'shutting-down') {
-      // Answering a handshake with `ready` while shutting down would promise
+      // Answering a handshake with a barrier while shutting down would promise
       // readiness this process no longer offers.
       this.logger.warn(
         {
@@ -367,18 +547,51 @@ class ServerProcess {
       return;
     }
     this.portalGeneration = message.portalGeneration;
-    // A later Portal can break the ordering again, and that recurrence should
-    // be visible rather than silenced by the first one.
-    this.missingHelloLogged = false;
     if (previous === undefined) {
       this.logger.info(
         { portalGeneration: message.portalGeneration },
         'portal generation accepted',
       );
+      this.beginPrepare();
       return;
     }
-    // The new Portal was not around for the first `ready`, and the barrier is
-    // per Portal: without a second one it would wait for readiness forever.
+    // A later Portal can break the ordering again, and that recurrence should
+    // be visible rather than silenced by the first one.
+    this.preReadyInputLogged = false;
+    if (this.phase === 'preparing') {
+      // The new Portal was not around for the first `prepared`, and the barrier
+      // is per Portal: without a second one it would wait for an answer it
+      // already missed.
+      this.logger.warn(
+        {
+          code: 'PORTAL_GENERATION_CHANGED',
+          portalGeneration: message.portalGeneration,
+          previousPortalGeneration: previous,
+        },
+        'new portal generation; resending prepared',
+      );
+      this.sendPrepared();
+      return;
+    }
+    if (this.phase === 'starting') {
+      // The start has not crossed the barrier yet, and it will send `ready`
+      // when it does. The new Portal is already reading this link, so there is
+      // no barrier to resend.
+      this.logger.warn(
+        {
+          code: 'PORTAL_GENERATION_CHANGED',
+          portalGeneration: message.portalGeneration,
+          previousPortalGeneration: previous,
+        },
+        'new portal generation during startup; ready will follow',
+      );
+      return;
+    }
+    const runtime = this.runtime;
+    const runner = this.runner;
+    if (runtime === undefined || runner === undefined) {
+      return;
+    }
     // In-flight work is deliberately kept — the handlers are already running,
     // their results are still the only answer for those ids (duplicates are
     // the business's problem, INV-011), and results go out on this same link.
@@ -397,33 +610,84 @@ class ServerProcess {
     );
   }
 
-  /**
-   * The request arrived before any `hello`. Executing is the only way to answer
-   * it: the protocol has no "not ready" reply, and dropping would leave Portal
-   * replaying this request forever without ever getting a result. The missing
-   * handshake is recorded once so it stays diagnosable without logging once per
-   * request (SPEC 7.1).
-   */
-  private noteRequestBeforeHello(ids: RequestIdentity): void {
-    if (this.portalGeneration !== undefined || this.missingHelloLogged) {
+  private onActivate(): void {
+    if (this.phase === 'preparing') {
+      this.logger.info(
+        { pid: process.pid },
+        'activation received; starting server',
+      );
+      void this.startAndServe().catch((error: unknown) => {
+        this.activation.reject(error);
+      });
       return;
     }
-    this.missingHelloLogged = true;
+    if (this.phase === 'starting') {
+      // Storage is already opening; a second activate would start it twice.
+      this.logger.debug({}, 'duplicate activation ignored');
+      return;
+    }
     this.logger.warn(
       {
-        ...ids,
-        code: 'REQUEST_BEFORE_HELLO',
-        reason: 'no hello received from this portal',
+        code: 'ACTIVATE_IGNORED',
+        reason: `activate arrived while ${this.phase}`,
       },
-      'request received before hello',
+      'ipc message ignored',
     );
   }
 
-  private onShutdown(
-    runtime: Runtime,
-    runner: RequestRunner,
-    message: ShutdownMessage,
-  ): void {
+  /**
+   * A request before `ready` cannot run: no backend and no handler exist yet
+   * (ADR-0007), and the Portal must not deliver before the barrier (SPEC 6.2).
+   * It is ignored, and the fault is recorded once per Portal generation so the
+   * log volume does not track the request rate (SPEC 7.1).
+   */
+  private onRequest(message: RequestMessage): void {
+    const runner = this.runner;
+    if (runner !== undefined) {
+      runner.accept(message);
+      return;
+    }
+    if (this.preReadyInputLogged) {
+      return;
+    }
+    this.preReadyInputLogged = true;
+    this.logger.warn(
+      {
+        ...requestIds(message),
+        code: 'REQUEST_BEFORE_READY',
+        phase: this.phase,
+        reason: 'no handler can run before the server is ready',
+      },
+      'request ignored before ready',
+    );
+  }
+
+  private onCancel(message: CancelMessage): void {
+    const runner = this.runner;
+    if (runner !== undefined) {
+      runner.cancel(message);
+      return;
+    }
+    // Same fault as a pre-ready request and the same volume, so it shares the
+    // one-per-generation flag rather than adding a second unbounded line.
+    if (this.preReadyInputLogged) {
+      return;
+    }
+    this.preReadyInputLogged = true;
+    // warn, not error: nothing ran, so nothing needs rolling back.
+    this.logger.warn(
+      {
+        requestId: message.requestId,
+        cancelCode: message.code,
+        code: 'CANCEL_BEFORE_READY',
+        phase: this.phase,
+        reason: 'no request can be in flight before the server is ready',
+      },
+      'cancel ignored before ready',
+    );
+  }
+
+  private onShutdown(message: ShutdownMessage): void {
     if (this.phase === 'shutting-down') {
       this.logger.warn(
         { code: 'SHUTDOWN_IN_PROGRESS', reason: 'shutdown already requested' },
@@ -431,10 +695,45 @@ class ServerProcess {
       );
       return;
     }
+    const runtime = this.runtime;
+    const runner = this.runner;
+    if (runtime !== undefined && runner !== undefined) {
+      this.beginShutdown(runtime, runner, message);
+      return;
+    }
+    if (this.phase === 'starting') {
+      // Storage is opening right now; closing the link here would leave a
+      // backend no one owns. The start finishes and then closes it.
+      this.phase = 'shutting-down';
+      this.pendingShutdown = message;
+      this.logger.info(
+        { pid: process.pid },
+        'shutdown requested during activation; closing after start',
+      );
+      return;
+    }
+    // ADR-0007: before activation there is no storage to drain or close, so an
+    // orderly close is just the announcement and the link.
+    this.phase = 'shutting-down';
+    this.logger.info(
+      { pid: process.pid, activated: false },
+      'server shut down before activation; no storage was opened',
+    );
+    this.sendQuietly({ type: 'closed', reason: 'shutdown' }, 'closed');
+    this.channel.close('shutdown complete');
+    this.completion.resolve();
+    this.activation.resolve(false);
+  }
+
+  private beginShutdown(
+    runtime: Runtime,
+    runner: RequestRunner,
+    message: ShutdownMessage,
+  ): void {
     this.phase = 'shutting-down';
     // SPEC 6.3 step 1: stop accepting before draining, so the drain below has a
     // closed set of requests and nothing new can enter the backend.
-    const budgetMs = this.shutdownBudgetMs(message);
+    const budgetMs = message.timeoutMs;
     this.logger.info(
       { pendingRequests: runner.running, budgetMs },
       'server shutting down',
@@ -483,22 +782,6 @@ class ServerProcess {
   }
 
   /**
-   * The total budget for the graceful close, from what the Portal declared.
-   *
-   * A message without a budget cannot come off the wire — the protocol requires
-   * it — but a directly constructed one can, and the Server must still close
-   * rather than refuse. The fallback is the pre-protocol derivation, and it is
-   * logged as a degradation because it may exceed the Portal's real patience.
-   */
-  private shutdownBudgetMs(message: ShutdownMessage): number {
-    return resolveShutdownBudgetMs(
-      message.timeoutMs,
-      this.options.timeoutMs,
-      this.logger,
-    );
-  }
-
-  /**
    * Closes the backend, which is mandatory (SPEC 6.3 step 4), but bounded: a
    * backend that waits for its queue would otherwise keep `closed` from ever
    * being sent when a handler never returns. The wait is abandoned, not the
@@ -535,13 +818,30 @@ class ServerProcess {
     }
   }
 
-  private onChannelClose(
-    runtime: Runtime,
-    runner: RequestRunner,
-    reason: string,
-  ): void {
+  private onChannelClose(reason: string): void {
+    // Recorded for the activation path: a start that finishes after the death
+    // must close the storage it just opened instead of announcing readiness.
+    this.channelClosedReason = reason;
     if (this.phase === 'shutting-down') {
-      // Our own `close` at the end of an orderly shutdown.
+      // Our own `close` at the end of an orderly shutdown, or the close that an
+      // abort already issued.
+      return;
+    }
+    const runtime = this.runtime;
+    const runner = this.runner;
+    if (runtime === undefined || runner === undefined) {
+      // ADR-0007: no storage is open before `ready`, so failing here cannot
+      // leave a second writer behind (INV-002). During `starting` the run
+      // itself closes whatever it just opened; rejecting here as well would let
+      // the caller exit the process while that close is still in flight.
+      this.logger.error(
+        { code: 'IPC_CHANNEL_CLOSED', reason },
+        'ipc channel closed before ready; server stopping',
+      );
+      if (this.phase !== 'starting') {
+        this.phase = 'shutting-down';
+        this.activation.reject(new ServerChannelClosedError(reason));
+      }
       return;
     }
     this.phase = 'shutting-down';
@@ -593,36 +893,28 @@ class ServerProcess {
       );
     }
   }
-}
 
-/**
- * Total budget for a graceful close. The Portal's declaration wins; without one
- * the pre-protocol derivation applies (twice `timeoutMs` for the drain plus
- * twice for the backend close) and is logged, because it may outlast the
- * Portal's real patience and get this process killed mid-close.
- *
- * Exported for the test that pins the fallback: the wire parser rejects a
- * `shutdown` without a budget, so the degraded path is unreachable through a
- * message and would otherwise be untested.
- */
-export function resolveShutdownBudgetMs(
-  declaredMs: number | undefined,
-  requestTimeoutMs: number,
-  logger: Logger,
-): number {
-  if (declaredMs !== undefined) {
-    return declaredMs;
+  /**
+   * Sends a readiness barrier, where a failed send is a startup failure rather
+   * than a logged annoyance. Without the barrier Portal never learns this
+   * process is usable: it would wait out its start timeout and kill a Server
+   * that is holding storage in the `active` phase. The caller decides what to
+   * close and rejects the activation with this error.
+   */
+  private sendBarrier(message: IpcMessage, what: string): void {
+    try {
+      this.channel.send(message);
+    } catch (error) {
+      const failure = new ServerStartupError(
+        `${what} could not be sent: ${messageOf(error)}`,
+      );
+      this.logger.error(
+        { code: failure.code, reason: failure.reason },
+        'server process failed to start',
+      );
+      throw failure;
+    }
   }
-  const fallback = requestTimeoutMs * DRAIN_LIMIT_MULTIPLIER * 2;
-  logger.warn(
-    {
-      code: 'SHUTDOWN_BUDGET_UNDECLARED',
-      timeoutMs: fallback,
-      reason: 'shutdown message carried no timeoutMs; using the legacy budget',
-    },
-    'running shutdown on the fallback budget',
-  );
-  return fallback;
 }
 
 function elapsedSince(startedAt: number): number {

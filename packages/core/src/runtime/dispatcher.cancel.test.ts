@@ -8,7 +8,7 @@ import {
   parseLines,
   quietDispatcher,
 } from '../test-support/dispatcher.ts';
-import { FrameworkTimeoutError, RequestCancelledError } from './dispatcher.ts';
+import { FrameworkTimeoutError, RequestCancelledError } from './wire-codes.ts';
 
 describe('Dispatcher.cancel', () => {
   test('cancel rejects later writes and rolls the transaction back', async () => {

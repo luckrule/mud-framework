@@ -42,15 +42,15 @@ ADR-0002 决定了拆成两个进程，但没定两件事：两个进程之间�
 
 关闭预算：`IpcExecutor` 自己声明关闭的最坏耗时 `closeBudgetMs`，是四段串行等待之和，不能压成一个乘式：排空未确认请求（`shutdownTimeoutMs`）、等 Server 回 `closed`（`shutdownTimeoutMs + SHUTDOWN_ACK_SLACK_MS`）、等进程退出（`EXIT_WAIT_TIMEOUT_MS`）、`SIGKILL` 后再等一次（`EXIT_WAIT_TIMEOUT_MS`）。默认值以 `ipc-budget.ts` 的常量为准：`shutdownTimeoutMs` 取 `DEFAULT_SHUTDOWN_TIMEOUT_MS`，另两个常量是 `EXIT_WAIT_TIMEOUT_MS` 与 `SHUTDOWN_ACK_SLACK_MS`。预算是 `closeBudget(shutdownTimeoutMs)`，即四段等待之和 `shutdownTimeoutMs + (shutdownTimeoutMs + SHUTDOWN_ACK_SLACK_MS) + EXIT_WAIT_TIMEOUT_MS + EXIT_WAIT_TIMEOUT_MS`；这里不写死数值。外层 `ConnectionLayer` 关闭执行器时取自身 `shutdownTimeoutMs` 与该预算加少量余量的较大者，而不是各用一个独立超时。理由是这几段等待必须串起来算：外层若只按自己的 `shutdownTimeoutMs` 计时，`stop()` 会在 Server 仍在写存储时返回，接着重开存储就是两个写者（INV-002）。
 
-预算单向派生：`shutdown` 消息携带 `timeoutMs`，由 Portal 声明自己愿意等 `closed` 多久；Server 的排空与关闭存储共享这一个 deadline，不再各自乘一次 `timeoutMs`，也不从自己的 `shutdownTimeoutMs` 推导。只有消息未带声明时才回退到 `4 × timeoutMs` 并记 `SHUTDOWN_BUDGET_UNDECLARED`。因此 Server 侧配置的 `timeoutMs` 不再拉长或缩短关闭时长。
+预算单向派生：`shutdown` 消息携带 `timeoutMs`，由 Portal 声明自己愿意等 `closed` 多久；Server 的排空与关闭存储共享这一个 deadline，不再各自乘一次 `timeoutMs`，也不从自己的 `shutdownTimeoutMs` 推导。预算由 Portal 声明，Server 必须服从；缺该字段的消息被解析层拒绝，没有回退路径。因此 Server 侧配置的 `timeoutMs` 不再拉长或缩短关闭时长。
 
 `SHUTDOWN_ACK_SLACK_MS` 是对齐而非余量：Server 的计时从收到 `shutdown` 开始，比 Portal 的 `waitForClosed` 晚一个 IPC 跳。两侧取同一值时 Portal 的定时器总是先到，Server 用满预算就会被杀在正常关闭途中。
 
-这段的旧公式是 `shutdownTimeoutMs × 2 + 退出等待上限 × 2`，与 Server 侧按 `4 × timeoutMs` 推导的预算不等；Server 的 `timeoutMs` 配得较大时，Portal 会 kill 一个正在正常关闭的 Server。这是修掉的真缺陷，不是可以简化的冗余：不要把这四段等待重新压回一个乘式。
+这段的旧公式是 `shutdownTimeoutMs × 2 + 退出等待上限 × 2`，与 Server 侧按自身 `timeoutMs` 推导的预算不等；Server 的 `timeoutMs` 配得较大时，Portal 会 kill 一个正在正常关闭的 Server。这是修掉的真缺陷，不是可以简化的冗余：不要把这四段等待重新压回一个乘式。
 
 ### 结果消息的两个 Session 字段
 
-`result` 上 `sessionId` 与 `requestSessionId` 语义不同：前者是 handler 在本次请求内新绑定的 Session，只有成功结果可能有；后者回显请求进入框架时已带的入口 Session，成功与失败结果都带，入口无 Session 时不带。加回显的原因是结果可能晚于 Portal 的结算（超时、取消、重放耗尽）：那时未确认缓冲里的条目已删除，Portal 只能从结果消息恢复 Session，而旧形状只覆盖"本次新绑定"，失败结果与"入口已有 Session 但未新绑定"的迟到结果都无从记录。`requestSessionId` 只属于线格式，不进入 `ExecutorOutcome` 或结算结果；旧 Server 不回显、旧 Portal 忽略未知字段，因此是加法兼容。`sessionId` 的语义不变。
+`result` 上 `sessionId` 与 `requestSessionId` 语义不同：前者是 handler 在本次请求内新绑定的 Session，只有成功结果可能有；后者回显请求进入框架时已带的入口 Session，成功与失败结果都带，入口无 Session 时不带。加回显的原因是结果可能晚于 Portal 的结算（超时、取消、重放耗尽）：那时未确认缓冲里的条目已删除，Portal 只能从结果消息恢复 Session，而只带 `sessionId` 的形状覆盖不到失败结果与"入口已有 Session 但未新绑定"的迟到结果。`requestSessionId` 只属于线格式，不进入 `ExecutorOutcome` 或结算结果。`sessionId` 的语义不变。
 
 ### 代码版本回显
 
@@ -58,7 +58,7 @@ ADR-0002 决定了拆成两个进程，但没定两件事：两个进程之间�
 
 为什么只回显：框架不解析版本，也不知道两个版本之间是否兼容。把版本用于路由、重放或准入判断，会把"应用如何发布"编码进框架，而发布策略（蓝绿、热修、回滚）属于部署方。回显只做一件事——让跨版本重放可被观察到。跨版本重放仍只承诺 at-least-once 与可观测，行为兼容不在承诺内（SPEC 6.4）。
 
-字段缺失与空值语义不同：缺失表示该对端没有声明版本，不构成"不同"；空串或非字符串是非法线格式，解析器拒绝。这一点保证旧对端（不发该字段）与新对端可以互操作，且不会把"未知"误报成"不匹配"。
+字段缺失与空值语义不同：缺失表示该部署未声明版本，不构成"不同"；空串或非字符串是非法线格式，解析器拒绝。这样不会把"未声明"误报成"不匹配"。
 
 ### 确认的边界：框架做不到什么
 

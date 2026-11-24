@@ -1,5 +1,4 @@
 import { messageOf } from '../internal/guards.ts';
-import type { IpcChannel } from '../ipc/channel.ts';
 import type { Logger } from '../logging/types.ts';
 import { checkBackendCapabilities } from '../storage/capabilities.ts';
 import { degradations } from '../storage/degradations.ts';
@@ -8,7 +7,6 @@ import type { StorageBackend, StorageCapabilities } from '../storage/types.ts';
 import { Dispatcher } from './dispatcher.ts';
 import { LocalExecutor } from './executor.ts';
 import type { Extension, ExtensionRegistrar } from './extension.ts';
-import { readyMessage } from './ipc-messages.ts';
 import type { ServerProcessOptions } from './server-process.ts';
 
 /**
@@ -45,24 +43,23 @@ export interface StartupResult {
 export interface StartupDeps {
   readonly options: ServerProcessOptions;
   readonly logger: Logger;
-  readonly channel: IpcChannel;
 }
 
 /**
  * Brings a Server up to the readiness barrier: backend, capability self-check,
- * degradation warnings, dispatcher, extensions and `ready` (SPEC 6.2). Returns
- * only after `ready` was sent, so a caller that starts accepting work afterwards
- * cannot see a half-initialized Server.
+ * degradation warnings, dispatcher and extensions (SPEC 6.2).
  *
- * Inbound handlers are deliberately not attached here: the caller attaches them
- * after this returns, and the channel buffers anything that arrived in between.
- * That order is the contract — a handler registered inside would deliver
- * requests before `ready` and let traffic overtake the readiness barrier.
+ * It deliberately does not send `ready` and does not attach inbound handlers.
+ * Both belong to the caller, in one order: install the full handler, set the
+ * process active, and only then announce `ready`. A `ready` sent from here would
+ * cross the barrier while requests still have nowhere to go, and a Portal that
+ * delivers immediately after `ready` (the contract SPEC 6.2 gives it) would lose
+ * them.
  *
  * Throws `ServerStartupError` and leaves no backend open when any step fails.
  */
 export async function startServer(deps: StartupDeps): Promise<StartupResult> {
-  const { options, logger, channel } = deps;
+  const { options, logger } = deps;
   // Checked before the backend exists: a `ready` carrying a value the wire
   // parser rejects would leave a Server that can never cross the readiness
   // barrier, so it would be started only to be restarted or killed after the
@@ -125,15 +122,10 @@ export async function startServer(deps: StartupDeps): Promise<StartupResult> {
         'no extension registered: every extension was skipped',
       );
     }
-    // SPEC 6.2 step 3: only now is the readiness barrier crossed. Sending it
-    // earlier would let the first requests hit a half-initialized Server.
-    channel.send(
-      readyMessage(process.pid, runtime.capabilities, options.codeVersion),
-    );
-    logger.info(
-      { pid: process.pid, capabilities: runtime.capabilities },
-      'server process ready',
-    );
+    // SPEC 6.2 step 3 is the caller's: the readiness barrier is crossed only
+    // once a request handler exists and the process is active, which cannot be
+    // known here. The caller logs and sends `ready` together, so this line would
+    // otherwise claim readiness before the wire did.
     return { runtime, skippedExtensions };
   } catch (error) {
     const failure =
@@ -158,8 +150,11 @@ export async function startServer(deps: StartupDeps): Promise<StartupResult> {
  * The failure is logged here as well as thrown, because the throw precedes the
  * shared catch below: every startup failure must produce exactly one
  * `SERVER_STARTUP_FAILED` line, whichever step refused.
+ *
+ * Exported because the two-phase handshake carries the same value on
+ * `prepared`, before `startServer` runs (ADR-0007).
  */
-function assertCodeVersion(
+export function assertCodeVersion(
   codeVersion: string | undefined,
   logger: Logger,
 ): void {

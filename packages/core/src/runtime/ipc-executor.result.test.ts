@@ -210,7 +210,7 @@ describe('IpcExecutor result', () => {
     await h.executor.close();
   });
 
-  test('leaves a late result without a session when the peer echoes nothing', async () => {
+  test('leaves a late result without a session when the result carries no echo', async () => {
     const h = harness({ timeoutMs: 5000 });
     const server = await started(h);
 
@@ -223,31 +223,11 @@ describe('IpcExecutor result', () => {
     server.send(successMessage('req-1', 'late'));
     await flushTicks();
 
-    // An older Server does not echo the entry session; the pending entry is
-    // gone, so the result itself carries nothing to log. Correlation falls back
-    // to the stable requestId (SPEC 7.3).
+    // The result carries no echo, so it names no Session; the pending entry is
+    // gone, so correlation falls back to the stable requestId (SPEC 7.3).
     const late = h.logs().find((line) => line.msg === 'late result discarded');
     expect(late).toBeDefined();
     expect(late).not.toHaveProperty('sessionId');
-    await h.executor.close();
-  });
-
-  test('fills result received from the request echo when the entry had none', async () => {
-    const h = harness();
-    const server = await started(h);
-
-    const outcomePromise = h.executor.execute(request({ requestId: 'req-1' }));
-    server.send({
-      type: 'result',
-      requestId: 'req-1',
-      requestSessionId: 'entry-1',
-      ok: false,
-      error: { code: 'NOT_ENOUGH_GOLD', message: 'you cannot afford that' },
-    });
-
-    await outcomePromise;
-    const received = h.logs().find((line) => line.msg === 'result received');
-    expect(received).toMatchObject({ sessionId: 'entry-1' });
     await h.executor.close();
   });
 

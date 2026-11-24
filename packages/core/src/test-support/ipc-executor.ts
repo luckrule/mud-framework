@@ -62,6 +62,10 @@ export async function waitFor(
   return poll();
 }
 
+export function preparedMessage(pid = 4242): IpcMessage {
+  return { type: 'prepared', pid };
+}
+
 export function readyMessage(
   maxTransactionDurationMs = 5000,
   codeVersion?: string,
@@ -146,13 +150,35 @@ export function expectOnlyHello(server: FakeServerProcess): void {
   expect(first.portalGeneration).toBeGreaterThan(0);
 }
 
+/**
+ * Asserts the completed two-phase handshake and nothing else: `hello` followed
+ * by `activate` (ADR-0007). A request at this point would mean the Portal
+ * delivered before `ready`.
+ */
+export function expectHandshake(server: FakeServerProcess): void {
+  const messages = messagesOf(server);
+  expect(messages.map((message) => message.type)).toEqual([
+    'hello',
+    'activate',
+  ]);
+}
+
 export interface FakeServerOptions {
   /** Ack `shutdown` with `closed`, like a cooperative Server. */
   autoCloseOnShutdown: boolean;
   /** Record the exit right after `closed`. False models a process that lingers. */
   exitOnShutdown?: boolean;
-  /** Reply `ready` to `hello` and exit at once: the crash-on-first-request loop. */
-  crashOnHello?: boolean;
+  /**
+   * Answer `hello` with `prepared` (ADR-0007). On by default: the two-phase
+   * handshake is the only startup path, so a fake that stayed silent on `hello`
+   * would model a Server that can never start.
+   */
+  autoPrepare?: boolean;
+  /**
+   * Answer `prepared` to `hello`, `ready` to `activate`, and exit at once: the
+   * "ready, then die on the first request" loop.
+   */
+  crashOnActivate?: boolean;
   /** Default true. False models a process that survives SIGKILL. */
   killExits?: boolean;
   /**
@@ -175,7 +201,8 @@ export class FakeServerProcess {
   private readonly exit = Promise.withResolvers<ServerExitInfo>();
   private readonly autoCloseOnShutdown: boolean;
   private readonly exitOnShutdown: boolean;
-  private readonly crashOnHello: boolean;
+  private readonly autoPrepare: boolean;
+  private readonly crashOnActivate: boolean;
   private readonly killExits: boolean;
   private readonly closeChannelOnExit: boolean;
   private exitRecorded = false;
@@ -188,7 +215,8 @@ export class FakeServerProcess {
     const [portal, server] = createInMemoryChannelPair();
     this.autoCloseOnShutdown = options.autoCloseOnShutdown;
     this.exitOnShutdown = options.exitOnShutdown ?? true;
-    this.crashOnHello = options.crashOnHello ?? false;
+    this.autoPrepare = options.autoPrepare ?? true;
+    this.crashOnActivate = options.crashOnActivate ?? false;
     this.killExits = options.killExits ?? true;
     this.closeChannelOnExit = options.closeChannelOnExit ?? false;
     this.channel = server;
@@ -228,7 +256,10 @@ export class FakeServerProcess {
           this.recordExit({ code: 0, signal: null, observed: true });
         }
       }
-      if (this.crashOnHello && parsed.message.type === 'hello') {
+      if (this.autoPrepare && parsed.message.type === 'hello') {
+        this.send(preparedMessage());
+      }
+      if (this.crashOnActivate && parsed.message.type === 'activate') {
         this.send(readyMessage());
         this.recordExit({ code: 1, signal: null, observed: true });
       }
@@ -310,7 +341,8 @@ export interface HarnessOptions {
   logger?: Logger;
   maxReplays?: number;
   autoClose?: boolean;
-  crashOnHello?: boolean;
+  autoPrepare?: boolean;
+  crashOnActivate?: boolean;
   restartBackoffMs?: number;
   shutdownTimeoutMs?: number;
   stableResetMs?: number;
@@ -344,7 +376,8 @@ export function harness(options: Partial<HarnessOptions> = {}): Harness {
       const server = new FakeServerProcess({
         autoCloseOnShutdown: options.autoClose ?? true,
         exitOnShutdown: options.exitOnShutdown,
-        crashOnHello: options.crashOnHello,
+        autoPrepare: options.autoPrepare,
+        crashOnActivate: options.crashOnActivate,
         killExits: options.killExits,
         closeChannelOnExit: options.closeChannelOnExit,
       });

@@ -12,14 +12,6 @@ import {
   UnknownHandlerError,
 } from './wire-codes.ts';
 
-/*
- * The error types live in `wire-codes.ts`, beside the codes they carry: a code
- * module that imported its own error classes from here would be a cycle. They
- * are re-exported so the existing `import ... from './dispatcher.ts'` call
- * sites (and the package surface in `index.ts`) keep working.
- */
-export { FrameworkTimeoutError, RequestCancelledError, UnknownHandlerError };
-
 /**
  * What the caller knows about a request before it is dispatched. All optional:
  * a direct `dispatch` has no connection, and a replayed request supplies the

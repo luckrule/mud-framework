@@ -1,7 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 
 import {
-  boundSuccessMessage,
   failureOf,
   flushTicks,
   harness,
@@ -42,8 +41,16 @@ describe('IpcExecutor timeout', () => {
     });
 
     // A result that arrives after the terminal state must be dropped quietly.
-    // Its own binding is the only Session id left: the pending entry is gone.
-    server.send(boundSuccessMessage('req-1', 'too late', 's-late'));
+    // The Session in the log comes from the result's echo of the entry Session:
+    // the pending entry that held it is gone.
+    server.send({
+      type: 'result',
+      requestId: 'req-1',
+      requestSessionId: 's1',
+      ok: true,
+      result: 'too late',
+      sessionId: 's-late',
+    });
     await flushTicks();
     expect(h.logs().some((line) => line.msg === 'late result discarded')).toBe(
       true,
@@ -55,7 +62,7 @@ describe('IpcExecutor timeout', () => {
           (line) =>
             line.msg === 'late result discarded' &&
             line.level === 'debug' &&
-            line.sessionId === 's-late',
+            line.sessionId === 's1',
         ),
     ).toBe(true);
     await h.executor.close();

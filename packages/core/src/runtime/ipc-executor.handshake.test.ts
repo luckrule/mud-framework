@@ -2,10 +2,13 @@ import { describe, expect, test } from 'bun:test';
 
 import { rejectionOf } from '../test-support/common.ts';
 import {
+  expectHandshake,
   expectOnlyHello,
   failureOf,
   flushTicks,
   harness,
+  messagesOf,
+  preparedMessage,
   readyMessage,
   request,
   requestIds,
@@ -15,17 +18,19 @@ import {
 } from '../test-support/ipc-executor.ts';
 
 describe('IpcExecutor handshake', () => {
-  test('sends hello and holds requests until the server is ready', async () => {
+  test('sends hello, then activate once the server is prepared, and holds requests until ready', async () => {
     const h = harness({ timeoutMs: 500 });
     const startPromise = h.executor.start();
     const server = serverAt(h, 0);
 
-    expectOnlyHello(server);
+    // ADR-0007: the fake answers `hello` with `prepared`, so the two-phase
+    // handshake is already complete before the first await.
+    expectHandshake(server);
 
     const outcomePromise = h.executor.execute(request({ requestId: 'req-1' }));
     await flushTicks();
     // The recovery barrier (SPEC 6.2): queued, not failed, not dropped.
-    expect(server.received).toHaveLength(1);
+    expect(server.received).toHaveLength(2);
 
     server.send(readyMessage());
     await startPromise;
@@ -35,6 +40,60 @@ describe('IpcExecutor handshake', () => {
     server.send(successMessage('req-1', 'ok'));
     expect(await outcomePromise).toEqual({ ok: true, result: 'ok' });
     await h.executor.close();
+  });
+
+  test('sends nothing but hello until the server is prepared', async () => {
+    const h = harness({ timeoutMs: 500, autoPrepare: false });
+    const startPromise = h.executor.start();
+    const server = serverAt(h, 0);
+    expectOnlyHello(server);
+
+    // Activation is the Server's move to make; the Portal must not open its
+    // storage on its own.
+    await flushTicks();
+    expectOnlyHello(server);
+
+    server.send(preparedMessage());
+    await flushTicks();
+    expectHandshake(server);
+
+    server.send(readyMessage());
+    await startPromise;
+    await h.executor.close();
+  });
+
+  test('does not activate again when prepared arrives after ready', async () => {
+    const h = harness({ timeoutMs: 500 });
+    const server = await started(h);
+    expectHandshake(server);
+
+    // A Server sends `prepared` once, so a second one is out of protocol. What
+    // matters is that it cannot reopen storage: this generation is already
+    // ready, and a second `activate` would make the Server start twice.
+    server.send(preparedMessage());
+    await flushTicks();
+
+    expectHandshake(server);
+    await h.executor.close();
+  });
+
+  test('does not activate a server that prepared while the executor is closing', async () => {
+    const h = harness({ timeoutMs: 500, autoPrepare: false });
+    void h.executor.start().catch(() => undefined);
+    const server = serverAt(h, 0);
+    expectOnlyHello(server);
+
+    const closing = h.executor.close();
+    // `close()` sets `closing` before its first await, so this lands inside the
+    // window the branch guards: nothing may open storage while the Portal is
+    // closing, because there would be nowhere to drain it (INV-002).
+    server.send(preparedMessage());
+    await flushTicks();
+    await closing;
+
+    expect(messagesOf(server).map((message) => message.type)).toEqual([
+      'hello',
+    ]);
   });
 
   test('fails immediately when execute is called before start', async () => {
@@ -66,7 +125,7 @@ describe('IpcExecutor handshake', () => {
     const h = harness({ timeoutMs: 5000 });
     const startPromise = h.executor.start();
     const server = serverAt(h, 0);
-    expectOnlyHello(server);
+    expectHandshake(server);
 
     await h.executor.close();
 

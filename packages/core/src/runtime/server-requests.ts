@@ -55,12 +55,6 @@ export interface RequestRunnerDeps {
    * version only to log a mismatch; it never changes the outcome (SPEC 6.4).
    */
   readonly codeVersion?: string;
-  /**
-   * Called for every accepted request, before its handler starts. The Server
-   * records a missing handshake at most once per Portal (SPEC 7.1); it never
-   * refuses the request, because executing is the only way to answer it.
-   */
-  readonly noteRequestBeforeHello: (ids: RequestIdentity) => void;
 }
 
 /**
@@ -107,7 +101,6 @@ export class RequestRunner {
 
   /** Accepts one request: duplicate check, then execution (SPEC 7.3). */
   accept(message: RequestMessage): void {
-    const ids = requestIds(message);
     // The duplicate check comes first: an id already in flight is owed its
     // real result even during shutdown, so answering it with a refusal would
     // report a failure for a request that may still succeed.
@@ -160,10 +153,6 @@ export class RequestRunner {
       );
       return;
     }
-    // A missing handshake never refuses the request: executing is the only way
-    // to answer it, and dropping would leave Portal replaying it forever. The
-    // Server records the fault once (SPEC 7.1).
-    this.deps.noteRequestBeforeHello(ids);
     const entry: PendingRequest = {
       message,
       started: false,
@@ -466,7 +455,12 @@ function resultEnvelope(message: RequestMessage): {
   };
 }
 
-function requestIds(message: RequestMessage): RequestIdentity {
+/**
+ * The identity fields of one request, ready to be used as log bindings. Shared
+ * with the process-level lines (`REQUEST_BEFORE_READY` and friends) so the two
+ * sides cannot drift into logging different ids for the same request.
+ */
+export function requestIds(message: RequestMessage): RequestIdentity {
   const ids: RequestIdentity = {
     requestId: message.requestId,
     connectionId: message.connectionId,

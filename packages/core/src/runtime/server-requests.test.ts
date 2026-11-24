@@ -52,7 +52,6 @@ function startRunner(
     },
     accepting,
     codeVersion,
-    noteRequestBeforeHello: () => undefined,
   });
   return {
     runner,

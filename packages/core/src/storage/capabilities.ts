@@ -3,12 +3,12 @@
  * check a declaration: the Server's self-check of its own backend and Portal's
  * parse of the `ready` message.
  *
- * The inputs differ in one respect only: a backend states `Infinity` when it has
- * no ceiling, while on the wire "unbounded" is `null` because JSON (the
- * cross-Node fallback in ADR-0001) turns `Infinity` into `null`. Field list,
- * enum values and error wording live here once, so the Server cannot accept a
- * declaration Portal then rejects: that mismatch would leave the Server ready
- * and the Portal waiting for a barrier that never arrives.
+ * Both callers validate the same values under the same rule: the capability
+ * object crosses Bun's IPC channel unchanged, so a backend's `Infinity` stays
+ * `Infinity` on the wire. Field list, enum values and error wording live here
+ * once, so the Server cannot accept a declaration Portal then rejects: that
+ * mismatch would leave the Server ready and the Portal waiting for a barrier
+ * that never arrives.
  */
 import { describeValue, isRecord } from '../internal/guards.ts';
 import type { StorageCapabilities } from './types.ts';
@@ -23,42 +23,22 @@ export type CapabilityCheck =
   | { readonly ok: true; readonly capabilities: StorageCapabilities }
   | { readonly ok: false; readonly reason: string };
 
-/** The only place the two entries below differ. */
-interface DurationRule {
-  /** Expected value as it appears in a rejection reason. */
-  readonly expected: string;
-  /** Whether `null` (wire "unbounded") is accepted and normalised. */
-  readonly acceptsNull: boolean;
-}
-
-const BACKEND_DURATION: DurationRule = {
-  expected: 'a positive finite number or Infinity',
-  acceptsNull: false,
-};
-
-const WIRE_DURATION: DurationRule = {
-  expected: 'a positive number or null',
-  acceptsNull: true,
-};
+/** How a duration field is described in a rejection reason. */
+const DURATION_EXPECTED = 'a positive finite number or Infinity';
 
 /**
  * Validates a backend's own declaration before it is trusted (SPEC 4.2,
  * INV-009). Every field is required: a missing or malformed one would turn a
  * capability check into an `undefined` comparison that silently passes.
- *
- * `null` is refused even though the wire entry accepts it: a backend states
- * `Infinity` for "no ceiling", and only the JSON wire has to encode it as
- * `null`.
  */
 export function checkBackendCapabilities(
   declared: StorageCapabilities,
 ): CapabilityCheck {
-  return validate(declared, BACKEND_DURATION, 'capabilities');
+  return validate(declared, 'capabilities');
 }
 
 /**
- * Validates a `ready.capabilities` value straight off the IPC channel, where
- * "unbounded" arrives as `null` and is normalised back to `Infinity`.
+ * Validates a `ready.capabilities` value straight off the IPC channel.
  *
  * `path` names the value in a rejection reason, e.g. `ready.capabilities`.
  */
@@ -66,7 +46,7 @@ export function checkWireCapabilities(
   raw: unknown,
   path: string,
 ): CapabilityCheck {
-  return validate(raw, WIRE_DURATION, path);
+  return validate(raw, path);
 }
 
 /**
@@ -80,11 +60,7 @@ class CapabilityError extends Error {
   }
 }
 
-function validate(
-  raw: unknown,
-  rule: DurationRule,
-  path: string,
-): CapabilityCheck {
+function validate(raw: unknown, path: string): CapabilityCheck {
   try {
     if (!isRecord(raw)) {
       throw new CapabilityError(capabilityReason(path, 'an object', raw));
@@ -109,7 +85,6 @@ function validate(
         ),
         maxTransactionDurationMs: readDuration(
           raw.maxTransactionDurationMs,
-          rule,
           `${path}.maxTransactionDurationMs`,
         ),
       },
@@ -146,14 +121,7 @@ function readBoolean(value: unknown, path: string): boolean {
  * Zero, negatives and NaN are rejected because they would clamp the effective
  * timeout to a millisecond or make every later comparison false (SPEC 3.4).
  */
-function readDuration(
-  value: unknown,
-  rule: DurationRule,
-  path: string,
-): number {
-  if (value === null && rule.acceptsNull) {
-    return Number.POSITIVE_INFINITY;
-  }
+function readDuration(value: unknown, path: string): number {
   if (
     typeof value === 'number' &&
     (value === Number.POSITIVE_INFINITY ||
@@ -161,7 +129,7 @@ function readDuration(
   ) {
     return value;
   }
-  throw new CapabilityError(capabilityReason(path, rule.expected, value));
+  throw new CapabilityError(capabilityReason(path, DURATION_EXPECTED, value));
 }
 
 function isOneOf<T extends string>(

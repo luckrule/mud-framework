@@ -25,6 +25,30 @@ export interface HelloMessage {
   readonly portalGeneration: number;
 }
 
+/**
+ * Server -> Portal: the handshake was accepted and the Server is waiting for
+ * activation (ADR-0007).
+ *
+ * Nothing that can write storage exists yet: no backend, no Extension, no
+ * handler. `pid` names the process so a Portal can observe the restart, and
+ * `codeVersion` is the same opaque echo `ready` carries.
+ */
+export interface PreparedMessage {
+  readonly type: 'prepared';
+  readonly pid: number;
+  readonly codeVersion?: string;
+}
+
+/**
+ * Portal -> Server: open storage and become ready (ADR-0007).
+ *
+ * Sent only after the previous Server process is known to be gone, so the
+ * storage never has two writers (INV-002). The Server answers with `ready`.
+ */
+export interface ActivateMessage {
+  readonly type: 'activate';
+}
+
 /** Portal -> Server: deliver one Request (first delivery or replay). */
 export interface RequestMessage extends RequestIdentity {
   readonly type: 'request';
@@ -69,9 +93,7 @@ export interface CancelMessage {
  * killed by a Portal that had already given up.
  *
  * Required, and validated: the Server's whole graceful close is bounded by it,
- * so a message without it cannot be acted on. The Server still tolerates a
- * directly constructed message without the field (see `server-process.ts`), but
- * nothing that goes through `parseIpcMessage` can reach that path.
+ * so a message without it cannot be acted on.
  */
 export interface ShutdownMessage {
   readonly type: 'shutdown';
@@ -85,8 +107,8 @@ export interface ReadyMessage {
   readonly capabilities: StorageCapabilities;
   /**
    * The application's opaque code version this Server is running. Omitted when
-   * the deployment declared none; a peer that predates the field sends nothing,
-   * which is not the same as reporting a different version (SPEC 6.4).
+   * the deployment declared none, which is not the same as reporting a
+   * different version (SPEC 6.4).
    */
   readonly codeVersion?: string;
 }
@@ -124,6 +146,8 @@ export interface ClosedMessage {
 
 export type IpcMessage =
   | HelloMessage
+  | PreparedMessage
+  | ActivateMessage
   | RequestMessage
   | CancelMessage
   | ShutdownMessage
@@ -137,6 +161,8 @@ export type IpcParseResult =
 
 const KNOWN_TYPES = [
   'hello',
+  'prepared',
+  'activate',
   'request',
   'cancel',
   'shutdown',
@@ -154,8 +180,9 @@ const KNOWN_TYPES = [
  * indistinguishable from a hung Server. A `reason` string is always produced so
  * the caller can log a diagnosable field (SPEC 7.1).
  *
- * Unknown extra fields are tolerated so a newer peer can add fields without
- * breaking an older one; known fields are checked strictly.
+ * Extra fields are not part of the parsed result: the parser reads the known
+ * fields and checks them strictly, so anything else stays out of the message
+ * the caller receives.
  */
 export function parseIpcMessage(raw: unknown): IpcParseResult {
   try {
@@ -191,6 +218,14 @@ function buildMessage(raw: unknown): IpcMessage {
         type: 'hello',
         portalGeneration: readInteger(raw, 'hello', 'portalGeneration', 0),
       };
+    case 'prepared':
+      return {
+        type: 'prepared',
+        pid: readInteger(raw, 'prepared', 'pid', 1),
+        codeVersion: readOptionalString(raw, 'prepared', 'codeVersion'),
+      };
+    case 'activate':
+      return { type: 'activate' };
     case 'request':
       return buildRequest(raw);
     case 'cancel':
@@ -204,15 +239,13 @@ function buildMessage(raw: unknown): IpcMessage {
         type: 'shutdown',
         timeoutMs: readPositiveNumber(raw, 'shutdown', 'timeoutMs'),
       };
-    case 'ready': {
-      const codeVersion = readOptionalString(raw, 'ready', 'codeVersion');
+    case 'ready':
       return {
         type: 'ready',
         pid: readInteger(raw, 'ready', 'pid', 1),
         capabilities: readCapabilities(raw, 'ready', 'capabilities'),
-        ...codeVersionField(codeVersion),
+        codeVersion: readOptionalString(raw, 'ready', 'codeVersion'),
       };
-    }
     case 'result':
       return buildResult(raw);
     case 'closed':
@@ -238,7 +271,7 @@ function buildRequest(raw: Record<string, unknown>): RequestMessage {
     payload: raw.payload,
     timeoutMs: readPositiveNumber(raw, 'request', 'timeoutMs'),
     replayCount: readInteger(raw, 'request', 'replayCount', 0),
-    ...codeVersionField(readOptionalString(raw, 'request', 'codeVersion')),
+    codeVersion: readOptionalString(raw, 'request', 'codeVersion'),
   };
 }
 
@@ -255,7 +288,7 @@ function buildResult(raw: Record<string, unknown>): ResultMessage {
     return {
       type: 'result',
       requestId,
-      ...requestSessionEcho(requestSessionId),
+      requestSessionId,
       ok: false,
       error: readResultError(raw, 'result', 'error'),
     };
@@ -263,34 +296,13 @@ function buildResult(raw: Record<string, unknown>): ResultMessage {
   return {
     type: 'result',
     requestId,
-    ...requestSessionEcho(requestSessionId),
+    requestSessionId,
     ok: true,
     result: raw.result,
     // Absent means "no Session bound" (SPEC 2), so it is passed through as
     // `undefined` rather than defaulted to an empty string.
     sessionId: readOptionalString(raw, 'result', 'sessionId'),
   };
-}
-
-/**
- * Keeps the parsed shape of a result from a peer that does not send the echo
- * unchanged: an absent field is not the same own property as an `undefined` one.
- */
-function requestSessionEcho(requestSessionId: string | undefined): {
-  requestSessionId?: string;
-} {
-  return requestSessionId === undefined ? {} : { requestSessionId };
-}
-
-/**
- * Absence is kept as absence, like the result's Session echo: a peer that
- * predates `codeVersion` must keep the exact parsed shape it had before, not
- * gain an own `undefined` property.
- */
-function codeVersionField(codeVersion: string | undefined): {
-  codeVersion?: string;
-} {
-  return codeVersion === undefined ? {} : { codeVersion };
 }
 
 function readResultError(

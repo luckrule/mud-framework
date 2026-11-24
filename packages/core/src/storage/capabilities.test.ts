@@ -69,7 +69,7 @@ describe('checkBackendCapabilities', () => {
     }
   });
 
-  test('rejects null, which is a wire encoding a backend must not use', () => {
+  test('rejects null, which is not a duration', () => {
     const checked = backendOf({ ...valid, maxTransactionDurationMs: null });
 
     expect(checked.ok).toBe(false);
@@ -117,15 +117,11 @@ describe('checkWireCapabilities', () => {
     }
   });
 
-  test('normalises a null ceiling to Infinity', () => {
+  test('rejects null, which is not a duration', () => {
     const checked = wireOf({ ...valid, maxTransactionDurationMs: null });
 
-    expect(checked.ok).toBe(true);
-    if (checked.ok) {
-      expect(checked.capabilities.maxTransactionDurationMs).toBe(
-        Number.POSITIVE_INFINITY,
-      );
-    }
+    expect(checked.ok).toBe(false);
+    expect(rejectionReasonOf(checked)).toContain('maxTransactionDurationMs');
   });
 
   test('accepts Infinity as unbounded', () => {
@@ -159,89 +155,48 @@ describe('the two entries agree', () => {
    * entry refuses would leave the Server ready and the Portal waiting for a
    * barrier that never arrives, with both sides logging normally.
    */
-  test('the backend acceptance set is a subset of the wire acceptance set', () => {
-    const ceilings: unknown[] = [
-      Number.POSITIVE_INFINITY,
-      1,
-      0.5,
-      5000,
-      null,
-      undefined,
-      0,
-      -0,
-      -1,
-      -0.5,
-      Number.NaN,
-      Number.NEGATIVE_INFINITY,
-      '5000',
-      true,
+  test('both entries reach the expected verdict on every candidate', () => {
+    // The expected verdict is written out per candidate rather than compared
+    // between the two entries: both call `validate`, so "the two agree" is true
+    // by construction and would assert nothing.
+    const ceilings: readonly [unknown, boolean][] = [
+      [Number.POSITIVE_INFINITY, true],
+      [1, true],
+      [0.5, true],
+      [5000, true],
+      [null, false],
+      [undefined, false],
+      [0, false],
+      [-0, false],
+      [-1, false],
+      [-0.5, false],
+      [Number.NaN, false],
+      [Number.NEGATIVE_INFINITY, false],
+      ['5000', false],
+      [true, false],
     ];
-    const otherFields: Record<string, unknown>[] = [
-      {},
-      { transactions: 'limited', concurrency: 'single' },
-      { transactions: 'partial' },
-      { transactions: 7 },
-      { concurrency: 'multi' },
-      { snapshotRead: false, uniqueConstraint: false },
-      { snapshotRead: 'true' },
-      { uniqueConstraint: 1 },
+    const otherFields: readonly [Record<string, unknown>, boolean][] = [
+      [{}, true],
+      [{ transactions: 'limited', concurrency: 'single' }, true],
+      [{ snapshotRead: false, uniqueConstraint: false }, true],
+      [{ transactions: 'partial' }, false],
+      [{ transactions: 7 }, false],
+      [{ concurrency: 'multi' }, false],
+      [{ snapshotRead: 'true' }, false],
+      [{ uniqueConstraint: 1 }, false],
     ];
 
-    for (const ceiling of ceilings) {
-      for (const extra of otherFields) {
+    for (const [ceiling, ceilingAccepted] of ceilings) {
+      for (const [extra, extraAccepted] of otherFields) {
         const candidate = {
           ...valid,
           ...extra,
           maxTransactionDurationMs: ceiling,
         };
-        if (acceptsBackend(candidate) && !acceptsWire(candidate)) {
-          throw new Error(
-            `the backend check accepts what the wire entry rejects: ${JSON.stringify(candidate)}`,
-          );
-        }
+        const expected = ceilingAccepted && extraAccepted;
+        expect(acceptsWire(candidate)).toBe(expected);
+        expect(acceptsBackend(candidate)).toBe(expected);
       }
-    }
-  });
-
-  test('only null tells the two acceptance sets apart', () => {
-    const ceilings: unknown[] = [
-      Number.POSITIVE_INFINITY,
-      1,
-      0.5,
-      5000,
-      null,
-      undefined,
-      0,
-      -1,
-      Number.NaN,
-      Number.NEGATIVE_INFINITY,
-      '5000',
-    ];
-
-    for (const ceiling of ceilings) {
-      const candidate = { ...valid, maxTransactionDurationMs: ceiling };
-      const backend = acceptsBackend(candidate);
-      const wire = acceptsWire(candidate);
-
-      if (ceiling === null) {
-        expect(backend).toBe(false);
-        expect(wire).toBe(true);
-      } else {
-        expect(wire).toBe(backend);
-      }
-    }
-  });
-
-  test('both entries normalise a null ceiling to the same value', () => {
-    const wire = wireOf({ ...valid, maxTransactionDurationMs: null });
-    const backend = backendOf({
-      ...valid,
-      maxTransactionDurationMs: Number.POSITIVE_INFINITY,
-    });
-
-    expect(wire.ok && backend.ok).toBe(true);
-    if (wire.ok && backend.ok) {
-      expect(wire.capabilities).toEqual(backend.capabilities);
     }
   });
 });

@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 
 import type { IpcChannel } from '../ipc/channel.ts';
 import { createInMemoryChannelPair } from '../ipc/channel.ts';
+import { parseIpcMessage } from '../ipc/protocol.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import { MemoryStorageBackend } from '../storage/memory.ts';
 import { rejectionOf } from '../test-support/common.ts';
@@ -12,12 +13,20 @@ import { runServerProcess } from './server-process.ts';
  * Stands in for a channel whose backlog replay throws inside `onMessage`: the
  * in-memory channel delivers queued messages synchronously, so a throwing
  * handler surfaces at the registration call instead of on the event loop.
+ *
+ * The first registration is the pre-activation handler and must succeed; the
+ * second one is the post-`ready` handler this test is about (ADR-0007).
  */
-function channelThatRejectsRegistration(inner: IpcChannel): IpcChannel {
+function channelThatRejectsSecondRegistration(inner: IpcChannel): IpcChannel {
+  let registrations = 0;
   return {
     send: (message) => inner.send(message),
-    onMessage: () => {
-      throw new Error('registration refused');
+    onMessage: (handler) => {
+      registrations += 1;
+      if (registrations > 1) {
+        throw new Error('registration refused');
+      }
+      inner.onMessage(handler);
     },
     onClose: (handler) => inner.onClose(handler),
     close: (reason) => inner.close(reason),
@@ -30,6 +39,12 @@ describe('runServerProcess inbound registration', () => {
     const messages: unknown[] = [];
     portal.onMessage((raw) => {
       messages.push(raw);
+      // Drive the two-phase handshake so the failure lands on the second
+      // `onMessage` registration, after `ready`.
+      const parsed = parseIpcMessage(raw);
+      if (parsed.ok && parsed.message.type === 'prepared') {
+        portal.send({ type: 'activate' });
+      }
     });
     const backend = new MemoryStorageBackend();
     const done = runServerProcess({
@@ -37,15 +52,17 @@ describe('runServerProcess inbound registration', () => {
       extensions: [],
       timeoutMs: 1000,
       logger: createJsonLogger({ sink: () => undefined }),
-      channel: channelThatRejectsRegistration(serverChannel),
+      channel: channelThatRejectsSecondRegistration(serverChannel),
     });
+    portal.send({ type: 'hello', portalGeneration: 1 });
 
     const error = await rejectionOf(done);
 
     expect(error.message).toBe('registration refused');
-    // The failure is after the readiness barrier, not a failed startup.
+    // The barrier is crossed only after the handler is installed, so a
+    // registration that throws means Portal never saw `ready`.
     expect(received(messages).map((message) => message.type)).toEqual([
-      'ready',
+      'prepared',
     ]);
     // The backend is the only storage writer (INV-002): a registration that
     // throws must not leave it open until the process exits.

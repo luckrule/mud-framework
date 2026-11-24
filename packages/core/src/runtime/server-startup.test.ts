@@ -4,7 +4,7 @@ import type { IpcChannel } from '../ipc/channel.ts';
 import { createInMemoryChannelPair } from '../ipc/channel.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import { MemoryStorageBackend } from '../storage/memory.ts';
-import { isRecord, rejectionOf } from '../test-support/common.ts';
+import { rejectionOf } from '../test-support/common.ts';
 import {
   parseLine,
   received,
@@ -56,7 +56,6 @@ function harness(extensions: readonly Extension[] = []): Harness {
         ...overrides,
       },
       logger,
-      channel,
     }),
   };
 }
@@ -71,7 +70,7 @@ function echoExtension(name = 'echo'): Extension {
 }
 
 describe('startServer', () => {
-  test('returns the runtime and sends ready as the only outbound message', async () => {
+  test('returns the runtime and sends nothing', async () => {
     const backend = new MemoryStorageBackend({
       capabilities: { concurrency: 'pooled' },
     });
@@ -80,13 +79,10 @@ describe('startServer', () => {
       test1.deps({ createBackend: () => backend }),
     );
 
-    expect(received(test1.messages)).toEqual([
-      {
-        type: 'ready',
-        pid: process.pid,
-        capabilities: backend.capabilities(),
-      },
-    ]);
+    // The readiness barrier belongs to the caller: sending it here would cross
+    // it before a request handler exists, and Portal is entitled to deliver the
+    // instant it sees `ready`.
+    expect(received(test1.messages)).toEqual([]);
     expect(result.runtime.capabilities).toEqual(backend.capabilities());
     expect(result.skippedExtensions).toBe(0);
     // The extension registered against the returned dispatcher.
@@ -103,40 +99,15 @@ describe('startServer', () => {
     await result.runtime.executor.close();
   });
 
-  test('reports the configured code version in ready', async () => {
+  test('reports the backend declaration the caller will announce', async () => {
     const backend = new MemoryStorageBackend();
     const test1 = harness([echoExtension()]);
     const { runtime } = await startServer(
       test1.deps({ createBackend: () => backend, codeVersion: 'build-1' }),
     );
 
-    expect(received(test1.messages)).toEqual([
-      {
-        type: 'ready',
-        pid: process.pid,
-        capabilities: backend.capabilities(),
-        codeVersion: 'build-1',
-      },
-    ]);
-
-    await runtime.executor.close();
-  });
-
-  test('omits the code version from ready when none is configured', async () => {
-    const test1 = harness([echoExtension()]);
-    const { runtime } = await startServer(test1.deps());
-
-    expect(received(test1.messages)).toEqual([
-      {
-        type: 'ready',
-        pid: process.pid,
-        capabilities: runtime.capabilities,
-      },
-    ]);
-    const raw = test1.messages.find(
-      (message) => isRecord(message) && message.type === 'ready',
-    );
-    expect(raw).not.toHaveProperty('codeVersion');
+    expect(received(test1.messages)).toEqual([]);
+    expect(runtime.capabilities).toEqual(backend.capabilities());
 
     await runtime.executor.close();
   });
@@ -227,17 +198,16 @@ describe('startServer', () => {
   });
 
   test('leaves inbound handlers unattached so messages stay buffered', async () => {
-    // The readiness barrier is `ready`; the caller attaches `onMessage` after
-    // `startServer` returns, and the channel buffers anything that arrived in
-    // between. A handler installed here would deliver requests before `ready`.
+    // The readiness barrier and the handler are the caller's, in that order. A
+    // handler installed here would deliver requests before the caller can say
+    // the process is active.
     const test1 = harness([echoExtension()]);
     const { runtime } = await startServer(test1.deps());
 
     test1.portal.send(requestMessage());
     await Promise.resolve();
 
-    expect(received(test1.messages)).toHaveLength(1);
-    expect(received(test1.messages)[0]?.type).toBe('ready');
+    expect(received(test1.messages)).toEqual([]);
 
     await runtime.executor.close();
   });
@@ -282,7 +252,7 @@ describe('startServer', () => {
     expect(received(test1.messages)).toEqual([]);
   });
 
-  test('reports every skipped extension but still sends ready', async () => {
+  test('reports every skipped extension and still returns a runtime', async () => {
     const backend = new MemoryStorageBackend({
       capabilities: { transactions: 'none', concurrency: 'single' },
     });
@@ -304,9 +274,7 @@ describe('startServer', () => {
     );
 
     expect(result.skippedExtensions).toBe(2);
-    expect(received(test1.messages).map((message) => message.type)).toEqual([
-      'ready',
-    ]);
+    expect(received(test1.messages)).toEqual([]);
     const warnings = test1
       .logs()
       .filter(

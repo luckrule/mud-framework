@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
 import {
-  expectOnlyHello,
+  expectHandshake,
   failureOf,
   flushTicks,
   harness,
@@ -84,7 +84,7 @@ describe('IpcExecutor cancel', () => {
 
     // Nothing was accepted under that id, so there is nothing to tell the
     // Server: only the handshake ever went out.
-    expectOnlyHello(server);
+    expectHandshake(server);
     expect(h.logs().some((line) => line.msg === 'request cancelled')).toBe(
       false,
     );

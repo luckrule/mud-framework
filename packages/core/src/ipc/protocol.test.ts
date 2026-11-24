@@ -26,6 +26,8 @@ const validMessages: IpcMessage[] = [
   },
   { type: 'cancel', requestId: 'req-1', code: 'FRAMEWORK_TIMEOUT' },
   { type: 'shutdown', timeoutMs: 5000 },
+  { type: 'prepared', pid: 4242 },
+  { type: 'activate' },
   { type: 'ready', pid: 4242, capabilities },
   { type: 'result', requestId: 'req-1', ok: true, result: { hp: 3 } },
   {
@@ -86,6 +88,61 @@ describe('parseIpcMessage', () => {
         timeoutMs: 250,
         replayCount: 2,
       },
+    });
+  });
+
+  test('accepts a prepared message carrying a code version', () => {
+    const parsed = parseIpcMessage({
+      type: 'prepared',
+      pid: 4242,
+      codeVersion: 'build-7',
+    });
+
+    expect(parsed).toEqual({
+      ok: true,
+      message: { type: 'prepared', pid: 4242, codeVersion: 'build-7' },
+    });
+  });
+
+  test('reports no code version when the peer sent none', () => {
+    const parsed = parseIpcMessage({ type: 'prepared', pid: 4242 });
+
+    // `toEqual` ignores undefined own keys, so this pins the value, not the
+    // message shape: whether the parsed object carries a `codeVersion` key is
+    // not part of the contract.
+    expect(parsed).toEqual({
+      ok: true,
+      message: { type: 'prepared', pid: 4242, codeVersion: undefined },
+    });
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok && parsed.message.type === 'prepared') {
+      expect(parsed.message.codeVersion).toBeUndefined();
+    }
+  });
+
+  test('rejects a prepared without a usable pid', () => {
+    for (const pid of [undefined, 0, -1, 1.5, '4242']) {
+      expectRejected({ type: 'prepared', pid }, 'pid');
+    }
+  });
+
+  test('rejects a prepared with an invalid code version', () => {
+    expectRejected(
+      { type: 'prepared', pid: 4242, codeVersion: '' },
+      'non-empty string',
+    );
+    expectRejected(
+      { type: 'prepared', pid: 4242, codeVersion: 7 },
+      'codeVersion',
+    );
+  });
+
+  test('accepts activate and drops extra fields', () => {
+    const parsed = parseIpcMessage({ type: 'activate', futureField: true });
+
+    expect(parsed).toStrictEqual({
+      ok: true,
+      message: { type: 'activate' },
     });
   });
 
@@ -177,7 +234,7 @@ describe('parseIpcMessage', () => {
     );
   });
 
-  test('keeps the request shape when codeVersion is absent', () => {
+  test('reports no code version on a request when the peer sent none', () => {
     const parsed = parseIpcMessage({
       type: 'request',
       requestId: 'req-1',
@@ -188,9 +245,9 @@ describe('parseIpcMessage', () => {
       replayCount: 0,
     });
 
-    // `toStrictEqual` plus the property check pin absence: a parser that always
-    // attached `codeVersion: undefined` would pass `toEqual` but not this.
-    expect(parsed).toStrictEqual({
+    // Value only: `toEqual` ignores undefined own keys, so the presence of the
+    // key itself is not what this asserts.
+    expect(parsed).toEqual({
       ok: true,
       message: {
         type: 'request',
@@ -202,28 +259,35 @@ describe('parseIpcMessage', () => {
         payload: undefined,
         timeoutMs: 250,
         replayCount: 0,
+        codeVersion: undefined,
       },
     });
     expect(parsed.ok).toBe(true);
-    if (parsed.ok) {
-      expect('codeVersion' in parsed.message).toBe(false);
+    if (parsed.ok && parsed.message.type === 'request') {
+      expect(parsed.message.codeVersion).toBeUndefined();
     }
   });
 
-  test('keeps the ready shape when codeVersion is absent', () => {
+  test('reports no code version on ready when the peer sent none', () => {
     const parsed = parseIpcMessage({
       type: 'ready',
       pid: 4242,
       capabilities,
     });
 
-    expect(parsed).toStrictEqual({
+    // Value only, same as the other absent-version cases.
+    expect(parsed).toEqual({
       ok: true,
-      message: { type: 'ready', pid: 4242, capabilities },
+      message: {
+        type: 'ready',
+        pid: 4242,
+        capabilities,
+        codeVersion: undefined,
+      },
     });
     expect(parsed.ok).toBe(true);
-    if (parsed.ok) {
-      expect('codeVersion' in parsed.message).toBe(false);
+    if (parsed.ok && parsed.message.type === 'ready') {
+      expect(parsed.message.codeVersion).toBeUndefined();
     }
   });
 
@@ -347,29 +411,28 @@ describe('parseIpcMessage', () => {
     );
   });
 
-  test('keeps the result shape when requestSessionId is absent', () => {
-    // `toEqual` ignores an own `undefined` property, so a parser that always
-    // attached `requestSessionId: undefined` would pass. `toStrictEqual` plus
-    // the explicit property checks pin "absent" against that.
+  test('reports no request session id when the peer sent none', () => {
     const success = parseIpcMessage({
       type: 'result',
       requestId: 'req-1',
       ok: true,
     });
-    expect(success).toStrictEqual({
+    // Value only: `toEqual` ignores undefined own keys, so the presence of the
+    // key itself is not part of the contract.
+    expect(success).toEqual({
       ok: true,
       message: {
         type: 'result',
         requestId: 'req-1',
+        requestSessionId: undefined,
         ok: true,
         result: undefined,
         sessionId: undefined,
       },
     });
     expect(success.ok).toBe(true);
-    if (success.ok) {
-      expect(success.message).not.toHaveProperty('requestSessionId');
-      expect('requestSessionId' in success.message).toBe(false);
+    if (success.ok && success.message.type === 'result') {
+      expect(success.message.requestSessionId).toBeUndefined();
     }
 
     const failed = parseIpcMessage({
@@ -378,19 +441,19 @@ describe('parseIpcMessage', () => {
       ok: false,
       error: { code: 'FRAMEWORK_TIMEOUT', message: 'timed out' },
     });
-    expect(failed).toStrictEqual({
+    expect(failed).toEqual({
       ok: true,
       message: {
         type: 'result',
         requestId: 'req-1',
+        requestSessionId: undefined,
         ok: false,
         error: { code: 'FRAMEWORK_TIMEOUT', message: 'timed out' },
       },
     });
     expect(failed.ok).toBe(true);
-    if (failed.ok) {
-      expect(failed.message).not.toHaveProperty('requestSessionId');
-      expect('requestSessionId' in failed.message).toBe(false);
+    if (failed.ok && failed.message.type === 'result') {
+      expect(failed.message.requestSessionId).toBeUndefined();
     }
   });
 
@@ -420,7 +483,7 @@ describe('parseIpcMessage', () => {
     );
   });
 
-  test('tolerates unknown extra fields from a newer peer', () => {
+  test('keeps extra fields out of the parsed message', () => {
     const parsed = parseIpcMessage({
       type: 'hello',
       portalGeneration: 1,
@@ -433,9 +496,9 @@ describe('parseIpcMessage', () => {
     });
   });
 
-  test('drops unknown fields from a result', () => {
-    // SPEC/ADR promise an old Portal tolerates a newer peer's additions; the
-    // parsed shape must stay the documented one rather than pass them through.
+  test('drops extra fields from a result', () => {
+    // The parsed message is the documented shape, not a copy of the frame: an
+    // unknown field must not reach the caller.
     const parsed = parseIpcMessage({
       type: 'result',
       requestId: 'req-1',
@@ -445,11 +508,12 @@ describe('parseIpcMessage', () => {
       futureField: 'ignored',
     });
 
-    expect(parsed).toStrictEqual({
+    expect(parsed).toEqual({
       ok: true,
       message: {
         type: 'result',
         requestId: 'req-1',
+        requestSessionId: undefined,
         ok: true,
         result: { hp: 3 },
         sessionId: 'bound-1',
@@ -557,26 +621,15 @@ describe('parseIpcMessage', () => {
     );
   });
 
-  test('reads a null transaction ceiling as unbounded', () => {
-    const parsed = parseIpcMessage({
-      type: 'ready',
-      pid: 1,
-      capabilities: { ...capabilities, maxTransactionDurationMs: null },
-    });
-
-    // JSON turns Infinity into null, so both must land on the same value. The
-    // whole message is asserted so a rejection cannot pass as a success.
-    expect(parsed).toEqual({
-      ok: true,
-      message: {
+  test('rejects a null transaction ceiling', () => {
+    expectRejected(
+      {
         type: 'ready',
         pid: 1,
-        capabilities: {
-          ...capabilities,
-          maxTransactionDurationMs: Number.POSITIVE_INFINITY,
-        },
+        capabilities: { ...capabilities, maxTransactionDurationMs: null },
       },
-    });
+      'maxTransactionDurationMs',
+    );
   });
 
   test('keeps a positive finite transaction ceiling as is', () => {
@@ -592,6 +645,7 @@ describe('parseIpcMessage', () => {
         type: 'ready',
         pid: 1,
         capabilities: { ...capabilities, maxTransactionDurationMs: 250 },
+        codeVersion: undefined,
       },
     });
   });
@@ -604,7 +658,7 @@ describe('parseIpcMessage', () => {
           pid: 1,
           capabilities: { ...capabilities, maxTransactionDurationMs: value },
         },
-        'a positive number or null',
+        'a positive finite number or Infinity',
       );
     }
   });

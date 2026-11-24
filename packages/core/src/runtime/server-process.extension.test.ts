@@ -4,6 +4,7 @@ import { MemoryStorageBackend } from '../storage/memory.ts';
 import { tick } from '../test-support/common.ts';
 import {
   echoRegistration,
+  messageTypes,
   received,
   requestMessage,
   results,
@@ -154,7 +155,7 @@ describe('runServerProcess extension capabilities', () => {
     // SPEC 6.2 step 2: the process cannot run without it, so no `ready` and a
     // ServerStartupError for the caller to map to a non-zero exit.
     expect(error.reason).toContain('banking');
-    expect(received(harness.messages)).toEqual([]);
+    expect(messageTypes(harness.messages)).toEqual(['prepared']);
     const failures = harness
       .logs()
       .filter((line) => line.msg === 'required extension cannot start');

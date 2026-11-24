@@ -88,7 +88,7 @@ describe('runServerProcess capability degradation warnings', () => {
       extensions: [{ name: 'echo', register: echoRegistration }],
     });
     await tick();
-    harness.portal.send({ type: 'hello', portalGeneration: 1 });
+    // The handshake already ran; a second `hello` would only log STALE_HELLO.
     const atStartup = degradationWarnings(harness.logs()).length;
 
     for (let index = 0; index < 3; index += 1) {
