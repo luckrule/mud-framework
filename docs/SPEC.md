@@ -10,7 +10,7 @@
 
 通用 MUD 游戏框架，运行于 Bun + TypeScript。
 
-框架的设计目标是提供让 MUD 业务能安全跑起来的骨架：连接的接入与有序化、请求的事务边界、存储后端的能力协商、业务进程的生命周期与崩溃恢复、可观测的日志与错误码。游戏规则、命令解析、世界模型属于 Extension，不属于框架。当前仓库只完成工程基础设施，这些能力尚未实现——本文写的是目标契约，不是现状说明。
+框架的设计目标是提供让 MUD 业务能安全跑起来的骨架：连接的接入与有序化、请求的事务边界、存储后端的能力协商、业务进程的生命周期与崩溃恢复、可观测的日志与错误码。游戏规则、命令解析、世界模型属于 Extension，不属于框架。上述核心能力已实现；尚未实现的集中在 Extension 机制与中止信号，传输能力协商已从契约中移除。逐节见「当前未实现」标注。
 
 读者是 AI 协作者与未来的维护者。因此本文优先写决策与边界，不写机制教程；机制细节以代码与类型定义为准。
 
@@ -48,7 +48,7 @@ Handler 可以 await，框架的调度建立在 Promise 之上。
 
 **Session（会话）** — 玩家的一次逻辑在线期，由 Session ID 标识，可跨越多个 Connection（断线重连）。Session 是路由与状态归属的单位。
 
-当前未实现：连接层不做 Session 路由，`RequestContext.sessionId` 恒为空。这是已知缺口，不是文档过期——条目保留为目标契约。
+连接层已做 Session 路由：保存 `sessionId → connectionId` 映射与重连顺序门。绑定由业务通过 `RequestContext.bindSession` 声明，只在请求成功时生效；框架不判断 id 是否合法。当前未实现：Session 超时回收——断线后 Session 保留多久由业务规则决定，框架不介入。这是已知缺口，不是文档过期——条目保留为目标契约。
 
 **Transport（传输）** — 传输实现的接口：接受连接、交付入站数据、写出发站数据、关闭。它只负责字节流与消息编解码，不含 Session 路由与输入缓冲——后者属于连接层进程。框架核心不依赖任何具体 Transport。
 
@@ -68,7 +68,7 @@ Handler 可以 await，框架的调度建立在 Promise 之上。
 
 **Request Context（请求上下文）** — 随 Request 传入 Handler 的框架侧上下文，携带 Session ID、Connection ID、请求标识、事务句柄、中止信号与日志器。Handler 的存储调用与日志调用 SHOULD 经由它，框架据此统一归属日志、统一判定事务是否仍有效。
 
-当前未实现：`RequestContext` 没有中止信号字段，Session ID 恒为空。条目保留为目标契约，缺口见 3.2 与 3.6。
+当前未实现：`RequestContext` 没有中止信号字段。条目保留为目标契约，缺口见 3.6。
 
 **Terminal State（终态）** — Request 的结局，只有三类：成功、业务失败、框架失败（超时、取消、存储不可用、传输在完成前断开）。终态表示处理结束、结果已确定；它不等于已确认。
 
@@ -90,7 +90,7 @@ Handler 可以 await，框架的调度建立在 Promise 之上。
 
 同一 Session 重连到新 Connection 时，旧 Connection 上未完成的 Request 必须先有终态（完成或失败），新 Connection 才开始处理，避免同一 Session 出现两条处理线。
 
-当前未实现：连接层没有 Session 路由，这条重连顺序没有执行者，`RequestContext.sessionId` 恒为空。条目保留为目标契约。
+重连顺序已实现：新 Connection 绑定同一 Session 时，其后续请求等旧 Connection 的在途工作到达终态。边界：等待有超时上限（默认 10 秒），超时后放行并记 warn——旧 handler 可能永不返回（3.4 已禁止事务内无界等待，那是业务的违约），而永久等待会让整个 Session 卡死。框架不保证跨 Connection 的事务一致性，也不提供 Session 的业务状态。
 
 理由：跨连接串行会抹掉异步模型的全部收益；同 Session 并行则让"谁的状态更新生效"变得不可判定。
 
@@ -286,7 +286,7 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 
 框架日志 MUST 是结构化的（字段而非拼接字符串）。字段名是契约，文案不是。每个 Request 的日志 SHOULD 至少携带：请求标识、Session ID、Connection ID、Extension 名、耗时、结果、错误码。日志级别按语义使用：告警级用于能力降级、重放、队列拒绝这类"能继续运行但需要人知道"的事件；错误级用于请求失败；不得用错误级记录预期内的业务拒绝。
 
-当前未实现：Session ID 与 Extension 名两个字段不可用。`RequestContext` 没有 Extension 名字段，`sessionId` 恒为空——Session 路由与 Extension 注册机制尚未实现（见 §2、§3.2、§4.3）。这是已知缺口，不是文档过期——本段保留为目标契约。
+当前未实现：Extension 名不可用——`RequestContext` 没有 Extension 名字段，Extension 注册机制尚未实现（见 §4.3）。这是已知缺口，不是文档过期——本段保留为目标契约。
 
 ### 7.2 错误码
 
