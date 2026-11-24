@@ -307,6 +307,10 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 
 已实现：`RequestContext.extension` 由 handler 的注册元数据填充。通过 `ExtensionRegistrar` 注册的 handler 自动带上所属 Extension 名，请求日志的 bindings 仅在存在该名时写入 `extension` 字段；不属于任何 Extension 的 handler 不带该字段。
 
+边界：`extension` 字段只有 Server 侧在 handler 注册元数据可知时填充。Portal 不持有 handler 注册信息，其请求级日志（例如拒绝、队列满、超时、取消、重放）无法获知 Extension，不能按该字段过滤 Portal 日志；这些日志与 Server 侧日志依靠请求标识与 Connection ID 关联。
+
+边界：请求结算之后产生的日志（如 `late result discarded`）可能没有 Session ID。只有本次请求内由 handler 新绑定且成功的结果，才能从结果消息本身恢复 Session ID——请求进入框架时已带的 Session ID 不在结果消息里回传，失败结果也不带。其余已结算的日志用稳定的请求标识（§7.3）与同一请求的其它日志行关联。
+
 ### 7.2 错误码
 
 错误码 MUST 稳定、可枚举、只增不删。语义变更 MUST 分配新码，不得复用旧码表示新含义。
