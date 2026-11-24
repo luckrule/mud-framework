@@ -13,6 +13,7 @@ import type { Logger } from '../logging/types.ts';
 import type { StorageBackend } from '../storage/types.ts';
 import type { Extension } from './extension.ts';
 import type { RequestIdentity } from './identity.ts';
+import { readyMessage } from './ipc-messages.ts';
 import { RequestRunner } from './server-requests.ts';
 import type { Runtime } from './server-startup.ts';
 import { startServer } from './server-startup.ts';
@@ -28,6 +29,13 @@ export interface ServerProcessOptions {
   extensions: readonly Extension[];
   /** Framework-side request ceiling; effective = min(this, backend max). */
   timeoutMs: number;
+  /**
+   * Opaque application code version; must be a non-empty string when set.
+   * Reported in `ready` and compared against a replay's stamped version only to
+   * log a mismatch; the framework never uses it to accept, reject or alter a
+   * Request (SPEC 6.4).
+   */
+  codeVersion?: string;
   logger?: Logger;
   /**
    * The IPC channel; defaults to the real process channel.
@@ -257,6 +265,7 @@ class ServerProcess {
     const runner = new RequestRunner({
       runtime,
       logger: this.logger,
+      codeVersion: this.options.codeVersion,
       send: (message, what) => this.sendQuietly(message, what),
       // The phase and the handshake flag stay in this class: `shutdown` and
       // `hello` own them, and the runner only asks.
@@ -383,11 +392,7 @@ class ServerProcess {
       'new portal generation; resending ready',
     );
     this.sendQuietly(
-      {
-        type: 'ready',
-        pid: process.pid,
-        capabilities: runtime.capabilities,
-      },
+      readyMessage(process.pid, runtime.capabilities, this.options.codeVersion),
       'ready',
     );
   }

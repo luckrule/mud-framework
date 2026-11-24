@@ -37,6 +37,13 @@ export interface RequestMessage extends RequestIdentity {
   readonly timeoutMs: number;
   /** 0 on first delivery; incremented by Portal on each replay (SPEC 7.3). */
   readonly replayCount: number;
+  /**
+   * The application's opaque code version at the moment this Request was
+   * accepted. A replay keeps the value its pending entry was stamped with, so
+   * it names the code the original delivery ran under, not the replacement
+   * Server's. The framework only reports a difference (SPEC 6.4).
+   */
+  readonly codeVersion?: string;
 }
 
 /**
@@ -76,6 +83,12 @@ export interface ReadyMessage {
   readonly type: 'ready';
   readonly pid: number;
   readonly capabilities: StorageCapabilities;
+  /**
+   * The application's opaque code version this Server is running. Omitted when
+   * the deployment declared none; a peer that predates the field sends nothing,
+   * which is not the same as reporting a different version (SPEC 6.4).
+   */
+  readonly codeVersion?: string;
 }
 
 /**
@@ -191,12 +204,15 @@ function buildMessage(raw: unknown): IpcMessage {
         type: 'shutdown',
         timeoutMs: readPositiveNumber(raw, 'shutdown', 'timeoutMs'),
       };
-    case 'ready':
+    case 'ready': {
+      const codeVersion = readOptionalString(raw, 'ready', 'codeVersion');
       return {
         type: 'ready',
         pid: readInteger(raw, 'ready', 'pid', 1),
         capabilities: readCapabilities(raw, 'ready', 'capabilities'),
+        ...codeVersionField(codeVersion),
       };
+    }
     case 'result':
       return buildResult(raw);
     case 'closed':
@@ -222,6 +238,7 @@ function buildRequest(raw: Record<string, unknown>): RequestMessage {
     payload: raw.payload,
     timeoutMs: readPositiveNumber(raw, 'request', 'timeoutMs'),
     replayCount: readInteger(raw, 'request', 'replayCount', 0),
+    ...codeVersionField(readOptionalString(raw, 'request', 'codeVersion')),
   };
 }
 
@@ -263,6 +280,17 @@ function requestSessionEcho(requestSessionId: string | undefined): {
   requestSessionId?: string;
 } {
   return requestSessionId === undefined ? {} : { requestSessionId };
+}
+
+/**
+ * Absence is kept as absence, like the result's Session echo: a peer that
+ * predates `codeVersion` must keep the exact parsed shape it had before, not
+ * gain an own `undefined` property.
+ */
+function codeVersionField(codeVersion: string | undefined): {
+  codeVersion?: string;
+} {
+  return codeVersion === undefined ? {} : { codeVersion };
 }
 
 function readResultError(

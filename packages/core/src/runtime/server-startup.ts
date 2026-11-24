@@ -8,6 +8,7 @@ import type { StorageBackend, StorageCapabilities } from '../storage/types.ts';
 import { Dispatcher } from './dispatcher.ts';
 import { LocalExecutor } from './executor.ts';
 import type { Extension, ExtensionRegistrar } from './extension.ts';
+import { readyMessage } from './ipc-messages.ts';
 import type { ServerProcessOptions } from './server-process.ts';
 
 /**
@@ -62,6 +63,11 @@ export interface StartupDeps {
  */
 export async function startServer(deps: StartupDeps): Promise<StartupResult> {
   const { options, logger, channel } = deps;
+  // Checked before the backend exists: a `ready` carrying a value the wire
+  // parser rejects would leave a Server that can never cross the readiness
+  // barrier, so it would be started only to be restarted or killed after the
+  // start timeout. Refusing here keeps the process from getting that far.
+  assertCodeVersion(options.codeVersion, logger);
   const backend = await createBackend(options, logger);
   let dispatcher: Dispatcher | undefined;
   try {
@@ -121,11 +127,9 @@ export async function startServer(deps: StartupDeps): Promise<StartupResult> {
     }
     // SPEC 6.2 step 3: only now is the readiness barrier crossed. Sending it
     // earlier would let the first requests hit a half-initialized Server.
-    channel.send({
-      type: 'ready',
-      pid: process.pid,
-      capabilities: runtime.capabilities,
-    });
+    channel.send(
+      readyMessage(process.pid, runtime.capabilities, options.codeVersion),
+    );
     logger.info(
       { pid: process.pid, capabilities: runtime.capabilities },
       'server process ready',
@@ -141,6 +145,35 @@ export async function startServer(deps: StartupDeps): Promise<StartupResult> {
       'server process failed to start',
     );
     await closeQuietly(dispatcher, backend, logger);
+    throw failure;
+  }
+}
+
+/**
+ * An application code version is opaque to the framework, but it must be a
+ * non-empty string: the wire parser accepts nothing else, so an invalid value
+ * would produce a `ready` no Portal can accept and a Server that never becomes
+ * usable.
+ *
+ * The failure is logged here as well as thrown, because the throw precedes the
+ * shared catch below: every startup failure must produce exactly one
+ * `SERVER_STARTUP_FAILED` line, whichever step refused.
+ */
+function assertCodeVersion(
+  codeVersion: string | undefined,
+  logger: Logger,
+): void {
+  if (codeVersion === undefined) {
+    return;
+  }
+  if (typeof codeVersion !== 'string' || codeVersion.length === 0) {
+    const failure = new ServerStartupError(
+      'codeVersion must be a non-empty string',
+    );
+    logger.error(
+      { code: failure.code, reason: failure.reason },
+      'server process failed to start',
+    );
     throw failure;
   }
 }

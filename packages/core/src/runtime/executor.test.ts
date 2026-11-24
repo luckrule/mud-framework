@@ -6,6 +6,7 @@ import { createJsonLogger } from '../logging/json-logger.ts';
 import type { Logger } from '../logging/types.ts';
 import { MemoryStorageBackend } from '../storage/memory.ts';
 import { Dispatcher } from './dispatcher.ts';
+import type { DispatchMeta } from './dispatcher.ts';
 import { LocalExecutor } from './executor.ts';
 import type { ExecutorRequest } from './executor.ts';
 import { BusinessError } from './wire-codes.ts';
@@ -331,6 +332,31 @@ describe('LocalExecutor', () => {
     // The per-request deadline wins over the executor's own 10s ceiling.
     expect(elapsed).toBeLessThan(1000);
     await sleep(60);
+    await executor.close();
+  });
+
+  test('strips the code version from the handler metadata', async () => {
+    const dispatcher = quietDispatcher({
+      backend: new MemoryStorageBackend(),
+      timeoutMs: 1000,
+    });
+    const metas: DispatchMeta[] = [];
+    const dispatch = dispatcher.dispatch.bind(dispatcher);
+    dispatcher.dispatch = (method, payload, meta) => {
+      const observed = meta ?? {};
+      metas.push(observed);
+      return dispatch(method, payload, observed);
+    };
+    dispatcher.register('echo', async (_ctx, payload) => payload);
+    const executor = new LocalExecutor({ dispatcher });
+
+    const outcome = await executor.execute(request({ codeVersion: 'build-1' }));
+
+    expect(outcome).toEqual({ ok: true, result: null });
+    expect(metas).toHaveLength(1);
+    // `codeVersion` is IPC envelope metadata: it must not reach the dispatcher
+    // as an undeclared `DispatchMeta` key.
+    expect(metas[0]).not.toHaveProperty('codeVersion');
     await executor.close();
   });
 

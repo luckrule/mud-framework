@@ -291,6 +291,8 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 
 理由：at-least-once 是"连接保活"这一承诺的直接代价——只要允许重放，重复执行就无法在框架层排除。这也是双进程架构存在的理由：单进程崩溃会同时带走连接与状态，无从重放。
 
+代码版本只回显，不判兼容：`ready` 与 `request` 上的 `codeVersion` 是应用提供的 opaque 非空字符串。两侧各记一种 warn：Portal 在 `ready.codeVersion` 与自身配置不同时记（`expectedCodeVersion`、`actualCodeVersion`、`pid`）；Server 在 `replayCount > 0`、请求版本与自身版本都存在且不同时记（请求标识字段、`requestCodeVersion`、`serverCodeVersion`、`replayCount`）。两者都不据此改变路由、重放策略或请求结局。跨版本重放只保证 at-least-once 与可观测，不保证行为兼容；是否允许带版本热修、如何发布，由部署方决定。
+
 ### 6.5 重放的顺序约束
 
 重放 MUST 保持原顺序：同一 Connection 上未确认的 Request 按接收顺序重放。理由：重放若乱序，等于在恢复路径上重新引入 3.1 已经排除的问题，而且发生在最不稳定的时刻。

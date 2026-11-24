@@ -89,6 +89,144 @@ describe('parseIpcMessage', () => {
     });
   });
 
+  test('accepts a request carrying a code version', () => {
+    const parsed = parseIpcMessage({
+      type: 'request',
+      requestId: 'req-1',
+      connectionId: 'conn-1',
+      clientRequestId: 'client-1',
+      method: 'look',
+      timeoutMs: 100,
+      replayCount: 1,
+      codeVersion: 'build-7',
+    });
+
+    expect(parsed).toEqual({
+      ok: true,
+      message: {
+        type: 'request',
+        requestId: 'req-1',
+        connectionId: 'conn-1',
+        clientRequestId: 'client-1',
+        sessionId: undefined,
+        method: 'look',
+        payload: undefined,
+        timeoutMs: 100,
+        replayCount: 1,
+        codeVersion: 'build-7',
+      },
+    });
+  });
+
+  test('accepts a ready carrying a code version', () => {
+    const parsed = parseIpcMessage({
+      type: 'ready',
+      pid: 4242,
+      capabilities,
+      codeVersion: 'build-7',
+    });
+
+    expect(parsed).toEqual({
+      ok: true,
+      message: {
+        type: 'ready',
+        pid: 4242,
+        capabilities,
+        codeVersion: 'build-7',
+      },
+    });
+  });
+
+  test('rejects an empty code version', () => {
+    expectRejected(
+      {
+        type: 'request',
+        requestId: 'req-1',
+        connectionId: 'conn-1',
+        clientRequestId: 'client-1',
+        method: 'look',
+        timeoutMs: 100,
+        replayCount: 0,
+        codeVersion: '',
+      },
+      'non-empty string',
+    );
+    expectRejected(
+      { type: 'ready', pid: 4242, capabilities, codeVersion: '' },
+      'non-empty string',
+    );
+  });
+
+  test('rejects a non-string code version', () => {
+    expectRejected(
+      {
+        type: 'request',
+        requestId: 'req-1',
+        connectionId: 'conn-1',
+        clientRequestId: 'client-1',
+        method: 'look',
+        timeoutMs: 100,
+        replayCount: 0,
+        codeVersion: 7,
+      },
+      'codeVersion',
+    );
+    expectRejected(
+      { type: 'ready', pid: 4242, capabilities, codeVersion: 7 },
+      'codeVersion',
+    );
+  });
+
+  test('keeps the request shape when codeVersion is absent', () => {
+    const parsed = parseIpcMessage({
+      type: 'request',
+      requestId: 'req-1',
+      connectionId: 'conn-1',
+      clientRequestId: 'client-1',
+      method: 'ping',
+      timeoutMs: 250,
+      replayCount: 0,
+    });
+
+    // `toStrictEqual` plus the property check pin absence: a parser that always
+    // attached `codeVersion: undefined` would pass `toEqual` but not this.
+    expect(parsed).toStrictEqual({
+      ok: true,
+      message: {
+        type: 'request',
+        requestId: 'req-1',
+        connectionId: 'conn-1',
+        clientRequestId: 'client-1',
+        sessionId: undefined,
+        method: 'ping',
+        payload: undefined,
+        timeoutMs: 250,
+        replayCount: 0,
+      },
+    });
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect('codeVersion' in parsed.message).toBe(false);
+    }
+  });
+
+  test('keeps the ready shape when codeVersion is absent', () => {
+    const parsed = parseIpcMessage({
+      type: 'ready',
+      pid: 4242,
+      capabilities,
+    });
+
+    expect(parsed).toStrictEqual({
+      ok: true,
+      message: { type: 'ready', pid: 4242, capabilities },
+    });
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect('codeVersion' in parsed.message).toBe(false);
+    }
+  });
+
   test('keeps a success result that carries no value', () => {
     const parsed = parseIpcMessage({
       type: 'result',

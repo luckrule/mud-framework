@@ -52,6 +52,14 @@ ADR-0002 决定了拆成两个进程，但没定两件事：两个进程之间�
 
 `result` 上 `sessionId` 与 `requestSessionId` 语义不同：前者是 handler 在本次请求内新绑定的 Session，只有成功结果可能有；后者回显请求进入框架时已带的入口 Session，成功与失败结果都带，入口无 Session 时不带。加回显的原因是结果可能晚于 Portal 的结算（超时、取消、重放耗尽）：那时未确认缓冲里的条目已删除，Portal 只能从结果消息恢复 Session，而旧形状只覆盖"本次新绑定"，失败结果与"入口已有 Session 但未新绑定"的迟到结果都无从记录。`requestSessionId` 只属于线格式，不进入 `ExecutorOutcome` 或结算结果；旧 Server 不回显、旧 Portal 忽略未知字段，因此是加法兼容。`sessionId` 的语义不变。
 
+### 代码版本回显
+
+`ready` 与 `request` 各带一个可选字段 `codeVersion`，值是应用提供的 opaque 非空字符串。`ready` 报告应用声明的、该 Server 正在运行的代码版本（由部署方声明，框架不校验其与实际构建产物是否一致）；`request` 记录 Portal 接受该请求时的版本，重放沿用该值而不是替换 Server 的版本。Portal 在自身配置了版本、且 `ready` 带了一个不同版本时记 warn（`expectedCodeVersion`、`actualCodeVersion`、`pid`）；Server 在处理 `replayCount > 0` 的请求、且请求版本与自身版本都存在且不同时记 warn（请求标识字段、`requestCodeVersion`、`serverCodeVersion`、`replayCount`）。两侧都不因不匹配失败、拒绝、取消请求或改变重放策略。
+
+为什么只回显：框架不解析版本，也不知道两个版本之间是否兼容。把版本用于路由、重放或准入判断，会把"应用如何发布"编码进框架，而发布策略（蓝绿、热修、回滚）属于部署方。回显只做一件事——让跨版本重放可被观察到。跨版本重放仍只承诺 at-least-once 与可观测，行为兼容不在承诺内（SPEC 6.4）。
+
+字段缺失与空值语义不同：缺失表示该对端没有声明版本，不构成"不同"；空串或非字符串是非法线格式，解析器拒绝。这一点保证旧对端（不发该字段）与新对端可以互操作，且不会把"未知"误报成"不匹配"。
+
 ### 确认的边界：框架做不到什么
 
 这一节写清楚能力的真实边界，避免把"已确认"读成更强的保证。

@@ -26,6 +26,7 @@ interface RunnerHarness {
 function startRunner(
   timeoutMs = 1000,
   accepting: () => boolean = () => true,
+  codeVersion?: string,
 ): RunnerHarness {
   const backend = new MemoryStorageBackend();
   const lines: string[] = [];
@@ -50,6 +51,7 @@ function startRunner(
       sent.push(message);
     },
     accepting,
+    codeVersion,
     noteRequestBeforeHello: () => undefined,
   });
   return {
@@ -408,6 +410,116 @@ describe('RequestRunner', () => {
     // No id is remembered: the cancel neither leaked a set entry nor claimed
     // the id for a later delivery.
     expect(harness.runner.pending).toBe(0);
+  });
+
+  test('warns when a replay was accepted under a different code version', async () => {
+    const harness = startRunner(1000, () => true, 'build-2');
+    harness.register('echo', (_ctx, payload) => Promise.resolve(payload));
+
+    harness.runner.accept(
+      requestMessage({
+        replayCount: 1,
+        codeVersion: 'build-1',
+        sessionId: 'entry-1',
+      }),
+    );
+    await tick();
+
+    // The mismatch is reported, not enforced: the Request still runs and its
+    // result keeps the ordinary shape (SPEC 6.4).
+    expect(harness.sent).toEqual([
+      {
+        type: 'result',
+        requestId: 'req-1',
+        requestSessionId: 'entry-1',
+        ok: true,
+        result: 'hi',
+      },
+    ]);
+    const warnings = harness
+      .logs()
+      .filter(
+        (line) =>
+          line.msg === 'replayed request carries a different code version',
+      );
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatchObject({
+      level: 'warn',
+      requestId: 'req-1',
+      connectionId: 'c1',
+      clientRequestId: 'client-1',
+      sessionId: 'entry-1',
+      replayCount: 1,
+      requestCodeVersion: 'build-1',
+      serverCodeVersion: 'build-2',
+    });
+  });
+
+  test('does not warn when the replay version matches the server version', async () => {
+    const harness = startRunner(1000, () => true, 'build-1');
+    harness.register('echo', (_ctx, payload) => Promise.resolve(payload));
+
+    harness.runner.accept(
+      requestMessage({ replayCount: 1, codeVersion: 'build-1' }),
+    );
+    await tick();
+
+    expect(
+      harness
+        .logs()
+        .some(
+          (line) =>
+            line.msg === 'replayed request carries a different code version',
+        ),
+    ).toBe(false);
+  });
+
+  test('does not warn about versions on a first delivery', async () => {
+    const harness = startRunner(1000, () => true, 'build-2');
+    harness.register('echo', (_ctx, payload) => Promise.resolve(payload));
+
+    // Only a replay crossed a restart; a fresh request runs entirely under the
+    // version that accepted it.
+    harness.runner.accept(
+      requestMessage({ replayCount: 0, codeVersion: 'build-1' }),
+    );
+    await tick();
+
+    expect(
+      harness
+        .logs()
+        .some(
+          (line) =>
+            line.msg === 'replayed request carries a different code version',
+        ),
+    ).toBe(false);
+  });
+
+  test('does not warn when either side has no code version', async () => {
+    const unknownServer = startRunner(1000, () => true);
+    unknownServer.register('echo', (_ctx, payload) => Promise.resolve(payload));
+    unknownServer.runner.accept(
+      requestMessage({ replayCount: 1, codeVersion: 'build-1' }),
+    );
+    await tick();
+
+    const unknownRequest = startRunner(1000, () => true, 'build-2');
+    unknownRequest.register('echo', (_ctx, payload) =>
+      Promise.resolve(payload),
+    );
+    unknownRequest.runner.accept(requestMessage({ replayCount: 1 }));
+    await tick();
+
+    for (const harness of [unknownServer, unknownRequest]) {
+      expect(
+        harness
+          .logs()
+          .some(
+            (line) =>
+              line.msg === 'replayed request carries a different code version',
+          ),
+      ).toBe(false);
+    }
   });
 
   test('drain waits for a running handler', async () => {

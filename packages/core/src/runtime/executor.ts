@@ -12,6 +12,14 @@ export interface ExecutorRequest extends RequestIdentity {
    * rolls back at the same instant instead of writing after this side gave up.
    */
   timeoutMs?: number;
+  /**
+   * Opaque application code version stamped on the Request. `IpcExecutor` fills
+   * it from its own configuration when the caller left it unset and keeps it
+   * across replays; a caller-supplied value must be a non-empty string, and an
+   * invalid one fails the request with `INTERNAL_ERROR` instead of being sent.
+   * It is never interpreted by the framework (SPEC 6.4).
+   */
+  codeVersion?: string;
 }
 
 /**
@@ -99,8 +107,10 @@ export class LocalExecutor implements RequestExecutor {
   async execute(request: ExecutorRequest): Promise<ExecutorOutcome> {
     try {
       // Everything except the handler arguments is dispatch metadata, so the
-      // split is expressed once here instead of field by field.
-      const { method, payload, ...meta } = request;
+      // split is expressed once here instead of field by field. `codeVersion`
+      // is IPC envelope metadata with no meaning in process; leaving it in
+      // `meta` would pass an undeclared key to the dispatcher.
+      const { method, payload, codeVersion: _codeVersion, ...meta } = request;
       const { result, boundSessionId } = await this.dispatcher.dispatch(
         method,
         payload,

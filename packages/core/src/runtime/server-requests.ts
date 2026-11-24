@@ -51,6 +51,11 @@ export interface RequestRunnerDeps {
    */
   readonly accepting: () => boolean;
   /**
+   * This Server's opaque code version. Compared against a replay's stamped
+   * version only to log a mismatch; it never changes the outcome (SPEC 6.4).
+   */
+  readonly codeVersion?: string;
+  /**
    * Called for every accepted request, before its handler starts. The Server
    * records a missing handshake at most once per Portal (SPEC 7.1); it never
    * refuses the request, because executing is the only way to answer it.
@@ -128,6 +133,7 @@ export class RequestRunner {
       }
       return;
     }
+    this.warnIfReplayCodeVersionChanged(message);
     if (!this.deps.accepting()) {
       // SPEC 3.5: a refused input gets a stable code rather than silence.
       // Portal may already have the request on the wire and will not settle it
@@ -280,6 +286,34 @@ export class RequestRunner {
         this.duplicateLogged.delete(oldest.value);
       }
     }
+  }
+
+  /**
+   * A replay keeps the code version it was accepted under, so a difference
+   * from this Server's version means the replacement may not behave the same.
+   * The framework reports that instead of guessing compatibility; the Request
+   * still runs unchanged because at-least-once is the whole promise (SPEC 6.4).
+   */
+  private warnIfReplayCodeVersionChanged(message: RequestMessage): void {
+    const requestCodeVersion = message.codeVersion;
+    const serverCodeVersion = this.deps.codeVersion;
+    if (
+      message.replayCount === 0 ||
+      requestCodeVersion === undefined ||
+      serverCodeVersion === undefined ||
+      requestCodeVersion === serverCodeVersion
+    ) {
+      return;
+    }
+    this.deps.logger.warn(
+      {
+        ...this.requestFields(message),
+        requestCodeVersion,
+        serverCodeVersion,
+        replayCount: message.replayCount,
+      },
+      'replayed request carries a different code version',
+    );
   }
 
   /**

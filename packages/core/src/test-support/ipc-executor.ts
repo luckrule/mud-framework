@@ -62,7 +62,10 @@ export async function waitFor(
   return poll();
 }
 
-export function readyMessage(maxTransactionDurationMs = 5000): IpcMessage {
+export function readyMessage(
+  maxTransactionDurationMs = 5000,
+  codeVersion?: string,
+): IpcMessage {
   return {
     type: 'ready',
     pid: 4242,
@@ -73,6 +76,7 @@ export function readyMessage(maxTransactionDurationMs = 5000): IpcMessage {
       uniqueConstraint: true,
       maxTransactionDurationMs,
     },
+    ...(codeVersion === undefined ? {} : { codeVersion }),
   };
 }
 
@@ -315,6 +319,7 @@ export interface HarnessOptions {
   startTimeoutMs?: number;
   maxPending?: number;
   closeChannelOnExit?: boolean;
+  codeVersion?: string;
 }
 
 export interface Harness {
@@ -353,6 +358,7 @@ export function harness(options: Partial<HarnessOptions> = {}): Harness {
     stableResetMs: options.stableResetMs,
     startTimeoutMs: options.startTimeoutMs,
     maxPending: options.maxPending,
+    codeVersion: options.codeVersion,
     logger,
   });
   return {

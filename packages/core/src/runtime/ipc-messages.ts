@@ -1,4 +1,5 @@
-import type { RequestMessage } from '../ipc/protocol.ts';
+import type { ReadyMessage, RequestMessage } from '../ipc/protocol.ts';
+import type { StorageCapabilities } from '../storage/types.ts';
 import type { ExecutorOutcome, ExecutorRequest } from './executor.ts';
 
 /**
@@ -29,6 +30,20 @@ export function requestMessage(
 
 export function failure(code: string, message: string): ExecutorOutcome {
   return { ok: false, error: { code, message } };
+}
+
+/**
+ * Builds the readiness barrier. `codeVersion` is omitted when the deployment
+ * declared none, so a peer that predates the field sees the same shape it
+ * always did (SPEC 6.4).
+ */
+export function readyMessage(
+  pid: number,
+  capabilities: StorageCapabilities,
+  codeVersion: string | undefined,
+): ReadyMessage {
+  const base = { type: 'ready' as const, pid, capabilities };
+  return codeVersion === undefined ? base : { ...base, codeVersion };
 }
 
 let portalGenerationCounter = 0;

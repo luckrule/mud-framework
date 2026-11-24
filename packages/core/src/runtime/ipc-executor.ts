@@ -80,6 +80,17 @@ export interface IpcExecutorOptions {
    */
   maxPending?: number;
   /**
+   * Opaque application code version. Stamped on every Request accepted here and
+   * kept across replays; compared only to warn when a `ready` reports another
+   * version. The framework never parses it or makes a decision from it
+   * (SPEC 6.4). Must be a non-empty string when set.
+   *
+   * A caller-supplied `ExecutorRequest.codeVersion` must also be a non-empty
+   * string; an invalid one fails that request with `INTERNAL_ERROR` instead of
+   * being sent.
+   */
+  codeVersion?: string;
+  /**
    * Defaults to a JSON logger writing to stdout with
    * `component: 'ipc-executor'` bindings (SPEC §7.1). Supplying one only
    * redirects where the events go; observability does not depend on it.
@@ -138,6 +149,7 @@ export class IpcExecutor implements RequestExecutor {
   private readonly stableResetMs: number;
   private readonly shutdownTimeoutMs: number;
   private readonly startTimeoutMs: number;
+  private readonly codeVersion: string | undefined;
   private readonly logger: Logger;
   private readonly portalGeneration: number;
   private readonly buffer: PendingBuffer;
@@ -200,6 +212,17 @@ export class IpcExecutor implements RequestExecutor {
       );
     }
     this.startTimeoutMs = startTimeoutMs;
+    // Opaque to the framework, but not every value survives the wire: the peer's
+    // parser accepts only a non-empty string, so anything else would leave a
+    // Server that can never reach `ready`.
+    if (
+      options.codeVersion !== undefined &&
+      (typeof options.codeVersion !== 'string' ||
+        options.codeVersion.length === 0)
+    ) {
+      throw new Error('codeVersion must be a non-empty string');
+    }
+    this.codeVersion = options.codeVersion;
     // The buffer owns the cap and validates it, so the refusal and the limit
     // it reports cannot drift from each other.
     this.buffer = new PendingBuffer({
@@ -395,9 +418,21 @@ export class IpcExecutor implements RequestExecutor {
         ),
       );
     }
+    const stamped = this.stampCodeVersion(request);
+    if (!stamped.ok) {
+      this.logger.error(
+        {
+          ...requestFields(request),
+          code: INTERNAL_ERROR,
+          reason: stamped.reason,
+        },
+        'request rejected',
+      );
+      return Promise.resolve(failure(INTERNAL_ERROR, stamped.reason));
+    }
     const deferred = Promise.withResolvers<ExecutorOutcome>();
     const pending = this.buffer.add(
-      request,
+      stamped.request,
       deferred,
       // A caller-supplied deadline may only tighten the ceiling this executor
       // already promised; otherwise the buffer would outlive the caller's own
@@ -428,6 +463,38 @@ export class IpcExecutor implements RequestExecutor {
       this.settle(pending, failure(INTERNAL_ERROR, messageOf(error)));
     }
     return deferred.promise;
+  }
+
+  /**
+   * Stamps this executor's code version on the Request it stores, so a replay
+   * carries the version it was accepted under rather than the replacement
+   * Server's (SPEC 6.4).
+   *
+   * A caller-supplied version wins, because the caller may know which code the
+   * Request belongs to, but it must be a non-empty string for the same reason
+   * the configured value is checked: the peer's parser rejects anything else, so
+   * the Request could never be delivered. An invalid value is refused here
+   * instead of being put on the wire.
+   */
+  private stampCodeVersion(
+    request: ExecutorRequest,
+  ): { ok: true; request: ExecutorRequest } | { ok: false; reason: string } {
+    if (request.codeVersion === undefined) {
+      return this.codeVersion === undefined
+        ? { ok: true, request }
+        : { ok: true, request: { ...request, codeVersion: this.codeVersion } };
+    }
+    if (
+      typeof request.codeVersion !== 'string' ||
+      request.codeVersion.length === 0
+    ) {
+      return {
+        ok: false,
+        reason:
+          'invalid caller-supplied codeVersion: expected a non-empty string',
+      };
+    }
+    return { ok: true, request };
   }
 
   /**
@@ -871,6 +938,7 @@ export class IpcExecutor implements RequestExecutor {
           server,
           message.pid,
           message.capabilities.maxTransactionDurationMs,
+          message.codeVersion,
         );
         return;
       case 'result':
@@ -906,6 +974,7 @@ export class IpcExecutor implements RequestExecutor {
     server: ServerState,
     pid: number,
     declaredMaxDurationMs: number,
+    actualCodeVersion: string | undefined,
   ): void {
     if (this.server !== server || server.closed) {
       this.logger.debug(
@@ -920,6 +989,24 @@ export class IpcExecutor implements RequestExecutor {
     }
     server.ready = true;
     server.pid = pid;
+    // Reported, not enforced: a Server built from different code may still be
+    // the only process available, and refusing it would turn a deployment
+    // mismatch into an outage (SPEC 6.4). A peer that omits the field says
+    // nothing about its version, so silence is not a mismatch.
+    if (
+      this.codeVersion !== undefined &&
+      actualCodeVersion !== undefined &&
+      actualCodeVersion !== this.codeVersion
+    ) {
+      this.logger.warn(
+        {
+          pid,
+          expectedCodeVersion: this.codeVersion,
+          actualCodeVersion,
+        },
+        'server code version differs from the portal version',
+      );
+    }
     if (this.isTerminal) {
       return;
     }

@@ -61,6 +61,7 @@ export interface HarnessOptions {
   extensions?: readonly Extension[];
   backend?: StorageBackend;
   timeoutMs?: number;
+  codeVersion?: string;
   /** Replaces the collecting logger: `logs()` then stays empty. */
   logger?: Logger;
   /** Observes every message Portal receives, for cross-array ordering checks. */
@@ -106,6 +107,7 @@ export function startServer(options: HarnessOptions = {}): Harness {
     createBackend: () => backend,
     extensions: options.extensions ?? [],
     timeoutMs: options.timeoutMs ?? 1000,
+    codeVersion: options.codeVersion,
     logger,
     channel: serverChannel,
     abortTimeoutMs: options.abortTimeoutMs,

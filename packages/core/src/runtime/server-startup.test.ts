@@ -4,7 +4,7 @@ import type { IpcChannel } from '../ipc/channel.ts';
 import { createInMemoryChannelPair } from '../ipc/channel.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import { MemoryStorageBackend } from '../storage/memory.ts';
-import { rejectionOf } from '../test-support/common.ts';
+import { isRecord, rejectionOf } from '../test-support/common.ts';
 import {
   parseLine,
   received,
@@ -101,6 +101,91 @@ describe('startServer', () => {
     expect(outcome).toEqual({ ok: true, result: 'hi' });
 
     await result.runtime.executor.close();
+  });
+
+  test('reports the configured code version in ready', async () => {
+    const backend = new MemoryStorageBackend();
+    const test1 = harness([echoExtension()]);
+    const { runtime } = await startServer(
+      test1.deps({ createBackend: () => backend, codeVersion: 'build-1' }),
+    );
+
+    expect(received(test1.messages)).toEqual([
+      {
+        type: 'ready',
+        pid: process.pid,
+        capabilities: backend.capabilities(),
+        codeVersion: 'build-1',
+      },
+    ]);
+
+    await runtime.executor.close();
+  });
+
+  test('omits the code version from ready when none is configured', async () => {
+    const test1 = harness([echoExtension()]);
+    const { runtime } = await startServer(test1.deps());
+
+    expect(received(test1.messages)).toEqual([
+      {
+        type: 'ready',
+        pid: process.pid,
+        capabilities: runtime.capabilities,
+      },
+    ]);
+    const raw = test1.messages.find(
+      (message) => isRecord(message) && message.type === 'ready',
+    );
+    expect(raw).not.toHaveProperty('codeVersion');
+
+    await runtime.executor.close();
+  });
+
+  test('rejects an empty code version before creating the backend', async () => {
+    const test1 = harness();
+    let created = 0;
+
+    const error = await rejectionOf(
+      startServer(
+        test1.deps({
+          codeVersion: '',
+          createBackend: () => {
+            created += 1;
+            return new MemoryStorageBackend();
+          },
+        }),
+      ),
+    );
+
+    expect(error).toBeInstanceOf(ServerStartupError);
+    // Refused before the backend exists, so there is nothing to close and the
+    // process never reaches the point where it would send `ready`.
+    expect(created).toBe(0);
+    expect(received(test1.messages)).toEqual([]);
+    const failures = test1
+      .logs()
+      .filter((line) => line.code === 'SERVER_STARTUP_FAILED');
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatchObject({
+      level: 'error',
+      msg: 'server process failed to start',
+      code: 'SERVER_STARTUP_FAILED',
+      reason: 'codeVersion must be a non-empty string',
+    });
+  });
+
+  test('rejects a non-string code version at runtime', async () => {
+    const test1 = harness();
+
+    const error = await rejectionOf(
+      startServer(test1.deps({ codeVersion: 7 as unknown as string })),
+    );
+
+    expect(error).toBeInstanceOf(ServerStartupError);
+    expect(received(test1.messages)).toEqual([]);
+    expect(
+      test1.logs().filter((line) => line.code === 'SERVER_STARTUP_FAILED'),
+    ).toHaveLength(1);
   });
 
   test('tags an Extension handler with the Extension name in context and logs', async () => {
