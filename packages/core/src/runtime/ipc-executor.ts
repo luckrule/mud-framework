@@ -1,6 +1,6 @@
 import { messageOf } from '../internal/guards.ts';
 import type { IpcChannel } from '../ipc/channel.ts';
-import type { RequestMessage, ResultMessage } from '../ipc/protocol.ts';
+import type { ResultMessage } from '../ipc/protocol.ts';
 import { parseIpcMessage } from '../ipc/protocol.ts';
 import type { ServerExitInfo, SpawnedServer } from '../ipc/spawn-port.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
@@ -10,6 +10,21 @@ import type {
   ExecutorRequest,
   RequestExecutor,
 } from './executor.ts';
+import {
+  DEFAULT_MAX_PENDING,
+  DEFAULT_MAX_REPLAYS,
+  DEFAULT_RESTART_BACKOFF_MS,
+  DEFAULT_SHUTDOWN_TIMEOUT_MS,
+  EXIT_WAIT_TIMEOUT_MS,
+  MAX_RESTART_BACKOFF_MS,
+  SHUTDOWN_ACK_SLACK_MS,
+  closeBudget,
+} from './ipc-budget.ts';
+import {
+  failure,
+  nextPortalGeneration,
+  requestMessage,
+} from './ipc-messages.ts';
 import { effectiveTimeoutMs, settleWithin, tightenTimeout } from './timeout.ts';
 import {
   FRAMEWORK_QUEUE_FULL,
@@ -18,35 +33,6 @@ import {
   FRAMEWORK_TIMEOUT,
   INTERNAL_ERROR,
 } from './wire-codes.ts';
-
-const DEFAULT_MAX_REPLAYS = 3;
-const DEFAULT_RESTART_BACKOFF_MS = 100;
-const MAX_RESTART_BACKOFF_MS = 5000;
-const DEFAULT_SHUTDOWN_TIMEOUT_MS = 5000;
-/**
- * Upper bound on how long a kill is awaited before the Portal moves on.
- * SIGKILL normally lands in milliseconds; a process stuck in uninterruptible
- * sleep would otherwise stall shutdown or restart forever.
- */
-const EXIT_WAIT_TIMEOUT_MS = 2000;
-/**
- * Slack on top of the graceful-close grace before the Portal gives up on
- * `closed`. The grace is declared to the Server in the `shutdown` message, but
- * the Server starts spending it when the message arrives — one IPC hop after the
- * Portal started its own timer. Waiting exactly the declared grace would
- * therefore always end first and kill a Server that was about to send `closed`,
- * which is the defect the declaration exists to remove. The slack covers the
- * hop, so "the Server used its whole budget" is the observable outcome.
- */
-const SHUTDOWN_ACK_SLACK_MS = 250;
-/**
- * Upper bound on requests buffered but not yet acknowledged. Their lifetime is
- * bounded by the request deadline, so this is not a steady-state limit; it is a
- * brake for the case the deadline cannot cover: a Server that stays unavailable
- * while a client keeps writing, which would otherwise grow the buffer until the
- * Portal runs out of memory.
- */
-const DEFAULT_MAX_PENDING = 10_000;
 
 export interface IpcExecutorOptions {
   spawn: () => SpawnedServer;
@@ -488,29 +474,11 @@ export class IpcExecutor implements RequestExecutor {
   }
 
   /**
-   * The worst case `doClose` can take, derived from the steps it actually runs:
-   *
-   * 1. drain the requests buffered but not yet acknowledged —
-   *    `shutdownTimeoutMs`;
-   * 2. send `shutdown` and wait for the Server's `closed` — the declared grace
-   *    plus `SHUTDOWN_ACK_SLACK_MS` (see `waitForClosed`);
-   * 3. wait for the process to exit — `EXIT_WAIT_TIMEOUT_MS`;
-   * 4. if it did not, kill it and wait once more — `EXIT_WAIT_TIMEOUT_MS`.
-   *
-   * The two shutdown timeouts are not the same wait: one is Portal's own drain,
-   * the other is the Server's graceful close, which is why both are counted.
-   *
-   * Step 2's grace is also the budget declared to the Server in the `shutdown`
-   * message, so the Server's whole graceful close fits inside step 2 by
-   * construction — that is what keeps a correctly closing Server from being
-   * killed by step 4.
+   * The worst case `doClose` can take, derived from the steps it actually runs
+   * (see `closeBudget` in `ipc-budget.ts`).
    */
   get closeBudgetMs(): number {
-    const drainMs = this.shutdownTimeoutMs;
-    const gracefulCloseMs = this.shutdownTimeoutMs + SHUTDOWN_ACK_SLACK_MS;
-    const exitWaitMs = EXIT_WAIT_TIMEOUT_MS;
-    const postKillExitWaitMs = EXIT_WAIT_TIMEOUT_MS;
-    return drainMs + gracefulCloseMs + exitWaitMs + postKillExitWaitMs;
+    return closeBudget(this.shutdownTimeoutMs);
   }
 
   /**
@@ -1209,7 +1177,13 @@ export class IpcExecutor implements RequestExecutor {
       return true;
     }
     try {
-      server.channel.send(requestMessage(pending, replayCount));
+      server.channel.send(
+        requestMessage(
+          pending.request,
+          Math.max(1, pending.deadlineAt - Date.now()),
+          replayCount,
+        ),
+      );
     } catch (error) {
       this.onServerLost(server, null, null, `send failed: ${messageOf(error)}`);
       return false;
@@ -1325,35 +1299,4 @@ export class IpcExecutor implements RequestExecutor {
     this.seq += 1;
     return this.seq;
   }
-}
-
-function requestMessage(
-  pending: PendingRequest,
-  replayCount: number,
-): RequestMessage {
-  const request = pending.request;
-  return {
-    // The identity fields are the request's own and mean the same on the wire,
-    // so they are carried over rather than copied one by one.
-    ...request,
-    type: 'request',
-    // The Portal's deadline is authoritative, so the Server is given the time
-    // actually left, not the original budget: a replay that arrives late must
-    // be able to roll back on its own instead of writing after the Portal has
-    // already settled the request (INV-007). The floor is 1 because the
-    // protocol requires a positive `timeoutMs`.
-    timeoutMs: Math.max(1, pending.deadlineAt - Date.now()),
-    replayCount,
-  };
-}
-
-function failure(code: string, message: string): ExecutorOutcome {
-  return { ok: false, error: { code, message } };
-}
-
-let portalGenerationCounter = 0;
-
-function nextPortalGeneration(): number {
-  portalGenerationCounter += 1;
-  return portalGenerationCounter;
 }
