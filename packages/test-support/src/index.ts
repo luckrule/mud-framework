@@ -185,7 +185,7 @@ export function isProcessAlive(pid: number): boolean {
  * It listens for `message` and `error` only: a `close` without either leaves it
  * pending forever, and it has no timeout. Pair it with `withDeadline` whenever a
  * missing reply must fail the test. The timed-out copy in
- * `scripts/package-smoke.ts` stays local on purpose: the smoke test needs
+ * `scripts/package-smoke/index.ts` stays local on purpose: the smoke test needs
  * `close` and timeout handling that these tests do not.
  */
 export function nextMessage(socket: WebSocket): Promise<string | Uint8Array> {

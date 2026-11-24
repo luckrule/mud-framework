@@ -42,7 +42,7 @@ import {
  * of letting cleanup hide it.
  */
 
-const SERVER_ENTRY = join(import.meta.dir, 'package-smoke', 'server.ts');
+const SERVER_ENTRY = join(import.meta.dir, 'server.ts');
 const REQUEST_TIMEOUT_MS = 5000;
 const DEFAULT_OVERALL_TIMEOUT_MS = 30_000;
 const CLEANUP_STOP_TIMEOUT_MS = 5000;

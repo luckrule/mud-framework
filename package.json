@@ -14,7 +14,7 @@
     "test": "bun test --parallel",
     "test:unit": "bun test packages --parallel",
     "test:integration": "bun test tests/integration --parallel",
-    "smoke:package": "bun run scripts/package-smoke.ts",
+    "smoke:package": "bun run scripts/package-smoke/index.ts",
     "prepare": "git config core.hooksPath .githooks || true"
   },
   "devDependencies": {
