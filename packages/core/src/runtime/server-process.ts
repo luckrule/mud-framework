@@ -11,15 +11,12 @@ import type {
 import { parseIpcMessage } from '../ipc/protocol.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import type { Logger } from '../logging/types.ts';
-import { checkBackendCapabilities } from '../storage/capabilities.ts';
-import { degradations } from '../storage/degradations.ts';
-import { unmetRequirements } from '../storage/requirements.ts';
-import type { StorageBackend, StorageCapabilities } from '../storage/types.ts';
-import { Dispatcher } from './dispatcher.ts';
+import type { StorageBackend } from '../storage/types.ts';
 import type { ExecutorOutcome } from './executor.ts';
-import { LocalExecutor } from './executor.ts';
 import type { Extension } from './extension.ts';
 import type { RequestIdentity } from './identity.ts';
+import type { Runtime } from './server-startup.ts';
+import { startServer } from './server-startup.ts';
 import { settleWithin } from './timeout.ts';
 import {
   FRAMEWORK_SHUTDOWN,
@@ -68,23 +65,6 @@ export interface ServerProcessOptions {
 }
 
 /**
- * The process could not reach the readiness barrier: backend creation, the
- * capability self-check, an Extension's unmet requirements or its `register`
- * failed. `ready` was not sent, so Portal must not have started delivering
- * requests.
- */
-export class ServerStartupError extends Error {
-  readonly code = 'SERVER_STARTUP_FAILED';
-  readonly reason: string;
-
-  constructor(reason: string) {
-    super(`server process failed to start: ${reason}`);
-    this.name = 'ServerStartupError';
-    this.reason = reason;
-  }
-}
-
-/**
  * The link to Portal went away without `shutdown`. The process has no one left
  * to answer, so it stops; Portal is expected to restart it and replay.
  */
@@ -97,12 +77,6 @@ export class ServerChannelClosedError extends Error {
     this.name = 'ServerChannelClosedError';
     this.reason = reason;
   }
-}
-
-interface Runtime {
-  readonly dispatcher: Dispatcher;
-  readonly executor: LocalExecutor;
-  readonly capabilities: StorageCapabilities;
 }
 
 interface PendingRequest {
@@ -296,147 +270,28 @@ class ServerProcess {
     void this.abort(runtime, 'the parent process is gone');
   }
 
-  private async start(): Promise<void> {
-    const backend = await this.createBackend();
-    let dispatcher: Dispatcher | undefined;
-    try {
-      // SPEC 6.2 step 1: the backend self-checks its declaration before any
-      // handler can see it. A declaration the framework cannot reason about is
-      // refused here, not degraded into undefined later (INV-009, INV-010).
-      const checked = checkBackendCapabilities(backend.capabilities());
-      if (!checked.ok) {
-        throw new ServerStartupError(
-          `storage capability self-check failed: ${checked.reason}`,
-        );
-      }
-      // SPEC 4.3: a backend weaker than the strongest level is a degradation,
-      // reported once per dimension here so it stays at startup volume. The
-      // `ready` info line below carries the full declaration; these lines carry
-      // what each shortfall costs the business. Both are needed: one for the
-      // whole picture, one per consequence.
-      for (const degradation of degradations(checked.capabilities)) {
-        this.logger.warn(
-          {
-            capability: degradation.capability,
-            declared: degradation.declared,
-            consequence: degradation.consequence,
-          },
-          'storage capability degraded',
-        );
-      }
-      dispatcher = new Dispatcher({
-        backend,
-        timeoutMs: this.options.timeoutMs,
-        logger: this.logger,
-      });
-      const runtime: Runtime = {
-        dispatcher,
-        executor: new LocalExecutor({ dispatcher }),
-        capabilities: checked.capabilities,
-      };
-      this.runtime = runtime;
-      // SPEC 6.2 step 2: every Extension is checked against the backend and
-      // registered before Portal can deliver anything (INV-010).
-      const skipped = await this.registerExtensions(
-        dispatcher,
-        checked.capabilities,
-      );
-      if (skipped > 0 && skipped === this.options.extensions.length) {
-        // Still ready: a Server with no handlers answers every request with
-        // UNKNOWN_METHOD, which is diagnosable, whereas refusing to start would
-        // take down a process the Portal is waiting on. The line is the signal.
-        this.logger.warn(
-          { total: this.options.extensions.length, skipped },
-          'no extension registered: every extension was skipped',
-        );
-      }
-      // SPEC 6.2 step 3: only now is the readiness barrier crossed. Sending it
-      // earlier would let the first requests hit a half-initialized Server.
-      this.channel.send({
-        type: 'ready',
-        pid: process.pid,
-        capabilities: runtime.capabilities,
-      });
-      this.logger.info(
-        { pid: process.pid, capabilities: runtime.capabilities },
-        'server process ready',
-      );
-      // Inbound plumbing goes last: a message that arrives before these
-      // handlers are attached is buffered by the channel and delivered at
-      // registration, so none is lost and none is handled before `ready`.
-      this.channel.onMessage((raw) => {
-        this.onMessage(runtime, raw);
-      });
-      this.channel.onClose((reason) => {
-        this.onChannelClose(runtime, reason);
-      });
-    } catch (error) {
-      const failure =
-        error instanceof ServerStartupError
-          ? error
-          : new ServerStartupError(messageOf(error));
-      this.logger.error(
-        { code: failure.code, reason: failure.reason },
-        'server process failed to start',
-      );
-      await closeQuietly(dispatcher, backend, this.logger);
-      throw failure;
-    }
-  }
-
   /**
-   * Checks each Extension against the backend declaration and registers the
-   * ones it satisfies (SPEC 4.3, INV-010). Returns how many were skipped.
-   *
-   * A skipped Extension never has its `register` called, so none of its
-   * handlers exist; one Extension being skipped does not affect the others. A
-   * `required` Extension that fails is different: the process cannot run
-   * without it, so startup is refused before `ready` (SPEC 6.2 step 2).
+   * Crosses the readiness barrier through `startServer` (SPEC 6.2) and only
+   * then attaches the inbound handlers: the channel buffers messages that
+   * arrive before registration, so nothing is lost and nothing is handled
+   * before `ready`. Attaching them earlier would break that contract.
    */
-  private async registerExtensions(
-    dispatcher: Dispatcher,
-    capabilities: StorageCapabilities,
-  ): Promise<number> {
-    let skipped = 0;
-    for (const extension of this.options.extensions) {
-      const unmet = unmetRequirements(capabilities, extension.requires ?? {});
-      if (unmet.length === 0) {
-        // oxlint-disable-next-line eslint/no-await-in-loop -- registration order is the contract: a later Extension may rely on an earlier one's handlers
-        await extension.register(dispatcher);
-        this.logger.info({ extension: extension.name }, 'extension registered');
-        continue;
-      }
-      if (extension.required === true) {
-        this.logger.error(
-          { extension: extension.name, unmet },
-          'required extension cannot start',
-        );
-        throw new ServerStartupError(
-          `required extension "${extension.name}" cannot start: ${unmet.join('; ')}`,
-        );
-      }
-      skipped += 1;
-      this.logger.warn(
-        { extension: extension.name, unmet },
-        'extension skipped: storage capabilities unmet',
-      );
-    }
-    return skipped;
-  }
-
-  private async createBackend(): Promise<StorageBackend> {
-    try {
-      return await this.options.createBackend();
-    } catch (error) {
-      const failure = new ServerStartupError(
-        `storage backend could not be created: ${messageOf(error)}`,
-      );
-      this.logger.error(
-        { code: failure.code, reason: failure.reason },
-        'server process failed to start',
-      );
-      throw failure;
-    }
+  private async start(): Promise<void> {
+    const { runtime } = await startServer({
+      options: this.options,
+      logger: this.logger,
+      channel: this.channel,
+    });
+    this.runtime = runtime;
+    // Inbound plumbing goes last: a message that arrives before these
+    // handlers are attached is buffered by the channel and delivered at
+    // registration, so none is lost and none is handled before `ready`.
+    this.channel.onMessage((raw) => {
+      this.onMessage(runtime, raw);
+    });
+    this.channel.onClose((reason) => {
+      this.onChannelClose(runtime, reason);
+    });
   }
 
   private onMessage(runtime: Runtime, raw: unknown): void {
@@ -1048,25 +903,6 @@ function requestIds(message: RequestMessage): RequestIdentity {
     return ids;
   }
   return { ...ids, sessionId: message.sessionId };
-}
-
-async function closeQuietly(
-  dispatcher: Dispatcher | undefined,
-  backend: StorageBackend,
-  logger: Logger,
-): Promise<void> {
-  try {
-    if (dispatcher !== undefined) {
-      await dispatcher.close();
-    } else {
-      await backend.close();
-    }
-  } catch (error) {
-    logger.error(
-      { code: 'STORAGE_CLOSE_FAILED', reason: messageOf(error) },
-      'storage backend could not be closed',
-    );
-  }
 }
 
 function elapsedSince(startedAt: number): number {

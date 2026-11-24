@@ -19,8 +19,8 @@ import {
   resolveShutdownBudgetMs,
   runServerProcess,
   ServerChannelClosedError,
-  ServerStartupError,
 } from './server-process.ts';
+import { ServerStartupError } from './server-startup.ts';
 import { BusinessError } from './wire-codes.ts';
 
 const sleep = (ms: number): Promise<void> =>
@@ -72,7 +72,6 @@ function results(messages: readonly unknown[]): ResultMessage[] {
 }
 
 function sendRaw(portal: IpcChannel, raw: unknown): void {
-  // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- the test sends a malformed message on purpose
   portal.send(raw as IpcMessage);
 }
 
@@ -1752,7 +1751,6 @@ describe('resolveShutdownBudgetMs', () => {
  */
 function brokenBackend(declared: unknown): StorageBackend {
   return {
-    // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- test double for an invalid declaration
     capabilities: (): StorageCapabilities => declared as StorageCapabilities,
     transaction: <T>(): Promise<T> =>
       Promise.reject(new Error('broken backend must not run transactions')),

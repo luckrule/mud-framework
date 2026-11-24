@@ -60,8 +60,8 @@
     "typescript/no-unsafe-assignment": "error",
     "typescript/no-unsafe-return": "error",
     "unicorn/no-process-exit": "error",
-    "eslint/no-console": "warn",
-    "eslint/no-await-in-loop": "warn"
+    "eslint/no-console": "error",
+    "eslint/no-await-in-loop": "error"
   },
   "options": {
     "typeAware": true,
@@ -69,10 +69,16 @@
   },
   "overrides": [
     {
-      "files": ["tests/**"],
+      "files": ["tests/**", "packages/**/*.test.ts"],
       "rules": {
         "eslint/no-console": "off",
-        "eslint/no-await-in-loop": "off"
+        "eslint/no-await-in-loop": "off",
+        "typescript/no-unsafe-type-assertion": "off",
+        "typescript/no-unsafe-assignment": "off",
+        "typescript/no-unsafe-argument": "off",
+        "typescript/no-unsafe-call": "off",
+        "typescript/no-unsafe-return": "off",
+        "typescript/prefer-readonly": "off"
       }
     }
   ],

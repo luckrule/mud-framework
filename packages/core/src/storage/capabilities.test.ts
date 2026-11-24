@@ -21,7 +21,6 @@ const valid: StorageCapabilities = {
 function backendOf(
   declared: unknown,
 ): ReturnType<typeof checkBackendCapabilities> {
-  // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- test double for an invalid declaration
   return checkBackendCapabilities(declared as StorageCapabilities);
 }
 

@@ -463,7 +463,6 @@ describe('ConnectionLayer', () => {
     const executor: RequestExecutor = {
       start: () => Promise.resolve(),
       execute: () => {
-        // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- untyped test double
         return Promise.resolve({ ok: false } as ExecutorOutcome);
       },
       cancel: () => Promise.resolve(),

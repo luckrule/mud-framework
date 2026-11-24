@@ -83,8 +83,8 @@ export type { ServerProcessOptions } from './runtime/server-process.ts';
 export {
   runServerProcess,
   ServerChannelClosedError,
-  ServerStartupError,
 } from './runtime/server-process.ts';
+export { ServerStartupError } from './runtime/server-startup.ts';
 export type { IpcChannel } from './ipc/channel.ts';
 export { IpcChannelClosedError } from './ipc/channel.ts';
 export type { IpcMessage, IpcParseResult } from './ipc/protocol.ts';
