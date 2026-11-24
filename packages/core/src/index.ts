@@ -24,17 +24,19 @@ export type {
 } from './storage/types.ts';
 export type { StorageRequirements } from './storage/requirements.ts';
 export { unmetRequirements } from './storage/requirements.ts';
-export type { Extension } from './runtime/extension.ts';
+export type { Extension, ExtensionRegistrar } from './runtime/extension.ts';
 export type {
   Transport,
   TransportConnection,
   TransportHandlers,
 } from './transport/types.ts';
 export type {
+  CancelOutcome,
   DispatchMeta,
   DispatchResult,
   DispatcherOptions,
   Handler,
+  HandlerOptions,
   RequestContext,
 } from './runtime/dispatcher.ts';
 export { Dispatcher } from './runtime/dispatcher.ts';

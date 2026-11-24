@@ -59,6 +59,8 @@ export interface RequestContext extends RequestIdentity {
    * half-created session behind.
    */
   bindSession(sessionId: string): void;
+  /** The Extension that registered this handler, when one did (SPEC 7.1). */
+  readonly extension?: string;
   /** Already bound to the request's ids; handlers never build one. */
   logger: Logger;
   storage: StorageTransaction;
@@ -86,6 +88,17 @@ export type Handler = (
   payload: unknown,
 ) => Promise<unknown>;
 
+export interface HandlerOptions {
+  /** The Extension that owns this handler, for request logs (SPEC 7.1). */
+  readonly extension?: string;
+  /**
+   * SPEC 3.6: the business declared this request must not be cancelled
+   * mid-flight, because its side effect cannot be rolled back. Timeouts still
+   * apply — only the cancel path is refused.
+   */
+  readonly cancellable?: boolean;
+}
+
 export interface DispatcherOptions {
   backend: StorageBackend;
   timeoutMs: number;
@@ -94,6 +107,14 @@ export interface DispatcherOptions {
   /** Defaults to the JSON logger; tests inject a sink-backed one. */
   logger?: Logger;
 }
+
+/**
+ * - `cancelled`: the transaction was invalidated and rolls back.
+ * - `not-cancellable`: the handler declared itself non-cancellable (SPEC 3.6);
+ *   it keeps running and its result is still owed.
+ * - `not-in-flight`: unknown id or already terminal.
+ */
+export type CancelOutcome = 'cancelled' | 'not-cancellable' | 'not-in-flight';
 
 /**
  * A request's terminal-state flag plus the signal that announces it. Both live
@@ -106,6 +127,15 @@ interface Expiry {
   readonly controller: AbortController;
 }
 
+/** What `register` remembers about a handler; `dispatch` and `cancel` need it. */
+interface HandlerEntry {
+  readonly handler: Handler;
+  /** The owning Extension, if any, for request logs (SPEC 7.1). */
+  readonly extension?: string;
+  /** False when the handler's side effect cannot be rolled back (SPEC 3.6). */
+  readonly cancellable: boolean;
+}
+
 /**
  * One request that has not reached a terminal state yet. `cancel` needs the
  * expiry (to invalidate later writes) and the resolver (to settle the dispatch
@@ -116,6 +146,10 @@ interface InFlight {
   /** Request-bound, so the cancellation line carries the same ids as the rest. */
   readonly logger: Logger;
   readonly startedAt: number;
+  /** Only the cancel-refused line names it; the logger binds ids, not methods. */
+  readonly method: string;
+  /** Captured at dispatch, so a later re-register cannot change this request. */
+  readonly cancellable: boolean;
   /** Settles the dispatch race as failed. A second call is a no-op. */
   readonly fail: (error: Error) => void;
 }
@@ -128,7 +162,7 @@ export class Dispatcher {
   private readonly timeoutMs: number;
   private readonly createRequestId: () => string;
   private readonly logger: Logger;
-  private readonly handlers = new Map<string, Handler>();
+  private readonly handlers = new Map<string, HandlerEntry>();
   /** Requests that have not reached a terminal state, by framework request id. */
   private readonly inFlight = new Map<string, InFlight>();
   private closed = false;
@@ -152,9 +186,15 @@ export class Dispatcher {
     });
   }
 
-  register(name: string, handler: Handler): void {
+  register(name: string, handler: Handler, options?: HandlerOptions): void {
     this.assertOpen();
-    this.handlers.set(name, handler);
+    this.handlers.set(name, {
+      handler,
+      ...(options?.extension === undefined
+        ? {}
+        : { extension: options.extension }),
+      cancellable: options?.cancellable ?? true,
+    });
   }
 
   async dispatch(
@@ -169,6 +209,7 @@ export class Dispatcher {
     const requestId = meta.requestId ?? this.createRequestId();
     const connectionId = meta.connectionId ?? '';
     const clientRequestId = meta.clientRequestId ?? '';
+    const registered = this.handlers.get(name);
     const bindings: Record<string, unknown> = {
       requestId,
       connectionId,
@@ -177,10 +218,14 @@ export class Dispatcher {
     if (meta.sessionId !== undefined) {
       bindings.sessionId = meta.sessionId;
     }
+    // Only when a handler has one: a request no Extension owns must not carry
+    // the field at all (SPEC 7.1).
+    if (registered?.extension !== undefined) {
+      bindings.extension = registered.extension;
+    }
     const logger = this.logger.child(bindings);
 
-    const handler = this.handlers.get(name);
-    if (handler === undefined) {
+    if (registered === undefined) {
       logger.warn({ method: name }, 'dispatch rejected: unknown method');
       throw new UnknownHandlerError(name);
     }
@@ -203,6 +248,8 @@ export class Dispatcher {
       expiry,
       logger,
       startedAt: performance.now(),
+      method: name,
+      cancellable: registered.cancellable,
       fail: (error) => terminal.reject(error),
     };
     // Registered before the handler can run so a cancel in the same batch finds
@@ -246,6 +293,7 @@ export class Dispatcher {
           clientRequestId,
           sessionId: meta.sessionId,
           signal: expiry.controller.signal,
+          extension: registered.extension,
           bindSession: (sessionId) => {
             assertActive(expiry);
             if (sessionId.length === 0) {
@@ -267,7 +315,7 @@ export class Dispatcher {
           logger,
           storage: guard(tx, expiry),
         };
-        const result = await handler(context, payload);
+        const result = await registered.handler(context, payload);
         // The handler outlived its terminal state: force the backend to roll
         // back instead of committing effects nobody is waiting for
         // (SPEC 3.3, 3.4).
@@ -307,19 +355,33 @@ export class Dispatcher {
    * rejected, and the transaction rolls back when the handler returns
    * (SPEC 3.3, 3.6). `ctx.signal` also aborts with `code` as its reason, so a
    * handler that listens can stop early instead of only discovering the
-   * terminal state at its next write. Returns false when the request already
-   * reached a terminal state, or never existed here.
+   * terminal state at its next write.
    *
-   * `true` means the cancellation was accepted, NOT that the transaction rolled
-   * back. `StorageBackend.transaction` commits after its callback resolves, so a
-   * handler that had already returned can still commit in the window before the
-   * backend's COMMIT finishes; that outcome is logged at warn with
-   * `code: 'CANCEL_LOST_TO_COMMIT'` instead of being silently swallowed.
+   * A handler registered with `cancellable: false` is refused instead: the
+   * request keeps its expiry, its signal and its promise, so the timeout still
+   * ends it and its result is still owed (SPEC 3.6). Only the cancel path is
+   * refused, never the deadline.
+   *
+   * `'cancelled'` means the cancellation was accepted, NOT that the transaction
+   * rolled back. `StorageBackend.transaction` commits after its callback
+   * resolves, so a handler that had already returned can still commit in the
+   * window before the backend's COMMIT finishes; that outcome is logged at warn
+   * with `code: 'CANCEL_LOST_TO_COMMIT'` instead of being silently swallowed.
    */
-  cancel(requestId: string, code: string): boolean {
+  cancel(requestId: string, code: string): CancelOutcome {
     const entry = this.inFlight.get(requestId);
     if (entry === undefined) {
-      return false;
+      return 'not-in-flight';
+    }
+    if (!entry.cancellable) {
+      // Nothing is touched: setting `expired` or aborting here would roll back
+      // work the business declared irreversible, and settling the promise would
+      // throw away a result that is still owed (SPEC 3.6).
+      entry.logger.warn(
+        { code, method: entry.method, reason: 'declared non-cancellable' },
+        'cancel refused: handler declared non-cancellable',
+      );
+      return 'not-cancellable';
     }
     // Removed before the race continuation runs, so a second cancel for the
     // same id already sees a terminal request.
@@ -337,7 +399,7 @@ export class Dispatcher {
       { code, durationMs: Math.round(performance.now() - entry.startedAt) },
       'request cancelled',
     );
-    return true;
+    return 'cancelled';
   }
 
   async close(): Promise<void> {

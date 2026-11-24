@@ -8,8 +8,7 @@ import type {
 import { parseIpcMessage } from '../ipc/protocol.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import type { Logger } from '../logging/types.ts';
-import type { Dispatcher } from '../runtime/dispatcher.ts';
-import type { Extension } from '../runtime/extension.ts';
+import type { Extension, ExtensionRegistrar } from '../runtime/extension.ts';
 import { runServerProcess } from '../runtime/server-process.ts';
 import { ServerStartupError } from '../runtime/server-startup.ts';
 import { MemoryStorageBackend } from '../storage/memory.ts';
@@ -143,8 +142,8 @@ export function numberField(
   return value;
 }
 
-export function echoRegistration(dispatcher: Dispatcher): void {
-  dispatcher.register('echo', (_ctx, payload) => Promise.resolve(payload));
+export function echoRegistration(registrar: ExtensionRegistrar): void {
+  registrar.register('echo', (_ctx, payload) => Promise.resolve(payload));
 }
 
 /** Narrows the rejection without an unchecked cast, so a wrong type fails loudly. */

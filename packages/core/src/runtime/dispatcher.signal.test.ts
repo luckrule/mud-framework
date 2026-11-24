@@ -64,7 +64,7 @@ describe('Dispatcher.abortSignal', () => {
 
     const pending = dispatcher.dispatch('slow', null, { requestId: 'r1' });
     await entered.promise;
-    expect(dispatcher.cancel('r1', 'TRANSPORT_CLOSED')).toBe(true);
+    expect(dispatcher.cancel('r1', 'TRANSPORT_CLOSED')).toBe('cancelled');
     await rejectionOf(pending);
     release.resolve();
     await sleep(5);

@@ -108,8 +108,8 @@ function requestMessage(
 function echoExtension(name = 'echo'): Extension {
   return {
     name,
-    register: (dispatcher) => {
-      dispatcher.register('echo', (_ctx, payload) => Promise.resolve(payload));
+    register: (registrar) => {
+      registrar.register('echo', (_ctx, payload) => Promise.resolve(payload));
     },
   };
 }
@@ -145,6 +145,79 @@ describe('startServer', () => {
     expect(outcome).toEqual({ ok: true, result: 'hi' });
 
     await result.runtime.executor.close();
+  });
+
+  test('tags an Extension handler with the Extension name in context and logs', async () => {
+    const test1 = harness([
+      {
+        name: 'banking',
+        register: (registrar) => {
+          registrar.register('deposit', async (ctx) => {
+            ctx.logger.info({ detail: 'seen' }, 'handler ran');
+            return ctx.extension;
+          });
+        },
+      },
+    ]);
+
+    const { runtime } = await startServer(test1.deps());
+    const outcome = await runtime.executor.execute({
+      requestId: 'req-1',
+      connectionId: 'c1',
+      clientRequestId: 'client-1',
+      method: 'deposit',
+      payload: null,
+      timeoutMs: 1000,
+    });
+
+    expect(outcome).toEqual({ ok: true, result: 'banking' });
+    const handlerLines = test1
+      .logs()
+      .filter((line) => line.msg === 'handler ran');
+    expect(handlerLines).toHaveLength(1);
+    expect(handlerLines[0]).toMatchObject({
+      extension: 'banking',
+      requestId: 'req-1',
+      connectionId: 'c1',
+      clientRequestId: 'client-1',
+    });
+
+    await runtime.executor.close();
+  });
+
+  test('passes a non-cancellable declaration through to the dispatcher', async () => {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const test1 = harness([
+      {
+        name: 'banking',
+        register: (registrar) => {
+          registrar.register(
+            'charge',
+            async () => {
+              entered.resolve();
+              await release.promise;
+              return 'charged';
+            },
+            { cancellable: false },
+          );
+        },
+      },
+    ]);
+
+    const { runtime } = await startServer(test1.deps());
+    const pending = runtime.dispatcher.dispatch('charge', null, {
+      requestId: 'req-nc',
+    });
+    await entered.promise;
+
+    expect(runtime.dispatcher.cancel('req-nc', 'TRANSPORT_CLOSED')).toBe(
+      'not-cancellable',
+    );
+    release.resolve();
+
+    expect(await pending).toEqual({ result: 'charged' });
+    await runtime.executor.close();
   });
 
   test('leaves inbound handlers unattached so messages stay buffered', async () => {

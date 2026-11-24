@@ -1,5 +1,17 @@
 import type { StorageRequirements } from '../storage/requirements.ts';
-import type { Dispatcher } from './dispatcher.ts';
+import type { Handler } from './dispatcher.ts';
+
+/**
+ * What an Extension registers through: the owning Extension is tagged
+ * automatically so request logs can name it (SPEC 7.1).
+ */
+export interface ExtensionRegistrar {
+  register(
+    method: string,
+    handler: Handler,
+    options?: { cancellable?: boolean },
+  ): void;
+}
 
 /**
  * A packaged unit of business capability (SPEC 2): it registers handlers and
@@ -16,5 +28,5 @@ export interface Extension {
    * startup instead of being skipped.
    */
   readonly required?: boolean;
-  register(dispatcher: Dispatcher): void | Promise<void>;
+  register(registrar: ExtensionRegistrar): void | Promise<void>;
 }

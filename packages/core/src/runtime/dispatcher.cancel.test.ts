@@ -8,7 +8,11 @@ import {
   parseLines,
   quietDispatcher,
 } from '../test-support/dispatcher.ts';
-import { FrameworkTimeoutError, RequestCancelledError } from './dispatcher.ts';
+import {
+  type CancelOutcome,
+  FrameworkTimeoutError,
+  RequestCancelledError,
+} from './dispatcher.ts';
 
 describe('Dispatcher.cancel', () => {
   test('cancel rejects later writes and rolls the transaction back', async () => {
@@ -32,7 +36,7 @@ describe('Dispatcher.cancel', () => {
 
     const pending = dispatcher.dispatch('slow', null, { requestId: 'r1' });
     await entered.promise;
-    expect(dispatcher.cancel('r1', 'TRANSPORT_CLOSED')).toBe(true);
+    expect(dispatcher.cancel('r1', 'TRANSPORT_CLOSED')).toBe('cancelled');
     const error = await rejectionOf(pending);
     release.resolve();
     // The rollback happens only when the abandoned handler returns.
@@ -81,16 +85,18 @@ describe('Dispatcher.cancel', () => {
     expect(typeof cancelled[0]?.durationMs).toBe('number');
   });
 
-  test('cancel returns false for a request that already finished', async () => {
+  test('cancel returns not-in-flight for a request that already finished', async () => {
     const backend = new MemoryStorageBackend();
     const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });
     dispatcher.register('echo', async (_ctx, payload) => payload);
 
     await dispatcher.dispatch('echo', 'hi', { requestId: 'done' });
 
-    expect(dispatcher.cancel('done', 'TRANSPORT_CLOSED')).toBe(false);
+    expect(dispatcher.cancel('done', 'TRANSPORT_CLOSED')).toBe('not-in-flight');
     // An id that never arrived is the same case: nothing to undo.
-    expect(dispatcher.cancel('never-seen', 'TRANSPORT_CLOSED')).toBe(false);
+    expect(dispatcher.cancel('never-seen', 'TRANSPORT_CLOSED')).toBe(
+      'not-in-flight',
+    );
     expect(backend.stats()).toEqual({ committed: 1, rolledBack: 0 });
   });
 
@@ -126,7 +132,7 @@ describe('Dispatcher.cancel', () => {
     const backend = new SlowCommitBackend();
     const lines: string[] = [];
     const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 }, lines);
-    let accepted: boolean | undefined;
+    let accepted: CancelOutcome | undefined;
 
     dispatcher.register('quick', async () => {
       // Runs before the backend's COMMIT timer, so the cancel lands in the
@@ -143,7 +149,7 @@ describe('Dispatcher.cancel', () => {
     await sleep(10);
 
     expect(error).toBeInstanceOf(RequestCancelledError);
-    expect(accepted).toBe(true);
+    expect(accepted).toBe('cancelled');
     // The commit is real, and the log must say so: a rollback and a commit used
     // to be indistinguishable from the log alone.
     expect(backend.stats()).toEqual({ committed: 1, rolledBack: 0 });
@@ -206,7 +212,7 @@ describe('Dispatcher.cancel', () => {
     const firstError = await rejectionOf(first);
     expect(firstError).toBeInstanceOf(FrameworkTimeoutError);
 
-    expect(dispatcher.cancel('X', 'TRANSPORT_CLOSED')).toBe(true);
+    expect(dispatcher.cancel('X', 'TRANSPORT_CLOSED')).toBe('cancelled');
     release.resolve();
     const secondError = await rejectionOf(second);
 
@@ -227,12 +233,131 @@ describe('Dispatcher.cancel', () => {
 
     const pending = dispatcher.dispatch('slow', null, { requestId: 'r2' });
     await entered.promise;
-    expect(dispatcher.cancel('r2', 'TRANSPORT_CLOSED')).toBe(true);
+    expect(dispatcher.cancel('r2', 'TRANSPORT_CLOSED')).toBe('cancelled');
     expect(() => dispatcher.cancel('r2', 'TRANSPORT_CLOSED')).not.toThrow();
-    expect(dispatcher.cancel('r2', 'TRANSPORT_CLOSED')).toBe(false);
+    expect(dispatcher.cancel('r2', 'TRANSPORT_CLOSED')).toBe('not-in-flight');
 
     await rejectionOf(pending);
     release.resolve();
     await sleep(5);
+  });
+
+  test('a handler is cancellable unless it declares otherwise', async () => {
+    const backend = new MemoryStorageBackend();
+    const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });
+    const entered = deferred<void>();
+    const release = deferred<void>();
+
+    dispatcher.register('slow', async () => {
+      entered.resolve();
+      await release.promise;
+      return 'late';
+    });
+
+    const pending = dispatcher.dispatch('slow', null, {
+      requestId: 'r-default',
+    });
+    await entered.promise;
+
+    expect(dispatcher.cancel('r-default', 'TRANSPORT_CLOSED')).toBe(
+      'cancelled',
+    );
+    await rejectionOf(pending);
+    release.resolve();
+    await sleep(5);
+  });
+
+  test('cancel is refused while a non-cancellable handler keeps its transaction', async () => {
+    const backend = new MemoryStorageBackend();
+    const lines: string[] = [];
+    const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 }, lines);
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    let aborted: boolean | undefined;
+    let lateWriteError = '';
+
+    dispatcher.register(
+      'charge',
+      async (ctx) => {
+        await ctx.storage.execute('INSERT 1');
+        entered.resolve();
+        await release.promise;
+        aborted = ctx.signal.aborted;
+        try {
+          await ctx.storage.execute('INSERT 2');
+        } catch (error) {
+          lateWriteError =
+            error instanceof Error ? error.message : String(error);
+        }
+        return 'charged';
+      },
+      { cancellable: false },
+    );
+
+    const pending = dispatcher.dispatch('charge', null, { requestId: 'r-nc' });
+    await entered.promise;
+
+    expect(dispatcher.cancel('r-nc', 'TRANSPORT_CLOSED')).toBe(
+      'not-cancellable',
+    );
+    // Refused, not deferred: the request is still running and has not been
+    // settled as failed.
+    expect(
+      await Promise.race([
+        pending.then(() => 'settled' as const),
+        sleep(5).then(() => 'pending' as const),
+      ]),
+    ).toBe('pending');
+
+    release.resolve();
+    const outcome = await pending;
+
+    expect(outcome).toEqual({ result: 'charged' });
+    expect(aborted).toBe(false);
+    expect(lateWriteError).toBe('');
+    expect(backend.stats()).toEqual({ committed: 1, rolledBack: 0 });
+    const refused = parseLines(lines).filter(
+      (entry) =>
+        entry.msg === 'cancel refused: handler declared non-cancellable',
+    );
+    expect(refused).toHaveLength(1);
+    expect(refused[0]).toMatchObject({
+      level: 'warn',
+      requestId: 'r-nc',
+      code: 'TRANSPORT_CLOSED',
+      method: 'charge',
+      reason: 'declared non-cancellable',
+    });
+  });
+
+  test('a non-cancellable request is still bounded by its timeout', async () => {
+    const backend = new MemoryStorageBackend();
+    const { dispatcher } = quietDispatcher({ backend, timeoutMs: 10 });
+    const handlerDone = deferred<void>();
+    let aborted: boolean | undefined;
+
+    dispatcher.register(
+      'charge',
+      async (ctx) => {
+        await sleep(40);
+        aborted = ctx.signal.aborted;
+        handlerDone.resolve();
+        return 'late';
+      },
+      { cancellable: false },
+    );
+
+    const error = await rejectionOf(
+      dispatcher.dispatch('charge', null, { requestId: 'r-nc' }),
+    );
+    await handlerDone.promise;
+    await sleep(5);
+
+    expect(error).toBeInstanceOf(FrameworkTimeoutError);
+    expect(aborted).toBe(true);
+    // Only the cancel path is refused; the deadline still invalidates the
+    // transaction (SPEC 3.6).
+    expect(backend.stats()).toEqual({ committed: 0, rolledBack: 1 });
+    expect(dispatcher.cancel('r-nc', 'TRANSPORT_CLOSED')).toBe('not-in-flight');
   });
 });

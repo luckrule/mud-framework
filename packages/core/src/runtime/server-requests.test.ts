@@ -6,7 +6,7 @@ import { MemoryStorageBackend } from '../storage/memory.ts';
 import { sleep, tick } from '../test-support/common.ts';
 import { parseLine, requestMessage } from '../test-support/server-process.ts';
 import { Dispatcher } from './dispatcher.ts';
-import type { Handler } from './dispatcher.ts';
+import type { Handler, HandlerOptions } from './dispatcher.ts';
 import { LocalExecutor } from './executor.ts';
 import { RequestRunner } from './server-requests.ts';
 
@@ -16,7 +16,11 @@ interface RunnerHarness {
   readonly sent: IpcMessage[];
   /** Parsed log lines, in emission order; debug lines included. */
   readonly logs: () => Record<string, unknown>[];
-  readonly register: (method: string, handler: Handler) => void;
+  readonly register: (
+    method: string,
+    handler: Handler,
+    options?: HandlerOptions,
+  ) => void;
 }
 
 function startRunner(timeoutMs = 1000): RunnerHarness {
@@ -49,8 +53,8 @@ function startRunner(timeoutMs = 1000): RunnerHarness {
     runner,
     sent,
     logs: () => lines.map(parseLine),
-    register: (method, handler) => {
-      dispatcher.register(method, handler);
+    register: (method, handler, options) => {
+      dispatcher.register(method, handler, options);
     },
   };
 }
@@ -145,6 +149,62 @@ describe('RequestRunner', () => {
       code: 'FRAMEWORK_TIMEOUT',
       requestId: 'req-1',
     });
+  });
+
+  test('cancel of a non-cancellable handler is refused and the result still goes out', async () => {
+    const harness = startRunner();
+    const entered = Promise.withResolvers<void>();
+    const gate = Promise.withResolvers<void>();
+    let lateWriteError = '';
+    harness.register(
+      'irreversible',
+      async (ctx) => {
+        await ctx.storage.execute('INSERT 1');
+        entered.resolve();
+        await gate.promise;
+        try {
+          await ctx.storage.execute('INSERT 2');
+        } catch (error) {
+          lateWriteError =
+            error instanceof Error ? error.message : String(error);
+        }
+        return 'done';
+      },
+      { cancellable: false },
+    );
+
+    harness.runner.accept(requestMessage({ method: 'irreversible' }));
+    await entered.promise;
+    harness.runner.cancel({
+      type: 'cancel',
+      requestId: 'req-1',
+      code: 'FRAMEWORK_TIMEOUT',
+    });
+    gate.resolve();
+    await tick();
+
+    // SPEC 3.6: the transaction was not invalidated, so the late write lands
+    // and the handler's result is still the answer Portal gets.
+    expect(lateWriteError).toBe('');
+    expect(harness.sent).toEqual([
+      { type: 'result', requestId: 'req-1', ok: true, result: 'done' },
+    ]);
+    const refused = harness
+      .logs()
+      .filter((line) => line.msg === 'cancel refused');
+    expect(refused).toHaveLength(1);
+    expect(refused[0]).toMatchObject({
+      level: 'warn',
+      code: 'FRAMEWORK_TIMEOUT',
+      method: 'irreversible',
+      reason: 'declared non-cancellable',
+      requestId: 'req-1',
+    });
+    expect(
+      harness
+        .logs()
+        .filter((line) => line.msg === 'cancel applied to a running handler'),
+    ).toHaveLength(0);
   });
 
   test('cancel of an unknown request id is a no-op', () => {

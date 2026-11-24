@@ -7,7 +7,7 @@ import { unmetRequirements } from '../storage/requirements.ts';
 import type { StorageBackend, StorageCapabilities } from '../storage/types.ts';
 import { Dispatcher } from './dispatcher.ts';
 import { LocalExecutor } from './executor.ts';
-import type { Extension } from './extension.ts';
+import type { Extension, ExtensionRegistrar } from './extension.ts';
 import type { ServerProcessOptions } from './server-process.ts';
 
 /**
@@ -159,8 +159,20 @@ async function registerExtensions(
   for (const extension of extensions) {
     const unmet = unmetRequirements(capabilities, extension.requires ?? {});
     if (unmet.length === 0) {
+      // The Extension never sees the dispatcher, so it cannot forget (or
+      // override) the name its handlers are logged under (SPEC 7.1).
+      const registrar: ExtensionRegistrar = {
+        register: (method, handler, options) => {
+          dispatcher.register(method, handler, {
+            extension: extension.name,
+            ...(options?.cancellable === undefined
+              ? {}
+              : { cancellable: options.cancellable }),
+          });
+        },
+      };
       // oxlint-disable-next-line eslint/no-await-in-loop -- registration order is the contract: a later Extension may rely on an earlier one's handlers
-      await extension.register(dispatcher);
+      await extension.register(registrar);
       logger.info({ extension: extension.name }, 'extension registered');
       continue;
     }
