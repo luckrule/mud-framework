@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
+import { isRecord, messageOf } from '../internal/guards.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import type { Logger } from '../logging/types.ts';
 import type {
@@ -681,14 +682,6 @@ function toFailure(error: unknown): ExecutorOutcome {
   };
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
 function elapsedSince(startedAt: number): number {
   return Math.round(performance.now() - startedAt);
-}
-
-function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

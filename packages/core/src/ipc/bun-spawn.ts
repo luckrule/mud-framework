@@ -1,6 +1,7 @@
 import { constants as osConstants } from 'node:os';
 import type { Subprocess } from 'bun';
 
+import { messageOf } from '../internal/guards.ts';
 import type { Logger } from '../logging/types.ts';
 import { IpcChannelClosedError } from './channel.ts';
 import type { IpcChannel } from './channel.ts';
@@ -209,10 +210,6 @@ export function spawnBunServer(options: BunServerSpawnOptions): SpawnedServer {
       }
     },
   };
-}
-
-function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 /**

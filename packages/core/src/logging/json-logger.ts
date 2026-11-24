@@ -1,3 +1,4 @@
+import { messageOf } from '../internal/guards.ts';
 import type {
   LogFields,
   LogLevel,
@@ -112,8 +113,4 @@ function fallbackLine(
     msg: message,
     logError: `log fields could not be serialized: ${messageOf(error)}`,
   });
-}
-
-function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

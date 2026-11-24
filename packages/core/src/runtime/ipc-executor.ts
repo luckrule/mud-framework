@@ -1,3 +1,4 @@
+import { messageOf } from '../internal/guards.ts';
 import type { IpcChannel } from '../ipc/channel.ts';
 import type { RequestMessage, ResultMessage } from '../ipc/protocol.ts';
 import { parseIpcMessage } from '../ipc/protocol.ts';
@@ -1331,10 +1332,6 @@ function requestMessage(
 
 function failure(code: string, message: string): ExecutorOutcome {
   return { ok: false, error: { code, message } };
-}
-
-function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 let portalGenerationCounter = 0;

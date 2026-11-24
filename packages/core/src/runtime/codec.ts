@@ -4,6 +4,8 @@
  * payload the handler interprets. Session routing and replay sit above this
  * (SPEC 5.4), so they do not appear here.
  */
+import { isRecord, messageOf } from '../internal/guards.ts';
+
 export interface Envelope {
   id: string;
   method: string;
@@ -69,12 +71,4 @@ export class JsonCodec implements Codec {
     }
     return { id: parsed.id, method: parsed.method, payload: parsed.payload };
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

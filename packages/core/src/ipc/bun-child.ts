@@ -1,3 +1,4 @@
+import { messageOf } from '../internal/guards.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import type { Logger } from '../logging/types.ts';
 import type { IpcChannel } from './channel.ts';
@@ -151,8 +152,4 @@ export function createProcessChannel(
   };
   processChannel = channel;
   return channel;
-}
-
-function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

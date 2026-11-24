@@ -10,6 +10,7 @@
  * declaration Portal then rejects: that mismatch would leave the Server ready
  * and the Portal waiting for a barrier that never arrives.
  */
+import { describeValue, isRecord } from '../internal/guards.ts';
 import type { StorageCapabilities } from './types.ts';
 
 /** Transaction modes a backend may declare (SPEC 4.2). */
@@ -173,33 +174,10 @@ function isOneOf<T extends string>(
   );
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
 function capabilityReason(
   path: string,
   expected: string,
   value: unknown,
 ): string {
   return `capability "${path}" must be ${expected}, received ${describeValue(value)}`;
-}
-
-function describeValue(value: unknown): string {
-  if (value === null) {
-    return 'null';
-  }
-  if (Array.isArray(value)) {
-    return 'array';
-  }
-  if (typeof value === 'string') {
-    return `string ${JSON.stringify(value)}`;
-  }
-  if (typeof value === 'number') {
-    return `number ${value.toString()}`;
-  }
-  if (typeof value === 'boolean') {
-    return `boolean ${value ? 'true' : 'false'}`;
-  }
-  return typeof value;
 }

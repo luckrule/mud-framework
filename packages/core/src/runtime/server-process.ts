@@ -1,3 +1,4 @@
+import { messageOf } from '../internal/guards.ts';
 import { createProcessChannel } from '../ipc/bun-child.ts';
 import type { IpcChannel } from '../ipc/channel.ts';
 import type {
@@ -990,8 +991,4 @@ async function closeQuietly(
 
 function elapsedSince(startedAt: number): number {
   return Math.round(performance.now() - startedAt);
-}
-
-function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

@@ -6,6 +6,7 @@
  * channel with structured serialization. The two must not share types or
  * validators, because a change to one must not silently change the other.
  */
+import { describeValue, isRecord, messageOf } from '../internal/guards.ts';
 import {
   type CapabilityCheck,
   checkWireCapabilities,
@@ -363,31 +364,4 @@ function fieldReason(
   value: unknown,
 ): string {
   return `ipc "${messageType}" field "${field}" must be ${expected}, received ${describeValue(value)}`;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function describeValue(value: unknown): string {
-  if (value === null) {
-    return 'null';
-  }
-  if (Array.isArray(value)) {
-    return 'array';
-  }
-  if (typeof value === 'string') {
-    return `string ${JSON.stringify(value)}`;
-  }
-  if (typeof value === 'number') {
-    return `number ${value.toString()}`;
-  }
-  if (typeof value === 'boolean') {
-    return `boolean ${value ? 'true' : 'false'}`;
-  }
-  return typeof value;
-}
-
-function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
