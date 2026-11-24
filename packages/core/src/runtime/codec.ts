@@ -12,42 +12,38 @@ export interface Envelope {
   payload: unknown;
 }
 
-export interface ResponseEnvelope {
-  id: string;
-  result?: unknown;
-  error?: { code: string; message: string };
-}
+/**
+ * A discriminated union rather than two optional fields. With optionals, `{}`
+ * and `{result, error}` are both representable, so every consumer would have to
+ * decide which field wins; and `JSON.stringify` drops an `undefined` result, so
+ * a void handler's success is indistinguishable from a frame with no body at
+ * all. The `ok` flag is on the wire for exactly that reason: `{"id":"x","ok":true}`
+ * says "succeeded, no value", which no optional-field shape can express.
+ *
+ * This matches how `ExecutorOutcome` and `ResultMessage` already discriminate.
+ */
+export type ResponseEnvelope = { id: string } & (
+  | { ok: true; result: unknown }
+  | { ok: false; error: { code: string; message: string } }
+);
 
 export interface Codec {
   encode(value: ResponseEnvelope): string | Uint8Array;
   decode(raw: string | Uint8Array): Envelope;
 }
 
-/**
- * Decoding failures carry no request id, so the connection layer has to treat
- * them as a class. A named error keeps that distinction out of message
- * matching.
- */
-export class EnvelopeError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'EnvelopeError';
-  }
-}
-
 const decoder = new TextDecoder();
 
 export class JsonCodec implements Codec {
   encode(value: ResponseEnvelope): string {
-    const body: Record<string, unknown> = { id: value.id };
-    // Mutually exclusive on purpose: a consumer must never have to decide
-    // whether a present result or a present error wins.
-    if (value.error !== undefined) {
-      body.error = value.error;
-    } else {
-      body.result = value.result;
-    }
-    return JSON.stringify(body);
+    // Spelled out per branch rather than spreading the rest of the object: the
+    // wire shape must be readable here, and `ok` must never be joined by the
+    // other branch's field.
+    return JSON.stringify(
+      value.ok
+        ? { id: value.id, ok: true, result: value.result }
+        : { id: value.id, ok: false, error: value.error },
+    );
   }
 
   decode(raw: string | Uint8Array): Envelope {
@@ -56,18 +52,18 @@ export class JsonCodec implements Codec {
     try {
       parsed = JSON.parse(text);
     } catch (error) {
-      throw new EnvelopeError(
-        `envelope is not valid JSON: ${messageOf(error)}`,
-      );
+      throw new Error(`envelope is not valid JSON: ${messageOf(error)}`, {
+        cause: error,
+      });
     }
     if (!isRecord(parsed)) {
-      throw new EnvelopeError('envelope must be a JSON object');
+      throw new Error('envelope must be a JSON object');
     }
     if (typeof parsed.id !== 'string' || parsed.id.length === 0) {
-      throw new EnvelopeError('envelope "id" must be a non-empty string');
+      throw new Error('envelope "id" must be a non-empty string');
     }
     if (typeof parsed.method !== 'string' || parsed.method.length === 0) {
-      throw new EnvelopeError('envelope "method" must be a non-empty string');
+      throw new Error('envelope "method" must be a non-empty string');
     }
     return { id: parsed.id, method: parsed.method, payload: parsed.payload };
   }

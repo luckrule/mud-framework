@@ -132,6 +132,7 @@ describe('vertical slice', () => {
       });
 
       expect(created.id).toBe('r1');
+      expect(created.ok).toBe(true);
       expect(created.error).toBeUndefined();
       expect(created.result).toMatchObject({ created: 'conan' });
 
@@ -139,7 +140,7 @@ describe('vertical slice', () => {
       // saw the first request's transaction.
       const listed = await call(url, { id: 'r2', method: 'player.list' });
 
-      expect(listed).toEqual({ id: 'r2', result: ['conan'] });
+      expect(listed).toEqual({ id: 'r2', ok: true, result: ['conan'] });
 
       // And the row really is in the database, not just in a handler's memory.
       const stored = await backend.transaction(async (tx) =>
@@ -173,9 +174,11 @@ describe('vertical slice', () => {
       const url = `ws://127.0.0.1:${port}/`;
 
       const unknown = await call(url, { id: 'a', method: 'nope' });
+      expect(unknown.ok).toBe(false);
       expect(unknown.error).toMatchObject({ code: 'UNKNOWN_METHOD' });
 
       const failed = await call(url, { id: 'b', method: 'broken' });
+      expect(failed.ok).toBe(false);
       expect(failed.error).toMatchObject({
         code: 'INTERNAL_ERROR',
         message: 'handler exploded',
@@ -206,6 +209,7 @@ describe('vertical slice', () => {
         socket.send('{not json');
         expect(parseFrame(await reply)).toMatchObject({
           id: '',
+          ok: false,
           error: { code: 'INVALID_ENVELOPE' },
         });
       } finally {

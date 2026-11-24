@@ -227,6 +227,7 @@ export class ConnectionLayer implements TransportHandlers {
       );
       return this.reply(connection, {
         id: envelope.id,
+        ok: false,
         error: {
           code: FRAMEWORK_QUEUE_FULL,
           message: `input queue is full (${this.maxQueuedPerConnection} waiting)`,
@@ -398,6 +399,7 @@ export class ConnectionLayer implements TransportHandlers {
     );
     await this.reply(connection, {
       id,
+      ok: false,
       error: {
         code: FRAMEWORK_SHUTDOWN,
         message: 'connection layer is shutting down',
@@ -427,6 +429,7 @@ export class ConnectionLayer implements TransportHandlers {
     // otherwise be healthy (SPEC 3.5 forbids silent drops).
     await this.reply(connection, {
       id: '',
+      ok: false,
       error: { code: INVALID_ENVELOPE, message: messageOf(error) },
     });
   }
@@ -467,15 +470,20 @@ export class ConnectionLayer implements TransportHandlers {
     state.inFlight.add(requestId);
     let outcome: ExecutorOutcome;
     try {
-      outcome = normalizeOutcome(
-        await this.executor.execute({
-          requestId,
-          connectionId: connection.id,
-          clientRequestId,
-          method,
-          payload: requestPayload,
-        }),
-      );
+      const raw: unknown = await this.executor.execute({
+        requestId,
+        connectionId: connection.id,
+        clientRequestId,
+        method,
+        payload: requestPayload,
+      });
+      // The guard exists because the executor is outside code: an outcome
+      // without `error` would otherwise produce no frame at all, which is the
+      // silent drop SPEC 3.5 forbids. A valid outcome is passed through as is,
+      // so `sessionId` (which only the executor's routing needs) is untouched.
+      outcome = isExecutorOutcome(raw)
+        ? raw
+        : toFailure(new Error('executor returned a malformed outcome'));
     } catch (error) {
       // The interface forbids throwing, but an executor is outside code. An
       // escaping throw would reject `handle` and leave the client unanswered,
@@ -485,46 +493,53 @@ export class ConnectionLayer implements TransportHandlers {
     } finally {
       state.inFlight.delete(requestId);
     }
-    let response: ResponseEnvelope;
     if (outcome.ok) {
-      response = { id: clientRequestId, result: outcome.result };
-    } else {
-      // An untracked connection means `onDisconnect` already ran: the request
-      // ended because the client left, which is expected, and nobody can read a
-      // reply. Writing one would only add a TRANSPORT_SEND_FAILED error on top
-      // of the cancel the executor already logged (SPEC 7.1).
-      if (!this.connections.has(connection.id)) {
-        logger.debug(
-          {
-            method,
-            code: outcome.error.code,
-            durationMs: elapsedSince(startedAt),
-          },
-          'request ended after the connection closed',
-        );
-        return;
-      }
-      // warn for a business refusal: it is an expected outcome the Extension
-      // decided on, and SPEC 7.1 forbids recording those at error level. The
-      // IPC protocol carries no category, so the shared framework-code list is
-      // the only judgement both processes can apply (wire-codes.ts).
-      logger[failureLogLevel(outcome.error)](
+      await this.reply(
+        connection,
+        { id: clientRequestId, ok: true, result: outcome.result },
+        logger,
+      );
+      return;
+    }
+    // An untracked connection means `onDisconnect` already ran: the request
+    // ended because the client left, which is expected, and nobody can read a
+    // reply. Writing one would only add a TRANSPORT_SEND_FAILED error on top
+    // of the cancel the executor already logged (SPEC 7.1).
+    if (!this.connections.has(connection.id)) {
+      logger.debug(
         {
           method,
           code: outcome.error.code,
           durationMs: elapsedSince(startedAt),
-          reason: outcome.error.message,
         },
-        'request failed',
+        'request ended after the connection closed',
       );
-      response = {
+      return;
+    }
+    // warn for a business refusal: it is an expected outcome the Extension
+    // decided on, and SPEC 7.1 forbids recording those at error level. The
+    // IPC protocol carries no category, so the shared framework-code list is
+    // the only judgement both processes can apply (wire-codes.ts).
+    logger[failureLogLevel(outcome.error)](
+      {
+        method,
+        code: outcome.error.code,
+        durationMs: elapsedSince(startedAt),
+        reason: outcome.error.message,
+      },
+      'request failed',
+    );
+    await this.reply(
+      connection,
+      {
         id: clientRequestId,
+        ok: false,
         // The wire contract is `{code, message}` (SPEC 7.2); the category is
         // internal and must not become a client-visible field.
         error: { code: outcome.error.code, message: outcome.error.message },
-      };
-    }
-    await this.reply(connection, response, logger);
+      },
+      logger,
+    );
   }
 
   private async cancelQuietly(
@@ -567,6 +582,7 @@ export class ConnectionLayer implements TransportHandlers {
         );
         frame = this.codec.encode({
           id: response.id,
+          ok: false,
           error: {
             code: INTERNAL_ERROR,
             message: 'result could not be encoded',
@@ -637,46 +653,31 @@ function toError(error: unknown): Error {
 }
 
 /**
- * Normalises whatever the executor returned. The outcome is produced by code
- * outside this layer, so a missing `error`, a `null` or an empty `code` must
- * still yield an answer: destructuring it unchecked would throw after the
- * `execute()` try/catch and drop the request with no frame at all (SPEC 3.5).
+ * A guard, not a normaliser. The executor is outside code, so a returned object
+ * is not proof of the field the branches below read: a bare `{ok:false}` would
+ * throw on `outcome.error.code` after the `execute()` try/catch and drop the
+ * request with no frame at all (SPEC 3.5). Checking `ok` alone is not enough for
+ * that reason — the failure branch must be checked too. Repairing a malformed
+ * outcome is not this layer's job: anything shaped wrongly is a framework
+ * failure, not a client-visible business result.
  */
-function normalizeOutcome(value: unknown): ExecutorOutcome {
-  if (isRecord(value)) {
-    if (value.ok === true) {
-      // `sessionId` must survive: it is how a handler's binding reaches the
-      // routing table, and dropping it here would silently discard every bind
-      // (SPEC 2). Only a non-empty string counts; anything else is treated as
-      // absent rather than handed to the router as a malformed id.
-      return typeof value.sessionId === 'string' && value.sessionId.length > 0
-        ? { ok: true, result: value.result, sessionId: value.sessionId }
-        : { ok: true, result: value.result };
-    }
-    const error = value.error;
-    if (
-      value.ok === false &&
-      isRecord(error) &&
-      typeof error.code === 'string' &&
-      error.code.length > 0
-    ) {
-      // The code is the contract; a non-string message must not void it.
-      return {
-        ok: false,
-        error: {
-          code: error.code,
-          message: typeof error.message === 'string' ? error.message : '',
-        },
-      };
-    }
+function isExecutorOutcome(value: unknown): value is ExecutorOutcome {
+  if (!isRecord(value)) {
+    return false;
   }
-  return {
-    ok: false,
-    error: {
-      code: INTERNAL_ERROR,
-      message: 'executor returned a malformed outcome',
-    },
-  };
+  if (value.ok === true) {
+    return true;
+  }
+  if (value.ok !== false) {
+    return false;
+  }
+  const error = value.error;
+  return (
+    isRecord(error) &&
+    typeof error.code === 'string' &&
+    error.code.length > 0 &&
+    typeof error.message === 'string'
+  );
 }
 
 function toFailure(error: unknown): ExecutorOutcome {

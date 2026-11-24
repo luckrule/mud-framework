@@ -222,7 +222,11 @@ describe('ConnectionLayer', () => {
 
     await transport.receive('c1', '{"id":"r1","method":"echo","payload":"hi"}');
 
-    expect(lastFrame(transport, 'c1')).toEqual({ id: 'r1', result: 'hi' });
+    expect(lastFrame(transport, 'c1')).toEqual({
+      id: 'r1',
+      ok: true,
+      result: 'hi',
+    });
     expect(backend.stats()).toEqual({ committed: 1, rolledBack: 0 });
   });
 
@@ -252,8 +256,8 @@ describe('ConnectionLayer', () => {
     // its writes have to be visible to it (SPEC 3.1).
     expect(log).toEqual(['a:start', 'a:end', 'b:start', 'b:end']);
     expect(transport.sentTo('c1').map(parseFrame)).toEqual([
-      { id: '1', result: 'a' },
-      { id: '2', result: 'b' },
+      { id: '1', ok: true, result: 'a' },
+      { id: '2', ok: true, result: 'b' },
     ]);
   });
 
@@ -279,8 +283,16 @@ describe('ConnectionLayer', () => {
     ]);
 
     expect(active).toBe(2);
-    expect(lastFrame(transport, 'c1')).toEqual({ id: '1', result: 2 });
-    expect(lastFrame(transport, 'c2')).toEqual({ id: '2', result: 2 });
+    expect(lastFrame(transport, 'c1')).toEqual({
+      id: '1',
+      ok: true,
+      result: 2,
+    });
+    expect(lastFrame(transport, 'c2')).toEqual({
+      id: '2',
+      ok: true,
+      result: 2,
+    });
   });
 
   test('maps a handler failure to INTERNAL_ERROR', async () => {
@@ -294,6 +306,7 @@ describe('ConnectionLayer', () => {
 
     expect(lastFrame(transport, 'c1')).toEqual({
       id: 'r1',
+      ok: false,
       error: { code: 'INTERNAL_ERROR', message: 'business failure' },
     });
   });
@@ -324,6 +337,7 @@ describe('ConnectionLayer', () => {
 
     expect(lastFrame(transport, 'c1')).toEqual({
       id: 'r1',
+      ok: false,
       error: { code: 'STORAGE_UNAVAILABLE', message: 'backend is gone' },
     });
     const failed = lines
@@ -341,20 +355,16 @@ describe('ConnectionLayer', () => {
     await layer.stop();
   });
 
-  test('maps a malformed executor outcome to INTERNAL_ERROR instead of dropping the request', async () => {
+  test('answers an executor outcome that is missing its error instead of dropping the request', async () => {
     const transport = new FakeTransport();
-    const outcomes: unknown[] = [
-      { ok: false },
-      null,
-      { ok: false, error: { code: '' } },
-    ];
+    // The regression this covers: `{ok:false}` without `error` used to produce
+    // no frame at all, so the client waited forever. The type says it cannot
+    // happen; an executor is outside code, so it is checked anyway.
     const executor: RequestExecutor = {
       start: () => Promise.resolve(),
       execute: () => {
-        // Deliberately outside the contract: an executor is external code and
-        // the point is that the layer survives whatever it returns.
         // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- untyped test double
-        return Promise.resolve(outcomes.shift() as ExecutorOutcome);
+        return Promise.resolve({ ok: false } as ExecutorOutcome);
       },
       cancel: () => Promise.resolve(),
       close: () => Promise.resolve(),
@@ -364,20 +374,17 @@ describe('ConnectionLayer', () => {
     transport.connect('c1');
 
     await transport.receive('c1', '{"id":"r1","method":"echo"}');
-    await transport.receive('c1', '{"id":"r2","method":"echo"}');
-    await transport.receive('c1', '{"id":"r3","method":"echo"}');
 
     const frames = transport.sentTo('c1').map(parseFrame);
-    expect(frames).toHaveLength(3);
-    for (const [index, frame] of frames.entries()) {
-      expect(frame).toEqual({
-        id: `r${index + 1}`,
-        error: {
-          code: 'INTERNAL_ERROR',
-          message: 'executor returned a malformed outcome',
-        },
-      });
-    }
+    expect(frames).toHaveLength(1);
+    expect(frames[0]).toEqual({
+      id: 'r1',
+      ok: false,
+      error: {
+        code: 'INTERNAL_ERROR',
+        message: 'executor returned a malformed outcome',
+      },
+    });
     await layer.stop();
   });
 
@@ -403,6 +410,7 @@ describe('ConnectionLayer', () => {
 
     expect(lastFrame(transport, 'c1')).toEqual({
       id: 'r1',
+      ok: false,
       error: { code: 'INTERNAL_ERROR', message: 'boom' },
     });
     const failed = lines
@@ -425,6 +433,7 @@ describe('ConnectionLayer', () => {
 
     const frame = lastFrame(transport, 'c1');
     expect(frame.id).toBe('r1');
+    expect(frame.ok).toBe(false);
     expect(frame.error).toMatchObject({ code: 'UNKNOWN_METHOD' });
     expect(frame.result).toBeUndefined();
   });
@@ -441,6 +450,7 @@ describe('ConnectionLayer', () => {
 
     const frame = lastFrame(transport, 'c1');
     expect(frame.id).toBe('r1');
+    expect(frame.ok).toBe(false);
     expect(frame.error).toMatchObject({ code: 'FRAMEWORK_TIMEOUT' });
     expect(frame.result).toBeUndefined();
     // Let the abandoned handler settle before the next test starts.
@@ -455,6 +465,7 @@ describe('ConnectionLayer', () => {
 
     const frame = lastFrame(transport, 'c1');
     expect(frame.id).toBe('');
+    expect(frame.ok).toBe(false);
     expect(frame.error).toMatchObject({ code: 'INVALID_ENVELOPE' });
   });
 
@@ -470,6 +481,7 @@ describe('ConnectionLayer', () => {
     expect(frames).toHaveLength(3);
     for (const frame of frames) {
       expect(frame.id).toBe('');
+      expect(frame.ok).toBe(false);
       expect(frame.error).toMatchObject({ code: 'INVALID_ENVELOPE' });
     }
   });
@@ -723,6 +735,7 @@ describe('ConnectionLayer', () => {
     // The wire reply still carries the client's id, not the framework's.
     expect(lastFrame(transport, 'c1')).toEqual({
       id: 'client-7',
+      ok: true,
       result: null,
     });
   });
@@ -744,6 +757,7 @@ describe('ConnectionLayer', () => {
 
     expect(lastFrame(transport, 'c1')).toMatchObject({
       id: 'client-1',
+      ok: false,
       error: { code: 'INTERNAL_ERROR' },
     });
     const failed = logs().filter((entry) => entry.code === 'INTERNAL_ERROR');
@@ -903,7 +917,7 @@ describe('ConnectionLayer', () => {
       throw new Error('expected a reply');
     }
     const decoded = Buffer.from(String(reply), 'base64').toString('utf8');
-    expect(parseFrame(decoded)).toEqual({ id: 'r1', result: 42 });
+    expect(parseFrame(decoded)).toEqual({ id: 'r1', ok: true, result: 42 });
   });
 
   test('JSON codec rejects a non-object envelope', () => {
@@ -913,13 +927,27 @@ describe('ConnectionLayer', () => {
     expect(() => codec.decode('[1,2]')).toThrow(/JSON object/);
   });
 
-  test('JSON codec omits result when an error is present', () => {
+  test('JSON codec keeps a success with no value distinguishable', () => {
     const codec = new JsonCodec();
 
-    const text = codec.encode({ id: 'r1', error: { code: 'X', message: 'y' } });
+    const text = codec.encode({ id: 'r1', ok: true, result: undefined });
+
+    // `ok:true` is what makes this different from "nothing was written".
+    expect(parseFrame(text)).toEqual({ id: 'r1', ok: true });
+  });
+
+  test('JSON codec writes the error branch without a result field', () => {
+    const codec = new JsonCodec();
+
+    const text = codec.encode({
+      id: 'r1',
+      ok: false,
+      error: { code: 'X', message: 'y' },
+    });
 
     expect(parseFrame(text)).toEqual({
       id: 'r1',
+      ok: false,
       error: { code: 'X', message: 'y' },
     });
   });
@@ -949,6 +977,7 @@ describe('ConnectionLayer', () => {
 
       const frames = transport.sentTo('c1').map(parseFrame);
       const refused = frames.find((frame) => frame.id === 'r2');
+      expect(refused?.ok).toBe(false);
       expect(refused?.error).toMatchObject({ code: 'FRAMEWORK_QUEUE_FULL' });
       expect(refused?.result).toBeUndefined();
       // The refused request never reached the handler.
@@ -978,10 +1007,12 @@ describe('ConnectionLayer', () => {
       const frames = transport.sentTo('c1').map(parseFrame);
       expect(frames.find((frame) => frame.id === 'r0')).toEqual({
         id: 'r0',
+        ok: true,
         result: 'a',
       });
       expect(frames.find((frame) => frame.id === 'r1')).toEqual({
         id: 'r1',
+        ok: true,
         result: 'b',
       });
     });
@@ -1016,11 +1047,13 @@ describe('ConnectionLayer', () => {
       );
 
       const frames = transport.sentTo('c1').map(parseFrame);
+      expect(frames.find((frame) => frame.id === 'r1')?.ok).toBe(false);
       expect(frames.find((frame) => frame.id === 'r1')?.error).toMatchObject({
         code: 'FRAMEWORK_QUEUE_FULL',
       });
       expect(frames.find((frame) => frame.id === 'r2')).toEqual({
         id: 'r2',
+        ok: true,
         result: 'c',
       });
     });
@@ -1086,8 +1119,11 @@ describe('ConnectionLayer', () => {
         return isRecord(error) && error.code === 'FRAMEWORK_QUEUE_FULL';
       });
       expect(refused).toHaveLength(2);
+      for (const frame of refused) {
+        expect(frame.ok).toBe(false);
+      }
       // Everything else got a normal reply rather than silence.
-      expect(frames.filter((frame) => !('error' in frame))).toHaveLength(1000);
+      expect(frames.filter((frame) => frame.ok === true)).toHaveLength(1000);
       expect(
         logs().filter((entry) => entry.code === 'FRAMEWORK_QUEUE_FULL'),
       ).toHaveLength(2);
@@ -1197,7 +1233,11 @@ describe('ConnectionLayer', () => {
       expect(order.indexOf('execute.end')).toBeLessThan(
         order.indexOf('executor.close'),
       );
-      expect(JSON.parse(sent[0] ?? '{}')).toEqual({ id: 'r1', result: 'done' });
+      expect(JSON.parse(sent[0] ?? '{}')).toEqual({
+        id: 'r1',
+        ok: true,
+        result: 'done',
+      });
     });
 
     test('answers a request that arrives during shutdown with FRAMEWORK_SHUTDOWN', async () => {
@@ -1225,6 +1265,7 @@ describe('ConnectionLayer', () => {
       const frame = parseFrame(sent[0] ?? '{}');
       expect(frame).toEqual({
         id: 'late',
+        ok: false,
         error: {
           code: 'FRAMEWORK_SHUTDOWN',
           message: 'connection layer is shutting down',

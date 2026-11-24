@@ -53,7 +53,7 @@ export {
   JsonLogger,
 } from './logging/json-logger.ts';
 export type { Codec, Envelope, ResponseEnvelope } from './runtime/codec.ts';
-export { EnvelopeError, JsonCodec } from './runtime/codec.ts';
+export { JsonCodec } from './runtime/codec.ts';
 export type {
   ExecutorOutcome,
   ExecutorRequest,

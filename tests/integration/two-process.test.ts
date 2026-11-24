@@ -290,14 +290,22 @@ describe('two-process integration', () => {
         method: 'echo',
         payload: { hello: 'world' },
       });
-      expect(echoed).toEqual({ id: 'r1', result: { hello: 'world' } });
+      expect(echoed).toEqual({
+        id: 'r1',
+        ok: true,
+        result: { hello: 'world' },
+      });
 
       const stored = await call(url, {
         id: 'r2',
         method: 'store',
         payload: 'note-1',
       });
-      expect(stored).toEqual({ id: 'r2', result: { stored: 'note-1' } });
+      expect(stored).toEqual({
+        id: 'r2',
+        ok: true,
+        result: { stored: 'note-1' },
+      });
     } finally {
       await stopQuietly(portal);
     }
@@ -328,6 +336,7 @@ describe('two-process integration', () => {
 
       const failed = await call(url, { id: 'boom', method: 'crash' });
       expect(failed.id).toBe('boom');
+      expect(failed.ok).toBe(false);
       expect(failed.error).toMatchObject({
         code: 'FRAMEWORK_REPLAY_EXHAUSTED',
       });
@@ -348,7 +357,7 @@ describe('two-process integration', () => {
         method: 'echo',
         payload: 'still here',
       });
-      expect(after).toEqual({ id: 'after', result: 'still here' });
+      expect(after).toEqual({ id: 'after', ok: true, result: 'still here' });
     } finally {
       await stopQuietly(portal);
       database.remove();
