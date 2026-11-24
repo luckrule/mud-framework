@@ -12,6 +12,7 @@ import { parseIpcMessage } from '../ipc/protocol.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import type { Logger } from '../logging/types.ts';
 import { checkBackendCapabilities } from '../storage/capabilities.ts';
+import { degradations } from '../storage/degradations.ts';
 import { unmetRequirements } from '../storage/requirements.ts';
 import type { StorageBackend, StorageCapabilities } from '../storage/types.ts';
 import { Dispatcher } from './dispatcher.ts';
@@ -306,6 +307,21 @@ class ServerProcess {
       if (!checked.ok) {
         throw new ServerStartupError(
           `storage capability self-check failed: ${checked.reason}`,
+        );
+      }
+      // SPEC 4.3: a backend weaker than the strongest level is a degradation,
+      // reported once per dimension here so it stays at startup volume. The
+      // `ready` info line below carries the full declaration; these lines carry
+      // what each shortfall costs the business. Both are needed: one for the
+      // whole picture, one per consequence.
+      for (const degradation of degradations(checked.capabilities)) {
+        this.logger.warn(
+          {
+            capability: degradation.capability,
+            declared: degradation.declared,
+            consequence: degradation.consequence,
+          },
+          'storage capability degraded',
         );
       }
       dispatcher = new Dispatcher({
