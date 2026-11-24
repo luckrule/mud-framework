@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -21,7 +21,7 @@ import { SqliteBackend } from '../../packages/storage-sqlite/src/index.ts';
  */
 const FIXTURE = join(import.meta.dir, 'fixtures', 'server-entry.ts');
 
-type Behavior = 'echo' | 'crash' | 'boot-fail';
+type Behavior = 'echo' | 'crash' | 'crash-once' | 'boot-fail';
 
 interface TempDatabase {
   readonly path: string;
@@ -170,6 +170,16 @@ function nextMessage(socket: WebSocket): Promise<string | Uint8Array> {
   });
 }
 
+/** One request on an already-open socket, which survives a Server restart. */
+async function callOnSocket(
+  socket: WebSocket,
+  request: { id: string; method: string; payload?: unknown },
+): Promise<Record<string, unknown>> {
+  const reply = nextMessage(socket);
+  socket.send(JSON.stringify(request));
+  return parseFrame(await reply);
+}
+
 /** One request over a fresh socket, so each call also crosses a new connection. */
 async function call(
   url: string,
@@ -177,12 +187,17 @@ async function call(
 ): Promise<Record<string, unknown>> {
   const socket = await openClient(url);
   try {
-    const reply = nextMessage(socket);
-    socket.send(JSON.stringify(request));
-    return parseFrame(await reply);
+    return await callOnSocket(socket, request);
   } finally {
     socket.close();
   }
+}
+
+/** One line per `store-once` handler execution, written by the fixture. */
+function attemptLog(databasePath: string): string[] {
+  return readFileSync(`${databasePath}.attempts`, 'utf8')
+    .split('\n')
+    .filter((line) => line.length > 0);
 }
 
 function urlOf(portal: Portal): string {
@@ -306,20 +321,25 @@ describe('two-process integration', () => {
         ok: true,
         result: { stored: 'note-1' },
       });
+
+      // `stopQuietly` is `stop()` plus a SIGKILL for every pid that reported
+      // ready: `stop()` alone can time out and return while the Server is still
+      // alive, and the reader below must not race a writer.
+      await stopQuietly(portal);
+
+      // The Portal never opened the file: this handle is a separate reader, so
+      // the row proves the Server's commit outlived its own process.
+      const reader = SqliteBackend.open({ filename: database.path });
+      try {
+        const rows = await reader.transaction((tx) =>
+          tx.query<{ body: string }>('SELECT body FROM notes'),
+        );
+        expect(rows).toEqual([{ body: 'note-1' }]);
+      } finally {
+        await reader.close();
+      }
     } finally {
       await stopQuietly(portal);
-    }
-
-    // The Portal never opened the file: this handle is a separate reader, so the
-    // row proves the Server's commit outlived its own process.
-    const reader = SqliteBackend.open({ filename: database.path });
-    try {
-      const rows = await reader.transaction((tx) =>
-        tx.query<{ body: string }>('SELECT body FROM notes'),
-      );
-      expect(rows).toEqual([{ body: 'note-1' }]);
-    } finally {
-      await reader.close();
       database.remove();
     }
   });
@@ -358,6 +378,91 @@ describe('two-process integration', () => {
         payload: 'still here',
       });
       expect(after).toEqual({ id: 'after', ok: true, result: 'still here' });
+    } finally {
+      await stopQuietly(portal);
+      database.remove();
+    }
+  });
+
+  test('a crash on the first execution is replayed and the same request succeeds', async () => {
+    const database = tempDatabase();
+    const portal = createPortal({
+      databasePath: database.path,
+      behavior: 'crash-once',
+      timeoutMs: 5000,
+    });
+    try {
+      await portal.layer.start();
+      const url = urlOf(portal);
+
+      // One socket for the whole exchange: the connection survives the Server
+      // crash, so the reply comes from the replay rather than a reconnect
+      // (INV-012).
+      const socket = await openClient(url);
+      try {
+        const frame = await callOnSocket(socket, {
+          id: 'once',
+          method: 'store-once',
+          payload: 'note-once',
+        });
+        expect(frame).toEqual({
+          id: 'once',
+          ok: true,
+          result: { stored: 'note-once' },
+        });
+
+        // The fixture appends the framework `requestId` before crashing, so the
+        // two lines are the same Request seen by the first attempt and by the
+        // replay: `requestId` is what replay preserves.
+        const attempts = attemptLog(database.path);
+        expect(attempts).toHaveLength(2);
+        expect(attempts[0]).toBe(attempts[1]);
+        expect(replayCounts(portal.logs)).toEqual([1]);
+        const replayed = portal.logs.lines.filter(
+          (line) => line.msg === 'request replayed',
+        );
+        expect(replayed).toHaveLength(1);
+        expect(replayed.at(0)).toMatchObject({
+          requestId: attempts[0],
+          clientRequestId: 'once',
+          replayCount: 1,
+        });
+        // The first process crashed; the second is the replayer that answered.
+        // The exact count is an implementation detail, as in the crash test
+        // above: `replayCounts` having one entry is what proves there was
+        // exactly one restart, not a retry loop.
+        expect(portal.spawns()).toBeGreaterThanOrEqual(2);
+        expect(serverPids(portal.logs).length).toBeGreaterThanOrEqual(2);
+      } finally {
+        socket.close();
+      }
+
+      await stopQuietly(portal);
+
+      // Two handler executions, one committed effect. `once_executions` is the
+      // evidence: it is not idempotent, so its single row means the interrupted
+      // attempt's transaction never reached COMMIT and the replay committed
+      // once. The interrupted attempt rolled back, so the replay does not hit
+      // `ON CONFLICT DO NOTHING` either; that guard is for a client retry,
+      // which keeps `clientRequestId` but arrives with a new `requestId`. A
+      // non-transactional side effect can still run twice on replay (INV-011).
+      const reader = SqliteBackend.open({ filename: database.path });
+      try {
+        const stored = await reader.transaction(async (tx) => ({
+          notes: await tx.query<{ client_request_id: string; body: string }>(
+            'SELECT client_request_id, body FROM once_notes',
+          ),
+          executions: await tx.query<{ client_request_id: string }>(
+            'SELECT client_request_id FROM once_executions',
+          ),
+        }));
+        expect(stored.notes).toEqual([
+          { client_request_id: 'once', body: 'note-once' },
+        ]);
+        expect(stored.executions).toEqual([{ client_request_id: 'once' }]);
+      } finally {
+        await reader.close();
+      }
     } finally {
       await stopQuietly(portal);
       database.remove();
