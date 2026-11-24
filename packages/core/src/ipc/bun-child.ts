@@ -1,5 +1,6 @@
 import { messageOf } from '../internal/guards.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
+import { safeLogger } from '../logging/safe-logger.ts';
 import type { Logger } from '../logging/types.ts';
 import type { IpcChannel } from './channel.ts';
 import { IpcChannelClosedError } from './channel.ts';
@@ -44,9 +45,10 @@ export function createProcessChannel(
       'a process channel already exists: a process has exactly one IPC link to its parent, so run each Server process in its own OS process',
     );
   }
-  const logger =
+  const logger = safeLogger(
     options.logger ??
-    createJsonLogger({ bindings: { component: 'bun-child' } });
+      createJsonLogger({ bindings: { component: 'bun-child' } }),
+  );
   const hasProcessSend = typeof process.send === 'function';
   if (!hasProcessSend) {
     logger.warn(

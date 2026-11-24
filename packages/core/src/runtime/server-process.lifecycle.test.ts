@@ -3,14 +3,13 @@ import { describe, expect, test } from 'bun:test';
 import { createProcessChannel } from '../ipc/bun-child.ts';
 import { MemoryStorageBackend } from '../storage/memory.ts';
 import type { StorageBackend } from '../storage/types.ts';
-import { rejectionOf, tick } from '../test-support/common.ts';
+import { rejectionOf, throwingLogger, tick } from '../test-support/common.ts';
 import {
   echoRegistration,
   received,
   requestMessage,
   results,
   sendRaw,
-  silentLogger,
   startServer,
 } from '../test-support/server-process.ts';
 import { ServerChannelClosedError } from './server-process.ts';
@@ -21,9 +20,12 @@ describe('createProcessChannel singleton', () => {
     // `process.send` and the `message`/`disconnect` events are process-global,
     // so a second channel would add a second listener and deliver every inbound
     // message to both — two Servers executing the same request (INV-002).
-    createProcessChannel({ logger: silentLogger() });
+    //
+    // `bun test` has no `process.send`, so construction logs `IPC_UNAVAILABLE`;
+    // a throwing logger proves that warn cannot change the singleton result.
+    createProcessChannel({ logger: throwingLogger() });
 
-    expect(() => createProcessChannel({ logger: silentLogger() })).toThrow(
+    expect(() => createProcessChannel({ logger: throwingLogger() })).toThrow(
       /already exists/,
     );
   });

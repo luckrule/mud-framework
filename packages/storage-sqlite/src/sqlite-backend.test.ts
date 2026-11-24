@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
 import { createJsonLogger } from 'mud-framework-core';
+import type { Logger } from 'mud-framework-core';
 
 import { SqliteBackend } from './sqlite-backend.ts';
 
@@ -58,6 +59,21 @@ function errorCode(error: Error): string | undefined {
     return error.code;
   }
   return undefined;
+}
+
+/** A logger whose every method throws, including `child`. */
+function throwingLogger(): Logger {
+  return {
+    debug: failLogging,
+    info: failLogging,
+    warn: failLogging,
+    error: failLogging,
+    child: failLogging,
+  };
+}
+
+function failLogging(): never {
+  throw new Error('logger exploded');
 }
 
 describe('SqliteBackend', () => {
@@ -285,5 +301,17 @@ describe('SqliteBackend', () => {
     expect(() => backend.transaction(async () => undefined)).toThrow(
       /unusable/,
     );
+  });
+
+  test('keeps the PRAGMA failure when the injected logger throws', () => {
+    // The log sits before the throw that reports the same failure. A logger
+    // throw must not replace the startup error with the logger's own error.
+    expect(() =>
+      SqliteBackend.open({
+        filename: ':memory:',
+        journalMode: 'wal',
+        logger: throwingLogger(),
+      }),
+    ).toThrow(/journal_mode/);
   });
 });

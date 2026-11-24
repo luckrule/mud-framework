@@ -5,6 +5,7 @@ import net from 'node:net';
 
 import { createJsonLogger } from 'mud-framework-core';
 import type {
+  Logger,
   TransportConnection,
   TransportHandlers,
 } from 'mud-framework-core';
@@ -70,6 +71,21 @@ function first<T>(items: readonly T[]): T {
     throw new Error('expected at least one item');
   }
   return item;
+}
+
+/** A logger whose every method throws, including `child`. */
+function throwingLogger(): Logger {
+  return {
+    debug: failLogging,
+    info: failLogging,
+    warn: failLogging,
+    error: failLogging,
+    child: failLogging,
+  };
+}
+
+function failLogging(): never {
+  throw new Error('logger exploded');
 }
 
 /** Polls instead of awaiting inside a loop, which the lint config forbids. */
@@ -253,6 +269,19 @@ async function safeStop(transport: WsTransport): Promise<void> {
 }
 
 describe('WsTransport', () => {
+  test('starts and stops with a logger whose every method throws', async () => {
+    const { transport, recorded, url } = await startTransport({
+      logger: throwingLogger(),
+    });
+    try {
+      const client = await openClient(url);
+      await until(() => recorded.connected.length === 1, 'onConnect');
+      client.close();
+    } finally {
+      await safeStop(transport);
+    }
+  });
+
   test('defaults the message ceiling to one mebibyte', async () => {
     const { transport, recorded, url } = await startTransport();
     try {

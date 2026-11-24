@@ -60,6 +60,8 @@ export interface HarnessOptions {
   extensions?: readonly Extension[];
   backend?: StorageBackend;
   timeoutMs?: number;
+  /** Replaces the collecting logger: `logs()` then stays empty. */
+  logger?: Logger;
   /** Observes every message Portal receives, for cross-array ordering checks. */
   onPortalMessage?: (raw: unknown) => void;
   /** Overrides the abort budget so a test need not wait the real 5s. */
@@ -91,11 +93,13 @@ export function startServer(options: HarnessOptions = {}): Harness {
     options.onPortalMessage?.(raw);
   });
   const lines: string[] = [];
-  const logger = createJsonLogger({
-    sink: (line) => {
-      lines.push(line);
-    },
-  });
+  const logger =
+    options.logger ??
+    createJsonLogger({
+      sink: (line) => {
+        lines.push(line);
+      },
+    });
   const backend = options.backend ?? new MemoryStorageBackend();
   const done = runServerProcess({
     createBackend: () => backend,
@@ -155,11 +159,6 @@ export async function startupFailure(
     throw new Error(`expected ServerStartupError, got ${error.name}`);
   }
   return error;
-}
-
-/** A logger that keeps the singleton test's warning out of the output. */
-export function silentLogger(): Logger {
-  return createJsonLogger({ sink: () => undefined });
 }
 
 /** SPEC 4.3 lines only, so unrelated warns do not change the counts. */

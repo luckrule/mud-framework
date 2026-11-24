@@ -301,6 +301,8 @@ export class FakeServerProcess {
 
 export interface HarnessOptions {
   timeoutMs: number;
+  /** Replaces the collecting logger: `logs()` then stays empty. */
+  logger?: Logger;
   maxReplays?: number;
   autoClose?: boolean;
   crashOnHello?: boolean;
@@ -322,12 +324,14 @@ export interface Harness {
 
 export function harness(options: Partial<HarnessOptions> = {}): Harness {
   const lines: string[] = [];
-  const logger: Logger = createJsonLogger({
-    level: 'debug',
-    sink: (line) => {
-      lines.push(line);
-    },
-  });
+  const logger: Logger =
+    options.logger ??
+    createJsonLogger({
+      level: 'debug',
+      sink: (line) => {
+        lines.push(line);
+      },
+    });
   const servers: FakeServerProcess[] = [];
   const executor = new IpcExecutor({
     spawn: () => {

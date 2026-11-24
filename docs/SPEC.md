@@ -303,6 +303,8 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 
 框架日志 MUST 是结构化的（字段而非拼接字符串）。字段名是契约，文案与日志行的产出顺序不是契约。每个 Request 的日志 SHOULD 至少携带：请求标识、Session ID、Connection ID、Extension 名、耗时、结果、错误码。日志级别按语义使用：告警级用于能力降级、重放、队列拒绝这类"能继续运行但需要人知道"的事件；错误级用于请求失败；不得用错误级记录预期内的业务拒绝。
 
+注入的日志实现抛错 MUST NOT 改变框架控制流。日志实现失败时框架不保证 `child()` 的绑定字段（bindings）完整：`safeLogger` 的 `child` 抛错会回退到父包装。
+
 已实现：`RequestContext.extension` 由 handler 的注册元数据填充。通过 `ExtensionRegistrar` 注册的 handler 自动带上所属 Extension 名，请求日志的 bindings 仅在存在该名时写入 `extension` 字段；不属于任何 Extension 的 handler 不带该字段。
 
 ### 7.2 错误码

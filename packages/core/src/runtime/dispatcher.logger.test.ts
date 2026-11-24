@@ -1,0 +1,52 @@
+import { describe, expect, test } from 'bun:test';
+
+import { MemoryStorageBackend } from '../storage/memory.ts';
+import { rejectionOf, throwingLogger } from '../test-support/common.ts';
+import { Dispatcher } from './dispatcher.ts';
+import { FrameworkTimeoutError, UnknownHandlerError } from './wire-codes.ts';
+
+describe('Dispatcher logger safety', () => {
+  test('returns the result and Session binding when the logger throws', async () => {
+    const dispatcher = new Dispatcher({
+      backend: new MemoryStorageBackend(),
+      timeoutMs: 1000,
+      logger: throwingLogger(),
+    });
+    dispatcher.register('login', (ctx) => {
+      ctx.bindSession('s1');
+      return Promise.resolve('ok');
+    });
+
+    const result = await dispatcher.dispatch('login', {});
+
+    expect(result).toEqual({ result: 'ok', boundSessionId: 's1' });
+    await dispatcher.close();
+  }, 2000);
+
+  test('keeps the unknown-method rejection type when the logger throws', async () => {
+    const dispatcher = new Dispatcher({
+      backend: new MemoryStorageBackend(),
+      timeoutMs: 1000,
+      logger: throwingLogger(),
+    });
+
+    const error = await rejectionOf(dispatcher.dispatch('missing', {}));
+
+    expect(error).toBeInstanceOf(UnknownHandlerError);
+    await dispatcher.close();
+  }, 2000);
+
+  test('still times out a hanging handler when the logger throws', async () => {
+    const dispatcher = new Dispatcher({
+      backend: new MemoryStorageBackend(),
+      timeoutMs: 10,
+      logger: throwingLogger(),
+    });
+    dispatcher.register('hang', () => new Promise<never>(() => undefined));
+
+    const error = await rejectionOf(dispatcher.dispatch('hang', {}));
+
+    expect(error).toBeInstanceOf(FrameworkTimeoutError);
+    await dispatcher.close();
+  }, 2000);
+});

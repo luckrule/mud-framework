@@ -4,6 +4,7 @@ import type { ResultMessage } from '../ipc/protocol.ts';
 import { parseIpcMessage } from '../ipc/protocol.ts';
 import type { ServerExitInfo, SpawnedServer } from '../ipc/spawn-port.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
+import { safeLogger } from '../logging/safe-logger.ts';
 import type { LogFields, Logger } from '../logging/types.ts';
 import type {
   ExecutorOutcome,
@@ -204,9 +205,10 @@ export class IpcExecutor implements RequestExecutor {
     this.buffer = new PendingBuffer({
       maxPending: options.maxPending ?? DEFAULT_MAX_PENDING,
     });
-    this.logger =
+    this.logger = safeLogger(
       options.logger ??
-      createJsonLogger({ bindings: { component: 'ipc-executor' } });
+        createJsonLogger({ bindings: { component: 'ipc-executor' } }),
+    );
     this.portalGeneration = nextPortalGeneration();
     // Until `ready` declares the backend ceiling, the Portal ceiling applies.
     this.effectiveTimeoutMs = options.timeoutMs;
@@ -354,7 +356,7 @@ export class IpcExecutor implements RequestExecutor {
       // it first, with a message specific to a start that never succeeded.
       // warn, not error: an orderly shutdown refusal is expected, and the
       // connection layer records the failed outcome at error level already.
-      this.warnSafely(
+      this.logger.warn(
         {
           ...requestFields(request),
           code: FRAMEWORK_SHUTDOWN,
@@ -421,8 +423,8 @@ export class IpcExecutor implements RequestExecutor {
         this.flush();
       }
     } catch (error) {
-      // Delivery is defensive against a throwing channel, but a logger or a
-      // future callback could still throw. The promise must settle regardless.
+      // Delivery is defensive against a throwing channel or callback. The
+      // promise must settle regardless.
       this.settle(pending, failure(INTERNAL_ERROR, messageOf(error)));
     }
     return deferred.promise;
@@ -515,7 +517,7 @@ export class IpcExecutor implements RequestExecutor {
       ) {
         // Per-request line: this is the only trace of why the request ended,
         // since no Server result or deadline will ever reach it.
-        this.warnSafely(
+        this.logger.warn(
           {
             ...requestFields(pending.request),
             code: FRAMEWORK_SHUTDOWN,
@@ -545,7 +547,7 @@ export class IpcExecutor implements RequestExecutor {
     // timeout. Treating a rejection as a timeout would fail every buffered
     // request with a message about a deadline that was never reached.
     if (drained.status === 'timeout') {
-      this.warnSafely(
+      this.logger.warn(
         { timeoutMs: this.shutdownTimeoutMs, pending: this.buffer.size },
         'pending requests did not settle before the shutdown timeout',
       );
@@ -1201,7 +1203,7 @@ export class IpcExecutor implements RequestExecutor {
     pending.timer = undefined;
     // warn, not error: the connection layer records the failed outcome at error
     // level, and one request failure should not produce two error lines.
-    this.warnSafely(
+    this.logger.warn(
       {
         ...requestFields(pending.request),
         code: FRAMEWORK_TIMEOUT,
@@ -1267,20 +1269,6 @@ export class IpcExecutor implements RequestExecutor {
   }
 
   /**
-   * A warn the caller survives. The logger is injectable, so its sink is
-   * arbitrary code: a throw there must never abort a settlement loop and leave
-   * the remaining requests pending forever. A failed log must not block
-   * settlement.
-   */
-  private warnSafely(fields: LogFields, message: string): void {
-    try {
-      this.logger.warn(fields, message);
-    } catch {
-      // Observability is best effort; the request outcome is the contract.
-    }
-  }
-
-  /**
    * Settles every buffered request with one failure. `message` is the outcome
    * text the caller sees; `reason` is log-only and names the call site, because
    * several paths share a code and would otherwise look identical in the logs.
@@ -1289,7 +1277,7 @@ export class IpcExecutor implements RequestExecutor {
     for (const pending of this.buffer.values()) {
       // warn, not error: the connection layer records the failed outcome at
       // error level, and one request failure should not produce two error lines.
-      this.warnSafely(
+      this.logger.warn(
         {
           ...requestFields(pending.request),
           code,

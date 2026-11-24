@@ -2,6 +2,7 @@ import { constants as osConstants } from 'node:os';
 import type { Subprocess } from 'bun';
 
 import { messageOf } from '../internal/guards.ts';
+import { safeLogger } from '../logging/safe-logger.ts';
 import type { Logger } from '../logging/types.ts';
 import { IpcChannelClosedError } from './channel.ts';
 import type { IpcChannel } from './channel.ts';
@@ -35,6 +36,8 @@ const DISCONNECTED_REASON = 'ipc channel disconnected';
 export function spawnBunServer(options: BunServerSpawnOptions): SpawnedServer {
   const inbound: unknown[] = [];
   const exit = Promise.withResolvers<ServerExitInfo>();
+  const logger =
+    options.logger === undefined ? undefined : safeLogger(options.logger);
 
   let onMessage: ((message: unknown) => void) | undefined;
   let onClose: ((reason: string) => void) | undefined;
@@ -94,7 +97,7 @@ export function spawnBunServer(options: BunServerSpawnOptions): SpawnedServer {
     // the real cause, so it still gets a line of its own: otherwise the most
     // common failure (a crash after the pipe dropped) never logs its code.
     if (observed && channelWasClosed && !closedLocally) {
-      options.logger?.warn(
+      logger?.warn(
         {
           code: 'IPC_SERVER_EXITED',
           exitCode: code,

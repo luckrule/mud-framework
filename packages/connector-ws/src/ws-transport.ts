@@ -1,6 +1,7 @@
 import { Buffer } from 'node:buffer';
 import { randomUUID } from 'node:crypto';
 
+import { safeLogger } from 'mud-framework-core';
 import type {
   Logger,
   Transport,
@@ -26,8 +27,9 @@ export interface WsTransportOptions {
    */
   sendTimeoutMs?: number;
   /**
-   * Optional: this package depends on core's types only, never on a logger
-   * implementation, so the caller supplies one. Without it nothing is logged.
+   * Optional: this package depends on core's types and the stateless
+   * `safeLogger` wrapper only, never on a logger implementation; the caller
+   * supplies the implementation. Without it nothing is logged.
    */
   logger?: Logger;
 }
@@ -87,7 +89,10 @@ export class WsTransport implements Transport {
         options.idleTimeoutSeconds ?? DEFAULT_IDLE_TIMEOUT_SECONDS,
       sendTimeoutMs: options.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS,
     };
-    this.logger = options.logger?.child({ transport: 'ws' });
+    this.logger =
+      options.logger === undefined
+        ? undefined
+        : safeLogger(options.logger).child({ transport: 'ws' });
   }
 
   /** The port actually bound, or `undefined` before `start` and after `stop`. */

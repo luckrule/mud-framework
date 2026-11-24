@@ -16,6 +16,10 @@
  * not make a transport swap change the core (INV-018). Its in-memory channel
  * pair stays private for the same reason as the fake transport: it is a test
  * double, not a framework implementation.
+ *
+ * `safeLogger` is exported so every component that accepts an injected logger
+ * (in this package or another) wraps it the same way, keeping a logging fault
+ * out of framework control flow (SPEC 7.1).
  */
 export type {
   StorageBackend,
@@ -45,6 +49,7 @@ export type {
   LoggerOptions,
 } from './logging/types.ts';
 export { createJsonLogger } from './logging/json-logger.ts';
+export { safeLogger } from './logging/safe-logger.ts';
 export type { Codec, Envelope, ResponseEnvelope } from './runtime/codec.ts';
 export { JsonCodec } from './runtime/codec.ts';
 export type {

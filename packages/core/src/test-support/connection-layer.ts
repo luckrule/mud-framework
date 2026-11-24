@@ -36,6 +36,11 @@ export async function harness(
   options: {
     timeoutMs?: number;
     codec?: Codec;
+    /**
+     * Replaces the collecting logger: `logs()` then stays empty and `level`
+     * is ignored.
+     */
+    logger?: Logger;
     createRequestId?: () => string;
     /** Defaults to the logger's own default (`info`). */
     level?: LogLevel;
@@ -48,12 +53,14 @@ export async function harness(
   const transport = new FakeTransport();
   const backend = new MemoryStorageBackend();
   const lines: string[] = [];
-  const logger: Logger = createJsonLogger({
-    level: options.level,
-    sink: (line) => {
-      lines.push(line);
-    },
-  });
+  const logger: Logger =
+    options.logger ??
+    createJsonLogger({
+      level: options.level,
+      sink: (line) => {
+        lines.push(line);
+      },
+    });
   const dispatcher = new Dispatcher({
     backend,
     timeoutMs: options.timeoutMs ?? 1000,

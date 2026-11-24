@@ -1,3 +1,5 @@
+import type { Logger } from '../logging/types.ts';
+
 /**
  * Helpers shared by the runtime and connector tests.
  *
@@ -40,4 +42,22 @@ export async function rejectionOf(promise: Promise<unknown>): Promise<Error> {
     throw new Error(`non-Error rejection: ${String(error)}`, { cause: error });
   }
   throw new Error('expected the promise to reject');
+}
+
+/**
+ * A logger whose every method throws, including `child`. Injecting it at a
+ * framework boundary proves a logger fault cannot alter control flow.
+ */
+export function throwingLogger(): Logger {
+  return {
+    debug: failLogging,
+    info: failLogging,
+    warn: failLogging,
+    error: failLogging,
+    child: failLogging,
+  };
+}
+
+function failLogging(): never {
+  throw new Error('logger exploded');
 }

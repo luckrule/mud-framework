@@ -8,6 +8,7 @@ import type {
 } from '../ipc/protocol.ts';
 import { parseIpcMessage } from '../ipc/protocol.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
+import { safeLogger } from '../logging/safe-logger.ts';
 import type { Logger } from '../logging/types.ts';
 import type { StorageBackend } from '../storage/types.ts';
 import type { Extension } from './extension.ts';
@@ -157,9 +158,10 @@ class ServerProcess {
 
   constructor(options: ServerProcessOptions) {
     this.options = options;
-    this.logger =
+    this.logger = safeLogger(
       options.logger ??
-      createJsonLogger({ bindings: { component: 'server-process' } });
+        createJsonLogger({ bindings: { component: 'server-process' } }),
+    );
     this.channel =
       options.channel ?? createProcessChannel({ logger: this.logger });
     // A startup failure throws out of `run` before it awaits the completion,

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 
 import { isRecord, messageOf } from '../internal/guards.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
+import { safeLogger } from '../logging/safe-logger.ts';
 import type { Logger } from '../logging/types.ts';
 import type {
   Transport,
@@ -177,9 +178,10 @@ export class ConnectionLayer implements TransportHandlers {
     this.transport = options.transport;
     this.executor = options.executor;
     this.codec = options.codec ?? new JsonCodec();
-    this.logger =
+    this.logger = safeLogger(
       options.logger ??
-      createJsonLogger({ bindings: { component: 'connection-layer' } });
+        createJsonLogger({ bindings: { component: 'connection-layer' } }),
+    );
     this.createRequestId = options.createRequestId ?? randomUUID;
     this.maxQueuedPerConnection =
       options.maxQueuedPerConnection ?? DEFAULT_MAX_QUEUED_PER_CONNECTION;

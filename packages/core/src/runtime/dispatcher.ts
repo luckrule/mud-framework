@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { createJsonLogger } from '../logging/json-logger.ts';
+import { safeLogger } from '../logging/safe-logger.ts';
 import type { Logger } from '../logging/types.ts';
 import type { StorageBackend, StorageTransaction } from '../storage/types.ts';
 import type { RequestIdentity } from './identity.ts';
@@ -161,7 +162,7 @@ export class Dispatcher {
     // A child rather than a default-only binding: an injected logger must still
     // carry `component: 'dispatcher'`, so every dispatcher line is identifiable
     // whatever the caller bound.
-    this.logger = (options.logger ?? createJsonLogger()).child({
+    this.logger = safeLogger(options.logger ?? createJsonLogger()).child({
       component: 'dispatcher',
     });
   }

@@ -1,6 +1,7 @@
 import { Database } from 'bun:sqlite';
 import type { SQLQueryBindings } from 'bun:sqlite';
 
+import { safeLogger } from 'mud-framework-core';
 import type {
   Logger,
   StorageBackend,
@@ -16,8 +17,9 @@ export interface SqliteBackendOptions {
   busyTimeoutMs?: number;
   maxTransactionDurationMs?: number;
   /**
-   * Optional: this package depends on core's types only, never on a logger
-   * implementation, so the caller supplies one. Without it nothing is logged.
+   * Optional: this package depends on core's types and the stateless
+   * `safeLogger` wrapper only, never on a logger implementation; the caller
+   * supplies the implementation. Without it nothing is logged.
    */
   logger?: Logger;
 }
@@ -66,7 +68,10 @@ export class SqliteBackend implements StorageBackend {
     this.busyTimeoutMs = busyTimeoutMs;
     // Bound once here, not per call: a rollback failure is rare but a PRAGMA
     // check is startup-only, so both may build the binding lazily.
-    this.logger = logger?.child({ backend: 'sqlite' });
+    this.logger =
+      logger === undefined
+        ? undefined
+        : safeLogger(logger).child({ backend: 'sqlite' });
   }
 
   static open(options: SqliteBackendOptions = {}): SqliteBackend {
