@@ -173,11 +173,18 @@ describe('IpcExecutor restart', () => {
     await rejectionOf(h.executor.start());
 
     const beganAt = Date.now();
-    const outcome = await h.executor.execute(request({ requestId: 'late' }));
+    const outcome = await h.executor.execute(
+      request({ requestId: 'late', sessionId: 's-late' }),
+    );
 
     expect(failureOf(outcome).code).toBe('INTERNAL_ERROR');
     expect(failureOf(outcome).message).toContain('failed to start');
     expect(Date.now() - beganAt).toBeLessThan(1000);
+    const rejected = h.logs().find((line) => line.msg === 'request rejected');
+    expect(rejected).toMatchObject({
+      code: 'INTERNAL_ERROR',
+      sessionId: 's-late',
+    });
     await h.executor.close();
   });
 

@@ -95,6 +95,26 @@ describe('IpcExecutor result', () => {
     await h.executor.close();
   });
 
+  test('logs the session a request already holds when the result reports none', async () => {
+    const h = harness();
+    const server = await started(h);
+
+    const outcomePromise = h.executor.execute(
+      request({ requestId: 'req-1', sessionId: 's-existing' }),
+    );
+    server.send({
+      type: 'result',
+      requestId: 'req-1',
+      ok: false,
+      error: { code: 'NOT_ENOUGH_GOLD', message: 'you cannot afford that' },
+    });
+
+    await outcomePromise;
+    const received = h.logs().find((line) => line.msg === 'result received');
+    expect(received).toMatchObject({ sessionId: 's-existing' });
+    await h.executor.close();
+  });
+
   test('omits the session id when the result reports none', async () => {
     const h = harness();
     const server = await started(h);

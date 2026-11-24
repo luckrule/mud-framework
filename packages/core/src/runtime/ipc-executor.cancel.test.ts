@@ -19,7 +19,7 @@ describe('IpcExecutor cancel', () => {
     const h = harness({ timeoutMs: 5000 });
     const server = await started(h);
 
-    void h.executor.execute(request({ requestId: 'req-1' }));
+    void h.executor.execute(request({ requestId: 'req-1', sessionId: 's1' }));
     expect(requestIds(server)).toEqual(['req-1']);
 
     await h.executor.cancel('req-1', 'TRANSPORT_CLOSED');
@@ -35,6 +35,7 @@ describe('IpcExecutor cancel', () => {
       requestId: 'req-1',
       connectionId: 'c1',
       clientRequestId: 'client-1',
+      sessionId: 's1',
       code: 'TRANSPORT_CLOSED',
     });
     expect(typeof cancelled?.durationMs).toBe('number');
@@ -87,6 +88,37 @@ describe('IpcExecutor cancel', () => {
     expect(h.logs().some((line) => line.msg === 'request cancelled')).toBe(
       false,
     );
+    await h.executor.close();
+  });
+
+  test('logs a cancel the channel refuses with the request session', async () => {
+    const h = harness({ timeoutMs: 5000, shutdownTimeoutMs: 20 });
+    const server = await started(h);
+
+    const outcomePromise = h.executor.execute(
+      request({ requestId: 'req-1', sessionId: 's1' }),
+    );
+    expect(requestIds(server)).toEqual(['req-1']);
+
+    // Closing the executor-side endpoint directly makes `channel.send` throw.
+    // The side that closes locally is not notified, so on the in-memory
+    // channel this is a synthetic way into that catch; it does not cover the
+    // peer-died path.
+    server.handle.channel.close('test channel closed');
+    await h.executor.cancel('req-1', 'TRANSPORT_CLOSED');
+
+    const failedCancel = h
+      .logs()
+      .find((line) => line.msg === 'cancel could not be sent');
+    expect(failedCancel).toMatchObject({
+      level: 'warn',
+      requestId: 'req-1',
+      connectionId: 'c1',
+      clientRequestId: 'client-1',
+      sessionId: 's1',
+      code: 'TRANSPORT_CLOSED',
+    });
+    expect(failureOf(await outcomePromise).code).toBe('TRANSPORT_CLOSED');
     await h.executor.close();
   });
 });

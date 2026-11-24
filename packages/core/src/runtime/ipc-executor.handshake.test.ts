@@ -40,7 +40,9 @@ describe('IpcExecutor handshake', () => {
   test('fails immediately when execute is called before start', async () => {
     const h = harness({ timeoutMs: 5000 });
 
-    const outcome = await h.executor.execute(request({ requestId: 'early' }));
+    const outcome = await h.executor.execute(
+      request({ requestId: 'early', sessionId: 's-early' }),
+    );
 
     // Not a silent wait for the deadline: nothing was ever spawned, and that
     // must be visible in the outcome and the logs (SPEC 6.2 step 3).
@@ -54,7 +56,8 @@ describe('IpcExecutor handshake', () => {
           (line) =>
             line.msg === 'request rejected' &&
             line.code === 'INTERNAL_ERROR' &&
-            line.level === 'error',
+            line.level === 'error' &&
+            line.sessionId === 's-early',
         ),
     ).toBe(true);
   });
@@ -77,12 +80,18 @@ describe('IpcExecutor handshake', () => {
     const h = harness();
     const server = await started(h);
 
-    void h.executor.execute(request({ requestId: 'dup' }));
-    const duplicate = await h.executor.execute(request({ requestId: 'dup' }));
+    void h.executor.execute(request({ requestId: 'dup', sessionId: 's-dup' }));
+    const duplicate = await h.executor.execute(
+      request({ requestId: 'dup', sessionId: 's-dup' }),
+    );
 
     expect(failureOf(duplicate).code).toBe('INTERNAL_ERROR');
     const rejected = h.logs().find((line) => line.msg === 'request rejected');
-    expect(rejected).toMatchObject({ level: 'warn', code: 'INTERNAL_ERROR' });
+    expect(rejected).toMatchObject({
+      level: 'warn',
+      code: 'INTERNAL_ERROR',
+      sessionId: 's-dup',
+    });
 
     server.send(successMessage('dup', null));
     await h.executor.close();
@@ -119,7 +128,9 @@ describe('IpcExecutor handshake', () => {
 
     void h.executor.execute(request({ requestId: 'req-1' }));
     void h.executor.execute(request({ requestId: 'req-2' }));
-    const refused = await h.executor.execute(request({ requestId: 'req-3' }));
+    const refused = await h.executor.execute(
+      request({ requestId: 'req-3', sessionId: 's-3' }),
+    );
 
     expect(failureOf(refused).code).toBe('FRAMEWORK_QUEUE_FULL');
     const logged = h
@@ -129,6 +140,7 @@ describe('IpcExecutor handshake', () => {
       level: 'warn',
       pending: 2,
       limit: 2,
+      sessionId: 's-3',
     });
     await h.executor.close();
   });

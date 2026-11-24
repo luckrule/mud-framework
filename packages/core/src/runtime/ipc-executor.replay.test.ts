@@ -20,7 +20,9 @@ describe('IpcExecutor replay', () => {
     const h = harness({ timeoutMs: 5000 });
     const first = await started(h);
 
-    const outcomePromise = h.executor.execute(request({ requestId: 'req-1' }));
+    const outcomePromise = h.executor.execute(
+      request({ requestId: 'req-1', sessionId: 's1' }),
+    );
     expect(requestIds(first)).toEqual(['req-1']);
 
     first.crash();
@@ -42,7 +44,10 @@ describe('IpcExecutor replay', () => {
       h
         .logs()
         .some(
-          (line) => line.msg === 'request replayed' && line.replayCount === 1,
+          (line) =>
+            line.msg === 'request replayed' &&
+            line.replayCount === 1 &&
+            line.sessionId === 's1',
         ),
     ).toBe(true);
 
@@ -58,7 +63,9 @@ describe('IpcExecutor replay', () => {
     const h = harness({ timeoutMs: 5000, maxReplays: 1 });
     const first = await started(h);
 
-    const outcomePromise = h.executor.execute(request({ requestId: 'req-1' }));
+    const outcomePromise = h.executor.execute(
+      request({ requestId: 'req-1', sessionId: 's1' }),
+    );
 
     first.crash();
     // The second restart already pays a real backoff: `ready` no longer resets
@@ -85,7 +92,9 @@ describe('IpcExecutor replay', () => {
         .logs()
         .some(
           (line) =>
-            line.msg === 'request replay exhausted' && line.level === 'error',
+            line.msg === 'request replay exhausted' &&
+            line.level === 'error' &&
+            line.sessionId === 's1',
         ),
     ).toBe(true);
     await h.executor.close();

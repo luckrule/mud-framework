@@ -4,7 +4,7 @@ import type { ResultMessage } from '../ipc/protocol.ts';
 import { parseIpcMessage } from '../ipc/protocol.ts';
 import type { ServerExitInfo, SpawnedServer } from '../ipc/spawn-port.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
-import type { Logger } from '../logging/types.ts';
+import type { LogFields, Logger } from '../logging/types.ts';
 import type {
   ExecutorOutcome,
   ExecutorRequest,
@@ -319,9 +319,7 @@ export class IpcExecutor implements RequestExecutor {
       // backend instead of a missing `start()` (SPEC 6.2 step 3).
       this.logger.error(
         {
-          requestId: request.requestId,
-          connectionId: request.connectionId,
-          clientRequestId: request.clientRequestId,
+          ...requestFields(request),
           code: INTERNAL_ERROR,
           reason: 'ipc executor was never started',
         },
@@ -337,9 +335,7 @@ export class IpcExecutor implements RequestExecutor {
       // never coming. Failing now is the same answer as the start rejection.
       this.logger.error(
         {
-          requestId: request.requestId,
-          connectionId: request.connectionId,
-          clientRequestId: request.clientRequestId,
+          ...requestFields(request),
           code: INTERNAL_ERROR,
           reason: 'ipc executor failed to start',
         },
@@ -373,9 +369,7 @@ export class IpcExecutor implements RequestExecutor {
       // bug. Failing it beats overwriting a promise nobody would ever settle.
       this.logger.warn(
         {
-          requestId: request.requestId,
-          connectionId: request.connectionId,
-          clientRequestId: request.clientRequestId,
+          ...requestFields(request),
           code: INTERNAL_ERROR,
           reason: 'duplicate requestId',
         },
@@ -432,9 +426,7 @@ export class IpcExecutor implements RequestExecutor {
   private refuseQueueFull(request: ExecutorRequest): Promise<ExecutorOutcome> {
     this.logger.warn(
       {
-        requestId: request.requestId,
-        connectionId: request.connectionId,
-        clientRequestId: request.clientRequestId,
+        ...requestFields(request),
         code: FRAMEWORK_QUEUE_FULL,
         pending: this.buffer.size,
         limit: this.buffer.maxPending,
@@ -481,9 +473,7 @@ export class IpcExecutor implements RequestExecutor {
     // warn, not error: this is a request ending by policy, not a failure.
     this.logger.warn(
       {
-        requestId,
-        connectionId: pending.request.connectionId,
-        clientRequestId: pending.request.clientRequestId,
+        ...requestFields(pending.request),
         code,
         durationMs: Date.now() - pending.startedAt,
       },
@@ -940,23 +930,28 @@ export class IpcExecutor implements RequestExecutor {
       // A result for a request that already reached a Portal-decided terminal
       // state. Expected, not an error (SPEC 7.3 keeps the id stable, so the
       // correlation still works — there is just nothing left to settle).
-      this.logger.debug(
-        {
-          requestId: message.requestId,
-          reason: 'request is no longer buffered',
-        },
-        'late result discarded',
-      );
+      // The pending entry is gone, so a session id is recoverable only when
+      // this request's handler bound one and the result carries it. Failure
+      // results never do, and neither do success results whose entry already
+      // had a session but bound nothing new. `requestId` is stable (SPEC 7.3)
+      // and the connection layer records the entry session on its request
+      // line, so the log is still correlatable by that id.
+      const fields: LogFields = {
+        requestId: message.requestId,
+        reason: 'request is no longer buffered',
+      };
+      if (message.ok && message.sessionId !== undefined) {
+        fields.sessionId = message.sessionId;
+      }
+      this.logger.debug(fields, 'late result discarded');
       return;
     }
     // The message is an `ExecutorOutcome` behind two envelope fields, so the
     // outcome is split off rather than rebuilt field by field. Dropping the
     // envelope is what keeps `requestId` and `type` out of the settled value.
-    const { type: _type, requestId, ...outcome } = message;
-    const fields: Record<string, unknown> = {
-      requestId,
-      connectionId: pending.request.connectionId,
-      clientRequestId: pending.request.clientRequestId,
+    const { type: _type, requestId: _requestId, ...outcome } = message;
+    const fields: LogFields = {
+      ...requestFields(pending.request),
       durationMs: Date.now() - pending.startedAt,
     };
     if (message.ok && message.sessionId !== undefined) {
@@ -1119,9 +1114,7 @@ export class IpcExecutor implements RequestExecutor {
       // retried, otherwise one bad input becomes a crash loop.
       this.logger.error(
         {
-          requestId: pending.request.requestId,
-          connectionId: pending.request.connectionId,
-          clientRequestId: pending.request.clientRequestId,
+          ...requestFields(pending.request),
           replayCount: pending.replayCount,
           code: FRAMEWORK_REPLAY_EXHAUSTED,
         },
@@ -1153,9 +1146,7 @@ export class IpcExecutor implements RequestExecutor {
     if (isReplay) {
       this.logger.warn(
         {
-          requestId: pending.request.requestId,
-          connectionId: pending.request.connectionId,
-          clientRequestId: pending.request.clientRequestId,
+          ...requestFields(pending.request),
           replayCount,
           durationMs: Date.now() - pending.startedAt,
         },
@@ -1184,9 +1175,7 @@ export class IpcExecutor implements RequestExecutor {
     // level, and one request failure should not produce two error lines.
     this.logger.warn(
       {
-        requestId: pending.request.requestId,
-        connectionId: pending.request.connectionId,
-        clientRequestId: pending.request.clientRequestId,
+        ...requestFields(pending.request),
         code: FRAMEWORK_TIMEOUT,
         durationMs: Date.now() - pending.startedAt,
       },
@@ -1223,7 +1212,7 @@ export class IpcExecutor implements RequestExecutor {
     } catch (error) {
       this.logger.warn(
         {
-          requestId: pending.request.requestId,
+          ...requestFields(pending.request),
           code,
           reason: messageOf(error),
         },
@@ -1254,4 +1243,24 @@ export class IpcExecutor implements RequestExecutor {
       this.settle(pending, failure(code, message));
     }
   }
+}
+
+/**
+ * Request-level log bindings (SPEC 7.1): the ids every request carries plus the
+ * Session its connection already held on entry.
+ *
+ * `sessionId` is omitted, not written as `undefined` or an empty string, when
+ * the connection holds no Session: absence is the contract for "unbound"
+ * (SPEC 2, identity.ts).
+ */
+function requestFields(request: ExecutorRequest): LogFields {
+  const fields: LogFields = {
+    requestId: request.requestId,
+    connectionId: request.connectionId,
+    clientRequestId: request.clientRequestId,
+  };
+  if (request.sessionId !== undefined) {
+    fields.sessionId = request.sessionId;
+  }
+  return fields;
 }

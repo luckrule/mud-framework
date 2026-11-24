@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
 import {
+  boundSuccessMessage,
   failureOf,
   flushTicks,
   harness,
@@ -18,10 +19,21 @@ describe('IpcExecutor timeout', () => {
     const h = harness({ timeoutMs: 30 });
     const server = await started(h);
 
-    const outcome = await h.executor.execute(request({ requestId: 'req-1' }));
+    const outcome = await h.executor.execute(
+      request({ requestId: 'req-1', sessionId: 's1' }),
+    );
 
     expect(failureOf(outcome).code).toBe('FRAMEWORK_TIMEOUT');
     expect(failureOf(outcome).message).toContain('timed out');
+    const timedOut = h.logs().find((line) => line.msg === 'request timed out');
+    expect(timedOut).toMatchObject({
+      level: 'warn',
+      requestId: 'req-1',
+      connectionId: 'c1',
+      clientRequestId: 'client-1',
+      sessionId: 's1',
+      code: 'FRAMEWORK_TIMEOUT',
+    });
     // The Server is told to stop working on a request Portal already settled.
     expect(messagesOf(server)).toContainEqual({
       type: 'cancel',
@@ -30,7 +42,8 @@ describe('IpcExecutor timeout', () => {
     });
 
     // A result that arrives after the terminal state must be dropped quietly.
-    server.send(successMessage('req-1', 'too late'));
+    // Its own binding is the only Session id left: the pending entry is gone.
+    server.send(boundSuccessMessage('req-1', 'too late', 's-late'));
     await flushTicks();
     expect(h.logs().some((line) => line.msg === 'late result discarded')).toBe(
       true,
@@ -40,7 +53,9 @@ describe('IpcExecutor timeout', () => {
         .logs()
         .some(
           (line) =>
-            line.msg === 'late result discarded' && line.level === 'debug',
+            line.msg === 'late result discarded' &&
+            line.level === 'debug' &&
+            line.sessionId === 's-late',
         ),
     ).toBe(true);
     await h.executor.close();
@@ -65,6 +80,11 @@ describe('IpcExecutor timeout', () => {
     expect(settles).toBe(1);
     // Still the timeout: the late result must not replace the settled outcome.
     expect(failureOf(outcome).code).toBe('FRAMEWORK_TIMEOUT');
+    // An unbound result has no session to report: absence must stay absence,
+    // not become an empty string.
+    const late = h.logs().find((line) => line.msg === 'late result discarded');
+    expect(late).toBeDefined();
+    expect(late).not.toHaveProperty('sessionId');
     await h.executor.close();
   });
 
