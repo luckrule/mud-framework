@@ -1,5 +1,7 @@
 import { join } from 'node:path';
 
+import { isRecord } from 'mud-framework-test-support';
+
 import { WsTransport } from '../../../packages/connector-ws/src/index.ts';
 import {
   ConnectionLayer,
@@ -51,10 +53,6 @@ interface ReadyLine {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function readMode(raw: string | undefined): Mode {

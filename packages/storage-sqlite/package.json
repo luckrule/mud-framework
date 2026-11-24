@@ -11,5 +11,8 @@
   },
   "dependencies": {
     "mud-framework-core": "workspace:*"
+  },
+  "devDependencies": {
+    "mud-framework-test-support": "workspace:*"
   }
 }

@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
+import { parseJsonLine as parseLine } from 'mud-framework-test-support';
+
 import { JsonLogger, createJsonLogger } from './json-logger.ts';
 import type { LogFields } from './types.ts';
 
@@ -25,20 +27,8 @@ function capture(
   return {
     lines,
     logger,
-    parsed: () => lines.map(parseLine),
+    parsed: () => lines.map((line) => parseLine(line)),
   };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function parseLine(line: string): Record<string, unknown> {
-  const parsed: unknown = JSON.parse(line);
-  if (!isRecord(parsed)) {
-    throw new Error(`line is not a JSON object: ${line}`);
-  }
-  return parsed;
 }
 
 describe('JsonLogger', () => {

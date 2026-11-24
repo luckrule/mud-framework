@@ -1,5 +1,7 @@
 import { Buffer } from 'node:buffer';
 
+import { isRecord, parseFrame } from 'mud-framework-test-support';
+
 import { createJsonLogger } from '../logging/json-logger.ts';
 import type { Logger, LogLevel } from '../logging/types.ts';
 import type { Codec, Envelope, ResponseEnvelope } from '../runtime/codec.ts';
@@ -10,7 +12,6 @@ import type { ExecutorRequest, RequestExecutor } from '../runtime/executor.ts';
 import { MemoryStorageBackend } from '../storage/memory.ts';
 import { FakeTransport } from '../transport/fake.ts';
 import type { Transport, TransportConnection } from '../transport/types.ts';
-import { isRecord, parseFrame } from './common.ts';
 
 export function lastFrame(
   transport: FakeTransport,

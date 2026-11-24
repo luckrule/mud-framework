@@ -1,7 +1,16 @@
 import { describe, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+
+import {
+  isProcessAlive,
+  isRecord,
+  nextMessage,
+  openClient,
+  parseFrame,
+  sleep,
+  tempDatabase,
+} from 'mud-framework-test-support';
 
 import { WsTransport } from '../../packages/connector-ws/src/index.ts';
 import {
@@ -29,11 +38,6 @@ type Behavior =
   | 'extension-trial'
   | 'required-extension-fail';
 
-interface TempDatabase {
-  readonly path: string;
-  remove(): void;
-}
-
 interface LogCapture {
   readonly logger: Logger;
   readonly lines: Record<string, unknown>[];
@@ -46,16 +50,6 @@ interface Portal {
   readonly logs: LogCapture;
   /** How many times the executor called `spawn`, so a restart loop is visible. */
   spawns: () => number;
-}
-
-function tempDatabase(): TempDatabase {
-  const directory = mkdtempSync(join(tmpdir(), 'mud-two-process-'));
-  return {
-    path: join(directory, 'server.sqlite'),
-    remove(): void {
-      rmSync(directory, { recursive: true, force: true });
-    },
-  };
 }
 
 function capturingLogger(): LogCapture {
@@ -113,69 +107,6 @@ function createPortal(options: {
     logs,
     spawns: () => spawnCounter.count,
   };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise<void>((resolve) => {
-    setTimeout(resolve, ms);
-  });
-}
-
-function parseFrame(raw: string | Uint8Array): Record<string, unknown> {
-  const text = typeof raw === 'string' ? raw : new TextDecoder().decode(raw);
-  const parsed: unknown = JSON.parse(text);
-  if (!isRecord(parsed)) {
-    throw new Error(`frame is not a JSON object: ${text}`);
-  }
-  return parsed;
-}
-
-function openClient(url: string): Promise<WebSocket> {
-  return new Promise((resolve, reject) => {
-    const socket = new WebSocket(url);
-    socket.addEventListener(
-      'open',
-      () => {
-        resolve(socket);
-      },
-      { once: true },
-    );
-    socket.addEventListener(
-      'error',
-      () => {
-        reject(new Error(`failed to connect to ${url}`));
-      },
-      { once: true },
-    );
-  });
-}
-
-function nextMessage(socket: WebSocket): Promise<string | Uint8Array> {
-  return new Promise((resolve, reject) => {
-    socket.addEventListener(
-      'message',
-      (event: MessageEvent) => {
-        const data: unknown = event.data;
-        if (typeof data === 'string' || data instanceof Uint8Array) {
-          resolve(data);
-          return;
-        }
-        reject(new Error(`unexpected message type: ${typeof data}`));
-      },
-      { once: true },
-    );
-    socket.addEventListener(
-      'error',
-      () => {
-        reject(new Error('socket errored before a reply arrived'));
-      },
-      { once: true },
-    );
-  });
 }
 
 /** One request on an already-open socket, which survives a Server restart. */
@@ -258,20 +189,6 @@ function replayCounts(logs: LogCapture): number[] {
 }
 
 /**
- * `process.kill(pid, 0)` is the only portable liveness probe: it throws ESRCH
- * for a reaped process. Anything else (EPERM) means it is still alive.
- */
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    const code = isRecord(error) ? error.code : undefined;
-    return code !== 'ESRCH';
-  }
-}
-
-/**
  * Always releases the Portal, then any Server pid it ever reported. A test that
  * fails its assertions must not leave a child behind for the rest of the suite.
  */
@@ -317,7 +234,7 @@ async function settleWithin(
 
 describe('two-process integration', () => {
   test('a WebSocket request is executed by the Server process and its write lands in SQLite', async () => {
-    const database = tempDatabase();
+    const database = tempDatabase({ prefix: 'mud-two-process-' });
     const portal = createPortal({
       databasePath: database.path,
       behavior: 'echo',
@@ -371,7 +288,7 @@ describe('two-process integration', () => {
   });
 
   test('a Server that dies mid-request is replayed to exhaustion while the Portal keeps serving', async () => {
-    const database = tempDatabase();
+    const database = tempDatabase({ prefix: 'mud-two-process-' });
     const portal = createPortal({
       databasePath: database.path,
       behavior: 'crash',
@@ -411,7 +328,7 @@ describe('two-process integration', () => {
   });
 
   test('a crash on the first execution is replayed and the same request succeeds', async () => {
-    const database = tempDatabase();
+    const database = tempDatabase({ prefix: 'mud-two-process-' });
     const portal = createPortal({
       databasePath: database.path,
       behavior: 'crash-once',
@@ -496,7 +413,7 @@ describe('two-process integration', () => {
   });
 
   test('an extension whose requirements SQLite meets registers and can bind a Session', async () => {
-    const database = tempDatabase();
+    const database = tempDatabase({ prefix: 'mud-two-process-' });
     const portal = createPortal({
       databasePath: database.path,
       behavior: 'extension-trial',
@@ -557,7 +474,7 @@ describe('two-process integration', () => {
   });
 
   test('an optional extension skipped for unmet capabilities leaves no handlers behind, and the Server keeps serving', async () => {
-    const database = tempDatabase();
+    const database = tempDatabase({ prefix: 'mud-two-process-' });
     const portal = createPortal({
       databasePath: database.path,
       behavior: 'extension-trial',
@@ -605,7 +522,7 @@ describe('two-process integration', () => {
   });
 
   test('a required extension whose requirements are unmet refuses startup', async () => {
-    const database = tempDatabase();
+    const database = tempDatabase({ prefix: 'mud-two-process-' });
     const portal = createPortal({
       databasePath: database.path,
       behavior: 'required-extension-fail',
@@ -643,7 +560,7 @@ describe('two-process integration', () => {
   });
 
   test('stop() returns only after the Server process has exited', async () => {
-    const database = tempDatabase();
+    const database = tempDatabase({ prefix: 'mud-two-process-' });
     const portal = createPortal({
       databasePath: database.path,
       behavior: 'echo',
@@ -671,7 +588,7 @@ describe('two-process integration', () => {
   });
 
   test('start() fails within a bounded time when the Server cannot boot', async () => {
-    const database = tempDatabase();
+    const database = tempDatabase({ prefix: 'mud-two-process-' });
     const portal = createPortal({
       databasePath: database.path,
       behavior: 'boot-fail',

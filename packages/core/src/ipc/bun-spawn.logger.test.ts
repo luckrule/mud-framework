@@ -1,8 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 
+import { withDeadline } from 'mud-framework-test-support';
+
 import type { LogFields, Logger } from '../logging/types.ts';
 import { spawnBunServer } from './bun-spawn.ts';
-import type { ServerExitInfo } from './spawn-port.ts';
 
 /**
  * The child drops the IPC pipe before exiting, which is the only way
@@ -39,31 +40,6 @@ function throwingLogger(warns: WarnCall[]): Logger {
     },
   };
   return logger;
-}
-
-/**
- * `server.exited` is served by the patched spawn below. A lost exit event
- * would otherwise hang the case and skip the `finally` that restores
- * `Bun.spawn`; the deadline turns that hang into an ordinary test failure.
- */
-function exitWithinDeadline(
-  exited: Promise<ServerExitInfo>,
-): Promise<ServerExitInfo> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => {
-      reject(
-        new Error(
-          `server.exited did not settle within ${String(EXIT_TIMEOUT_MS)}ms`,
-        ),
-      );
-    }, EXIT_TIMEOUT_MS);
-  });
-  return Promise.race([exited, deadline]).finally(() => {
-    if (timer !== undefined) {
-      clearTimeout(timer);
-    }
-  });
 }
 
 type SpawnOptions = Bun.Spawn.BaseOptions<'ignore', 'inherit', 'inherit'> & {
@@ -117,7 +93,14 @@ describe('spawnBunServer', () => {
         closes.push(reason);
       });
 
-      const exit = await exitWithinDeadline(server.exited);
+      // `server.exited` is served by the patched spawn above. A lost exit event
+      // would otherwise hang the case and skip the `finally` that restores
+      // `Bun.spawn`; the deadline turns that hang into an ordinary test failure.
+      const exit = await withDeadline(
+        server.exited,
+        EXIT_TIMEOUT_MS,
+        'server.exited did not settle',
+      );
 
       expect(exitHandlerError).toBeUndefined();
       expect(warns).toHaveLength(1);

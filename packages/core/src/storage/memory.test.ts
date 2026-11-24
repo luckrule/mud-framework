@@ -1,18 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 
-import { MemoryStorageBackend } from './memory.ts';
+import { rejectionOf } from 'mud-framework-test-support';
 
-async function rejectionOf(promise: Promise<unknown>): Promise<Error> {
-  try {
-    await promise;
-  } catch (error) {
-    if (error instanceof Error) {
-      return error;
-    }
-    throw new Error(`non-Error rejection: ${String(error)}`, { cause: error });
-  }
-  throw new Error('expected the promise to reject');
-}
+import { MemoryStorageBackend } from './memory.ts';
 
 describe('MemoryStorageBackend', () => {
   test('declares the weakest honest capabilities by default', () => {

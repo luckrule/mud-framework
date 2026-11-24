@@ -11,6 +11,13 @@ import {
 } from 'mud-framework-core';
 import type { Logger } from 'mud-framework-core';
 import { SqliteBackend } from 'mud-framework-storage-sqlite';
+import {
+  isProcessAlive,
+  isRecord,
+  openClient,
+  parseFrame,
+  sleep,
+} from 'mud-framework-test-support';
 
 /**
  * Manual end-to-end check of the path a consumer actually takes; it is not
@@ -89,18 +96,8 @@ interface Diagnostics {
   readonly tempDirRemoved: boolean;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
 }
 
 function writeStdout(text: string): void {
@@ -182,16 +179,6 @@ function recordServerPids(
   }
 }
 
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    const code = isRecord(error) ? error.code : undefined;
-    return code !== 'ESRCH';
-  }
-}
-
 /**
  * Linux exposes the Portal's direct children here. `undefined` means the child
  * list could not be read; it must never be reported as "no children".
@@ -224,61 +211,6 @@ function formatChildren(children: number[] | undefined): string {
     return 'check skipped (no /proc)';
   }
   return children.length === 0 ? 'none' : children.join(', ');
-}
-
-function parseFrame(raw: string | Uint8Array): Record<string, unknown> {
-  const text = typeof raw === 'string' ? raw : new TextDecoder().decode(raw);
-  const parsed: unknown = JSON.parse(text);
-  if (!isRecord(parsed)) {
-    throw new Error(`frame is not a JSON object: ${text}`);
-  }
-  return parsed;
-}
-
-function openClient(url: string): Promise<WebSocket> {
-  return new Promise((resolve, reject) => {
-    const socket = new WebSocket(url);
-    let timer: ReturnType<typeof setTimeout> | undefined;
-
-    function cleanup(): void {
-      if (timer !== undefined) {
-        clearTimeout(timer);
-      }
-      socket.removeEventListener('open', onOpen);
-      socket.removeEventListener('error', onError);
-      socket.removeEventListener('close', onClose);
-    }
-
-    function fail(error: Error): void {
-      cleanup();
-      socket.close();
-      reject(error);
-    }
-
-    function onOpen(): void {
-      cleanup();
-      resolve(socket);
-    }
-
-    function onError(): void {
-      fail(new Error(`failed to connect to ${url}`));
-    }
-
-    function onClose(): void {
-      fail(new Error(`connection to ${url} closed before open`));
-    }
-
-    socket.addEventListener('open', onOpen);
-    socket.addEventListener('error', onError);
-    socket.addEventListener('close', onClose);
-    timer = setTimeout(() => {
-      fail(
-        new Error(
-          `connection to ${url} timed out after ${REQUEST_TIMEOUT_MS}ms`,
-        ),
-      );
-    }, REQUEST_TIMEOUT_MS);
-  });
 }
 
 function nextMessage(
@@ -333,7 +265,7 @@ async function call(
   url: string,
   request: { id: string; method: string; payload: unknown },
 ): Promise<Record<string, unknown>> {
-  const socket = await openClient(url);
+  const socket = await openClient(url, { timeoutMs: REQUEST_TIMEOUT_MS });
   try {
     const reply = nextMessage(socket);
     try {

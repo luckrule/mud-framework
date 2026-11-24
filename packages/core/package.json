@@ -8,5 +8,8 @@
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts"
+  },
+  "devDependencies": {
+    "mud-framework-test-support": "workspace:*"
   }
 }

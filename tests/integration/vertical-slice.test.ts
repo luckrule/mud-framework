@@ -1,5 +1,12 @@
 import { describe, expect, test } from 'bun:test';
 
+import {
+  isRecord,
+  nextMessage,
+  openClient,
+  parseFrame,
+} from 'mud-framework-test-support';
+
 import { WsTransport } from '../../packages/connector-ws/src/index.ts';
 import {
   ConnectionLayer,
@@ -7,63 +14,6 @@ import {
   LocalExecutor,
 } from '../../packages/core/src/index.ts';
 import { SqliteBackend } from '../../packages/storage-sqlite/src/index.ts';
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function parseFrame(raw: string | Uint8Array): Record<string, unknown> {
-  const text = typeof raw === 'string' ? raw : new TextDecoder().decode(raw);
-  const parsed: unknown = JSON.parse(text);
-  if (!isRecord(parsed)) {
-    throw new Error(`frame is not a JSON object: ${text}`);
-  }
-  return parsed;
-}
-
-function openClient(url: string): Promise<WebSocket> {
-  return new Promise((resolve, reject) => {
-    const socket = new WebSocket(url);
-    socket.addEventListener(
-      'open',
-      () => {
-        resolve(socket);
-      },
-      { once: true },
-    );
-    socket.addEventListener(
-      'error',
-      () => {
-        reject(new Error(`failed to connect to ${url}`));
-      },
-      { once: true },
-    );
-  });
-}
-
-function nextMessage(socket: WebSocket): Promise<string | Uint8Array> {
-  return new Promise((resolve, reject) => {
-    socket.addEventListener(
-      'message',
-      (event: MessageEvent) => {
-        const data: unknown = event.data;
-        if (typeof data === 'string' || data instanceof Uint8Array) {
-          resolve(data);
-          return;
-        }
-        reject(new Error(`unexpected message type: ${typeof data}`));
-      },
-      { once: true },
-    );
-    socket.addEventListener(
-      'error',
-      () => {
-        reject(new Error('socket errored before a reply arrived'));
-      },
-      { once: true },
-    );
-  });
-}
 
 /**
  * One request over a fresh real WebSocket, closed afterwards. Each call is a

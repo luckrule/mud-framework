@@ -1,20 +1,12 @@
 import { describe, expect, test } from 'bun:test';
 
-import { throwingLogger } from '../test-support/common.ts';
+import {
+  parseJsonLine as parseLine,
+  throwingLogger,
+} from 'mud-framework-test-support';
+
 import { createJsonLogger } from './json-logger.ts';
 import { safeLogger } from './safe-logger.ts';
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function parseLine(line: string): Record<string, unknown> {
-  const parsed: unknown = JSON.parse(line);
-  if (!isRecord(parsed)) {
-    throw new Error(`line is not a JSON object: ${line}`);
-  }
-  return parsed;
-}
 
 describe('safeLogger', () => {
   test('swallows a throw from every level', () => {
@@ -64,7 +56,7 @@ describe('safeLogger', () => {
     const child = logger.child({ requestId: 'r1' });
     child.info({ b: 2 }, 'child');
 
-    expect(lines.map(parseLine)).toEqual([
+    expect(lines.map((line) => parseLine(line))).toEqual([
       {
         level: 'info',
         time: expect.any(String),

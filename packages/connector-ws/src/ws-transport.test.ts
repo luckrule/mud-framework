@@ -5,17 +5,19 @@ import net from 'node:net';
 
 import { createJsonLogger } from 'mud-framework-core';
 import type {
-  Logger,
   TransportConnection,
   TransportHandlers,
 } from 'mud-framework-core';
+import {
+  openClient,
+  parseJsonLine,
+  rejectionOf,
+  tick as settle,
+  throwingLogger,
+} from 'mud-framework-test-support';
 
 import { WsTransport } from './ws-transport.ts';
 import type { WsTransportOptions } from './ws-transport.ts';
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 /** JSON logger writing into an array, so emitted events can be asserted. */
 function captureLogger(): {
@@ -30,14 +32,7 @@ function captureLogger(): {
   });
   return {
     logger,
-    entries: () =>
-      lines.map((line) => {
-        const parsed: unknown = JSON.parse(line);
-        if (!isRecord(parsed)) {
-          throw new Error(`log line is not a JSON object: ${line}`);
-        }
-        return parsed;
-      }),
+    entries: () => lines.map((line) => parseJsonLine(line, 'log line')),
   };
 }
 
@@ -73,21 +68,6 @@ function first<T>(items: readonly T[]): T {
   return item;
 }
 
-/** A logger whose every method throws, including `child`. */
-function throwingLogger(): Logger {
-  return {
-    debug: failLogging,
-    info: failLogging,
-    warn: failLogging,
-    error: failLogging,
-    child: failLogging,
-  };
-}
-
-function failLogging(): never {
-  throw new Error('logger exploded');
-}
-
 /** Polls instead of awaiting inside a loop, which the lint config forbids. */
 async function until(
   predicate: () => boolean,
@@ -108,18 +88,6 @@ async function until(
     return poll();
   };
   return poll();
-}
-
-async function rejectionOf(promise: Promise<unknown>): Promise<Error> {
-  try {
-    await promise;
-  } catch (error) {
-    if (error instanceof Error) {
-      return error;
-    }
-    throw new Error(`non-Error rejection: ${String(error)}`, { cause: error });
-  }
-  throw new Error('expected the promise to reject');
 }
 
 interface Tracked {
@@ -147,12 +115,6 @@ function tracked(promise: Promise<void>): Tracked {
     },
   );
   return { promise, state: () => state, error: () => error };
-}
-
-async function settle(): Promise<void> {
-  await new Promise<void>((resolve) => {
-    setTimeout(resolve, 0);
-  });
 }
 
 /** Large enough to fill the kernel and Bun buffers on its own. */
@@ -206,26 +168,6 @@ function rawClient(port: number): Promise<net.Socket> {
     socket.once('connect', () => {
       resolve(socket);
     });
-  });
-}
-
-function openClient(url: string): Promise<WebSocket> {
-  return new Promise((resolve, reject) => {
-    const socket = new WebSocket(url);
-    socket.addEventListener(
-      'open',
-      () => {
-        resolve(socket);
-      },
-      { once: true },
-    );
-    socket.addEventListener(
-      'error',
-      () => {
-        reject(new Error(`failed to connect to ${url}`));
-      },
-      { once: true },
-    );
   });
 }
 

@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-工程基础设施已就绪（workspace、格式化与静态检查、类型检查、测试入口、本地与 CI 共用的门禁脚本、Git 钩子、GitHub Actions）。`packages/` 下已有 core、connector-ws 与 storage-sqlite 三个包，实现存储契约、传输契约与端到端链路；对外契约见 `docs/SPEC.md`。
+工程基础设施已就绪（workspace、格式化与静态检查、类型检查、测试入口、本地与 CI 共用的门禁脚本、Git 钩子、GitHub Actions）。`packages/` 下有四个 workspace 包：core、connector-ws 与 storage-sqlite 实现存储契约、传输契约与端到端链路，test-support（`mud-framework-test-support`）是 private 包，仅用于测试辅助，不参与对外契约；对外契约见 `docs/SPEC.md`。
 
 ## 快速开始
 
@@ -17,7 +17,7 @@ mud-framework/
 ├── .githooks/         pre-commit 与 commit-msg 钩子
 ├── .github/           CI 配置与 PR 模板
 ├── docs/              规格、不变量与协作规范
-├── packages/          三个包：core、connector-ws、storage-sqlite
+├── packages/          四个包：core、connector-ws、storage-sqlite，以及 private 的 test-support（仅测试辅助）
 ├── scripts/           门禁脚本，本地与 CI 共用
 ├── tests/             跨包集成测试
 ├── .bun-version       Bun 版本约束

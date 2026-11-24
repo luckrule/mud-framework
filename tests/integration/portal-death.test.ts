@@ -1,8 +1,19 @@
 import { describe, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { constants as osConstants, tmpdir } from 'node:os';
+import { existsSync, readFileSync } from 'node:fs';
+import { constants as osConstants } from 'node:os';
 import { join } from 'node:path';
-import type { ReadableStreamDefaultReader } from 'node:stream/web';
+
+import {
+  isProcessAlive,
+  isRecord,
+  LineReader,
+  openClient,
+  parseJsonLine,
+  sleep,
+  tempDatabase,
+  withDeadline,
+} from 'mud-framework-test-support';
+import type { TempDatabase } from 'mud-framework-test-support';
 
 import { SqliteBackend } from '../../packages/storage-sqlite/src/index.ts';
 
@@ -94,78 +105,10 @@ interface PortalReady {
   readonly mode: PortalMode;
 }
 
-interface TempDatabase {
-  readonly directory: string;
-  readonly path: string;
-  remove(): void;
-}
-
 type PortalProcess = Bun.Subprocess<'ignore', 'pipe', 'pipe'>;
-
-const TIMED_OUT = Symbol('timed out');
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 function errorFrom(value: unknown): Error {
   return value instanceof Error ? value : new Error(String(value));
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise<void>((resolve) => {
-    setTimeout(resolve, ms);
-  });
-}
-
-function withDeadline<T>(
-  promise: Promise<T>,
-  timeoutMs: number,
-  description: string,
-): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<typeof TIMED_OUT>((resolve) => {
-    timer = setTimeout(() => {
-      resolve(TIMED_OUT);
-    }, timeoutMs);
-  });
-  return Promise.race([promise, timeout])
-    .then((result) => {
-      if (result === TIMED_OUT) {
-        throw new Error(`${description} within ${timeoutMs}ms`);
-      }
-      return result;
-    })
-    .finally(() => {
-      if (timer !== undefined) {
-        clearTimeout(timer);
-      }
-    });
-}
-
-function tempDatabase(): TempDatabase {
-  const directory = mkdtempSync(join(tmpdir(), 'mud-portal-death-'));
-  return {
-    directory,
-    path: join(directory, 'server.sqlite'),
-    remove(): void {
-      rmSync(directory, { recursive: true, force: true });
-    },
-  };
-}
-
-/**
- * `process.kill(pid, 0)` is the probe docs/INTEGRATION.md prescribes: ESRCH
- * means gone, anything else (EPERM included) means the process still exists.
- */
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    const code = isRecord(error) ? error.code : undefined;
-    return code !== 'ESRCH';
-  }
 }
 
 function assertMissing(pid: number): void {
@@ -216,19 +159,6 @@ async function waitForGone(
     }
     await sleep(intervalMs);
   }
-}
-
-function parseJsonLine(line: string): Record<string, unknown> {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(line);
-  } catch {
-    throw new Error(`portal stdout line is not JSON: ${line}`);
-  }
-  if (!isRecord(parsed)) {
-    throw new Error(`portal stdout line is not a JSON object: ${line}`);
-  }
-  return parsed;
 }
 
 function requireReady(value: Record<string, unknown>): PortalReady {
@@ -377,42 +307,6 @@ async function waitForServerReadyPids(
   }
 }
 
-/**
- * Splits the Portal's stdout into lines. The Portal writes one JSON handshake;
- * the Server inherits the same stdout and interleaves its own JSON log lines,
- * so the reader keeps looking until it sees `event: "portal-ready"`.
- */
-class LineReader {
-  private readonly reader: ReadableStreamDefaultReader<Uint8Array<ArrayBuffer>>;
-  private readonly decoder = new TextDecoder();
-  private buffer = '';
-
-  constructor(stream: ReadableStream<Uint8Array<ArrayBuffer>>) {
-    this.reader = stream.getReader();
-  }
-
-  async nextLine(): Promise<string | undefined> {
-    let index = this.buffer.indexOf('\n');
-    while (index < 0) {
-      const chunk = await this.reader.read();
-      if (chunk.done) {
-        const rest = this.buffer;
-        this.buffer = '';
-        return rest.length > 0 ? rest : undefined;
-      }
-      this.buffer += this.decoder.decode(chunk.value, { stream: true });
-      index = this.buffer.indexOf('\n');
-    }
-    const line = this.buffer.slice(0, index);
-    this.buffer = this.buffer.slice(index + 1);
-    return line;
-  }
-
-  cancel(): Promise<void> {
-    return this.reader.cancel();
-  }
-}
-
 interface StderrCapture {
   readonly lines: string[];
   readonly done: Promise<void>;
@@ -441,7 +335,7 @@ async function readReadyLine(
   let line = await reader.nextLine();
   while (line !== undefined) {
     observed.push(line);
-    const parsed = parseJsonLine(line);
+    const parsed = parseJsonLine(line, 'portal stdout line');
     if (parsed.event === 'portal-ready') {
       return requireReady(parsed);
     }
@@ -461,26 +355,6 @@ async function drainLines(
   }
 }
 
-function openClient(url: string): Promise<WebSocket> {
-  return new Promise((resolve, reject) => {
-    const socket = new WebSocket(url);
-    socket.addEventListener(
-      'open',
-      () => {
-        resolve(socket);
-      },
-      { once: true },
-    );
-    socket.addEventListener(
-      'error',
-      () => {
-        reject(new Error(`failed to connect to ${url}`));
-      },
-      { once: true },
-    );
-  });
-}
-
 function nextFrame(socket: WebSocket): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
     socket.addEventListener(
@@ -494,7 +368,7 @@ function nextFrame(socket: WebSocket): Promise<Record<string, unknown>> {
         const text =
           typeof data === 'string' ? data : new TextDecoder().decode(data);
         try {
-          resolve(parseJsonLine(text));
+          resolve(parseJsonLine(text, 'portal stdout line'));
         } catch (error) {
           reject(error instanceof Error ? error : new Error(String(error)));
         }
@@ -571,7 +445,7 @@ function serverStopLine(
   for (const line of observed) {
     let parsed: Record<string, unknown>;
     try {
-      parsed = parseJsonLine(line);
+      parsed = parseJsonLine(line, 'portal stdout line');
     } catch {
       continue;
     }
@@ -732,7 +606,7 @@ async function cleanupPortal(run: RunningPortal): Promise<CleanupResult> {
 }
 
 async function runSignalScenario(scenario: SignalScenario): Promise<void> {
-  const database = tempDatabase();
+  const database = tempDatabase({ prefix: 'mud-portal-death-' });
   const observed: string[] = [];
   const graceful = scenario.mode === 'graceful';
   const portal = Bun.spawn({
@@ -892,7 +766,7 @@ async function runSignalScenario(scenario: SignalScenario): Promise<void> {
  * database must survive until then.
  */
 async function runBrokenHandshake(): Promise<void> {
-  const database = tempDatabase();
+  const database = tempDatabase({ prefix: 'mud-portal-death-' });
   const observed: string[] = [];
   const portal = Bun.spawn({
     cmd: [process.execPath, 'run', PORTAL_FIXTURE, database.path, 'default'],

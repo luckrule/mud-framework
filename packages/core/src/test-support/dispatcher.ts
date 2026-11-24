@@ -1,3 +1,7 @@
+import { deferred, parseJsonLine, sleep } from 'mud-framework-test-support';
+
+export { deferred };
+
 import { createJsonLogger } from '../logging/json-logger.ts';
 import type { Logger } from '../logging/types.ts';
 import { Dispatcher } from '../runtime/dispatcher.ts';
@@ -6,19 +10,12 @@ import type {
   StorageCapabilities,
   StorageTransaction,
 } from '../storage/types.ts';
-import { isRecord, sleep } from './common.ts';
 
 /** Parsed log lines, in emission order. */
 export function parseLines(
   lines: readonly string[],
 ): Record<string, unknown>[] {
-  return lines.map((line) => {
-    const parsed: unknown = JSON.parse(line);
-    if (!isRecord(parsed)) {
-      throw new Error(`log line is not a JSON object: ${line}`);
-    }
-    return parsed;
-  });
+  return lines.map((line) => parseJsonLine(line, 'log line'));
 }
 
 /** Dispatcher whose logs go to `lines` instead of stdout. */
@@ -35,17 +32,6 @@ export function quietDispatcher(
     dispatcher: new Dispatcher({ ...options, logger }),
     lines,
   };
-}
-
-export function deferred<T>(): {
-  promise: Promise<T>;
-  resolve: (value: T) => void;
-} {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((res) => {
-    resolve = res;
-  });
-  return { promise, resolve };
 }
 
 /**

@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
+import { rejectionOf } from 'mud-framework-test-support';
+
 import { FakeTransport } from './fake.ts';
 import type { TransportConnection, TransportHandlers } from './types.ts';
 
@@ -25,18 +27,6 @@ function recorder(): { handlers: TransportHandlers; recorded: Recorded } {
       },
     },
   };
-}
-
-async function rejectionOf(promise: Promise<unknown>): Promise<Error> {
-  try {
-    await promise;
-  } catch (error) {
-    if (error instanceof Error) {
-      return error;
-    }
-    throw new Error(`non-Error rejection: ${String(error)}`, { cause: error });
-  }
-  throw new Error('expected the promise to reject');
 }
 
 describe('FakeTransport', () => {

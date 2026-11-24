@@ -1,3 +1,5 @@
+import { parseJsonLine, rejectionOf } from 'mud-framework-test-support';
+
 import type { IpcChannel } from '../ipc/channel.ts';
 import { createInMemoryChannelPair } from '../ipc/channel.ts';
 import type {
@@ -13,7 +15,6 @@ import { runServerProcess } from '../runtime/server-process.ts';
 import { ServerStartupError } from '../runtime/server-startup.ts';
 import { MemoryStorageBackend } from '../storage/memory.ts';
 import type { StorageBackend, StorageCapabilities } from '../storage/types.ts';
-import { isRecord, rejectionOf } from './common.ts';
 
 export function requestMessage(
   overrides: Partial<RequestMessage> = {},
@@ -127,11 +128,7 @@ export function startServer(options: HarnessOptions = {}): Harness {
 }
 
 export function parseLine(line: string): Record<string, unknown> {
-  const parsed: unknown = JSON.parse(line);
-  if (!isRecord(parsed)) {
-    throw new Error(`log line is not a JSON object: ${line}`);
-  }
-  return parsed;
+  return parseJsonLine(line, 'log line');
 }
 
 /** Reads a numeric log field, failing loudly when it is missing or not a number. */

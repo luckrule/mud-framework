@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
+import { sleep } from 'mud-framework-test-support';
+
 import { createJsonLogger } from '../logging/json-logger.ts';
 import type { Logger } from '../logging/types.ts';
 import { MemoryStorageBackend } from '../storage/memory.ts';
@@ -7,11 +9,6 @@ import { Dispatcher } from './dispatcher.ts';
 import { LocalExecutor } from './executor.ts';
 import type { ExecutorRequest } from './executor.ts';
 import { BusinessError } from './wire-codes.ts';
-
-const sleep = (ms: number): Promise<void> =>
-  new Promise<void>((resolve) => {
-    setTimeout(resolve, ms);
-  });
 
 function quietDispatcher(
   options: ConstructorParameters<typeof Dispatcher>[0],

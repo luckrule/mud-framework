@@ -1,13 +1,14 @@
 import { describe, expect, test } from 'bun:test';
 
 import { createJsonLogger } from 'mud-framework-core';
-import type { Logger } from 'mud-framework-core';
+import {
+  deferred,
+  parseJsonLine,
+  rejectionOf,
+  throwingLogger,
+} from 'mud-framework-test-support';
 
 import { SqliteBackend } from './sqlite-backend.ts';
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 /** JSON logger writing into an array, so emitted events can be asserted. */
 function captureLogger(): {
@@ -22,36 +23,8 @@ function captureLogger(): {
   });
   return {
     logger,
-    entries: () =>
-      lines.map((line) => {
-        const parsed: unknown = JSON.parse(line);
-        if (!isRecord(parsed)) {
-          throw new Error(`log line is not a JSON object: ${line}`);
-        }
-        return parsed;
-      }),
+    entries: () => lines.map((line) => parseJsonLine(line, 'log line')),
   };
-}
-
-interface Deferred {
-  promise: Promise<void>;
-  resolve: () => void;
-}
-
-function deferred(): Deferred {
-  return Promise.withResolvers<void>();
-}
-
-async function rejectionOf(promise: Promise<unknown>): Promise<Error> {
-  try {
-    await promise;
-  } catch (error) {
-    if (error instanceof Error) {
-      return error;
-    }
-    throw new Error(`non-Error rejection: ${String(error)}`, { cause: error });
-  }
-  throw new Error('expected the promise to reject');
 }
 
 function errorCode(error: Error): string | undefined {
@@ -59,21 +32,6 @@ function errorCode(error: Error): string | undefined {
     return error.code;
   }
   return undefined;
-}
-
-/** A logger whose every method throws, including `child`. */
-function throwingLogger(): Logger {
-  return {
-    debug: failLogging,
-    info: failLogging,
-    warn: failLogging,
-    error: failLogging,
-    child: failLogging,
-  };
-}
-
-function failLogging(): never {
-  throw new Error('logger exploded');
 }
 
 describe('SqliteBackend', () => {
@@ -156,8 +114,8 @@ describe('SqliteBackend', () => {
   test('serializes transactions instead of interleaving them', async () => {
     const backend = SqliteBackend.open();
     const events: string[] = [];
-    const gate = deferred();
-    const firstStarted = deferred();
+    const gate = deferred<void>();
+    const firstStarted = deferred<void>();
 
     const first = backend.transaction(async (tx) => {
       events.push('first:start');

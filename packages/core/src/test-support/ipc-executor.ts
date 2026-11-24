@@ -1,5 +1,7 @@
 import { expect } from 'bun:test';
 
+import { parseJsonLine, tick } from 'mud-framework-test-support';
+
 import type { IpcChannel } from '../ipc/channel.ts';
 import { createInMemoryChannelPair } from '../ipc/channel.ts';
 import type { IpcMessage, RequestMessage } from '../ipc/protocol.ts';
@@ -9,7 +11,6 @@ import { createJsonLogger } from '../logging/json-logger.ts';
 import type { Logger } from '../logging/types.ts';
 import type { ExecutorOutcome, ExecutorRequest } from '../runtime/executor.ts';
 import { IpcExecutor } from '../runtime/ipc-executor.ts';
-import { isRecord, tick } from './common.ts';
 
 /**
  * The in-memory channel delivers synchronously, but crash detection, the exit
@@ -357,14 +358,7 @@ export function harness(options: Partial<HarnessOptions> = {}): Harness {
   return {
     executor,
     servers,
-    logs: () =>
-      lines.map((line) => {
-        const parsed: unknown = JSON.parse(line);
-        if (!isRecord(parsed)) {
-          throw new Error(`log line is not an object: ${line}`);
-        }
-        return parsed;
-      }),
+    logs: () => lines.map((line) => parseJsonLine(line, 'log line')),
   };
 }
 

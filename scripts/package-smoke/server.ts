@@ -3,6 +3,7 @@ import { appendFileSync } from 'node:fs';
 import { createJsonLogger, runServerProcess } from 'mud-framework-core';
 import type { Extension } from 'mud-framework-core';
 import { SqliteBackend } from 'mud-framework-storage-sqlite';
+import { isRecord } from 'mud-framework-test-support';
 
 /**
  * Server half of the package-name smoke. `spawnBunServer` starts this file, so
@@ -13,10 +14,6 @@ import { SqliteBackend } from 'mud-framework-storage-sqlite';
  * integration fixtures write failure files: the child's stderr is inherited by
  * the Portal, so the orchestrator cannot capture it for a failure report.
  */
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 function valueOf(payload: unknown): string {
   if (!isRecord(payload) || typeof payload.value !== 'string') {
