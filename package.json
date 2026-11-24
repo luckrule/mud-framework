@@ -12,8 +12,8 @@
     "lint": "oxlint --deny-warnings .",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "bun test --parallel",
-    "test:unit": "bun test packages",
-    "test:integration": "bun test tests/integration",
+    "test:unit": "bun test packages --parallel",
+    "test:integration": "bun test tests/integration --parallel",
     "prepare": "git config core.hooksPath .githooks || true"
   },
   "devDependencies": {

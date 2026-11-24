@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { jsonLoggerFactory } from '../logging/json-logger.ts';
 import type { Logger, LoggerFactory } from '../logging/types.ts';
 import type { StorageBackend, StorageTransaction } from '../storage/types.ts';
+import { FRAMEWORK_TIMEOUT, UNKNOWN_METHOD } from './wire-codes.ts';
 
 /**
  * What the caller knows about a request before it is dispatched. All optional:
@@ -14,6 +15,15 @@ export interface DispatchMeta {
   connectionId?: string;
   sessionId?: string;
   clientRequestId?: string;
+  /**
+   * A tighter deadline for this request only. It can shorten a request but
+   * never extend one: the effective timeout is still
+   * `min(this, configured timeoutMs, backend max)`, because the configured
+   * value is the promise this dispatcher made to the rest of the framework and
+   * a caller (or a Portal relaying its own budget) must not be able to relax it
+   * (SPEC 3.4).
+   */
+  timeoutMs?: number;
 }
 
 export interface RequestContext {
@@ -47,11 +57,25 @@ interface Expiry {
   expired: boolean;
 }
 
+/**
+ * One request that has not reached a terminal state yet. `cancel` needs the
+ * expiry (to invalidate later writes) and the resolver (to settle the dispatch
+ * promise), neither of which is reachable from outside `dispatch` otherwise.
+ */
+interface InFlight {
+  readonly expiry: Expiry;
+  /** Request-bound, so the cancellation line carries the same ids as the rest. */
+  readonly logger: Logger;
+  readonly startedAt: number;
+  /** Settles the dispatch race as failed. A second call is a no-op. */
+  readonly fail: (error: Error) => void;
+}
+
 const EXPIRED_MESSAGE =
   'storage transaction expired: the request already reached a terminal state';
 
 export class FrameworkTimeoutError extends Error {
-  readonly code = 'FRAMEWORK_TIMEOUT';
+  readonly code = FRAMEWORK_TIMEOUT;
   readonly requestId: string;
   readonly timeoutMs: number;
 
@@ -64,12 +88,30 @@ export class FrameworkTimeoutError extends Error {
 }
 
 /**
+ * A request ended because someone asked it to, not because it ran out of time.
+ * A distinct type so the code stays the caller's (a connection layer sends
+ * `TRANSPORT_CLOSED`, a Portal sends `FRAMEWORK_TIMEOUT`), rather than being
+ * flattened into the timeout code (SPEC 7.2).
+ */
+export class RequestCancelledError extends Error {
+  readonly code: string;
+  readonly requestId: string;
+
+  constructor(requestId: string, code: string) {
+    super(`request ${requestId} was cancelled: ${code}`);
+    this.name = 'RequestCancelledError';
+    this.code = code;
+    this.requestId = requestId;
+  }
+}
+
+/**
  * A distinct type rather than a bare Error: the connection layer maps it to a
  * stable wire code, and callers must not have to match on message text to tell
  * "no such method" apart from a handler that failed (INV-014).
  */
 export class UnknownHandlerError extends Error {
-  readonly code = 'UNKNOWN_METHOD';
+  readonly code = UNKNOWN_METHOD;
   readonly method: string;
 
   constructor(method: string) {
@@ -85,6 +127,8 @@ export class Dispatcher {
   private readonly createRequestId: () => string;
   private readonly logger: Logger;
   private readonly handlers = new Map<string, Handler>();
+  /** Requests that have not reached a terminal state, by framework request id. */
+  private readonly inFlight = new Map<string, InFlight>();
   private closed = false;
 
   constructor(options: DispatcherOptions) {
@@ -136,47 +180,113 @@ export class Dispatcher {
       throw new UnknownHandlerError(name);
     }
 
-    const effectiveTimeoutMs = Math.min(
-      this.timeoutMs,
-      this.backend.capabilities().maxTransactionDurationMs,
+    const effectiveTimeoutMs = tightenTimeout(
+      Math.min(
+        this.timeoutMs,
+        this.backend.capabilities().maxTransactionDurationMs,
+      ),
+      meta.timeoutMs,
     );
     const expiry: Expiry = { expired: false };
-    const timeout = Promise.withResolvers<never>();
+    // Both the timer and `cancel` settle this, and only the first settles it:
+    // a request has exactly one terminal state (SPEC 2).
+    const terminal = Promise.withResolvers<never>();
+    const entry: InFlight = {
+      expiry,
+      logger,
+      startedAt: performance.now(),
+      fail: (error) => terminal.reject(error),
+    };
+    // Registered before the handler can run so a cancel in the same batch finds
+    // it. Ids are unique per request (SPEC 7.3) and the callers that can
+    // duplicate one drop the duplicate before dispatching, so a same-id
+    // overwrite would mean the caller broke that contract.
+    this.inFlight.set(requestId, entry);
+
     const timer = setTimeout(() => {
+      // Same guard as `finally`: a second dispatch of the same id overwrote the
+      // map entry, and deleting it here would make that running request
+      // uncancellable.
+      if (this.inFlight.get(requestId) === entry) {
+        this.inFlight.delete(requestId);
+      }
       expiry.expired = true;
       logger.warn(
         { method: name, timeoutMs: effectiveTimeoutMs },
         'request timed out',
       );
-      timeout.reject(new FrameworkTimeoutError(requestId, effectiveTimeoutMs));
+      terminal.reject(new FrameworkTimeoutError(requestId, effectiveTimeoutMs));
     }, effectiveTimeoutMs);
 
-    const work = this.backend.transaction(async (tx) => {
-      const context: RequestContext = {
-        requestId,
-        connectionId,
-        clientRequestId,
-        sessionId: meta.sessionId,
-        logger,
-        storage: guard(tx, expiry),
-      };
-      const result = await handler(context, payload);
-      // The handler outlived its timeout: force the backend to roll back
-      // instead of committing effects nobody is waiting for (SPEC 3.4).
-      if (expiry.expired) {
-        throw new Error(EXPIRED_MESSAGE);
-      }
-      return result;
-    });
-
     try {
-      // After a timeout the abandoned transaction settles later; mark its
-      // rejection handled so it cannot surface as an unhandled rejection.
-      void work.catch(() => undefined);
-      return await Promise.race([work, timeout.promise]);
+      const work = this.backend.transaction(async (tx) => {
+        const context: RequestContext = {
+          requestId,
+          connectionId,
+          clientRequestId,
+          sessionId: meta.sessionId,
+          logger,
+          storage: guard(tx, expiry),
+        };
+        const result = await handler(context, payload);
+        // The handler outlived its terminal state: force the backend to roll
+        // back instead of committing effects nobody is waiting for
+        // (SPEC 3.3, 3.4).
+        if (expiry.expired) {
+          throw new Error(EXPIRED_MESSAGE);
+        }
+        return result;
+      });
+      // After a timeout or cancel the abandoned transaction settles later, and
+      // its rejection must not surface as an unhandled rejection. The commit
+      // side is not silent, though: a backend commits after the handler returns,
+      // so a cancel or timeout that landed in that window still commits, and
+      // without a line here that outcome is indistinguishable from a rollback.
+      void work.then(
+        () =>
+          expiry.expired ? logLostCommit(logger, entry.startedAt) : undefined,
+        () => undefined,
+      );
+      return await Promise.race([work, terminal.promise]);
     } finally {
       clearTimeout(timer);
+      if (this.inFlight.get(requestId) === entry) {
+        this.inFlight.delete(requestId);
+      }
     }
+  }
+
+  /**
+   * Invalidates a request's transaction and settles it as cancelled. The
+   * handler keeps running (JS cannot preempt it) but every later write is
+   * rejected, and the transaction rolls back when the handler returns
+   * (SPEC 3.3, 3.6). Returns false when the request already reached a terminal
+   * state, or never existed here.
+   *
+   * `true` means the cancellation was accepted, NOT that the transaction rolled
+   * back. `StorageBackend.transaction` commits after its callback resolves, so a
+   * handler that had already returned can still commit in the window before the
+   * backend's COMMIT finishes; that outcome is logged at warn with
+   * `code: 'CANCEL_LOST_TO_COMMIT'` instead of being silently swallowed.
+   */
+  cancel(requestId: string, code: string): boolean {
+    const entry = this.inFlight.get(requestId);
+    if (entry === undefined) {
+      return false;
+    }
+    // Removed before the race continuation runs, so a second cancel for the
+    // same id already sees a terminal request.
+    this.inFlight.delete(requestId);
+    entry.expiry.expired = true;
+    entry.fail(new RequestCancelledError(requestId, code));
+    // warn, not error: the framework kept running and nothing failed
+    // internally, but someone should know a request was dropped mid-flight
+    // (SPEC 7.1).
+    entry.logger.warn(
+      { code, durationMs: Math.round(performance.now() - entry.startedAt) },
+      'request cancelled',
+    );
+    return true;
   }
 
   async close(): Promise<void> {
@@ -192,6 +302,22 @@ export class Dispatcher {
       throw new Error('dispatcher is closed');
     }
   }
+}
+
+/**
+ * Records a commit that landed after the request already had a terminal state
+ * (a cancel or a timeout). Both are the same defect from the operator's side —
+ * a write nobody is waiting for — so the line is named for the outcome, not for
+ * one of the two causes.
+ */
+function logLostCommit(logger: Logger, startedAt: number): void {
+  logger.warn(
+    {
+      code: 'CANCEL_LOST_TO_COMMIT',
+      durationMs: Math.round(performance.now() - startedAt),
+    },
+    'transaction committed after the request reached a terminal state',
+  );
 }
 
 function guard(tx: StorageTransaction, expiry: Expiry): StorageTransaction {
@@ -211,4 +337,24 @@ function assertActive(expiry: Expiry): void {
   if (expiry.expired) {
     throw new Error(EXPIRED_MESSAGE);
   }
+}
+
+/**
+ * Applies a per-request deadline to the dispatcher's own ceiling. Only a
+ * smaller value wins, and an unusable one (NaN, zero, negative) is ignored
+ * rather than propagated: `setTimeout(NaN)` fires on the next tick, so a bad
+ * override would otherwise cancel every request immediately.
+ */
+function tightenTimeout(
+  ceilingMs: number,
+  overrideMs: number | undefined,
+): number {
+  if (
+    overrideMs === undefined ||
+    !Number.isFinite(overrideMs) ||
+    overrideMs <= 0
+  ) {
+    return ceilingMs;
+  }
+  return Math.min(ceilingMs, overrideMs);
 }

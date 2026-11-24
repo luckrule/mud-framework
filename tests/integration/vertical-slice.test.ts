@@ -1,7 +1,11 @@
 import { describe, expect, test } from 'bun:test';
 
 import { WsTransport } from '../../packages/connector-ws/src/index.ts';
-import { ConnectionLayer, Dispatcher } from '../../packages/core/src/index.ts';
+import {
+  ConnectionLayer,
+  Dispatcher,
+  LocalExecutor,
+} from '../../packages/core/src/index.ts';
 import { SqliteBackend } from '../../packages/storage-sqlite/src/index.ts';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -88,7 +92,10 @@ describe('vertical slice', () => {
     const backend = SqliteBackend.open({ filename: ':memory:' });
     const dispatcher = new Dispatcher({ backend, timeoutMs: 2000 });
     const transport = new WsTransport({ port: 0 });
-    const layer = new ConnectionLayer({ transport, dispatcher });
+    const layer = new ConnectionLayer({
+      transport,
+      executor: new LocalExecutor({ dispatcher }),
+    });
 
     dispatcher.register('player.create', async (ctx, payload) => {
       const name = isRecord(payload) ? payload.name : undefined;
@@ -148,7 +155,10 @@ describe('vertical slice', () => {
     const backend = SqliteBackend.open({ filename: ':memory:' });
     const dispatcher = new Dispatcher({ backend, timeoutMs: 2000 });
     const transport = new WsTransport({ port: 0 });
-    const layer = new ConnectionLayer({ transport, dispatcher });
+    const layer = new ConnectionLayer({
+      transport,
+      executor: new LocalExecutor({ dispatcher }),
+    });
 
     dispatcher.register('broken', async () => {
       throw new Error('handler exploded');
@@ -179,7 +189,10 @@ describe('vertical slice', () => {
     const backend = SqliteBackend.open({ filename: ':memory:' });
     const dispatcher = new Dispatcher({ backend, timeoutMs: 2000 });
     const transport = new WsTransport({ port: 0 });
-    const layer = new ConnectionLayer({ transport, dispatcher });
+    const layer = new ConnectionLayer({
+      transport,
+      executor: new LocalExecutor({ dispatcher }),
+    });
 
     try {
       await layer.start();
