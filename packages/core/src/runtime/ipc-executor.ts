@@ -10,7 +10,7 @@ import type {
   ExecutorRequest,
   RequestExecutor,
 } from './executor.ts';
-import { effectiveTimeoutMs, tightenTimeout } from './timeout.ts';
+import { effectiveTimeoutMs, settleWithin, tightenTimeout } from './timeout.ts';
 import {
   FRAMEWORK_QUEUE_FULL,
   FRAMEWORK_REPLAY_EXHAUSTED,
@@ -29,6 +29,16 @@ const DEFAULT_SHUTDOWN_TIMEOUT_MS = 5000;
  * sleep would otherwise stall shutdown or restart forever.
  */
 const EXIT_WAIT_TIMEOUT_MS = 2000;
+/**
+ * Slack on top of the graceful-close grace before the Portal gives up on
+ * `closed`. The grace is declared to the Server in the `shutdown` message, but
+ * the Server starts spending it when the message arrives — one IPC hop after the
+ * Portal started its own timer. Waiting exactly the declared grace would
+ * therefore always end first and kill a Server that was about to send `closed`,
+ * which is the defect the declaration exists to remove. The slack covers the
+ * hop, so "the Server used its whole budget" is the observable outcome.
+ */
+const SHUTDOWN_ACK_SLACK_MS = 250;
 /**
  * Upper bound on requests buffered but not yet acknowledged. Their lifetime is
  * bounded by the request deadline, so this is not a steady-state limit; it is a
@@ -478,13 +488,29 @@ export class IpcExecutor implements RequestExecutor {
   }
 
   /**
-   * The worst case `doClose` can take: the pending-drain budget, the graceful
-   * shutdown grace, then two bounded exit waits (the second follows the kill
-   * issued when the first one gave up). A caller that gives this less time
-   * would return while the Server could still be writing.
+   * The worst case `doClose` can take, derived from the steps it actually runs:
+   *
+   * 1. drain the requests buffered but not yet acknowledged —
+   *    `shutdownTimeoutMs`;
+   * 2. send `shutdown` and wait for the Server's `closed` — the declared grace
+   *    plus `SHUTDOWN_ACK_SLACK_MS` (see `waitForClosed`);
+   * 3. wait for the process to exit — `EXIT_WAIT_TIMEOUT_MS`;
+   * 4. if it did not, kill it and wait once more — `EXIT_WAIT_TIMEOUT_MS`.
+   *
+   * The two shutdown timeouts are not the same wait: one is Portal's own drain,
+   * the other is the Server's graceful close, which is why both are counted.
+   *
+   * Step 2's grace is also the budget declared to the Server in the `shutdown`
+   * message, so the Server's whole graceful close fits inside step 2 by
+   * construction — that is what keeps a correctly closing Server from being
+   * killed by step 4.
    */
   get closeBudgetMs(): number {
-    return this.shutdownTimeoutMs * 2 + EXIT_WAIT_TIMEOUT_MS * 2;
+    const drainMs = this.shutdownTimeoutMs;
+    const gracefulCloseMs = this.shutdownTimeoutMs + SHUTDOWN_ACK_SLACK_MS;
+    const exitWaitMs = EXIT_WAIT_TIMEOUT_MS;
+    const postKillExitWaitMs = EXIT_WAIT_TIMEOUT_MS;
+    return drainMs + gracefulCloseMs + exitWaitMs + postKillExitWaitMs;
   }
 
   /**
@@ -549,11 +575,15 @@ export class IpcExecutor implements RequestExecutor {
     // executor was still waiting and the Server was still writing (the two
     // timeouts were unrelated). Past the budget the requests are failed and the
     // Server is shut down anyway.
-    const drained = await this.settleWithin(
+    const drained = await settleWithin(
       this.awaitPendingSettled(),
       this.shutdownTimeoutMs,
     );
-    if (!drained) {
+    // A rejection counts as "no longer pending" here, on purpose: the waiter
+    // only ever resolves, so the one thing this branch must distinguish is a
+    // timeout. Treating a rejection as a timeout would fail every buffered
+    // request with a message about a deadline that was never reached.
+    if (drained.status === 'timeout') {
       this.logger.warn(
         { timeoutMs: this.shutdownTimeoutMs, pending: this.pending.size },
         'pending requests did not settle before the shutdown timeout',
@@ -572,32 +602,6 @@ export class IpcExecutor implements RequestExecutor {
     );
   }
 
-  /** Resolves true when `work` settled within `limitMs`, false on timeout. */
-  private async settleWithin(
-    work: Promise<void>,
-    limitMs: number,
-  ): Promise<boolean> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const limit = new Promise<boolean>((resolve) => {
-      timer = setTimeout(() => {
-        resolve(false);
-      }, limitMs);
-    });
-    try {
-      return await Promise.race([
-        work.then(
-          () => true,
-          () => true,
-        ),
-        limit,
-      ]);
-    } finally {
-      if (timer !== undefined) {
-        clearTimeout(timer);
-      }
-    }
-  }
-
   private async shutdownServer(): Promise<void> {
     const server = this.server;
     if (server === undefined) {
@@ -606,7 +610,13 @@ export class IpcExecutor implements RequestExecutor {
     if (!server.closed) {
       if (server.ready) {
         try {
-          server.channel.send({ type: 'shutdown' });
+          // The Server gets exactly the grace `waitForClosed` will wait for, so
+          // its drain and backend close share one deadline that ends with the
+          // Portal's patience rather than twice its own request ceiling.
+          server.channel.send({
+            type: 'shutdown',
+            timeoutMs: this.shutdownTimeoutMs,
+          });
         } catch (error) {
           // The process died between the pending drain and this send; the
           // channel close handler is about to report the same thing.
@@ -619,11 +629,12 @@ export class IpcExecutor implements RequestExecutor {
       }
       if (!server.closed && !server.shutdownAcknowledged) {
         // A stalled graceful shutdown, or a Server that never finished
-        // starting, must not hold the Portal open.
+        // starting, must not hold the Portal open. The logged wait is the one
+        // `waitForClosed` actually performed, not the declared grace.
         this.logger.warn(
           {
             pid: server.pid,
-            timeoutMs: this.shutdownTimeoutMs,
+            timeoutMs: this.shutdownTimeoutMs + SHUTDOWN_ACK_SLACK_MS,
             ready: server.ready,
           },
           'server did not finish shutting down; killing it',
@@ -679,11 +690,15 @@ export class IpcExecutor implements RequestExecutor {
     if (server.closed || server.shutdownAcknowledged) {
       return Promise.resolve();
     }
+    // The declared grace plus the slack: the Server spends the grace starting
+    // one IPC hop after this timer does, so waiting exactly the grace would
+    // always give up first on a Server that used its whole budget.
+    const waitMs = this.shutdownTimeoutMs + SHUTDOWN_ACK_SLACK_MS;
     return new Promise<void>((resolve) => {
       this.closedWaiter = resolve;
       this.closedTimer = setTimeout(() => {
         this.resolveClosed();
-      }, this.shutdownTimeoutMs);
+      }, waitMs);
       // The exit may have landed between the check above and this assignment,
       // in which case its `resolveClosed` found no waiter. Re-check so the
       // grace period is not paid for a process that is already gone.

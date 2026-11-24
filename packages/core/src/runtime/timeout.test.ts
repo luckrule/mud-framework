@@ -1,6 +1,6 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, jest, test } from 'bun:test';
 
-import { effectiveTimeoutMs, tightenTimeout } from './timeout.ts';
+import { effectiveTimeoutMs, settleWithin, tightenTimeout } from './timeout.ts';
 
 describe('tightenTimeout', () => {
   test('an undefined override keeps the ceiling', () => {
@@ -63,5 +63,64 @@ describe('effectiveTimeoutMs', () => {
   test('two very large values yield the smaller one', () => {
     expect(effectiveTimeoutMs(Number.MAX_SAFE_INTEGER, 1e15)).toBe(1e15);
     expect(effectiveTimeoutMs(1e15, Number.MAX_SAFE_INTEGER)).toBe(1e15);
+  });
+});
+
+describe('settleWithin', () => {
+  test('reports the value of a promise that settled first', async () => {
+    const result = await settleWithin(Promise.resolve('done'), 1000);
+
+    expect(result).toEqual({ status: 'settled', value: 'done' });
+  });
+
+  test('reports a rejection as rejected rather than throwing', async () => {
+    const failure = new Error('boom');
+
+    const result = await settleWithin(Promise.reject(failure), 1000);
+
+    expect(result).toEqual({ status: 'rejected', error: failure });
+  });
+
+  test('reports a timeout when the promise outlives the budget', async () => {
+    // Never settles: the only outcome is the timer.
+    const result = await settleWithin(new Promise<never>(() => undefined), 10);
+
+    expect(result).toEqual({ status: 'timeout' });
+  });
+
+  test('a rejection after the timeout is consumed, not left unhandled', async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const late = Promise.withResolvers<void>();
+      const result = await settleWithin(late.promise, 5);
+      expect(result).toEqual({ status: 'timeout' });
+
+      late.reject(new Error('rejected after the race was lost'));
+      // The rejection surfaces on the next turn if nothing consumed it.
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 20);
+      });
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+
+    expect(unhandled).toEqual([]);
+  });
+
+  test('clears its timer when the promise settles first', async () => {
+    // A leftover timer would keep the event loop alive after shutdown finished.
+    jest.useFakeTimers();
+    try {
+      const result = await settleWithin(Promise.resolve(1), 60_000);
+
+      expect(result).toEqual({ status: 'settled', value: 1 });
+      expect(jest.getTimerCount()).toBe(0);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });

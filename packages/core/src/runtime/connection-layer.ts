@@ -11,6 +11,7 @@ import type {
 import { JsonCodec } from './codec.ts';
 import type { Codec, Envelope, ResponseEnvelope } from './codec.ts';
 import type { ExecutorOutcome, RequestExecutor } from './executor.ts';
+import { settleWithin } from './timeout.ts';
 import {
   FRAMEWORK_QUEUE_FULL,
   FRAMEWORK_SHUTDOWN,
@@ -554,10 +555,7 @@ export class ConnectionLayer implements TransportHandlers {
             timeoutMs,
             this.executor.closeBudgetMs + EXECUTOR_CLOSE_SLACK_MS,
           );
-    const closed = await settleWithin(
-      asPromise(() => this.closeExecutor()),
-      executorBudgetMs,
-    );
+    const closed = await settleWithin(this.closeExecutor(), executorBudgetMs);
     if (closed.status === 'timeout') {
       this.logger.error(
         { timeoutMs: executorBudgetMs },
@@ -573,9 +571,7 @@ export class ConnectionLayer implements TransportHandlers {
     const stopped = await settleWithin(
       // A transport whose `start` failed has nothing to stop and would reject;
       // its own lifecycle error must not mask the executor close above.
-      asPromise(() =>
-        this.transportStarted ? this.transport.stop() : Promise.resolve(),
-      ),
+      this.transportStarted ? this.transport.stop() : Promise.resolve(),
       timeoutMs,
     );
     this.status = 'stopped';
@@ -856,47 +852,6 @@ export class ConnectionLayer implements TransportHandlers {
 /** Length only: the raw frame may hold client data that must not be logged. */
 function rawLengthOf(payload: string | Uint8Array): number {
   return typeof payload === 'string' ? payload.length : payload.byteLength;
-}
-
-type SettleOutcome =
-  | { status: 'settled' }
-  | { status: 'rejected'; error: unknown }
-  | { status: 'timeout' };
-
-/**
- * Races `promise` against `timeoutMs`. Either way the promise is consumed here,
- * so a step shutdown gave up on never leaves an unhandled rejection behind.
- */
-async function settleWithin(
-  promise: Promise<unknown>,
-  timeoutMs: number,
-): Promise<SettleOutcome> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<SettleOutcome>((resolve) => {
-    timer = setTimeout(() => {
-      resolve({ status: 'timeout' });
-    }, timeoutMs);
-  });
-  // Both handlers return a value, so `settled` cannot reject: the step that
-  // lost the race must not leave an unhandled rejection behind.
-  const settled = promise.then(
-    (): SettleOutcome => ({ status: 'settled' }),
-    (error: unknown): SettleOutcome => ({ status: 'rejected', error }),
-  );
-  try {
-    return await Promise.race([settled, deadline]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/** Runs `work`, turning a synchronous throw into a rejection. */
-function asPromise(work: () => Promise<void>): Promise<void> {
-  try {
-    return work();
-  } catch (error) {
-    return Promise.reject(toError(error));
-  }
 }
 
 function toError(error: unknown): Error {

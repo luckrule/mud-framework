@@ -15,6 +15,7 @@ import { MemoryStorageBackend } from '../storage/memory.ts';
 import type { StorageBackend, StorageCapabilities } from '../storage/types.ts';
 import type { Dispatcher } from './dispatcher.ts';
 import {
+  resolveShutdownBudgetMs,
   runServerProcess,
   ServerChannelClosedError,
   ServerStartupError,
@@ -146,6 +147,18 @@ function parseLine(line: string): Record<string, unknown> {
     throw new Error(`log line is not a JSON object: ${line}`);
   }
   return parsed;
+}
+
+/** Reads a numeric log field, failing loudly when it is missing or not a number. */
+function numberField(
+  line: Record<string, unknown> | undefined,
+  field: string,
+): number {
+  const value = line?.[field];
+  if (typeof value !== 'number') {
+    throw new Error(`log field "${field}" is not a number: ${String(value)}`);
+  }
+  return value;
 }
 
 async function rejectionOf(promise: Promise<unknown>): Promise<Error> {
@@ -826,7 +839,7 @@ describe('runServerProcess lifecycle', () => {
     await tick();
 
     harness.portal.send(requestMessage());
-    harness.portal.send({ type: 'shutdown' });
+    harness.portal.send({ type: 'shutdown', timeoutMs: 2000 });
     harness.portal.send(requestMessage({ requestId: 'req-late' }));
     await harness.done;
 
@@ -868,7 +881,7 @@ describe('runServerProcess lifecycle', () => {
     const harness = startServer({ register: echoRegistration });
     await tick();
 
-    harness.portal.send({ type: 'shutdown' });
+    harness.portal.send({ type: 'shutdown', timeoutMs: 2000 });
     harness.portal.send(requestMessage({ requestId: 'req-a' }));
     harness.portal.send(requestMessage({ requestId: 'req-b' }));
     await harness.done;
@@ -901,7 +914,7 @@ describe('runServerProcess lifecycle', () => {
 
     harness.portal.send(requestMessage({ method: 'slow' }));
     await tick();
-    harness.portal.send({ type: 'shutdown' });
+    harness.portal.send({ type: 'shutdown', timeoutMs: 2000 });
     harness.portal.send(requestMessage({ method: 'slow', replayCount: 1 }));
     await tick();
 
@@ -941,7 +954,7 @@ describe('runServerProcess lifecycle', () => {
 
     harness.portal.send(requestMessage({ method: 'slow' }));
     await tick();
-    harness.portal.send({ type: 'shutdown' });
+    harness.portal.send({ type: 'shutdown', timeoutMs: 2000 });
     await tick();
 
     // Still draining: the backend must not close under a running handler.
@@ -998,8 +1011,8 @@ describe('runServerProcess lifecycle', () => {
 
     harness.portal.send(requestMessage({ method: 'stuck' }));
     await tick();
-    harness.portal.send({ type: 'shutdown' });
-    // The close budget is twice `timeoutMs`, so `closed` must arrive while the
+    harness.portal.send({ type: 'shutdown', timeoutMs: 20 });
+    // The declared budget bounds the close, so `closed` must arrive while the
     // handler is still holding the backend.
     await harness.done;
 
@@ -1011,10 +1024,72 @@ describe('runServerProcess lifecycle', () => {
       .logs()
       .filter((line) => line.code === 'STORAGE_CLOSE_TIMEOUT');
     expect(closeTimeouts).toHaveLength(1);
-    expect(closeTimeouts[0]?.timeoutMs).toBe(20);
+    // The drain settled first (the dispatcher answers at `timeoutMs` even while
+    // the handler runs), so the close step got the budget minus the drain time:
+    // at most the declared 20ms, never twice it.
+    const closeBudget = numberField(closeTimeouts[0], 'timeoutMs');
+    expect(closeBudget).toBeGreaterThan(0);
+    expect(closeBudget).toBeLessThanOrEqual(20);
     // The dispatcher already answered the request at `timeoutMs` while the
     // handler kept running, so nothing is left in flight to name here.
     expect(closeTimeouts[0]?.pendingRequests).toBe(0);
+    release.resolve();
+    await tick();
+  });
+
+  test('shares one deadline between the drain and the backend close', async () => {
+    // The defect this covers: drain and close each got the full budget, so a
+    // Server that spent its whole declared budget draining then got a second,
+    // fresh budget for the close — exactly the overrun that made the Portal kill
+    // a Server closing correctly. Here the drain consumes the whole budget, so
+    // the close must see only the remainder.
+    const release = Promise.withResolvers<void>();
+    const inner = new MemoryStorageBackend();
+    const backend: StorageBackend = {
+      capabilities: () => inner.capabilities(),
+      transaction: (fn) => inner.transaction(fn),
+      async close(): Promise<void> {
+        await release.promise;
+        await inner.close();
+      },
+    };
+    const harness = startServer({
+      backend,
+      // The request ceiling is far above the declared budget, so the drain
+      // cannot settle by the dispatcher's timeout and runs out the budget.
+      timeoutMs: 5000,
+      register: (dispatcher) => {
+        dispatcher.register('stuck', async () => {
+          await release.promise;
+          return 'late';
+        });
+      },
+    });
+    await tick();
+
+    harness.portal.send(requestMessage({ method: 'stuck' }));
+    await tick();
+    const startedAt = performance.now();
+    harness.portal.send({ type: 'shutdown', timeoutMs: 80 });
+    await harness.done;
+    const elapsedMs = performance.now() - startedAt;
+
+    // A per-step budget would spend 80ms twice (160ms). One shared deadline ends
+    // near 80ms, which is what the Portal is actually waiting for.
+    expect(elapsedMs).toBeLessThan(130);
+    const drainTimeouts = harness
+      .logs()
+      .filter((line) => line.code === 'SHUTDOWN_DRAIN_TIMEOUT');
+    expect(drainTimeouts).toHaveLength(1);
+    const closeTimeouts = harness
+      .logs()
+      .filter((line) => line.code === 'STORAGE_CLOSE_TIMEOUT');
+    expect(closeTimeouts).toHaveLength(1);
+    // The drain consumed the budget, so the close step is left with less than
+    // the declared 80ms — not a fresh 80ms of its own.
+    const closeBudget = numberField(closeTimeouts[0], 'timeoutMs');
+    expect(closeBudget).toBeLessThan(80);
+    expect(closeBudget).toBeGreaterThan(0);
     release.resolve();
     await tick();
   });
@@ -1175,6 +1250,41 @@ describe('runServerProcess lifecycle', () => {
       .filter((line) => line.code === 'IPC_PARENT_GONE');
     expect(logged).toHaveLength(1);
     expect(logged[0]?.level).toBe('error');
+  });
+});
+
+describe('resolveShutdownBudgetMs', () => {
+  test('uses the budget the Portal declared', () => {
+    const lines: string[] = [];
+    const logger = createJsonLogger({
+      sink: (line) => {
+        lines.push(line);
+      },
+    });
+
+    expect(resolveShutdownBudgetMs(1500, 5000, logger)).toBe(1500);
+    // No degradation, so nothing to report.
+    expect(lines).toEqual([]);
+  });
+
+  test('falls back to 4 * timeoutMs and warns when no budget was declared', () => {
+    // The wire parser requires the field, so this is the legacy-peer path: it
+    // still has to close, but the larger, unrelated budget must be visible.
+    const lines: string[] = [];
+    const logger = createJsonLogger({
+      sink: (line) => {
+        lines.push(line);
+      },
+    });
+
+    expect(resolveShutdownBudgetMs(undefined, 5000, logger)).toBe(20_000);
+    const warnings = lines.map(parseLine);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatchObject({
+      level: 'warn',
+      code: 'SHUTDOWN_BUDGET_UNDECLARED',
+      timeoutMs: 20_000,
+    });
   });
 });
 

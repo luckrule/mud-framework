@@ -824,7 +824,10 @@ describe('IpcExecutor', () => {
 
     await h.executor.close();
 
-    expect(messagesOf(server)).toContainEqual({ type: 'shutdown' });
+    expect(messagesOf(server)).toContainEqual({
+      type: 'shutdown',
+      timeoutMs: 5000,
+    });
     expect(server.killCount).toBe(0);
   });
 
@@ -837,10 +840,13 @@ describe('IpcExecutor', () => {
 
       const closing = h.executor.close();
       await flushMicrotasks();
-      expect(messagesOf(server)).toContainEqual({ type: 'shutdown' });
+      expect(messagesOf(server)).toContainEqual({
+        type: 'shutdown',
+        timeoutMs: 5000,
+      });
       expect(server.killCount).toBe(0);
 
-      jest.advanceTimersByTime(5000);
+      jest.advanceTimersByTime(5000 + 250);
       await flushMicrotasks();
       await closing;
 
@@ -1324,11 +1330,46 @@ describe('IpcExecutor', () => {
   test('exposes a close budget covering the drain, grace and exit wait', async () => {
     const h = harness({ timeoutMs: 5000, shutdownTimeoutMs: 30 });
 
-    // drain + grace + two bounded exit waits (the second after the kill): a
-    // caller must give the executor at least this much, or it returns while the
-    // Server is still writing.
-    expect(h.executor.closeBudgetMs).toBe(30 * 2 + 2000 * 2);
+    // drain + grace (+ the IPC-hop slack) + two bounded exit waits (the second
+    // after the kill): a caller must give the executor at least this much, or it
+    // returns while the Server is still writing.
+    expect(h.executor.closeBudgetMs).toBe(30 * 2 + 250 + 2000 * 2);
     await h.executor.close();
+  });
+
+  test('declares a grace that covers the Server-side worst-case close', async () => {
+    // The bug this pins: the Server derived its graceful-close budget from its
+    // own `timeoutMs` (4x), the Portal derived its patience from
+    // `shutdownTimeoutMs`, and nothing compared the two. A Server closing inside
+    // its own budget was killed by a Portal that had already given up.
+    const h = harness({ timeoutMs: 5000, shutdownTimeoutMs: 30 });
+    const server = await started(h);
+
+    await h.executor.close();
+
+    // The declared grace IS the Server's whole graceful close now, so the
+    // inequality to protect is "the budget contains that grace plus every other
+    // step this side performs". A budget that dropped below it would start
+    // killing Servers that were closing correctly.
+    const shutdown = messagesOf(server).find(
+      (message) => message.type === 'shutdown',
+    );
+    if (shutdown?.type !== 'shutdown') {
+      throw new Error('the executor did not send a shutdown message');
+    }
+    const declaredGraceMs = shutdown.timeoutMs;
+    const shutdownTimeoutMs = 30;
+    const exitWaitMs = 2000;
+    const ackSlackMs = 250;
+    // The grace is exactly `shutdownTimeoutMs`, so neither side can be retuned
+    // without the other noticing.
+    expect(declaredGraceMs).toBe(shutdownTimeoutMs);
+    // The budget has to contain the Server's share plus every other step this
+    // side performs; a budget that dropped below that would start killing
+    // Servers that were closing correctly.
+    expect(h.executor.closeBudgetMs).toBe(
+      shutdownTimeoutMs + declaredGraceMs + ackSlackMs + exitWaitMs * 2,
+    );
   });
 
   test('fails pending requests instead of waiting past its own close budget', async () => {

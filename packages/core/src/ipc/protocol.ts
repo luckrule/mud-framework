@@ -50,9 +50,24 @@ export interface CancelMessage {
   readonly code: string;
 }
 
-/** Portal -> Server: shut down in an orderly fashion. */
+/**
+ * Portal -> Server: shut down in an orderly fashion.
+ *
+ * `timeoutMs` is the budget the Server has for the whole graceful close (drain
+ * plus backend close), declared by the Portal that is waiting for it. It is a
+ * one-way derivation: the Portal knows how long it will wait, so the Server must
+ * fit inside that rather than derive its own budget from its request ceiling —
+ * the two used to be unrelated, and a Server closing inside its own budget was
+ * killed by a Portal that had already given up.
+ *
+ * Required, and validated: the Server's whole graceful close is bounded by it,
+ * so a message without it cannot be acted on. The Server still tolerates a
+ * directly constructed message without the field (see `server-process.ts`), but
+ * nothing that goes through `parseIpcMessage` can reach that path.
+ */
 export interface ShutdownMessage {
   readonly type: 'shutdown';
+  readonly timeoutMs: number;
 }
 
 /** Server -> Portal: readiness barrier, sent only after init and self-check. */
@@ -175,7 +190,10 @@ function buildMessage(raw: unknown): IpcMessage {
         code: readString(raw, 'cancel', 'code', true),
       };
     case 'shutdown':
-      return { type: 'shutdown' };
+      return {
+        type: 'shutdown',
+        timeoutMs: readPositiveNumber(raw, 'shutdown', 'timeoutMs'),
+      };
     case 'ready':
       return {
         type: 'ready',

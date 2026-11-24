@@ -6,6 +6,7 @@ import type {
   HelloMessage,
   IpcMessage,
   RequestMessage,
+  ShutdownMessage,
 } from '../ipc/protocol.ts';
 import { parseIpcMessage } from '../ipc/protocol.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
@@ -16,6 +17,7 @@ import { Dispatcher } from './dispatcher.ts';
 import type { ExecutorOutcome } from './executor.ts';
 import { LocalExecutor } from './executor.ts';
 import type { RequestIdentity } from './identity.ts';
+import { settleWithin } from './timeout.ts';
 import {
   FRAMEWORK_SHUTDOWN,
   INTERNAL_ERROR,
@@ -116,18 +118,19 @@ interface PendingRequest {
  */
 const DUPLICATE_LOG_MEMORY = 100;
 /**
- * Multiplier applied to `timeoutMs` when bounding each step of the shutdown
- * (drain, then backend close). The dispatcher answers every request at
- * `timeoutMs` even if its handler is still running (SPEC 3.4), so a step that
- * has not finished within twice that budget is stuck on something the framework
- * cannot stop waiting for.
+ * Multiplier applied to `timeoutMs` when bounding the shutdown as a whole, on
+ * the fallback path only (a Portal that did not declare a budget). The
+ * dispatcher answers every request at `timeoutMs` even if its handler is still
+ * running (SPEC 3.4), so a close that has not finished within twice that budget
+ * is stuck on something the framework cannot stop waiting for. It is a total,
+ * not a per-step value: drain and backend close share one deadline.
  */
 const DRAIN_LIMIT_MULTIPLIER = 2;
 
 /**
  * Budget for each step of an abort (Portal died, nobody can read a result).
- * Deliberately a fixed value unrelated to `timeoutMs`: the `2 * timeoutMs`
- * bound used on the orderly path is 4 minutes at `timeoutMs = 60s`, which is
+ * Deliberately a fixed value unrelated to `timeoutMs`: the `4 * timeoutMs`
+ * fallback used on the orderly path is 4 minutes at `timeoutMs = 60s`, which is
  * indistinguishable from waiting forever, and every second of it is a second
  * this orphaned process keeps writing to storage beside the next Server
  * (INV-002). Nobody is waiting for this process, so a short cap is the right
@@ -387,7 +390,7 @@ class ServerProcess {
         this.onCancel(runtime, message);
         return;
       case 'shutdown':
-        this.onShutdown(runtime);
+        this.onShutdown(runtime, message);
         return;
       case 'ready':
       case 'result':
@@ -769,7 +772,7 @@ class ServerProcess {
     );
   }
 
-  private onShutdown(runtime: Runtime): void {
+  private onShutdown(runtime: Runtime, message: ShutdownMessage): void {
     if (this.shuttingDown) {
       this.logger.warn(
         { code: 'SHUTDOWN_IN_PROGRESS', reason: 'shutdown already requested' },
@@ -781,11 +784,12 @@ class ServerProcess {
     // SPEC 6.3 step 1: stop accepting before draining, so the drain below has a
     // closed set of requests and nothing new can enter the backend.
     this.accepting = false;
+    const budgetMs = this.shutdownBudgetMs(message);
     this.logger.info(
-      { pendingRequests: this.running.size },
+      { pendingRequests: this.running.size, budgetMs },
       'server shutting down',
     );
-    void this.shutdown(runtime).catch((error: unknown) => {
+    void this.shutdown(runtime, budgetMs).catch((error: unknown) => {
       // Nothing below `shutdown` is expected to throw, but a channel that
       // throws on close must still resolve the completion instead of hanging.
       this.logger.error(
@@ -796,15 +800,23 @@ class ServerProcess {
     });
   }
 
-  private async shutdown(runtime: Runtime): Promise<void> {
+  private async shutdown(runtime: Runtime, limitMs: number): Promise<void> {
     const startedAt = performance.now();
+    // One deadline for both steps, like `abort`: the Portal declared a single
+    // budget for the whole close, so spending it twice would overrun it by
+    // exactly the amount that made the Portal kill a Server that was closing
+    // correctly.
+    const deadlineAt = performance.now() + limitMs;
     // SPEC 6.3 steps 2-3: every accepted request settles to a terminal state,
     // bounded by the per-request timeout the dispatcher already enforces, and
     // its result still goes out before `closed`.
-    await this.drain(this.shutdownBudgetMs());
+    await this.drain(limitMs);
     // Step 4: close the backend before announcing, so Portal never restarts a
     // Server whose storage is still open.
-    await this.closeStorage(runtime, this.shutdownBudgetMs());
+    await this.closeStorage(
+      runtime,
+      Math.max(1, Math.round(deadlineAt - performance.now())),
+    );
     this.sendQuietly({ type: 'closed', reason: 'shutdown' }, 'closed');
     // Step 5: the link itself goes last, after the final message.
     this.channel.close('shutdown complete');
@@ -816,13 +828,19 @@ class ServerProcess {
   }
 
   /**
-   * The budget for each bounded step of the shutdown, derived from the request
-   * ceiling. The dispatcher answers every request at `timeoutMs` even while its
-   * handler keeps running (SPEC 3.4), so twice that is already generous: past
-   * it the step is stuck on something the framework cannot interrupt.
+   * The total budget for the graceful close, from what the Portal declared.
+   *
+   * A message without a budget cannot come off the wire — the protocol requires
+   * it — but a directly constructed one can, and the Server must still close
+   * rather than refuse. The fallback is the pre-protocol derivation, and it is
+   * logged as a degradation because it may exceed the Portal's real patience.
    */
-  private shutdownBudgetMs(): number {
-    return this.options.timeoutMs * DRAIN_LIMIT_MULTIPLIER;
+  private shutdownBudgetMs(message: ShutdownMessage): number {
+    return resolveShutdownBudgetMs(
+      message.timeoutMs,
+      this.options.timeoutMs,
+      this.logger,
+    );
   }
 
   /**
@@ -833,11 +851,11 @@ class ServerProcess {
    * silently abandoned; their ids say which handler is holding the process.
    */
   private async drain(limitMs: number): Promise<void> {
-    const drained = await this.settleWithin(
+    const drained = await settleWithin(
       Promise.allSettled(this.running),
       limitMs,
     );
-    if (!drained.settled) {
+    if (drained.status === 'timeout') {
       this.logger.error(
         {
           code: 'SHUTDOWN_DRAIN_TIMEOUT',
@@ -857,12 +875,10 @@ class ServerProcess {
    * close: the call is still made and its own failure is still logged.
    */
   private async closeStorage(runtime: Runtime, limitMs: number): Promise<void> {
-    const attempt = runtime.executor.close().then(
-      () => ({ failed: false as const }),
-      (error: unknown) => ({ failed: true as const, error }),
-    );
-    const outcome = await this.settleWithin(attempt, limitMs);
-    if (!outcome.settled) {
+    // `settleWithin` consumes a rejection itself, so the failure is read from
+    // the result instead of being mapped into a value first.
+    const outcome = await settleWithin(runtime.executor.close(), limitMs);
+    if (outcome.status === 'timeout') {
       this.logger.error(
         {
           code: 'STORAGE_CLOSE_TIMEOUT',
@@ -874,37 +890,14 @@ class ServerProcess {
       );
       return;
     }
-    if (outcome.value.failed) {
+    if (outcome.status === 'rejected') {
       this.logger.error(
         {
           code: 'STORAGE_CLOSE_FAILED',
-          reason: messageOf(outcome.value.error),
+          reason: messageOf(outcome.error),
         },
         'storage backend could not be closed',
       );
-    }
-  }
-
-  /**
-   * Races `work` against a timer. `work` must not reject: both callers map the
-   * failure they care about into their own result, and a rejection here would
-   * surface as an unhandled rejection instead of a log line.
-   */
-  private async settleWithin<T>(
-    work: Promise<T>,
-    limitMs: number,
-  ): Promise<{ settled: true; value: T } | { settled: false }> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const limit = new Promise<{ settled: false }>((resolve) => {
-      timer = setTimeout(() => resolve({ settled: false }), limitMs);
-    });
-    try {
-      const settled = work.then((value) => ({ settled: true as const, value }));
-      return await Promise.race([settled, limit]);
-    } finally {
-      if (timer !== undefined) {
-        clearTimeout(timer);
-      }
     }
   }
 
@@ -958,6 +951,36 @@ class ServerProcess {
       );
     }
   }
+}
+
+/**
+ * Total budget for a graceful close. The Portal's declaration wins; without one
+ * the pre-protocol derivation applies (twice `timeoutMs` for the drain plus
+ * twice for the backend close) and is logged, because it may outlast the
+ * Portal's real patience and get this process killed mid-close.
+ *
+ * Exported for the test that pins the fallback: the wire parser rejects a
+ * `shutdown` without a budget, so the degraded path is unreachable through a
+ * message and would otherwise be untested.
+ */
+export function resolveShutdownBudgetMs(
+  declaredMs: number | undefined,
+  requestTimeoutMs: number,
+  logger: Logger,
+): number {
+  if (declaredMs !== undefined) {
+    return declaredMs;
+  }
+  const fallback = requestTimeoutMs * DRAIN_LIMIT_MULTIPLIER * 2;
+  logger.warn(
+    {
+      code: 'SHUTDOWN_BUDGET_UNDECLARED',
+      timeoutMs: fallback,
+      reason: 'shutdown message carried no timeoutMs; using the legacy budget',
+    },
+    'running shutdown on the fallback budget',
+  );
+  return fallback;
 }
 
 function requestIds(message: RequestMessage): RequestIdentity {

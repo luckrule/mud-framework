@@ -25,7 +25,7 @@ const validMessages: IpcMessage[] = [
     replayCount: 0,
   },
   { type: 'cancel', requestId: 'req-1', code: 'FRAMEWORK_TIMEOUT' },
-  { type: 'shutdown' },
+  { type: 'shutdown', timeoutMs: 5000 },
   { type: 'ready', pid: 4242, capabilities },
   { type: 'result', requestId: 'req-1', ok: true, result: { hp: 3 } },
   {
@@ -319,6 +319,23 @@ describe('parseIpcMessage', () => {
       },
       'timeoutMs',
     );
+  });
+
+  test('rejects a shutdown without a budget', () => {
+    // A Server must know how long the Portal will wait; without the field it
+    // would fall back to a budget derived from its own request ceiling, which is
+    // exactly the mismatch that let a correctly closing Server be killed.
+    expectRejected({ type: 'shutdown' }, 'timeoutMs');
+  });
+
+  test('rejects a shutdown budget that is not a positive number', () => {
+    for (const timeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expectRejected({ type: 'shutdown', timeoutMs }, 'timeoutMs');
+    }
+  });
+
+  test('rejects a shutdown budget that is not a number', () => {
+    expectRejected({ type: 'shutdown', timeoutMs: '5000' }, 'timeoutMs');
   });
 
   test('rejects a negative replayCount', () => {
