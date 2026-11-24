@@ -45,6 +45,28 @@ const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
  */
 const EXECUTOR_CLOSE_SLACK_MS = 1000;
 
+/**
+ * Upper bound on the Session routes this layer keeps (SPEC 6.1). A route is
+ * removed when its connection goes away, so this is not a steady-state target;
+ * it is a brake for a business that never ends a Session and keeps minting ids,
+ * which would otherwise grow the table until the process runs out of memory.
+ * 10k is the same order as the executor's pending-buffer brake: one route per
+ * plausible concurrent player rather than a capacity promise.
+ */
+const DEFAULT_MAX_SESSIONS = 10_000;
+
+/**
+ * How long a reconnecting connection waits for the previous connection's work
+ * to settle (SPEC 3.2, INV-004). A handler can hang forever — JS cannot preempt
+ * running code (SPEC 3.4) — so this wait MUST be bounded: a late release makes
+ * two processing lines overlap visibly, a permanent wait would stall the
+ * Session. 10s matches the layer's other wait for in-flight work and covers a
+ * healthy commit or rollback. Deliberately independent of `shutdownTimeoutMs`:
+ * one bounds a runtime routing wait, the other a shutdown step, and tuning one
+ * must not silently change the other.
+ */
+const DEFAULT_SESSION_HANDOFF_TIMEOUT_MS = 10_000;
+
 export interface ConnectionLayerOptions {
   transport: Transport;
   executor: RequestExecutor;
@@ -80,9 +102,49 @@ export interface ConnectionLayerOptions {
    * process was still draining and writing.
    */
   shutdownTimeoutMs?: number;
+  /**
+   * Session routes this layer may hold at once (SPEC 6.1). Defaults to
+   * `DEFAULT_MAX_SESSIONS`; a binding beyond the cap is refused and logged, but
+   * the request that carried it still succeeds, because a routing failure is
+   * not a business failure.
+   */
+  maxSessions?: number;
+  /**
+   * How long a reconnecting connection waits for the previous holder's work to
+   * settle (SPEC 3.2, INV-004). Defaults to
+   * `DEFAULT_SESSION_HANDOFF_TIMEOUT_MS`; on expiry the wait is released and
+   * logged, because the previous connection may be stuck on a handler nobody
+   * can preempt (SPEC 3.4).
+   */
+  sessionHandoffTimeoutMs?: number;
 }
 
 type Status = 'idle' | 'started' | 'stopping' | 'stopped';
+
+/**
+ * Which connection currently holds a Session, and the tail of that
+ * connection's chain at the time it bound. Only routing information: the
+ * Session's business state belongs to the business process (SPEC 6.1).
+ */
+interface SessionRoute {
+  connectionId: string;
+  chain: Promise<unknown>;
+}
+
+/**
+ * Set on the connection that rebinds a Session another connection still holds
+ * (a reconnect). The next request here waits for the previous holder's chain to
+ * settle before it starts, so one Session never has two processing lines
+ * (SPEC 3.2, INV-004). The wait is bounded by the layer's handoff timeout: a
+ * handler nobody can preempt would otherwise stall the Session forever
+ * (SPEC 3.4).
+ */
+interface SessionGate {
+  readonly sessionId: string;
+  readonly previousConnectionId: string;
+  /** The previous holder's chain tail; already caught, so it never rejects. */
+  readonly settled: Promise<unknown>;
+}
 
 interface ConnectionState {
   readonly connection: TransportConnection;
@@ -100,12 +162,32 @@ interface ConnectionState {
    * could read its result (SPEC 3.6).
    */
   readonly inFlight: Set<string>;
+  /**
+   * The Session this connection currently holds, if any. Kept beside the table
+   * so a disconnect clears the route in O(1) instead of scanning every Session
+   * (SPEC 6.1). Rebinding replaces it; the old route is removed at that point.
+   */
+  sessionId?: string;
+  /** Pending reconnect wait; consumed by the first request that waits on it. */
+  sessionGate?: SessionGate;
+  /**
+   * Resolves when this connection is gone, so a request waiting on
+   * `sessionGate` does not outlive the client it would answer. Otherwise a
+   * reconnect-then-drop would keep the chain, and shutdown's drain, waiting for
+   * the full handoff timeout.
+   */
+  readonly closed: Promise<void>;
+  readonly markClosed: () => void;
 }
 
 /**
  * Wires a transport to an executor. It owns only what sits between the two:
- * decode, per-connection ordering, error mapping and encode (SPEC 5.2). Session
- * routing, replay and input buffering are deliberately absent.
+ * decode, per-connection ordering, Session routing, error mapping and encode
+ * (SPEC 5.2). The routing is a table plus an ordering gate — which connection
+ * holds a Session, and the wait that keeps a reconnect from overlapping the
+ * previous connection's work (SPEC 3.2); it carries no business state, which
+ * belongs to the business process (SPEC 6.1). Replay is `IpcExecutor`'s
+ * (SPEC 6.4) and input buffering is the `queued` counter itself (SPEC 3.5).
  */
 export class ConnectionLayer implements TransportHandlers {
   private readonly transport: Transport;
@@ -115,7 +197,15 @@ export class ConnectionLayer implements TransportHandlers {
   private readonly createRequestId: () => string;
   private readonly maxQueuedPerConnection: number;
   private readonly shutdownTimeoutMs: number;
+  private readonly maxSessions: number;
+  private readonly sessionHandoffTimeoutMs: number;
   private readonly connections = new Map<string, ConnectionState>();
+  /**
+   * Session ID → the connection that holds it. Written when a successful
+   * request binds, cleared when that connection goes away; never a cache of
+   * business state (SPEC 6.1).
+   */
+  private readonly sessions = new Map<string, SessionRoute>();
   private status: Status = 'idle';
   /** Whether `transport.start` succeeded, so `stop` is only called on a live one. */
   private transportStarted = false;
@@ -136,6 +226,9 @@ export class ConnectionLayer implements TransportHandlers {
       options.maxQueuedPerConnection ?? DEFAULT_MAX_QUEUED_PER_CONNECTION;
     this.shutdownTimeoutMs =
       options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
+    this.maxSessions = options.maxSessions ?? DEFAULT_MAX_SESSIONS;
+    this.sessionHandoffTimeoutMs =
+      options.sessionHandoffTimeoutMs ?? DEFAULT_SESSION_HANDOFF_TIMEOUT_MS;
   }
 
   async start(): Promise<void> {
@@ -172,11 +265,14 @@ export class ConnectionLayer implements TransportHandlers {
       // ever looks the connection up, so nothing is silently dropped.
       return Promise.resolve();
     }
+    const closed = Promise.withResolvers<void>();
     this.connections.set(connection.id, {
       connection,
       chain: Promise.resolve(),
       queued: 0,
       inFlight: new Set(),
+      closed: closed.promise,
+      markClosed: closed.resolve,
     });
     return Promise.resolve();
   }
@@ -235,14 +331,56 @@ export class ConnectionLayer implements TransportHandlers {
       });
     }
     state.queued += 1;
-    return this.enqueue(state, () => {
-      // Counted down when the request actually starts, not when it is refused:
-      // the cap measures work that is waiting, and a refused request never
-      // waits. It also keeps the count aligned with "excluding the executing
-      // request".
-      state.queued -= 1;
-      return this.handle(connection, envelope);
-    });
+    return this.enqueue(state, () => this.startAfterGate(state, envelope));
+  }
+
+  /**
+   * Waits out a pending reconnect gate, then runs the request. The wait sits at
+   * the head of this connection's chain, so it orders every later request on
+   * the new connection behind the old connection's work rather than only the
+   * first one (SPEC 3.2, INV-004).
+   */
+  private async startAfterGate(
+    state: ConnectionState,
+    envelope: Envelope,
+  ): Promise<void> {
+    const gate = state.sessionGate;
+    if (gate !== undefined) {
+      // Consumed, not re-read: this request is the one that crosses the
+      // handoff, and the requests behind it are already ordered by the chain.
+      state.sessionGate = undefined;
+      // The live tail, not the one captured at bind time: the old connection
+      // may have accepted more requests in between, and those are exactly the
+      // work that must have a terminal state first. The captured tail is the
+      // fallback for a holder this layer no longer tracks.
+      const previousState = this.connections.get(gate.previousConnectionId);
+      const settled = previousState?.chain ?? gate.settled;
+      // Raced against `closed` so a client that drops while waiting releases
+      // the chain now instead of pinning shutdown's drain for the full wait.
+      const waited = await settleWithin(
+        Promise.race([settled, state.closed]),
+        this.sessionHandoffTimeoutMs,
+      );
+      if (waited.status === 'timeout') {
+        // The previous holder may be stuck on a handler nobody can preempt
+        // (SPEC 3.4). Releasing is the lesser evil: a permanent wait would
+        // stall the Session, and the overlap is visible in this line.
+        this.logger.warn(
+          {
+            sessionId: gate.sessionId,
+            previousConnectionId: gate.previousConnectionId,
+            timeoutMs: this.sessionHandoffTimeoutMs,
+          },
+          'session handoff timed out; releasing the next request',
+        );
+      }
+    }
+    // Counted down when the request actually starts, not when it is refused or
+    // admitted: the cap measures work that is waiting, and a request blocked on
+    // the gate is still waiting. It also keeps the count aligned with
+    // "excluding the executing request".
+    state.queued -= 1;
+    return this.handle(state.connection, envelope);
   }
 
   async onDisconnect(connection: TransportConnection): Promise<void> {
@@ -251,6 +389,13 @@ export class ConnectionLayer implements TransportHandlers {
     if (state === undefined) {
       return;
     }
+    // SPEC 6.1: the layer keeps routing information only, so a route whose
+    // connection is gone is gone with it. A reconnect after this point binds as
+    // a first binding, not as a handoff from a dead connection.
+    this.removeSessionRoute(state);
+    // Releases a request still waiting on a reconnect gate: nobody can read its
+    // result, and shutdown's drain must not wait for the handoff timeout.
+    state.markClosed();
     // SPEC 3.6 default policy: a connection closing mid-request cancels it. The
     // handler may still be running, but nobody can read its result, and letting
     // it commit would leave a state change the player never saw.
@@ -260,6 +405,86 @@ export class ConnectionLayer implements TransportHandlers {
     }
     state.inFlight.clear();
     await Promise.all(cancels);
+  }
+
+  /** Drops the route this connection holds, if it is still the holder. */
+  private removeSessionRoute(state: ConnectionState): void {
+    const sessionId = state.sessionId;
+    if (sessionId === undefined) {
+      return;
+    }
+    state.sessionId = undefined;
+    // A gate orders this connection behind the previous holder of the Session
+    // it just left; that ordering no longer applies to whatever it binds next.
+    state.sessionGate = undefined;
+    const route = this.sessions.get(sessionId);
+    if (route?.connectionId === state.connection.id) {
+      this.sessions.delete(sessionId);
+    }
+  }
+
+  /**
+   * Records that `connection` holds `sessionId` (SPEC 2, 3.2). A binding that
+   * lands on a Session another connection still holds is a reconnect: the new
+   * connection is gated on the old one's chain so the two never process at the
+   * same time (INV-004). Refusing a binding never fails the request that
+   * carried it — routing is not the business result.
+   */
+  private bindSession(
+    state: ConnectionState,
+    sessionId: string,
+    logger: Logger,
+  ): void {
+    const connectionId = state.connection.id;
+    const route = this.sessions.get(sessionId);
+    if (state.sessionId === sessionId && route?.connectionId === connectionId) {
+      // Same connection, same Session, still the holder: only the chain tail
+      // moved. Not logged, or a long-lived connection would emit one line per
+      // request.
+      this.sessions.set(sessionId, { connectionId, chain: state.chain });
+      return;
+    }
+    if (route === undefined && this.sessions.size >= this.maxSessions) {
+      // Refused rather than evicting: evicting a live Session would send its
+      // next reconnect to the wrong connection. The request itself still
+      // succeeds, because a routing limit is not a business failure.
+      logger.warn(
+        { sessionId, connectionId, limit: this.maxSessions },
+        'session binding refused: session table is full',
+      );
+      return;
+    }
+    // A connection holds one Session at a time; binding a new one drops the old
+    // route so the table does not accumulate ids this connection has left.
+    this.removeSessionRoute(state);
+    // A route held by another connection is a reconnect, including the case
+    // where this connection used to hold the Session and another one has taken
+    // it over since.
+    if (route !== undefined && route.connectionId !== connectionId) {
+      logger.warn(
+        {
+          sessionId,
+          previousConnectionId: route.connectionId,
+          connectionId,
+        },
+        'session rebound to a new connection',
+      );
+      // The stored tail is the one captured at bind time; the live one also
+      // covers requests the old connection accepted since then, which is what
+      // "its work has a terminal state" means. The stored tail is the fallback
+      // for a holder this layer no longer tracks.
+      const previousState = this.connections.get(route.connectionId);
+      // The binding request itself is not delayed: it already ran. Only the
+      // next request on this connection waits for the old chain to settle.
+      state.sessionGate = {
+        sessionId,
+        previousConnectionId: route.connectionId,
+        settled: previousState?.chain ?? route.chain,
+      };
+    }
+    state.sessionId = sessionId;
+    this.sessions.set(sessionId, { connectionId, chain: state.chain });
+    logger.info({ sessionId, connectionId }, 'session bound');
   }
 
   stop(): Promise<void> {
@@ -276,6 +501,13 @@ export class ConnectionLayer implements TransportHandlers {
     // arrives while the drain is running is refused rather than queued.
     this.status = 'stopping';
     const timeoutMs = this.shutdownTimeoutMs;
+    // A request waiting on a reconnect gate would otherwise hold its chain for
+    // the full handoff timeout, which can be longer than this drain. Shutdown
+    // outranks the handoff: release every wait now so the drain measures real
+    // work rather than a routing delay.
+    for (const state of this.connections.values()) {
+      state.markClosed();
+    }
 
     // Step 2: drain what was already accepted. New input is refused, so the
     // chains can only shrink. Bounded because a handler that never returns
@@ -299,6 +531,10 @@ export class ConnectionLayer implements TransportHandlers {
       );
     }
     this.connections.clear();
+    // SPEC 6.1: routes outlive neither their connections nor the layer. Leaving
+    // them behind would make a restarted layer route a reconnect to a
+    // connection id that no longer exists.
+    this.sessions.clear();
 
     // Step 4 before step 5 (SPEC 6.3): storage closes before the transport, so
     // no write can land after the connection that would report it is gone.
@@ -494,6 +730,21 @@ export class ConnectionLayer implements TransportHandlers {
       state.inFlight.delete(requestId);
     }
     if (outcome.ok) {
+      // SPEC 2: the binding a handler declared takes effect only when the
+      // request succeeded, so a failed login leaves no route behind. Applied
+      // before the reply so a reconnect sees the new holder as soon as the
+      // client can, and so the reply itself is part of the chain a later
+      // handoff waits for.
+      //
+      // Skipped once the connection is gone: `onDisconnect` already removed its
+      // route, and re-adding one here would route a future reconnect to a
+      // connection id that no longer exists.
+      if (
+        outcome.sessionId !== undefined &&
+        this.connections.get(connection.id) === state
+      ) {
+        this.bindSession(state, outcome.sessionId, logger);
+      }
       await this.reply(
         connection,
         { id: clientRequestId, ok: true, result: outcome.result },
