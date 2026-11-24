@@ -1,62 +1,59 @@
-import {
-  FrameworkTimeoutError,
-  RequestCancelledError,
-  UnknownHandlerError,
-} from './dispatcher.ts';
-
 /*
- * The wire codes (SPEC 7.2). Each value appears exactly once in this file: the
- * constants below are the only place a code string is written, `WIRE_CODES`
- * derives from them and `FRAMEWORK_CODES` derives from that, so adding a code
- * is one edit and the classification follows without a second list.
+ * The wire codes (SPEC 7.2). `CODES` is the only place a code string is
+ * written: the named exports and `WIRE_CODES` both derive from it, so adding a
+ * code is one edit and the classification follows without a second list.
+ *
+ * The key order is SPEC 7.2 order, and it is also `WIRE_CODES` order: JS
+ * preserves insertion order for string keys, so `Object.values` yields the
+ * documented order without a separate ordered list to keep in sync.
  *
  * The values themselves are the contract: renaming one is a breaking change
  * for every downstream that keys on it, and a new meaning needs a new name
  * rather than a reused one (INV-014, SPEC 7.2).
  */
+const CODES = {
+  /** SPEC 7.2: the request exceeded its deadline. */
+  FRAMEWORK_TIMEOUT: 'FRAMEWORK_TIMEOUT',
+  /** SPEC 7.2/3.5: the input queue was full, so the request was refused. */
+  FRAMEWORK_QUEUE_FULL: 'FRAMEWORK_QUEUE_FULL',
+  /** SPEC 7.2/6.3: the framework is stopping; the request was not executed. */
+  FRAMEWORK_SHUTDOWN: 'FRAMEWORK_SHUTDOWN',
+  /** SPEC 7.2/6.5: the replay budget ran out; the request reached a terminal state. */
+  FRAMEWORK_REPLAY_EXHAUSTED: 'FRAMEWORK_REPLAY_EXHAUSTED',
+  /** SPEC 7.2/4.3: a reserved code, no path produces it yet. */
+  FRAMEWORK_CAPABILITY_UNSUPPORTED: 'FRAMEWORK_CAPABILITY_UNSUPPORTED',
+  /** SPEC 7.2: the transport closed before the request finished. */
+  TRANSPORT_CLOSED: 'TRANSPORT_CLOSED',
+  /** SPEC 7.2: the result could not be written back to the transport. */
+  TRANSPORT_SEND_FAILED: 'TRANSPORT_SEND_FAILED',
+  /** SPEC 7.2: a reserved code, no path produces it yet. */
+  STORAGE_UNAVAILABLE: 'STORAGE_UNAVAILABLE',
+  /** SPEC 7.2: an inbound frame could not be decoded. */
+  INVALID_ENVELOPE: 'INVALID_ENVELOPE',
+  /** SPEC 7.2: no handler is registered for the method. */
+  UNKNOWN_METHOD: 'UNKNOWN_METHOD',
+  /** SPEC 7.2: a framework-internal failure, including an undeclared business error. */
+  INTERNAL_ERROR: 'INTERNAL_ERROR',
+} as const;
 
-/** SPEC 7.2: the request exceeded its deadline. */
-export const FRAMEWORK_TIMEOUT = 'FRAMEWORK_TIMEOUT';
-/** SPEC 7.2/3.5: the input queue was full, so the request was refused. */
-export const FRAMEWORK_QUEUE_FULL = 'FRAMEWORK_QUEUE_FULL';
-/** SPEC 7.2/6.3: the framework is stopping; the request was not executed. */
-export const FRAMEWORK_SHUTDOWN = 'FRAMEWORK_SHUTDOWN';
-/** SPEC 7.2/6.5: the replay budget ran out; the request reached a terminal state. */
-export const FRAMEWORK_REPLAY_EXHAUSTED = 'FRAMEWORK_REPLAY_EXHAUSTED';
-/** SPEC 7.2/4.3: a reserved code, no path produces it yet. */
+export const FRAMEWORK_TIMEOUT = CODES.FRAMEWORK_TIMEOUT;
+export const FRAMEWORK_QUEUE_FULL = CODES.FRAMEWORK_QUEUE_FULL;
+export const FRAMEWORK_SHUTDOWN = CODES.FRAMEWORK_SHUTDOWN;
+export const FRAMEWORK_REPLAY_EXHAUSTED = CODES.FRAMEWORK_REPLAY_EXHAUSTED;
 export const FRAMEWORK_CAPABILITY_UNSUPPORTED =
-  'FRAMEWORK_CAPABILITY_UNSUPPORTED';
-/** SPEC 7.2: the transport closed before the request finished. */
-export const TRANSPORT_CLOSED = 'TRANSPORT_CLOSED';
-/** SPEC 7.2: the result could not be written back to the transport. */
-export const TRANSPORT_SEND_FAILED = 'TRANSPORT_SEND_FAILED';
-/** SPEC 7.2: a reserved code, no path produces it yet. */
-export const STORAGE_UNAVAILABLE = 'STORAGE_UNAVAILABLE';
-/** SPEC 7.2: an inbound frame could not be decoded. */
-export const INVALID_ENVELOPE = 'INVALID_ENVELOPE';
-/** SPEC 7.2: no handler is registered for the method. */
-export const UNKNOWN_METHOD = 'UNKNOWN_METHOD';
-/** SPEC 7.2: a framework-internal failure, including an undeclared business error. */
-export const INTERNAL_ERROR = 'INTERNAL_ERROR';
+  CODES.FRAMEWORK_CAPABILITY_UNSUPPORTED;
+export const TRANSPORT_CLOSED = CODES.TRANSPORT_CLOSED;
+export const TRANSPORT_SEND_FAILED = CODES.TRANSPORT_SEND_FAILED;
+export const STORAGE_UNAVAILABLE = CODES.STORAGE_UNAVAILABLE;
+export const INVALID_ENVELOPE = CODES.INVALID_ENVELOPE;
+export const UNKNOWN_METHOD = CODES.UNKNOWN_METHOD;
+export const INTERNAL_ERROR = CODES.INTERNAL_ERROR;
 
 /**
- * Every wire code, in SPEC 7.2 order. The array is derived from the constants
- * above rather than repeating their values, and is what tests and the
+ * Every wire code, in SPEC 7.2 order (`CODES` key order). What tests and the
  * classification set iterate over.
  */
-export const WIRE_CODES = [
-  FRAMEWORK_TIMEOUT,
-  FRAMEWORK_QUEUE_FULL,
-  FRAMEWORK_SHUTDOWN,
-  FRAMEWORK_REPLAY_EXHAUSTED,
-  FRAMEWORK_CAPABILITY_UNSUPPORTED,
-  TRANSPORT_CLOSED,
-  TRANSPORT_SEND_FAILED,
-  STORAGE_UNAVAILABLE,
-  INVALID_ENVELOPE,
-  UNKNOWN_METHOD,
-  INTERNAL_ERROR,
-] as const;
+export const WIRE_CODES: readonly string[] = Object.values(CODES);
 
 /**
  * A handler failure whose code is part of the Extension's own contract. Only
@@ -71,6 +68,53 @@ export class BusinessError extends Error {
     super(message);
     this.name = 'BusinessError';
     this.code = code;
+  }
+}
+
+export class FrameworkTimeoutError extends Error {
+  readonly code = FRAMEWORK_TIMEOUT;
+  readonly requestId: string;
+  readonly timeoutMs: number;
+
+  constructor(requestId: string, timeoutMs: number) {
+    super(`request ${requestId} timed out after ${timeoutMs}ms`);
+    this.name = 'FrameworkTimeoutError';
+    this.requestId = requestId;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+/**
+ * A request ended because someone asked it to, not because it ran out of time.
+ * A distinct type so the code stays the caller's (a connection layer sends
+ * `TRANSPORT_CLOSED`, a Portal sends `FRAMEWORK_TIMEOUT`), rather than being
+ * flattened into the timeout code (SPEC 7.2).
+ */
+export class RequestCancelledError extends Error {
+  readonly code: string;
+  readonly requestId: string;
+
+  constructor(requestId: string, code: string) {
+    super(`request ${requestId} was cancelled: ${code}`);
+    this.name = 'RequestCancelledError';
+    this.code = code;
+    this.requestId = requestId;
+  }
+}
+
+/**
+ * A distinct type rather than a bare Error: the connection layer maps it to a
+ * stable wire code, and callers must not have to match on message text to tell
+ * "no such method" apart from a handler that failed (INV-014).
+ */
+export class UnknownHandlerError extends Error {
+  readonly code = UNKNOWN_METHOD;
+  readonly method: string;
+
+  constructor(method: string) {
+    super(`no handler registered for "${method}"`);
+    this.name = 'UnknownHandlerError';
+    this.method = method;
   }
 }
 

@@ -117,7 +117,7 @@ interface ServerState {
    */
   readonly exitPromise: Promise<ServerExitInfo>;
   /** Synchronous view of the exit, for the channel-close path. */
-  readonly lastExit: (() => ServerExitInfo | undefined) | undefined;
+  readonly lastExit: () => ServerExitInfo | undefined;
   ready: boolean;
   closed: boolean;
   /** True once the child process itself is known to be gone. */
@@ -818,7 +818,7 @@ export class IpcExecutor implements RequestExecutor {
         spawned.kill();
       },
       exitPromise: spawned.exited,
-      lastExit: spawned.lastExit,
+      lastExit: () => spawned.lastExit(),
       ready: false,
       closed: false,
       exited: false,
@@ -837,7 +837,7 @@ export class IpcExecutor implements RequestExecutor {
       // tick, but its continuation is a microtask and this callback is
       // synchronous, so the promise is not readable yet. The synchronous view
       // is what keeps the real exit code in the crash line instead of a null.
-      const recorded = server.lastExit?.();
+      const recorded = server.lastExit();
       if (recorded?.observed === true) {
         server.exited = true;
         this.onServerLost(server, recorded.code, recorded.signal, reason);

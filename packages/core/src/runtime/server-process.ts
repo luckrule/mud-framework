@@ -178,8 +178,13 @@ class ServerProcess {
   /** Promises of accepted requests, so shutdown has a fixed set to wait for. */
   private readonly running = new Set<Promise<void>>();
   private portalGeneration: number | undefined;
-  private accepting = true;
-  private shuttingDown = false;
+  /**
+   * `accepting` until shutdown begins, then `shutting-down` for the rest of the
+   * process's life. One field rather than two booleans because they only ever
+   * changed together, and every read asks the same question: "may this process
+   * still take new work?".
+   */
+  private phase: 'accepting' | 'shutting-down' = 'accepting';
   /**
    * True once the missing handshake has been reported for this Portal. A request
    * before `hello` means the timing is broken, and logging every one of them
@@ -266,11 +271,10 @@ class ServerProcess {
   }
 
   private onParentGone(): void {
-    if (this.shuttingDown) {
+    if (this.phase === 'shutting-down') {
       return;
     }
-    this.shuttingDown = true;
-    this.accepting = false;
+    this.phase = 'shutting-down';
     this.logger.error(
       { code: 'IPC_PARENT_GONE', reason: 'the parent process is gone' },
       'parent process gone; server stopping',
@@ -407,7 +411,7 @@ class ServerProcess {
   }
 
   private onHello(runtime: Runtime, message: HelloMessage): void {
-    if (!this.accepting) {
+    if (this.phase === 'shutting-down') {
       // Answering a handshake with `ready` while shutting down would promise
       // readiness this process no longer offers.
       this.logger.warn(
@@ -493,7 +497,7 @@ class ServerProcess {
       }
       return;
     }
-    if (!this.accepting) {
+    if (this.phase === 'shutting-down') {
       // SPEC 3.5: a refused input gets a stable code rather than silence.
       // Portal may already have the request on the wire and will not settle it
       // until a result or its own deadline arrives, so dropping it here would
@@ -773,17 +777,16 @@ class ServerProcess {
   }
 
   private onShutdown(runtime: Runtime, message: ShutdownMessage): void {
-    if (this.shuttingDown) {
+    if (this.phase === 'shutting-down') {
       this.logger.warn(
         { code: 'SHUTDOWN_IN_PROGRESS', reason: 'shutdown already requested' },
         'duplicate shutdown ignored',
       );
       return;
     }
-    this.shuttingDown = true;
+    this.phase = 'shutting-down';
     // SPEC 6.3 step 1: stop accepting before draining, so the drain below has a
     // closed set of requests and nothing new can enter the backend.
-    this.accepting = false;
     const budgetMs = this.shutdownBudgetMs(message);
     this.logger.info(
       { pendingRequests: this.running.size, budgetMs },
@@ -902,12 +905,11 @@ class ServerProcess {
   }
 
   private onChannelClose(runtime: Runtime, reason: string): void {
-    if (this.shuttingDown) {
+    if (this.phase === 'shutting-down') {
       // Our own `close` at the end of an orderly shutdown.
       return;
     }
-    this.shuttingDown = true;
-    this.accepting = false;
+    this.phase = 'shutting-down';
     this.logger.error(
       { code: 'IPC_CHANNEL_CLOSED', reason },
       'ipc channel closed; server stopping',

@@ -1,56 +1,62 @@
 import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
 
-import {
-  FrameworkTimeoutError,
-  RequestCancelledError,
-  UnknownHandlerError,
-} from './dispatcher.ts';
 import * as wireCodes from './wire-codes.ts';
 import {
   BusinessError,
+  FrameworkTimeoutError,
   INTERNAL_ERROR,
+  RequestCancelledError,
+  UnknownHandlerError,
   WIRE_CODES,
   describeFailure,
   failureLogLevel,
   isFrameworkCode,
 } from './wire-codes.ts';
 
-/**
- * The code constants as the module actually exports them, discovered rather
- * than listed: a new `export const SOME_CODE = '...'` shows up here without
- * this file being edited, which is the point of the guards below. Only the
- * code strings are exported from `wire-codes.ts`, so a string export is a code.
- */
-const moduleExports: Record<string, unknown> = wireCodes;
-const exportedCodes: [string, string][] = Object.entries(moduleExports).filter(
-  (entry): entry is [string, string] => typeof entry[1] === 'string',
-);
 const codeValues: readonly string[] = WIRE_CODES;
 
+/**
+ * The named constants as the module exports them. `WIRE_CODES` derives from the
+ * same object, so the table cannot drift from it; what can still drift is a new
+ * table entry without a named export, which is what the guard below checks.
+ */
+const exportedCodeValues = new Set<string>();
+for (const value of Object.values(wireCodes)) {
+  if (typeof value === 'string') {
+    exportedCodeValues.add(value);
+  }
+}
+
 describe('wire code table', () => {
-  test('every exported code constant is in the summary array', () => {
-    // Guards the one edit a new code needs: adding the constant without adding
-    // it to `WIRE_CODES` would otherwise leave `isFrameworkCode` unaware.
-    expect(exportedCodes.length).toBeGreaterThan(0);
-    for (const [name, value] of exportedCodes) {
-      expect({ name, listed: codeValues.includes(value) }).toEqual({
-        name,
-        listed: true,
+  test('every code in the table has a named export', () => {
+    // A table entry with no constant would be unaddressable from the call sites
+    // that emit it.
+    expect(codeValues.length).toBeGreaterThan(0);
+    for (const code of codeValues) {
+      expect({ code, exported: exportedCodeValues.has(code) }).toEqual({
+        code,
+        exported: true,
       });
     }
   });
 
-  test('the summary array holds exactly the exported constants', () => {
-    // The other direction: a code listed in `WIRE_CODES` with no constant to
-    // name it would be unaddressable from the call sites that emit it.
-    expect(codeValues.length).toBe(exportedCodes.length);
-  });
-
-  test('no two code constants share a value', () => {
+  test('no two codes share a value', () => {
     // A second name for an existing string is a silent alias: both would appear
     // distinct in code while downstream sees one code, which INV-014 forbids.
-    const values = exportedCodes.map(([, value]) => value);
-    expect(new Set(values).size).toBe(values.length);
+    expect(new Set(codeValues).size).toBe(codeValues.length);
+  });
+
+  test('wire-codes does not import dispatcher', () => {
+    // The error types used to live in `dispatcher.ts` and be imported here,
+    // while dispatcher imported the codes: a cycle that only worked because the
+    // classes were used inside function bodies. Guard the direction that keeps
+    // the module a leaf.
+    const source = readFileSync(
+      new URL('./wire-codes.ts', import.meta.url),
+      'utf8',
+    );
+    expect(source).not.toContain('./dispatcher.ts');
   });
 });
 

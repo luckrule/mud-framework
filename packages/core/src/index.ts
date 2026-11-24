@@ -34,12 +34,7 @@ export type {
   Handler,
   RequestContext,
 } from './runtime/dispatcher.ts';
-export {
-  Dispatcher,
-  FrameworkTimeoutError,
-  RequestCancelledError,
-  UnknownHandlerError,
-} from './runtime/dispatcher.ts';
+export { Dispatcher } from './runtime/dispatcher.ts';
 export type {
   LogFields,
   LogLevel,
@@ -67,12 +62,15 @@ export {
   FRAMEWORK_REPLAY_EXHAUSTED,
   FRAMEWORK_SHUTDOWN,
   FRAMEWORK_TIMEOUT,
+  FrameworkTimeoutError,
   INTERNAL_ERROR,
   INVALID_ENVELOPE,
+  RequestCancelledError,
   STORAGE_UNAVAILABLE,
   TRANSPORT_CLOSED,
   TRANSPORT_SEND_FAILED,
   UNKNOWN_METHOD,
+  UnknownHandlerError,
   WIRE_CODES,
   describeFailure,
   failureLogLevel,

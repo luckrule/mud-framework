@@ -27,16 +27,17 @@ export interface SpawnedServer {
   /** Resolves once the child process is gone, or once that cannot be observed. */
   exited: Promise<ServerExitInfo>;
   /**
-   * The exit recorded so far, readable synchronously.
+   * The exit recorded so far, readable synchronously. `undefined` means "no
+   * exit has been recorded yet", not "this spawn cannot report one".
    *
    * `exited` resolves on the same event, but its continuation runs a microtask
    * later and the channel's `onClose` fires synchronously first: without a
    * synchronous read the crash line reports `exitCode: null` and the real code
-   * survives only inside the free-text reason. Optional so a minimal
-   * implementation still satisfies the interface; a caller then falls back to
-   * the asynchronous path.
+   * survives only inside the free-text reason. Required because every spawn
+   * can answer it — the caller has no asynchronous fallback for the
+   * channel-close path.
    */
-  lastExit?: () => ServerExitInfo | undefined;
+  lastExit(): ServerExitInfo | undefined;
   /** Forcible termination, used when graceful shutdown stalls. */
   kill(): void;
 }

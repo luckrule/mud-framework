@@ -5,7 +5,19 @@ import type { Logger, LoggerFactory } from '../logging/types.ts';
 import type { StorageBackend, StorageTransaction } from '../storage/types.ts';
 import type { RequestIdentity } from './identity.ts';
 import { tightenTimeout } from './timeout.ts';
-import { FRAMEWORK_TIMEOUT, UNKNOWN_METHOD } from './wire-codes.ts';
+import {
+  FrameworkTimeoutError,
+  RequestCancelledError,
+  UnknownHandlerError,
+} from './wire-codes.ts';
+
+/*
+ * The error types live in `wire-codes.ts`, beside the codes they carry: a code
+ * module that imported its own error classes from here would be a cycle. They
+ * are re-exported so the existing `import ... from './dispatcher.ts'` call
+ * sites (and the package surface in `index.ts`) keep working.
+ */
+export { FrameworkTimeoutError, RequestCancelledError, UnknownHandlerError };
 
 /**
  * What the caller knows about a request before it is dispatched. All optional:
@@ -95,53 +107,6 @@ interface InFlight {
 
 const EXPIRED_MESSAGE =
   'storage transaction expired: the request already reached a terminal state';
-
-export class FrameworkTimeoutError extends Error {
-  readonly code = FRAMEWORK_TIMEOUT;
-  readonly requestId: string;
-  readonly timeoutMs: number;
-
-  constructor(requestId: string, timeoutMs: number) {
-    super(`request ${requestId} timed out after ${timeoutMs}ms`);
-    this.name = 'FrameworkTimeoutError';
-    this.requestId = requestId;
-    this.timeoutMs = timeoutMs;
-  }
-}
-
-/**
- * A request ended because someone asked it to, not because it ran out of time.
- * A distinct type so the code stays the caller's (a connection layer sends
- * `TRANSPORT_CLOSED`, a Portal sends `FRAMEWORK_TIMEOUT`), rather than being
- * flattened into the timeout code (SPEC 7.2).
- */
-export class RequestCancelledError extends Error {
-  readonly code: string;
-  readonly requestId: string;
-
-  constructor(requestId: string, code: string) {
-    super(`request ${requestId} was cancelled: ${code}`);
-    this.name = 'RequestCancelledError';
-    this.code = code;
-    this.requestId = requestId;
-  }
-}
-
-/**
- * A distinct type rather than a bare Error: the connection layer maps it to a
- * stable wire code, and callers must not have to match on message text to tell
- * "no such method" apart from a handler that failed (INV-014).
- */
-export class UnknownHandlerError extends Error {
-  readonly code = UNKNOWN_METHOD;
-  readonly method: string;
-
-  constructor(method: string) {
-    super(`no handler registered for "${method}"`);
-    this.name = 'UnknownHandlerError';
-    this.method = method;
-  }
-}
 
 export class Dispatcher {
   private readonly backend: StorageBackend;
