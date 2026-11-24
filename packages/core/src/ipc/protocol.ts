@@ -78,6 +78,8 @@ export interface ResultSuccessMessage {
   readonly ok: true;
   /** Handler return value; `unknown` admits `undefined` for a void handler. */
   readonly result: unknown;
+  /** Set when the handler bound the connection to a Session (SPEC 2). */
+  readonly sessionId?: string;
 }
 
 export interface ResultFailureMessage {
@@ -223,7 +225,15 @@ function buildResult(raw: Record<string, unknown>): ResultMessage {
       error: readResultError(raw, 'result', 'error'),
     };
   }
-  return { type: 'result', requestId, ok: true, result: raw.result };
+  return {
+    type: 'result',
+    requestId,
+    ok: true,
+    result: raw.result,
+    // Absent means "no Session bound" (SPEC 2), so it is passed through as
+    // `undefined` rather than defaulted to an empty string.
+    sessionId: readOptionalString(raw, 'result', 'sessionId'),
+  };
 }
 
 function readResultError(

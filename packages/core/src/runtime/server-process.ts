@@ -683,16 +683,30 @@ class ServerProcess {
   ): void {
     const ids = requestIds(message);
     if (outcome.ok) {
-      this.logger.debug({ ...ids, durationMs }, 'request completed');
-      this.sendQuietly(
-        {
-          type: 'result',
-          requestId: message.requestId,
-          ok: true,
-          result: outcome.result,
-        },
-        'result',
-      );
+      const sessionId = outcome.sessionId;
+      const fields: Record<string, unknown> = { ...ids, durationMs };
+      if (sessionId !== undefined) {
+        fields.sessionId = sessionId;
+      }
+      this.logger.debug(fields, 'request completed');
+      // Only a bound Session adds the field, so its absence on the wire keeps
+      // meaning "this request bound nothing" (SPEC 2).
+      const result: IpcMessage =
+        sessionId === undefined
+          ? {
+              type: 'result',
+              requestId: message.requestId,
+              ok: true,
+              result: outcome.result,
+            }
+          : {
+              type: 'result',
+              requestId: message.requestId,
+              ok: true,
+              result: outcome.result,
+              sessionId,
+            };
+      this.sendQuietly(result, 'result');
       return;
     }
     this.logger[failureLogLevel(outcome.error)](

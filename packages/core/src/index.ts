@@ -30,6 +30,7 @@ export type {
 } from './transport/types.ts';
 export type {
   DispatchMeta,
+  DispatchResult,
   DispatcherOptions,
   Handler,
   RequestContext,

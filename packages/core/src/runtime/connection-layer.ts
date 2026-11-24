@@ -647,7 +647,13 @@ function toError(error: unknown): Error {
 function normalizeOutcome(value: unknown): ExecutorOutcome {
   if (isRecord(value)) {
     if (value.ok === true) {
-      return { ok: true, result: value.result };
+      // `sessionId` must survive: it is how a handler's binding reaches the
+      // routing table, and dropping it here would silently discard every bind
+      // (SPEC 2). Only a non-empty string counts; anything else is treated as
+      // absent rather than handed to the router as a malformed id.
+      return typeof value.sessionId === 'string' && value.sessionId.length > 0
+        ? { ok: true, result: value.result, sessionId: value.sessionId }
+        : { ok: true, result: value.result };
     }
     const error = value.error;
     if (

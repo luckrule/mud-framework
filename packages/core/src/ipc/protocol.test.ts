@@ -103,8 +103,56 @@ describe('parseIpcMessage', () => {
         requestId: 'req-1',
         ok: true,
         result: undefined,
+        sessionId: undefined,
       });
     }
+  });
+
+  test('accepts a success result carrying a session id', () => {
+    const parsed = parseIpcMessage({
+      type: 'result',
+      requestId: 'req-1',
+      ok: true,
+      result: null,
+      sessionId: 'session-1',
+    });
+
+    expect(parsed).toEqual({
+      ok: true,
+      message: {
+        type: 'result',
+        requestId: 'req-1',
+        ok: true,
+        result: null,
+        sessionId: 'session-1',
+      },
+    });
+  });
+
+  test('rejects an empty session id on a success result', () => {
+    expectRejected(
+      {
+        type: 'result',
+        requestId: 'req-1',
+        ok: true,
+        result: null,
+        sessionId: '',
+      },
+      'non-empty string',
+    );
+  });
+
+  test('rejects a non-string session id on a success result', () => {
+    expectRejected(
+      {
+        type: 'result',
+        requestId: 'req-1',
+        ok: true,
+        result: null,
+        sessionId: 7,
+      },
+      'sessionId',
+    );
   });
 
   test('tolerates unknown extra fields from a newer peer', () => {

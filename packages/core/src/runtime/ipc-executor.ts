@@ -979,21 +979,30 @@ export class IpcExecutor implements RequestExecutor {
       );
       return;
     }
-    const outcome: ExecutorOutcome = message.ok
-      ? { ok: true, result: message.result }
-      : {
-          ok: false,
-          error: { code: message.error.code, message: message.error.message },
-        };
-    this.logger.debug(
-      {
-        requestId: message.requestId,
-        connectionId: pending.request.connectionId,
-        clientRequestId: pending.request.clientRequestId,
-        durationMs: Date.now() - pending.startedAt,
-      },
-      'result received',
-    );
+    let outcome: ExecutorOutcome;
+    if (message.ok) {
+      // Only a bound Session adds the field, so "absent" keeps meaning "not
+      // bound" all the way through the Portal (SPEC 2).
+      outcome =
+        message.sessionId === undefined
+          ? { ok: true, result: message.result }
+          : { ok: true, result: message.result, sessionId: message.sessionId };
+    } else {
+      outcome = {
+        ok: false,
+        error: { code: message.error.code, message: message.error.message },
+      };
+    }
+    const fields: Record<string, unknown> = {
+      requestId: message.requestId,
+      connectionId: pending.request.connectionId,
+      clientRequestId: pending.request.clientRequestId,
+      durationMs: Date.now() - pending.startedAt,
+    };
+    if (message.ok && message.sessionId !== undefined) {
+      fields.sessionId = message.sessionId;
+    }
+    this.logger.debug(fields, 'result received');
     this.settle(pending, outcome);
   }
 

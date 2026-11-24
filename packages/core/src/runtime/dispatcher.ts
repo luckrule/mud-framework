@@ -34,10 +34,38 @@ export interface RequestContext {
   connectionId: string;
   /** The client's correlation key; empty when the caller supplied none. */
   clientRequestId: string;
+  /**
+   * The Session this request arrived under, if the connection was already
+   * bound. A handler that starts a Session declares it through `bindSession`;
+   * that binding takes effect only after this request succeeds (SPEC 2).
+   */
   sessionId?: string;
+  /**
+   * Binds the current connection to a Session. The framework stores the mapping
+   * and routes by it; it does not validate the id — who a player is, and when a
+   * session starts or ends, belongs to the business (SPEC 2).
+   *
+   * Only a successful request commits the binding: a handler that throws or
+   * times out leaves the connection unbound, so a failed login cannot leave a
+   * half-created session behind.
+   */
+  bindSession(sessionId: string): void;
   /** Already bound to the request's ids; handlers never build one. */
   logger: Logger;
   storage: StorageTransaction;
+}
+
+/**
+ * What a successful dispatch yields: the handler's value plus the Session it
+ * bound, if any. Failures are still thrown — `instanceof` only works in
+ * process, and `LocalExecutor` is the one place that turns them into the
+ * cross-process `ExecutorOutcome` union.
+ */
+export interface DispatchResult {
+  /** The handler's return value. */
+  result: unknown;
+  /** Set when the handler bound the connection to a Session (SPEC 2). */
+  sessionId?: string;
 }
 
 export type Handler = (
@@ -157,7 +185,7 @@ export class Dispatcher {
     name: string,
     payload: unknown,
     meta: DispatchMeta = {},
-  ): Promise<unknown> {
+  ): Promise<DispatchResult> {
     this.assertOpen();
     // The supplied id wins: a replay must keep the id the original request
     // got on entry (SPEC 7.3), and generating a fresh one would split one
@@ -219,6 +247,12 @@ export class Dispatcher {
       terminal.reject(new FrameworkTimeoutError(requestId, effectiveTimeoutMs));
     }, effectiveTimeoutMs);
 
+    // Recorded, not applied: the binding is committed only when the handler
+    // succeeds, so a failed login leaves the connection unbound (SPEC 2). A
+    // holder object rather than a `let`, because the handler closure assigns it
+    // and control-flow narrowing would otherwise treat it as still undefined.
+    const binding: { sessionId?: string } = {};
+
     try {
       const work = this.backend.transaction(async (tx) => {
         const context: RequestContext = {
@@ -226,6 +260,24 @@ export class Dispatcher {
           connectionId,
           clientRequestId,
           sessionId: meta.sessionId,
+          bindSession: (sessionId) => {
+            assertActive(expiry);
+            if (sessionId.length === 0) {
+              // An empty id cannot be routed, and the framework does not
+              // invent one: the business owns what a session is (SPEC 2).
+              throw new Error('bindSession requires a non-empty session id');
+            }
+            if (binding.sessionId !== undefined) {
+              // Two ids in one request have no defined meaning, and letting the
+              // last call win would make the binding depend on call order while
+              // looking successful. Failing the request keeps it diagnosable and
+              // leaves the connection unbound.
+              throw new Error(
+                `bindSession called twice in one request: "${binding.sessionId}" then "${sessionId}"`,
+              );
+            }
+            binding.sessionId = sessionId;
+          },
           logger,
           storage: guard(tx, expiry),
         };
@@ -248,7 +300,13 @@ export class Dispatcher {
           expiry.expired ? logLostCommit(logger, entry.startedAt) : undefined,
         () => undefined,
       );
-      return await Promise.race([work, terminal.promise]);
+      const result = await Promise.race([work, terminal.promise]);
+      const sessionId = binding.sessionId;
+      if (sessionId === undefined) {
+        return { result };
+      }
+      logger.debug({ sessionId }, 'session bound');
+      return { result, sessionId };
     } finally {
       clearTimeout(timer);
       if (this.inFlight.get(requestId) === entry) {

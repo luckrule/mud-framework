@@ -243,6 +243,63 @@ describe('LocalExecutor', () => {
     await executor.close();
   });
 
+  test('carries the session id a handler bound into the success outcome', async () => {
+    const dispatcher = quietDispatcher({
+      backend: new MemoryStorageBackend(),
+      timeoutMs: 1000,
+    });
+    dispatcher.register('login', async (ctx) => {
+      ctx.bindSession('session-1');
+      return 'welcome';
+    });
+    const executor = new LocalExecutor({ dispatcher });
+
+    const outcome = await executor.execute(request({ method: 'login' }));
+
+    expect(outcome).toEqual({
+      ok: true,
+      result: 'welcome',
+      sessionId: 'session-1',
+    });
+    await executor.close();
+  });
+
+  test('omits the session id when the handler binds nothing', async () => {
+    const dispatcher = quietDispatcher({
+      backend: new MemoryStorageBackend(),
+      timeoutMs: 1000,
+    });
+    dispatcher.register('echo', async (_ctx, payload) => payload);
+    const executor = new LocalExecutor({ dispatcher });
+
+    const outcome = await executor.execute(request({ payload: 'hi' }));
+
+    // Exactly equal, so an `undefined` field would fail: the absence is part of
+    // the contract (SPEC 2).
+    expect(outcome).toEqual({ ok: true, result: 'hi' });
+    await executor.close();
+  });
+
+  test('does not carry a session id on a failure', async () => {
+    const dispatcher = quietDispatcher({
+      backend: new MemoryStorageBackend(),
+      timeoutMs: 1000,
+    });
+    dispatcher.register('login', async (ctx) => {
+      ctx.bindSession('half-made');
+      throw new BusinessError('LOGIN_REFUSED', 'nope');
+    });
+    const executor = new LocalExecutor({ dispatcher });
+
+    const outcome = await executor.execute(request({ method: 'login' }));
+
+    expect(outcome).toEqual({
+      ok: false,
+      error: { code: 'LOGIN_REFUSED', message: 'nope' },
+    });
+    await executor.close();
+  });
+
   test('close closes the dispatcher and through it the backend', async () => {
     const backend = new MemoryStorageBackend();
     const dispatcher = quietDispatcher({ backend, timeoutMs: 1000 });

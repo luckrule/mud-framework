@@ -30,7 +30,7 @@ export interface ExecutorRequest {
  * prefix rules.
  */
 export type ExecutorOutcome =
-  | { ok: true; result: unknown }
+  | { ok: true; result: unknown; sessionId?: string }
   | { ok: false; error: { code: string; message: string } };
 
 /**
@@ -103,7 +103,7 @@ export class LocalExecutor implements RequestExecutor {
 
   async execute(request: ExecutorRequest): Promise<ExecutorOutcome> {
     try {
-      const result = await this.dispatcher.dispatch(
+      const { result, sessionId } = await this.dispatcher.dispatch(
         request.method,
         request.payload,
         {
@@ -114,7 +114,13 @@ export class LocalExecutor implements RequestExecutor {
           timeoutMs: request.timeoutMs,
         },
       );
-      return { ok: true, result };
+      // `sessionId` is present only when the handler bound this request to a
+      // Session; an unbound success must not carry an `undefined` field, or
+      // the "absent means unbound" convention would be indistinguishable from
+      // "bound to nothing" further down the IPC path (SPEC 2).
+      return sessionId === undefined
+        ? { ok: true, result }
+        : { ok: true, result, sessionId };
     } catch (error) {
       return { ok: false, error: describeFailure(error) };
     }

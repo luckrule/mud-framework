@@ -405,6 +405,56 @@ describe('runServerProcess requests', () => {
     await harness.stop();
   });
 
+  test('carries the session id a handler bound into the result message', async () => {
+    const harness = startServer({
+      register: (dispatcher) => {
+        dispatcher.register('login', async (ctx) => {
+          ctx.bindSession('session-1');
+          return 'welcome';
+        });
+      },
+    });
+    await tick();
+
+    harness.portal.send(requestMessage({ method: 'login' }));
+    await tick();
+
+    expect(results(harness.messages)).toEqual([
+      {
+        type: 'result',
+        requestId: 'req-1',
+        ok: true,
+        result: 'welcome',
+        sessionId: 'session-1',
+      },
+    ]);
+    await harness.stop();
+  });
+
+  test('omits the session id from the result when the handler binds nothing', async () => {
+    const harness = startServer({ register: echoRegistration });
+    await tick();
+
+    harness.portal.send(requestMessage());
+    await tick();
+
+    expect(results(harness.messages)).toEqual([
+      {
+        type: 'result',
+        requestId: 'req-1',
+        ok: true,
+        result: 'hi',
+      },
+    ]);
+    // The parsed message always carries the key, so absence is asserted on the
+    // wire shape: an `undefined` field is not the same as a missing one.
+    const raw = harness.messages.find(
+      (message) => isRecord(message) && message.type === 'result',
+    );
+    expect(raw).not.toHaveProperty('sessionId');
+    await harness.stop();
+  });
+
   test('maps a request timeout to FRAMEWORK_TIMEOUT', async () => {
     const harness = startServer({
       timeoutMs: 10,

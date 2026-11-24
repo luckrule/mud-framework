@@ -95,6 +95,14 @@ function successMessage(requestId: string, result: unknown): IpcMessage {
   return { type: 'result', requestId, ok: true, result };
 }
 
+function boundSuccessMessage(
+  requestId: string,
+  result: unknown,
+  sessionId: string,
+): IpcMessage {
+  return { type: 'result', requestId, ok: true, result, sessionId };
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -467,6 +475,36 @@ describe('IpcExecutor', () => {
       code: 'NOT_ENOUGH_GOLD',
       message: 'you cannot afford that',
     });
+    await h.executor.close();
+  });
+
+  test('carries the session id a result reports into the outcome', async () => {
+    const h = harness();
+    const server = await started(h);
+
+    const outcomePromise = h.executor.execute(request({ requestId: 'req-1' }));
+    server.send(boundSuccessMessage('req-1', 'welcome', 'session-1'));
+
+    expect(await outcomePromise).toEqual({
+      ok: true,
+      result: 'welcome',
+      sessionId: 'session-1',
+    });
+    const received = h.logs().find((line) => line.msg === 'result received');
+    expect(received).toMatchObject({ sessionId: 'session-1' });
+    await h.executor.close();
+  });
+
+  test('omits the session id when the result reports none', async () => {
+    const h = harness();
+    const server = await started(h);
+
+    const outcomePromise = h.executor.execute(request({ requestId: 'req-1' }));
+    server.send(successMessage('req-1', 'ok'));
+
+    expect(await outcomePromise).toEqual({ ok: true, result: 'ok' });
+    const received = h.logs().find((line) => line.msg === 'result received');
+    expect(received).not.toHaveProperty('sessionId');
     await h.executor.close();
   });
 
