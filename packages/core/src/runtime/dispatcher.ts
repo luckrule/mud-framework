@@ -42,6 +42,14 @@ export type DispatchMeta = Partial<RequestIdentity> & {
 
 export interface RequestContext extends RequestIdentity {
   /**
+   * Aborts when the request reaches a terminal state before the handler
+   * returns: timeout, cancellation, or disconnect (SPEC 3.6). It is a
+   * notification, not a preemption — JS cannot stop running code, so a handler
+   * that ignores it keeps running and only loses its transaction (SPEC 3.4).
+   * Pass it to `fetch`, `Bun.sleep`, or anything else that accepts one.
+   */
+  readonly signal: AbortSignal;
+  /**
    * Binds the current connection to a Session. The framework stores the mapping
    * and routes by it; it does not validate the id — who a player is, and when a
    * session starts or ends, belongs to the business (SPEC 2).
@@ -87,8 +95,15 @@ export interface DispatcherOptions {
   logger?: Logger;
 }
 
+/**
+ * A request's terminal-state flag plus the signal that announces it. Both live
+ * here because every set point must do both: `expired` is what `guard` enforces
+ * (a write after the deadline MUST fail), while the abort is only a
+ * notification that lets a cooperative handler stop early (SPEC 3.6).
+ */
 interface Expiry {
   expired: boolean;
+  readonly controller: AbortController;
 }
 
 /**
@@ -177,7 +192,10 @@ export class Dispatcher {
       ),
       meta.timeoutMs,
     );
-    const expiry: Expiry = { expired: false };
+    const expiry: Expiry = {
+      expired: false,
+      controller: new AbortController(),
+    };
     // Both the timer and `cancel` settle this, and only the first settles it:
     // a request has exactly one terminal state (SPEC 2).
     const terminal = Promise.withResolvers<never>();
@@ -201,6 +219,12 @@ export class Dispatcher {
         this.inFlight.delete(requestId);
       }
       expiry.expired = true;
+      // A reason, not just the fact: a handler that reacts to the abort may
+      // want to tell a timeout from a disconnect, and a string keeps the two
+      // cases distinguishable without the handler matching on error types.
+      // `abort` is idempotent, so a later cancel for the same request needs no
+      // guard here.
+      expiry.controller.abort('timeout');
       logger.warn(
         { method: name, timeoutMs: effectiveTimeoutMs },
         'request timed out',
@@ -221,6 +245,7 @@ export class Dispatcher {
           connectionId,
           clientRequestId,
           sessionId: meta.sessionId,
+          signal: expiry.controller.signal,
           bindSession: (sessionId) => {
             assertActive(expiry);
             if (sessionId.length === 0) {
@@ -280,8 +305,10 @@ export class Dispatcher {
    * Invalidates a request's transaction and settles it as cancelled. The
    * handler keeps running (JS cannot preempt it) but every later write is
    * rejected, and the transaction rolls back when the handler returns
-   * (SPEC 3.3, 3.6). Returns false when the request already reached a terminal
-   * state, or never existed here.
+   * (SPEC 3.3, 3.6). `ctx.signal` also aborts with `code` as its reason, so a
+   * handler that listens can stop early instead of only discovering the
+   * terminal state at its next write. Returns false when the request already
+   * reached a terminal state, or never existed here.
    *
    * `true` means the cancellation was accepted, NOT that the transaction rolled
    * back. `StorageBackend.transaction` commits after its callback resolves, so a
@@ -298,6 +325,10 @@ export class Dispatcher {
     // same id already sees a terminal request.
     this.inFlight.delete(requestId);
     entry.expiry.expired = true;
+    // The caller's code is the reason: the handler sees the same value the
+    // cancel carried (`TRANSPORT_CLOSED`, `FRAMEWORK_TIMEOUT`, ...), so a
+    // disconnect and a Portal-side timeout stay distinguishable (SPEC 3.6).
+    entry.expiry.controller.abort(code);
     entry.fail(new RequestCancelledError(requestId, code));
     // warn, not error: the framework kept running and nothing failed
     // internally, but someone should know a request was dropped mid-flight

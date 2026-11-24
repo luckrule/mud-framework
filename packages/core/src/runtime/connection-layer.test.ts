@@ -761,6 +761,33 @@ describe('ConnectionLayer', () => {
     expect(transport.sentTo('c1')).toHaveLength(0);
   });
 
+  test('aborts ctx.signal when a disconnect cancels the request', async () => {
+    // The full path, not just the executor call: onDisconnect → executor.cancel
+    // → dispatcher.cancel → expiry.controller.abort (SPEC 3.6). A handler that
+    // only listens to the signal must be woken, not left waiting.
+    const { transport, dispatcher } = await harness();
+    const entered = Promise.withResolvers<void>();
+    const woke = Promise.withResolvers<string>();
+    dispatcher.register('waiting', async (ctx) => {
+      entered.resolve();
+      const reason = await new Promise<unknown>((resolve) => {
+        ctx.signal.addEventListener('abort', () => {
+          resolve(ctx.signal.reason);
+        });
+      });
+      woke.resolve(String(reason));
+      return 'done';
+    });
+    transport.connect('c1');
+
+    const inFlight = transport.receive('c1', '{"id":"r1","method":"waiting"}');
+    await entered.promise;
+    await transport.disconnect('c1', 'client left');
+
+    expect(await woke.promise).toBe('TRANSPORT_CLOSED');
+    await inFlight;
+  });
+
   test('calls the executor cancel with TRANSPORT_CLOSED on disconnect', async () => {
     const transport = new FakeTransport();
     const cancelled: { requestId: string; code: string }[] = [];
