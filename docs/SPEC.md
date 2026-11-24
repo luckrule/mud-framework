@@ -40,7 +40,7 @@ Handler 可以 await，框架的调度建立在 Promise 之上。
 
 ## 2. 核心术语
 
-代码标识符、日志字段与文档 MUST 使用本节的定义，不引入同义词。
+代码标识符、日志字段与文档 MUST 使用本节的定义，不引入同义词。类型名、类名、进程名与导出函数名是例外：它们标识实现构件，允许与术语不同，但每个不同的名字 MUST 在本节内显式声明它对应哪个术语（形如 Connection Process 下的「实现命名」段），且同一概念 MUST NOT 有两个实现名。文档用本节术语指代概念；使用实现名时 MUST 以本节声明的映射为依据，不得另起名字或随手互换。
 
 **Request（请求）** — 客户端输入的最小处理单元，也是顺序保证与事务边界的基本单位。一条输入对应一个 Request；框架不把多条输入合并成一个 Request。
 
@@ -65,6 +65,8 @@ Handler 可以 await，框架的调度建立在 Promise 之上。
 **Business Process（业务进程）** — 承载 Extension、Handler 执行与存储访问的进程，与连接层进程分离，是存储的唯一写者。
 
 **Connection Process（连接层进程）** — 只负责传输接入、Session 路由与输入缓冲的进程。它不执行 Handler，不访问存储。
+
+实现命名：Connection Process 在框架实现里叫 **Portal**（`ConnectionLayer` 与 `IpcExecutor` 两个类的组合），Business Process 叫 **Server**（`runServerProcess` 启动的进程）。后文使用这两个名字时代指本节的两个术语。
 
 **Input Queue（输入队列）** — 每个 Connection 上的有界请求队列，保证同连接内请求有序。见 3.5。
 
@@ -151,7 +153,7 @@ Connection 在 Request 处理中关闭时，该 Request MUST 进入终态，不�
 
 ### 4.1 接口边界
 
-框架包 MUST 只导出存储接口与能力声明类型，MUST NOT 包含任何后端实现，MUST NOT import 具体后端包。存储接口（读、写、事务开启/提交/回滚）的签名稳定；能力差异通过能力声明表达，而不是通过接口分叉或运行时嗅探。新增后端不得要求改动框架核心。
+框架包 MUST NOT 包含任何存储后端实现，MUST NOT import 具体后端包。存储接口（读、写、事务开启/提交/回滚）与能力声明类型的签名稳定；能力差异通过能力声明表达，而不是通过接口分叉或运行时嗅探。新增后端不得要求改动框架核心。
 
 理由：后端与具体驱动、方言、连接模型强绑定，发版节奏与框架不同；放在同一个包里，任一方升级都会拖累另一方。
 
@@ -160,14 +162,11 @@ Connection 在 Request 处理中关闭时，该 Request MUST 进入终态，不�
 后端 MUST 导出能力声明。当前约定的字段：
 
 ```ts
-type Transactions = 'full' | 'limited' | 'none';
-type Concurrency = 'single' | 'pooled';
-
-interface Capabilities {
+interface StorageCapabilities {
   /** full：多实体原子；limited：仅单实体/单键原子；none：无回滚 */
-  transactions: Transactions;
+  transactions: 'full' | 'limited' | 'none';
   /** single：单连接串行；pooled：连接池并行 */
-  concurrency: Concurrency;
+  concurrency: 'single' | 'pooled';
   /** 事务内读是否为一致快照 */
   snapshotRead: boolean;
   /** 是否提供原子唯一约束（检查与写入不可分割） */
@@ -225,7 +224,7 @@ Extension 对存储能力的依赖 MUST 显式声明。启动时若后端能力�
 
 ### 5.1 接口边界
 
-框架核心 MUST 只导出 `Transport` 接口，MUST NOT 包含任何具体传输实现，MUST NOT import 具体传输包。`connector-ws` 等实现是独立包，独立发版、独立测试。新增传输只需实现接口，不得要求改动框架核心。
+框架核心 MUST NOT 包含任何具体传输实现，MUST NOT import 具体传输包。`Transport` 接口的签名稳定。`connector-ws` 等实现是独立包，独立发版、独立测试。新增传输只需实现接口，不得要求改动框架核心。
 
 理由：传输与具体协议、帧格式、握手强绑定，发版节奏与框架不同；放在同一个包里，任一方升级都会拖累另一方。
 

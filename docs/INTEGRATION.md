@@ -80,7 +80,7 @@ try {
 
 ### 子进程不得往 stdout 写
 
-`spawnBunServer` 的 `stdio` 是 `['ignore', 'inherit', 'inherit']`：子进程的 stdout 直接继承 Portal 的 stdout，stderr 也是。IPC 走独立通道，往 stdout 写不会破坏消息，但会把内容混进 Portal 的输出流——若 Portal 输出结构化日志，混入的裸行会让按行解析的下游失败。框架自身的 Server 日志默认写 stdout，所以生产装配要么给 `runServerProcess` 传一个 `sink` 指向 stderr 的 logger，要么接受两个进程的日志交织在同一 stdout 上并保证下游不假设每行都合法。诊断信息用 `console.error`。
+`spawnBunServer` 的 `stdio` 是 `['ignore', 'inherit', 'inherit']`：子进程的 stdout 直接继承 Portal 的 stdout，stderr 也是。IPC 走独立通道，往 stdout 写不会破坏消息，但会把内容混进 Portal 的输出流——若 Portal 输出结构化日志，混入的裸行会让按行解析的下游失败。框架自身的 Server 日志默认写 stdout，所以生产装配要么给 `runServerProcess` 传一个用 `createJsonLogger({ sink })` 构造、`sink` 写 stderr 的 logger，要么接受两个进程的日志交织在同一 stdout 上并保证下游不假设每行都合法。诊断信息用 `console.error`。
 
 ### 一个进程只能有一个 `runServerProcess`
 
