@@ -25,6 +25,8 @@ import {
   nextPortalGeneration,
   requestMessage,
 } from './ipc-messages.ts';
+import type { PendingRequest } from './ipc-pending.ts';
+import { PendingBuffer } from './ipc-pending.ts';
 import { effectiveTimeoutMs, settleWithin, tightenTimeout } from './timeout.ts';
 import {
   FRAMEWORK_QUEUE_FULL,
@@ -114,30 +116,6 @@ interface ServerState {
 }
 
 /**
- * A Request that has been accepted but not acknowledged (SPEC §2: only a
- * `result` acknowledges). It stays here across crashes and is removed only by a
- * result or by a Portal-decided terminal state.
- */
-interface PendingRequest {
-  readonly request: ExecutorRequest;
-  /**
-   * Ordering key for replay. Comes from one global counter, so it is strictly
-   * ascending within any connection (all SPEC 6.5 needs) without a
-   * per-connection map that would never shrink.
-   */
-  readonly perConnectionSeq: number;
-  /** When the Portal accepted the request; the deadline is measured from here. */
-  readonly startedAt: number;
-  readonly resolve: (outcome: ExecutorOutcome) => void;
-  replayCount: number;
-  /** Server generation this request was last sent on; `undefined` = never sent. */
-  sentOn: number | undefined;
-  deadlineAt: number;
-  effectiveTimeoutMs: number;
-  timer: ReturnType<typeof setTimeout> | undefined;
-}
-
-/**
  * The Portal side of the process split (ADR-0002): ships Requests to a Server
  * process over IPC and keeps them buffered until the Server acknowledges them.
  *
@@ -159,15 +137,13 @@ export class IpcExecutor implements RequestExecutor {
   private readonly stableResetMs: number;
   private readonly shutdownTimeoutMs: number;
   private readonly startTimeoutMs: number;
-  private readonly maxPending: number;
   private readonly logger: Logger;
   private readonly portalGeneration: number;
-  private readonly pending = new Map<string, PendingRequest>();
+  private readonly buffer: PendingBuffer;
   private status: Status = 'idle';
   private server: ServerState | undefined;
   private effectiveTimeoutMs: number;
   private generation = 0;
-  private seq = 0;
   /**
    * Crashes since the last stable run; drives the restart backoff. Reset only
    * by `stableTimer`, never by `ready`: a Server that reaches the handshake and
@@ -223,13 +199,11 @@ export class IpcExecutor implements RequestExecutor {
       );
     }
     this.startTimeoutMs = startTimeoutMs;
-    const maxPending = options.maxPending ?? DEFAULT_MAX_PENDING;
-    if (!Number.isInteger(maxPending) || maxPending < 1) {
-      throw new Error(
-        `maxPending must be a positive integer, got ${maxPending}`,
-      );
-    }
-    this.maxPending = maxPending;
+    // The buffer owns the cap and validates it, so the refusal and the limit
+    // it reports cannot drift from each other.
+    this.buffer = new PendingBuffer({
+      maxPending: options.maxPending ?? DEFAULT_MAX_PENDING,
+    });
     this.logger =
       options.logger ??
       createJsonLogger({ bindings: { component: 'ipc-executor' } });
@@ -385,28 +359,7 @@ export class IpcExecutor implements RequestExecutor {
         failure(FRAMEWORK_SHUTDOWN, 'ipc executor is shutting down'),
       );
     }
-    if (this.pending.size >= this.maxPending) {
-      // warn, not error: a full buffer is a refusal by policy, and the caller
-      // gets a stable code rather than a request that waits out its deadline.
-      this.logger.warn(
-        {
-          requestId: request.requestId,
-          connectionId: request.connectionId,
-          clientRequestId: request.clientRequestId,
-          code: FRAMEWORK_QUEUE_FULL,
-          pending: this.pending.size,
-          limit: this.maxPending,
-        },
-        'request refused: pending buffer is full',
-      );
-      return Promise.resolve(
-        failure(
-          FRAMEWORK_QUEUE_FULL,
-          `ipc executor pending buffer is full (${this.maxPending} unacknowledged)`,
-        ),
-      );
-    }
-    if (this.pending.has(request.requestId)) {
+    if (this.buffer.get(request.requestId) !== undefined) {
       // Request ids are minted by the connection layer and a replay goes
       // through the buffer, so a second execute() for the same id is a caller
       // bug. Failing it beats overwriting a promise nobody would ever settle.
@@ -428,26 +381,35 @@ export class IpcExecutor implements RequestExecutor {
       );
     }
     const deferred = Promise.withResolvers<ExecutorOutcome>();
-    const startedAt = Date.now();
-    const pending: PendingRequest = {
+    const pending = this.buffer.add(
       request,
-      perConnectionSeq: this.nextSeq(),
-      startedAt,
-      resolve: deferred.resolve,
-      replayCount: 0,
-      sentOn: undefined,
+      deferred,
       // A caller-supplied deadline may only tighten the ceiling this executor
       // already promised; otherwise the buffer would outlive the caller's own
       // terminal state and replay work for an answer nobody reads (SPEC 3.4).
-      effectiveTimeoutMs: tightenTimeout(
-        this.effectiveTimeoutMs,
-        request.timeoutMs,
-      ),
-      deadlineAt: 0,
-      timer: undefined,
-    };
-    pending.deadlineAt = startedAt + pending.effectiveTimeoutMs;
-    this.pending.set(request.requestId, pending);
+      tightenTimeout(this.effectiveTimeoutMs, request.timeoutMs),
+    );
+    if (pending === undefined) {
+      // warn, not error: a full buffer is a refusal by policy, and the caller
+      // gets a stable code rather than a request that waits out its deadline.
+      this.logger.warn(
+        {
+          requestId: request.requestId,
+          connectionId: request.connectionId,
+          clientRequestId: request.clientRequestId,
+          code: FRAMEWORK_QUEUE_FULL,
+          pending: this.buffer.size,
+          limit: this.buffer.maxPending,
+        },
+        'request refused: pending buffer is full',
+      );
+      return Promise.resolve(
+        failure(
+          FRAMEWORK_QUEUE_FULL,
+          `ipc executor pending buffer is full (${this.buffer.maxPending} unacknowledged)`,
+        ),
+      );
+    }
     this.armTimer(pending);
     try {
       const server = this.server;
@@ -491,7 +453,7 @@ export class IpcExecutor implements RequestExecutor {
    * it rolls back instead of committing writes nobody can see.
    */
   cancel(requestId: string, code: string): Promise<void> {
-    const pending = this.pending.get(requestId);
+    const pending = this.buffer.get(requestId);
     if (pending === undefined) {
       // Already terminal, or never accepted: nothing to undo and nothing to
       // tell the Server, which either has no such request or has finished it.
@@ -525,7 +487,7 @@ export class IpcExecutor implements RequestExecutor {
     // Deleting the current entry during iteration is safe for a Map, and
     // settling only resolves a promise (the continuation runs as a microtask),
     // so this cannot mutate the map mid-loop.
-    for (const pending of this.pending.values()) {
+    for (const pending of this.buffer.values()) {
       if (
         server === undefined ||
         server.closed ||
@@ -553,7 +515,7 @@ export class IpcExecutor implements RequestExecutor {
     // request with a message about a deadline that was never reached.
     if (drained.status === 'timeout') {
       this.logger.warn(
-        { timeoutMs: this.shutdownTimeoutMs, pending: this.pending.size },
+        { timeoutMs: this.shutdownTimeoutMs, pending: this.buffer.size },
         'pending requests did not settle before the shutdown timeout',
       );
       this.failAllPending(
@@ -752,7 +714,7 @@ export class IpcExecutor implements RequestExecutor {
   }
 
   private awaitPendingSettled(): Promise<void> {
-    if (this.pending.size === 0) {
+    if (this.buffer.isEmpty) {
       return Promise.resolve();
     }
     return new Promise<void>((resolve) => {
@@ -933,7 +895,7 @@ export class IpcExecutor implements RequestExecutor {
       declaredMaxDurationMs,
     );
     this.effectiveTimeoutMs = declared;
-    for (const pending of this.pending.values()) {
+    for (const pending of this.buffer.values()) {
       // Only ever tighten. A later Server declaring a longer ceiling must not
       // extend a deadline the Portal already promised, or a crash loop could
       // keep a request alive past its original ceiling (SPEC 3.4).
@@ -954,7 +916,7 @@ export class IpcExecutor implements RequestExecutor {
   }
 
   private onResult(message: ResultMessage): void {
-    const pending = this.pending.get(message.requestId);
+    const pending = this.buffer.get(message.requestId);
     if (pending === undefined) {
       // A result for a request that already reached a Portal-decided terminal
       // state. Expected, not an error (SPEC 7.3 keeps the id stable, so the
@@ -1101,12 +1063,8 @@ export class IpcExecutor implements RequestExecutor {
   }
 
   /**
-   * Delivers every buffered request that has not been sent on the current
-   * server generation, grouped by connection and ordered by `perConnectionSeq`
-   * (SPEC 6.5). Replays and never-sent requests share the one ordering: a
-   * request enqueued during a restart always has a higher sequence than the
-   * replays on its connection, so one sort per connection satisfies both rules
-   * and correctness does not depend on Map insertion order.
+   * Delivers everything `undelivered` reports for the current generation, in
+   * the order it reports them (SPEC 6.5).
    *
    * A request that keeps killing the process starves the later requests on its
    * connection: every flush stops at it (its replay budget runs out, and the
@@ -1121,33 +1079,16 @@ export class IpcExecutor implements RequestExecutor {
     if (this.isTerminal) {
       return;
     }
-    const byConnection = new Map<string, PendingRequest[]>();
-    for (const pending of this.pending.values()) {
-      if (pending.sentOn === server.generation) {
-        continue;
-      }
-      const group = byConnection.get(pending.request.connectionId);
-      if (group === undefined) {
-        byConnection.set(pending.request.connectionId, [pending]);
-      } else {
-        group.push(pending);
-      }
-    }
-    for (const group of byConnection.values()) {
-      group.sort(
-        (left, right) => left.perConnectionSeq - right.perConnectionSeq,
-      );
-      for (const pending of group) {
-        if (!this.deliver(server, pending)) {
-          return;
-        }
+    for (const pending of this.buffer.undelivered(server.generation)) {
+      if (!this.deliver(server, pending)) {
+        return;
       }
     }
   }
 
   /** Returns false when the channel died and delivery must stop. */
   private deliver(server: ServerState, pending: PendingRequest): boolean {
-    if (!this.pending.has(pending.request.requestId)) {
+    if (this.buffer.get(pending.request.requestId) !== pending) {
       return true;
     }
     const isReplay = pending.sentOn !== undefined;
@@ -1216,7 +1157,7 @@ export class IpcExecutor implements RequestExecutor {
   }
 
   private onDeadline(pending: PendingRequest): void {
-    if (this.pending.get(pending.request.requestId) !== pending) {
+    if (this.buffer.get(pending.request.requestId) !== pending) {
       return;
     }
     pending.timer = undefined;
@@ -1273,16 +1214,16 @@ export class IpcExecutor implements RequestExecutor {
   }
 
   private settle(pending: PendingRequest, outcome: ExecutorOutcome): void {
-    if (this.pending.get(pending.request.requestId) !== pending) {
+    if (this.buffer.get(pending.request.requestId) !== pending) {
       return;
     }
-    this.pending.delete(pending.request.requestId);
+    this.buffer.take(pending.request.requestId);
     if (pending.timer !== undefined) {
       clearTimeout(pending.timer);
       pending.timer = undefined;
     }
     pending.resolve(outcome);
-    if (this.pending.size === 0) {
+    if (this.buffer.isEmpty) {
       const drained = this.drainedWaiter;
       this.drainedWaiter = undefined;
       drained?.();
@@ -1290,13 +1231,8 @@ export class IpcExecutor implements RequestExecutor {
   }
 
   private failAllPending(code: string, message: string): void {
-    for (const pending of this.pending.values()) {
+    for (const pending of this.buffer.values()) {
       this.settle(pending, failure(code, message));
     }
-  }
-
-  private nextSeq(): number {
-    this.seq += 1;
-    return this.seq;
   }
 }
