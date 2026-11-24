@@ -475,6 +475,8 @@ describe('IpcExecutor', () => {
       code: 'NOT_ENOUGH_GOLD',
       message: 'you cannot afford that',
     });
+    expect(outcome).not.toHaveProperty('type');
+    expect(outcome).not.toHaveProperty('requestId');
     await h.executor.close();
   });
 
@@ -485,11 +487,17 @@ describe('IpcExecutor', () => {
     const outcomePromise = h.executor.execute(request({ requestId: 'req-1' }));
     server.send(boundSuccessMessage('req-1', 'welcome', 'session-1'));
 
-    expect(await outcomePromise).toEqual({
+    const outcome = await outcomePromise;
+    expect(outcome).toEqual({
       ok: true,
       result: 'welcome',
       sessionId: 'session-1',
     });
+    // The outcome is the message minus its envelope: a leaked `type` or
+    // `requestId` would mean the split is wrong, and the connection layer would
+    // be looking at wire fields it does not own.
+    expect(outcome).not.toHaveProperty('type');
+    expect(outcome).not.toHaveProperty('requestId');
     const received = h.logs().find((line) => line.msg === 'result received');
     expect(received).toMatchObject({ sessionId: 'session-1' });
     await h.executor.close();

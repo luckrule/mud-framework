@@ -684,24 +684,14 @@ class ServerProcess {
         fields.sessionId = sessionId;
       }
       this.logger.debug(fields, 'request completed');
-      // Only a bound Session adds the field, so its absence on the wire keeps
-      // meaning "this request bound nothing" (SPEC 2).
-      const result: IpcMessage =
-        sessionId === undefined
-          ? {
-              type: 'result',
-              requestId: message.requestId,
-              ok: true,
-              result: outcome.result,
-            }
-          : {
-              type: 'result',
-              requestId: message.requestId,
-              ok: true,
-              result: outcome.result,
-              sessionId,
-            };
-      this.sendQuietly(result, 'result');
+      // The outcome already has the shape of the message's payload half, so it
+      // is spread rather than copied field by field. An unbound success carries
+      // `sessionId: undefined` as an own property, which every channel either
+      // drops (JSON) or keeps with the same meaning as absence (SPEC 2).
+      this.sendQuietly(
+        { type: 'result', requestId: message.requestId, ...outcome },
+        'result',
+      );
       return;
     }
     this.logger[failureLogLevel(outcome.error)](
@@ -714,12 +704,7 @@ class ServerProcess {
       'request failed',
     );
     this.sendQuietly(
-      {
-        type: 'result',
-        requestId: message.requestId,
-        ok: false,
-        error: outcome.error,
-      },
+      { type: 'result', requestId: message.requestId, ...outcome },
       'result',
     );
   }

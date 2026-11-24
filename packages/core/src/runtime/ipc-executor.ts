@@ -1000,22 +1000,12 @@ export class IpcExecutor implements RequestExecutor {
       );
       return;
     }
-    let outcome: ExecutorOutcome;
-    if (message.ok) {
-      // Only a bound Session adds the field, so "absent" keeps meaning "not
-      // bound" all the way through the Portal (SPEC 2).
-      outcome =
-        message.sessionId === undefined
-          ? { ok: true, result: message.result }
-          : { ok: true, result: message.result, sessionId: message.sessionId };
-    } else {
-      outcome = {
-        ok: false,
-        error: { code: message.error.code, message: message.error.message },
-      };
-    }
+    // The message is an `ExecutorOutcome` behind two envelope fields, so the
+    // outcome is split off rather than rebuilt field by field. Dropping the
+    // envelope is what keeps `requestId` and `type` out of the settled value.
+    const { type: _type, requestId, ...outcome } = message;
     const fields: Record<string, unknown> = {
-      requestId: message.requestId,
+      requestId,
       connectionId: pending.request.connectionId,
       clientRequestId: pending.request.clientRequestId,
       durationMs: Date.now() - pending.startedAt,

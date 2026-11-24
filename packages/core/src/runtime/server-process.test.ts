@@ -459,12 +459,17 @@ describe('runServerProcess requests', () => {
         result: 'hi',
       },
     ]);
-    // The parsed message always carries the key, so absence is asserted on the
-    // wire shape: an `undefined` field is not the same as a missing one.
+    // The outcome is spread into the message, so an unbound success carries the
+    // key with `undefined` rather than omitting it. JSON drops the key and
+    // structured clone keeps it with the same meaning as absence (SPEC 2), so
+    // the wire assertion is on the value.
     const raw = harness.messages.find(
       (message) => isRecord(message) && message.type === 'result',
     );
-    expect(raw).not.toHaveProperty('sessionId');
+    if (!isRecord(raw)) {
+      throw new Error('expected a raw result message');
+    }
+    expect(raw.sessionId).toBeUndefined();
     await harness.stop();
   });
 

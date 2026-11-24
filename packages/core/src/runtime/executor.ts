@@ -20,10 +20,9 @@ export interface ExecutorRequest extends RequestIdentity {
  * and both sides would need different handling. As a return value, in-process
  * and remote execution follow one path.
  *
- * There is deliberately no category field: the IPC `ResultError` is `{code,
- * message}` and the protocol is not this module's to widen. Both processes
- * classify through `isFrameworkCode` instead, which is one list rather than two
- * prefix rules.
+ * There is deliberately no category field: the IPC result message carries this
+ * type as its own outcome half, so both sides classify through
+ * `isFrameworkCode` instead, which is one list rather than two prefix rules.
  */
 export type ExecutorOutcome =
   | { ok: true; result: unknown; sessionId?: string }

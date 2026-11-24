@@ -7,6 +7,7 @@
  * validators, because a change to one must not silently change the other.
  */
 import { describeValue, isRecord, messageOf } from '../internal/guards.ts';
+import type { ExecutorOutcome } from '../runtime/executor.ts';
 import type { RequestIdentity } from '../runtime/identity.ts';
 import {
   type CapabilityCheck,
@@ -77,34 +78,20 @@ export interface ReadyMessage {
   readonly capabilities: StorageCapabilities;
 }
 
-export interface ResultError {
-  readonly code: string;
-  readonly message: string;
-}
-
-export interface ResultSuccessMessage {
-  readonly type: 'result';
-  readonly requestId: string;
-  readonly ok: true;
-  /** Handler return value; `unknown` admits `undefined` for a void handler. */
-  readonly result: unknown;
-  /** Set when the handler bound the connection to a Session (SPEC 2). */
-  readonly sessionId?: string;
-}
-
-export interface ResultFailureMessage {
-  readonly type: 'result';
-  readonly requestId: string;
-  readonly ok: false;
-  readonly error: ResultError;
-}
-
 /**
  * One message type discriminated by `ok`, deliberately not split into
  * `result`/`error` message types: Portal correlates both outcomes by the same
  * `requestId`, and a single type keeps the correlation switch in one place.
+ *
+ * The outcome half is `ExecutorOutcome` itself rather than a copy of its
+ * fields: the two sides are the same value, and a second declaration only
+ * creates a second place to forget a field. Only the envelope (`type`,
+ * `requestId`) is added here.
  */
-export type ResultMessage = ResultSuccessMessage | ResultFailureMessage;
+export type ResultMessage = {
+  readonly type: 'result';
+  readonly requestId: string;
+} & ExecutorOutcome;
 
 /** Server -> Portal: shutdown finished. */
 export interface ClosedMessage {
@@ -253,7 +240,7 @@ function readResultError(
   raw: Record<string, unknown>,
   messageType: string,
   field: string,
-): ResultError {
+): { code: string; message: string } {
   const record = readRecord(raw, messageType, field);
   const prefix = `${messageType}.${field}`;
   return {
