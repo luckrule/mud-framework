@@ -48,6 +48,8 @@ Handler 可以 await，框架的调度建立在 Promise 之上。
 
 **Session（会话）** — 玩家的一次逻辑在线期，由 Session ID 标识，可跨越多个 Connection（断线重连）。Session 是路由与状态归属的单位。
 
+当前未实现：连接层不做 Session 路由，`RequestContext.sessionId` 恒为空。这是已知缺口，不是文档过期——条目保留为目标契约。
+
 **Transport（传输）** — 传输实现的接口：接受连接、交付入站数据、写出发站数据、关闭。它只负责字节流与消息编解码，不含 Session 路由与输入缓冲——后者属于连接层进程。框架核心不依赖任何具体 Transport。
 
 **Handler（处理器）** — 处理单个 Request 的业务函数，可以是 async。输入是已解码的请求与请求上下文；正常返回即表示该请求成功。
@@ -65,6 +67,8 @@ Handler 可以 await，框架的调度建立在 Promise 之上。
 **Input Queue（输入队列）** — 每个 Connection 上的有界请求队列，保证同连接内请求有序。见 3.5。
 
 **Request Context（请求上下文）** — 随 Request 传入 Handler 的框架侧上下文，携带 Session ID、Connection ID、请求标识、事务句柄、中止信号与日志器。Handler 的存储调用与日志调用 SHOULD 经由它，框架据此统一归属日志、统一判定事务是否仍有效。
+
+当前未实现：`RequestContext` 没有中止信号字段，Session ID 恒为空。条目保留为目标契约，缺口见 3.2 与 3.6。
 
 **Terminal State（终态）** — Request 的结局，只有三类：成功、业务失败、框架失败（超时、取消、存储不可用、传输在完成前断开）。终态表示处理结束、结果已确定；它不等于已确认。
 
@@ -85,6 +89,8 @@ Handler 可以 await，框架的调度建立在 Promise 之上。
 不同 Connection 之间 MUST 并发处理。
 
 同一 Session 重连到新 Connection 时，旧 Connection 上未完成的 Request 必须先有终态（完成或失败），新 Connection 才开始处理，避免同一 Session 出现两条处理线。
+
+当前未实现：连接层没有 Session 路由，这条重连顺序没有执行者，`RequestContext.sessionId` 恒为空。条目保留为目标契约。
 
 理由：跨连接串行会抹掉异步模型的全部收益；同 Session 并行则让"谁的状态更新生效"变得不可判定。
 
@@ -123,6 +129,8 @@ Handler 内 MUST NOT 开启新事务。需要多段原子性的业务应拆成�
 
 每个 Connection 的 Input Queue MUST 有明确上限。队列满时的行为 MUST 是显式策略之一：拒绝新输入并返回稳定错误码，或对传输层施加背压。MUST NOT 静默丢弃——静默丢弃会让玩家指令凭空消失且不可诊断，这是最难排查的一类线上问题。
 
+队列满时采用拒绝策略：拒绝新输入并返回 `FRAMEWORK_QUEUE_FULL`，不做背压。理由是不依赖尚未实现的 `TransportCapabilities.backpressure`——把队列策略绑在一个还没有实现的能力上，会让队列上限在多数传输上失效。
+
 ### 3.6 取消与断线
 
 Connection 在 Request 处理中关闭时，该 Request MUST 进入终态，不得无限期挂起。
@@ -130,6 +138,8 @@ Connection 在 Request 处理中关闭时，该 Request MUST 进入终态，不�
 默认策略是取消：中止信号触发，事务回滚，Request 以框架错误结束。选择"取消"而非"继续执行"的理由是：玩家已经看不到结果，继续写入只会产生无法解释的状态变更。
 
 例外：Extension 可声明某类 Request 为不可取消（例如已经进入不可回滚的外部副作用）。框架 MUST 允许这种声明，但不可取消的 Request 仍受超时约束，且必须在关闭流程中等待其终态。
+
+当前未实现：没有让 Extension 声明"不可取消"的机制，也没有中止信号。这是已知缺口，不是文档过期——条目保留为目标契约。取消当前的实际语义是：使后续写入失效并让结果不再送达，不保证 handler 停止（JS 无法抢占执行中的代码，见 3.4），也不保证事务已回滚（见 3.3 与 ADR-0004）。
 
 断线不等于 Session 结束。Session 状态在业务进程侧保留一段时间（由配置决定），期间重连可恢复；超时未重连则按业务规则结束。
 
@@ -171,6 +181,8 @@ interface Capabilities {
 
 框架按声明选择路径，并把降级事实记录为告警级日志（每个后端进程启动时一次，不按请求刷屏）：
 
+当前未实现：Server 进程启动时以 info 记录一次完整能力声明，没有按降级项逐条产出告警。这是已知缺口，不是文档过期——表格描述的是目标行为。传输侧同类告警见 5.3。
+
 | 声明                    | 框架行为                                                                         | 业务需要承担的                                      |
 | ----------------------- | -------------------------------------------------------------------------------- | --------------------------------------------------- |
 | transactions: full      | 提供 3.3 的全部语义                                                              | 无需额外处理                                        |
@@ -182,6 +194,8 @@ interface Capabilities {
 | uniqueConstraint: false | 框架不提供"检查再写入"的原子性                                                   | 唯一性由单写者或业务侧幂等键保证                    |
 
 Extension 对存储能力的依赖 MUST 显式声明。启动时若后端能力不满足某个 Extension 声明的最低要求，框架 MUST 拒绝注册该 Extension（fail fast），不影响其他 Extension。
+
+当前未实现：没有 Extension 注册机制，`runServerProcess` 的 `register` 回调只拿到一个 `Dispatcher` 供业务注册 handler，没有让 Extension 声明存储能力最低要求的入口。`ServerProcess` 启动时只对后端能力声明做格式自检（字段齐全、取值合法），不做"Extension 要求 vs 后端能力"的比对。后果是 INV-010 当前没有执行者——一个要求 `transactions: full` 的业务可以静默跑在 `transactions: none` 的后端上。这是已知缺口，不是文档过期——条目保留为目标契约。
 
 依赖声明的粒度是"最低要求"，不是"完整能力清单"。例如银行类 Extension 要求 `transactions: full` 与 `uniqueConstraint: true`；只读查询类 Extension 可以不声明任何存储能力要求，从而在任何后端上运行。
 
@@ -234,6 +248,8 @@ interface TransportCapabilities {
 
 框架按声明选择路径，降级事实与存储降级同样记为启动时一次的告警日志。降级不是等价替代：被降级的能力在框架层不存在，业务不得依赖。
 
+当前未实现：传输降级的告警日志尚未落地，框架目前也不读 `Transport.capabilities()`。这是已知缺口，不是文档过期——下表描述的是目标行为。
+
 | 声明                   | 框架行为                                                                      |
 | ---------------------- | ----------------------------------------------------------------------------- |
 | fragmentation: false   | 框架按 `maxMessageBytes` 限制单条消息，超限拒绝并返回稳定错误码；不做分片重组 |
@@ -263,7 +279,7 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 ### 6.2 启动顺序
 
 1. 存储后端初始化并自检能力声明。
-2. 业务进程加载 Extension，按 4.3 校验其声明的存储能力；业务进程启动所必需的能力不满足时拒绝启动业务进程。
+2. 业务进程加载 Extension，按 4.3 校验其声明的存储能力；业务进程启动所必需的能力不满足时拒绝启动业务进程。当前未实现：这一步的校验没有执行者，实际顺序是存储后端初始化 → 能力格式自检 → `register` 注册 handler → 发 `ready`，缺口见 4.3。
 3. 连接层开始接受连接。
 
 连接层 MUST NOT 在业务进程就绪之前接受输入。理由：否则第一批玩家会收到"框架正在启动"这类本不该存在的错误。
@@ -272,7 +288,7 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 
 1. 连接层停止接受新连接。
 2. 对 Input Queue 中的请求执行显式策略：采用 3.5 的拒绝策略，或在关闭场景下排空；无论选哪种，行为必须可预期。
-3. 等待进行中的事务提交或回滚，受超时约束。
+3. 等待进行中的事务提交或回滚，受超时约束；超时后记 error 并继续关闭。
 4. 关闭存储后端。
 5. 关闭传输。
 
@@ -300,19 +316,39 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 
 框架日志 MUST 是结构化的（字段而非拼接字符串）。字段名是契约，文案不是。每个 Request 的日志 SHOULD 至少携带：请求标识、Session ID、Connection ID、Extension 名、耗时、结果、错误码。日志级别按语义使用：告警级用于能力降级、重放、队列拒绝这类"能继续运行但需要人知道"的事件；错误级用于请求失败；不得用错误级记录预期内的业务拒绝。
 
+当前未实现：Session ID 与 Extension 名两个字段不可用。`RequestContext` 没有 Extension 名字段，`sessionId` 恒为空——Session 路由与 Extension 注册机制尚未实现（见 §2、§3.2、§4.3）。这是已知缺口，不是文档过期——本段保留为目标契约。
+
 ### 7.2 错误码
 
-错误码 MUST 稳定、可枚举、带命名空间前缀，例如：
+错误码 MUST 稳定、可枚举、只增不删。语义变更 MUST 分配新码，不得复用旧码表示新含义。
 
-- FRAMEWORK_TIMEOUT — 请求超时
-- FRAMEWORK_QUEUE_FULL — 输入队列拒绝
-- FRAMEWORK_CAPABILITY_UNSUPPORTED — 存储能力不满足 Extension 声明
-- TRANSPORT_CLOSED — 传输在请求完成前关闭
-- STORAGE_UNAVAILABLE — 存储后端不可达
+错误码分两类，约束不同：
 
-错误码只增不删。语义变更 MUST 分配新码，不得复用旧码表示新含义。
+**wire 码** 随 `result.error.code` 发给客户端，属于对外契约，MUST 稳定可枚举：
 
-业务错误码由 Extension 自行定义，框架 MUST 原样透传，不改写、不吞掉。
+| 码                                 | 含义                                    |
+| ---------------------------------- | --------------------------------------- |
+| `FRAMEWORK_TIMEOUT`                | 请求超时                                |
+| `FRAMEWORK_QUEUE_FULL`             | 输入队列拒绝（见 3.5）                  |
+| `FRAMEWORK_SHUTDOWN`               | 框架正在关闭，请求未被执行              |
+| `FRAMEWORK_REPLAY_EXHAUSTED`       | 重放次数用尽，请求进入终态（见 6.5）    |
+| `FRAMEWORK_CAPABILITY_UNSUPPORTED` | 存储能力不满足 Extension 声明（见 4.3） |
+| `TRANSPORT_CLOSED`                 | 传输在请求完成前关闭                    |
+| `TRANSPORT_SEND_FAILED`            | 结果无法写回传输                        |
+| `STORAGE_UNAVAILABLE`              | 存储后端不可达                          |
+| `INVALID_ENVELOPE`                 | 入站帧无法解码                          |
+| `UNKNOWN_METHOD`                   | 没有该方法的 Handler                    |
+| `INTERNAL_ERROR`                   | 框架内部失败，含未声明的业务错误        |
+
+`FRAMEWORK_CAPABILITY_UNSUPPORTED` 与 `STORAGE_UNAVAILABLE` 是预留码：当前没有任何路径产出它们，先占住名字，免得实现时另发明一个码让下游同时面对两套语义。
+
+`TRANSPORT_SEND_FAILED` 的触发条件是"写不出去"，因此它结构上不可能送达客户端，只能作为日志字段被观察到。`TRANSPORT_CLOSED` 在当前实现里同样只出现在日志中：请求因断线结束时连接已不在，没有可回写的通道。两码仍是契约——它们回答"请求为什么结束"，删掉会让终态失去可枚举的说法。
+
+**仅日志诊断字段** 出现在日志的 `code` 字段里，用于定位，不发给客户端，也不构成 wire 契约：`CANCEL_LOST_TO_COMMIT`、`IPC_CHANNEL_CLOSED`、`SERVER_STARTUP_FAILED`、`DUPLICATE_REQUEST`、`INVALID_IPC_MESSAGE` 等。日志里的 `code` 只是一个字段名，取值不受本节约束——把它当成错误码清单会误判哪些码是契约。
+
+`FRAMEWORK_` 前缀是示例惯例，不是强制格式。`INVALID_ENVELOPE`、`UNKNOWN_METHOD`、`INTERNAL_ERROR`、`TRANSPORT_SEND_FAILED` 没有该前缀，是既有实现；改名等于换码，会打断依赖旧码的下游（INV-014），因此保留。这是文档补正，不是代码缺陷。
+
+业务错误码由 Extension 用 `BusinessError` 显式定义，框架原样透传，不改写、不吞掉。只有 `BusinessError` 的 `code` 与框架自身错误码进入 wire：驱动或运行时的偶然 `code`（如 `ENOENT`、`SQLITE_CONSTRAINT_UNIQUE`）不透传，统一降级为 `INTERNAL_ERROR`。否则第三方库升级会静默改变对外契约（INV-014）。
 
 ### 7.3 请求标识与关联
 
