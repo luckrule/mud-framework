@@ -248,6 +248,14 @@ function requireReady(value: Record<string, unknown>): PortalReady {
 }
 
 /**
+ * `process.kill(0, …)` signals the caller's whole process group and a negative
+ * pid addresses a group too, so only positive integers may reach a kill call.
+ */
+function isUsablePid(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0;
+}
+
+/**
  * Pids from the Server's own `server process ready` log line. The handshake
  * carries the pid too, but the handshake can be the line that never arrives;
  * this is the fallback cleanup uses to find the process anyway.
@@ -264,7 +272,7 @@ function serverReadyPids(observed: readonly string[]): number[] {
     if (
       isRecord(parsed) &&
       parsed.msg === 'server process ready' &&
-      typeof parsed.pid === 'number'
+      isUsablePid(parsed.pid)
     ) {
       pids.push(parsed.pid);
     }
@@ -281,7 +289,7 @@ function serverPidFromStderr(lines: readonly string[]): number | undefined {
       continue;
     }
     const parsed = Number.parseInt(line.slice(prefix.length), 10);
-    if (!Number.isNaN(parsed)) {
+    if (isUsablePid(parsed)) {
       pid = parsed;
     }
   }
@@ -289,30 +297,37 @@ function serverPidFromStderr(lines: readonly string[]): number | undefined {
 }
 
 /**
- * Waits only for the fixture's deterministic stderr announcement. The broken
- * handshake test freezes the Server through this, so it does not depend on the
- * cleanup's own fallback lookup.
+ * The pid the fixture announces on stdout ahead of an unparsable handshake.
+ * Same-stream order is what makes it reliable: a lone stderr chunk can be
+ * delivered late, while a stdout line written before the broken handshake
+ * cannot be read after it.
  */
-async function waitForAnnouncedServerPid(
-  stderrLines: readonly string[],
-  timeoutMs: number,
-): Promise<number | undefined> {
-  const deadlineAt = performance.now() + timeoutMs;
-  for (;;) {
-    const pid = serverPidFromStderr(stderrLines);
-    if (pid !== undefined) {
-      return pid;
+function serverPidFromAnnouncements(
+  observed: readonly string[],
+): number | undefined {
+  let pid: number | undefined;
+  for (const line of observed) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      continue;
     }
-    if (performance.now() > deadlineAt) {
-      return undefined;
+    if (
+      isRecord(parsed) &&
+      parsed.event === 'portal-server-pid' &&
+      isUsablePid(parsed.serverPid)
+    ) {
+      pid = parsed.serverPid;
     }
-    await sleep(POLL_INTERVAL_MS);
   }
+  return pid;
 }
 
 /**
- * The handshake is the primary source. The Server's own log line and the
- * fixture's stderr announcement cover the case where it never arrived.
+ * The handshake is the primary source. The fixture's stdout announcement, the
+ * Server's own log line and the fixture's stderr announcement cover the case
+ * where it never arrived.
  */
 async function findServerPid(
   knownPid: number | undefined,
@@ -326,7 +341,9 @@ async function findServerPid(
   const deadlineAt = performance.now() + timeoutMs;
   for (;;) {
     const pid =
-      serverReadyPids(observed).at(-1) ?? serverPidFromStderr(stderrLines);
+      serverPidFromAnnouncements(observed) ??
+      serverReadyPids(observed).at(-1) ??
+      serverPidFromStderr(stderrLines);
     if (pid !== undefined) {
       return pid;
     }
@@ -626,11 +643,11 @@ interface CleanupResult {
 /**
  * Kills both processes and deletes the database directory only after both are
  * confirmed gone. The Server pid comes from the handshake when it arrived, and
- * otherwise from the Server's own log line or the fixture's stderr
- * announcement; without that fallback a failed handshake would delete the
- * directory under a live Server. An unconfirmed process keeps the directory
- * and is reported through the return value instead of being thrown, so a
- * cleanup failure cannot hide the test's own error.
+ * otherwise from the fixture's stdout announcement, the Server's own log line
+ * or the fixture's stderr announcement; without that fallback a failed
+ * handshake would delete the directory under a live Server. An unconfirmed
+ * process keeps the directory and is reported through the return value instead
+ * of being thrown, so a cleanup failure cannot hide the test's own error.
  */
 async function cleanupPortal(run: RunningPortal): Promise<CleanupResult> {
   const { portal, observed, stderr, reader, drain, database } = run;
@@ -867,7 +884,9 @@ async function runSignalScenario(scenario: SignalScenario): Promise<void> {
 }
 
 /**
- * A handshake the test can never parse, with the Server still running. On
+ * A handshake the test can never parse, with the Server still running. The
+ * fixture announces the Server pid on stdout ahead of the broken line, so the
+ * test does not depend on a lone stderr chunk that Bun may deliver late. On
  * POSIX the Server is frozen before cleanup so it cannot exit on IPC
  * disconnect by itself: only the fallback pid lookup can remove it, and the
  * database must survive until then.
@@ -884,6 +903,7 @@ async function runBrokenHandshake(): Promise<void> {
   });
   const reader = new LineReader(portal.stdout);
   const stderr = captureStderr(portal.stderr);
+  let announcedPid: number | undefined;
   let failure: unknown;
   let cleanup: CleanupResult | undefined;
   try {
@@ -895,18 +915,29 @@ async function runBrokenHandshake(): Promise<void> {
     expect(handshakeFailure).toBeInstanceOf(Error);
     if (handshakeFailure instanceof Error) {
       expect(handshakeFailure.message).toContain('not JSON');
+      // The message quotes the offending line, so this text proves the reader
+      // had already consumed a valid announcement and then hit the broken
+      // line; if the announcement itself were unparsable it would be absent.
+      expect(handshakeFailure.message).toContain('portal handshake failed');
     }
+    expect(observed.at(-1)).toContain('portal handshake failed');
 
-    const serverPid = await waitForAnnouncedServerPid(
-      stderr.lines,
-      CLEANUP_PID_TIMEOUT_MS,
-    );
-    if (serverPid === undefined) {
-      throw new Error('the fixture never announced the Server pid');
+    // Same-stream ordering is the synchronization point: the fixture writes
+    // this line to stdout before the broken handshake, so a reader that
+    // reached the broken line necessarily observed it. stderr stays a cleanup
+    // fallback only, because Bun can deliver a lone chunk late.
+    announcedPid = serverPidFromAnnouncements(observed);
+    expect(announcedPid).toBeDefined();
+    if (announcedPid === undefined) {
+      throw new Error('the fixture never announced the Server pid on stdout');
     }
-    expect(isProcessAlive(serverPid)).toBe(true);
+    const stderrPid = serverPidFromStderr(stderr.lines);
+    if (stderrPid !== undefined) {
+      expect(stderrPid).toBe(announcedPid);
+    }
+    expect(isProcessAlive(announcedPid)).toBe(true);
     if (process.platform !== 'win32') {
-      process.kill(serverPid, 'SIGSTOP');
+      process.kill(announcedPid, 'SIGSTOP');
     }
   } catch (error) {
     failure = error;
@@ -940,10 +971,8 @@ async function runBrokenHandshake(): Promise<void> {
       `cleanup kept ${database.directory}: ${cleanup.retainedReason ?? 'reason unknown'}`,
     );
   }
-
-  const announcedPid = serverPidFromStderr(stderr.lines);
   if (announcedPid === undefined) {
-    throw new Error('the fixture never announced the Server pid');
+    throw new Error('the fixture never announced the Server pid on stdout');
   }
   expect(cleanup.serverPid).toBe(announcedPid);
   assertMissing(portal.pid);

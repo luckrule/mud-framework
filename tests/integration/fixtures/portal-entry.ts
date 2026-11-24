@@ -25,11 +25,13 @@ import type { Logger } from '../../../packages/core/src/index.ts';
  * and interleaves its own JSON log lines, including before the handshake, so
  * the test skips them until it finds `event: "portal-ready"`. All diagnostics
  * from this file go to stderr, including the Server pid announced before the
- * handshake: if the handshake is lost or unparsable, that line is the only way
- * the test can still find and kill the Server. Setting
+ * handshake: if the handshake is lost or unparsable, that line is one way the
+ * test can still find and kill the Server. Setting
  * `PORTAL_FIXTURE_BROKEN_HANDSHAKE=1` replaces the handshake with a deliberately
- * unparsable line and keeps the process alive, so the test's failure path has a
- * real Server to clean up.
+ * unparsable line, announces the pid once more on stdout as
+ * `event: "portal-server-pid"` so the pid cannot be lost behind a late stderr
+ * delivery, and keeps the process alive, so the test's failure path has a real
+ * Server to clean up.
  */
 
 const SERVER_FIXTURE = join(import.meta.dir, 'server-entry.ts');
@@ -156,10 +158,19 @@ async function main(): Promise<void> {
   }
 
   // stdout is the handshake channel, so the pid the test needs if that
-  // handshake never becomes usable goes to stderr.
-  console.error(`portal server pid ${serverPid}`);
+  // handshake never becomes usable goes to stderr. Await the write so the line
+  // is in the pipe before any handshake line is written; `console.error`
+  // happens to flush synchronously, but the ordering should not rest on that.
+  await Bun.stderr.write(`portal server pid ${serverPid}\n`);
 
   if (process.env.PORTAL_FIXTURE_BROKEN_HANDSHAKE === '1') {
+    // Bun can deliver a lone stderr chunk late, so the test cannot use the
+    // stderr copy as its synchronization point. This announcement shares
+    // stdout with the broken handshake below, so a reader scanning that stream
+    // necessarily sees it first.
+    await Bun.stdout.write(
+      `${JSON.stringify({ event: 'portal-server-pid', serverPid })}\n`,
+    );
     await Bun.stdout.write(
       'portal handshake failed: intentional fixture fault\n',
     );
