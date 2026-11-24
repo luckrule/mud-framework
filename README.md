@@ -16,6 +16,7 @@
 mud-framework/
 ├── .githooks/         pre-commit 与 commit-msg 钩子
 ├── .github/           CI 配置与 PR 模板
+├── benchmarks/        手动性能基准，不接入 CI
 ├── docs/              规格、不变量与协作规范
 ├── packages/          四个包：core、connector-ws、storage-sqlite，以及 private 的 test-support（仅测试辅助）
 ├── scripts/           门禁脚本，本地与 CI 共用
