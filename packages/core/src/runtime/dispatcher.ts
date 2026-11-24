@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { jsonLoggerFactory } from '../logging/json-logger.ts';
 import type { Logger, LoggerFactory } from '../logging/types.ts';
 import type { StorageBackend, StorageTransaction } from '../storage/types.ts';
+import { tightenTimeout } from './timeout.ts';
 import { FRAMEWORK_TIMEOUT, UNKNOWN_METHOD } from './wire-codes.ts';
 
 /**
@@ -337,24 +338,4 @@ function assertActive(expiry: Expiry): void {
   if (expiry.expired) {
     throw new Error(EXPIRED_MESSAGE);
   }
-}
-
-/**
- * Applies a per-request deadline to the dispatcher's own ceiling. Only a
- * smaller value wins, and an unusable one (NaN, zero, negative) is ignored
- * rather than propagated: `setTimeout(NaN)` fires on the next tick, so a bad
- * override would otherwise cancel every request immediately.
- */
-function tightenTimeout(
-  ceilingMs: number,
-  overrideMs: number | undefined,
-): number {
-  if (
-    overrideMs === undefined ||
-    !Number.isFinite(overrideMs) ||
-    overrideMs <= 0
-  ) {
-    return ceilingMs;
-  }
-  return Math.min(ceilingMs, overrideMs);
 }

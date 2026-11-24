@@ -8,6 +8,7 @@ import type {
   ExecutorRequest,
   RequestExecutor,
 } from './executor.ts';
+import { effectiveTimeoutMs, tightenTimeout } from './timeout.ts';
 import {
   FRAMEWORK_QUEUE_FULL,
   FRAMEWORK_REPLAY_EXHAUSTED,
@@ -1330,40 +1331,6 @@ function requestMessage(
 
 function failure(code: string, message: string): ExecutorOutcome {
   return { ok: false, error: { code, message } };
-}
-
-/**
- * Applies a caller-supplied deadline to an already established ceiling. Only a
- * smaller usable value wins: the ceiling is what this executor promised its
- * caller, and an unusable override (NaN, zero, negative) would otherwise make
- * `setTimeout` fire on the next tick and fail the request immediately.
- */
-function tightenTimeout(
-  ceilingMs: number,
-  overrideMs: number | undefined,
-): number {
-  if (
-    overrideMs === undefined ||
-    !Number.isFinite(overrideMs) ||
-    overrideMs <= 0
-  ) {
-    return ceilingMs;
-  }
-  return Math.min(ceilingMs, overrideMs);
-}
-
-/**
- * SPEC 3.4: the shorter of the Portal ceiling and the backend's declaration
- * wins. The protocol requires a positive finite `timeoutMs`, so a backend that
- * declares 0 or a negative ceiling degrades to the shortest expressible
- * timeout instead of producing an invalid request message.
- */
-function effectiveTimeoutMs(
-  portalTimeoutMs: number,
-  declaredMaxDurationMs: number,
-): number {
-  const effective = Math.min(portalTimeoutMs, declaredMaxDurationMs);
-  return Number.isFinite(effective) && effective >= 1 ? effective : 1;
 }
 
 function messageOf(error: unknown): string {
