@@ -2,27 +2,20 @@ import { messageOf } from '../internal/guards.ts';
 import { createProcessChannel } from '../ipc/bun-child.ts';
 import type { IpcChannel } from '../ipc/channel.ts';
 import type {
-  CancelMessage,
   HelloMessage,
   IpcMessage,
-  RequestMessage,
   ShutdownMessage,
 } from '../ipc/protocol.ts';
 import { parseIpcMessage } from '../ipc/protocol.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import type { Logger } from '../logging/types.ts';
 import type { StorageBackend } from '../storage/types.ts';
-import type { ExecutorOutcome } from './executor.ts';
 import type { Extension } from './extension.ts';
 import type { RequestIdentity } from './identity.ts';
+import { RequestRunner } from './server-requests.ts';
 import type { Runtime } from './server-startup.ts';
 import { startServer } from './server-startup.ts';
 import { settleWithin } from './timeout.ts';
-import {
-  FRAMEWORK_SHUTDOWN,
-  INTERNAL_ERROR,
-  failureLogLevel,
-} from './wire-codes.ts';
 
 export interface ServerProcessOptions {
   /** Builds the storage backend. Called once per process start. */
@@ -79,25 +72,6 @@ export class ServerChannelClosedError extends Error {
   }
 }
 
-interface PendingRequest {
-  readonly message: RequestMessage;
-  /** Set once the handler call has been made; a started request cannot be stopped. */
-  started: boolean;
-  /** Cancel code that arrived before the handler started: the handler never runs. */
-  preStartCancel: string | undefined;
-  /**
-   * Cancel code that invalidated the transaction while the handler ran. The
-   * handler keeps running, but its outcome is neither committed nor answered.
-   */
-  cancelledCode: string | undefined;
-}
-
-/**
- * How many duplicate request ids are remembered for log suppression. Bounded
- * because the set outlives individual requests: an unbounded one would grow for
- * the life of the process on a Portal that keeps replaying.
- */
-const DUPLICATE_LOG_MEMORY = 100;
 /**
  * Multiplier applied to `timeoutMs` when bounding the shutdown as a whole, on
  * the fallback path only (a Portal that did not declare a budget). The
@@ -154,10 +128,6 @@ class ServerProcess {
   private readonly logger: Logger;
   private readonly channel: IpcChannel;
   private readonly completion = Promise.withResolvers<void>();
-  /** Accepted requests that have not reached a terminal state, by request id. */
-  private readonly inFlight = new Map<string, PendingRequest>();
-  /** Promises of accepted requests, so shutdown has a fixed set to wait for. */
-  private readonly running = new Set<Promise<void>>();
   private portalGeneration: number | undefined;
   /**
    * `accepting` until shutdown begins, then `shutting-down` for the rest of the
@@ -172,12 +142,6 @@ class ServerProcess {
    * would scale the log volume with the request rate (SPEC 7.1).
    */
   private missingHelloLogged = false;
-  /**
-   * Request ids whose duplicate delivery has already been logged, most recent
-   * last. Bounded by `DUPLICATE_LOG_MEMORY` and pruned on terminal state, so a
-   * long-lived process cannot accumulate ids it will never see again.
-   */
-  private readonly duplicateLogged = new Set<string>();
   /** Set while the parent-liveness poll is installed; cleared on completion. */
   private parentTimer: ReturnType<typeof setInterval> | undefined;
   /**
@@ -185,6 +149,11 @@ class ServerProcess {
    * fires outside the message flow, where the runtime is not a parameter.
    */
   private runtime: Runtime | undefined;
+  /**
+   * The request runner, created together with the runtime. Stored for the same
+   * reason: the parent-liveness poll reaches the drain through `abort`.
+   */
+  private runner: RequestRunner | undefined;
 
   constructor(options: ServerProcessOptions) {
     this.options = options;
@@ -261,13 +230,14 @@ class ServerProcess {
       'parent process gone; server stopping',
     );
     const runtime = this.runtime;
-    if (runtime === undefined) {
+    const runner = this.runner;
+    if (runtime === undefined || runner === undefined) {
       this.completion.reject(
         new ServerChannelClosedError('the parent process is gone'),
       );
       return;
     }
-    void this.abort(runtime, 'the parent process is gone');
+    void this.abort(runtime, runner, 'the parent process is gone');
   }
 
   /**
@@ -282,19 +252,33 @@ class ServerProcess {
       logger: this.logger,
       channel: this.channel,
     });
+    const runner = new RequestRunner({
+      runtime,
+      logger: this.logger,
+      send: (message, what) => this.sendQuietly(message, what),
+      // The phase and the handshake flag stay in this class: `shutdown` and
+      // `hello` own them, and the runner only asks.
+      accepting: () => this.phase === 'accepting',
+      noteRequestBeforeHello: (ids) => this.noteRequestBeforeHello(ids),
+    });
     this.runtime = runtime;
+    this.runner = runner;
     // Inbound plumbing goes last: a message that arrives before these
     // handlers are attached is buffered by the channel and delivered at
     // registration, so none is lost and none is handled before `ready`.
     this.channel.onMessage((raw) => {
-      this.onMessage(runtime, raw);
+      this.onMessage(runtime, runner, raw);
     });
     this.channel.onClose((reason) => {
-      this.onChannelClose(runtime, reason);
+      this.onChannelClose(runtime, runner, reason);
     });
   }
 
-  private onMessage(runtime: Runtime, raw: unknown): void {
+  private onMessage(
+    runtime: Runtime,
+    runner: RequestRunner,
+    raw: unknown,
+  ): void {
     const parsed = parseIpcMessage(raw);
     if (!parsed.ok) {
       // warn, not error: one unreadable message is a rejected input, and
@@ -308,16 +292,16 @@ class ServerProcess {
     const message = parsed.message;
     switch (message.type) {
       case 'hello':
-        this.onHello(runtime, message);
+        this.onHello(runtime, runner, message);
         return;
       case 'request':
-        this.onRequest(runtime, message);
+        runner.accept(message);
         return;
       case 'cancel':
-        this.onCancel(runtime, message);
+        runner.cancel(message);
         return;
       case 'shutdown':
-        this.onShutdown(runtime, message);
+        this.onShutdown(runtime, runner, message);
         return;
       case 'ready':
       case 'result':
@@ -333,7 +317,11 @@ class ServerProcess {
     }
   }
 
-  private onHello(runtime: Runtime, message: HelloMessage): void {
+  private onHello(
+    runtime: Runtime,
+    runner: RequestRunner,
+    message: HelloMessage,
+  ): void {
     if (this.phase === 'shutting-down') {
       // Answering a handshake with `ready` while shutting down would promise
       // readiness this process no longer offers.
@@ -379,7 +367,7 @@ class ServerProcess {
         code: 'PORTAL_GENERATION_CHANGED',
         portalGeneration: message.portalGeneration,
         previousPortalGeneration: previous,
-        pendingRequests: this.inFlight.size,
+        pendingRequests: runner.pending,
       },
       'new portal generation; resending ready',
     );
@@ -393,298 +381,33 @@ class ServerProcess {
     );
   }
 
-  private onRequest(runtime: Runtime, message: RequestMessage): void {
-    const ids = requestIds(message);
-    // The duplicate check comes first: an id already in flight is owed its
-    // real result even during shutdown, so answering it with a refusal would
-    // report a failure for a request that may still succeed.
-    if (this.inFlight.has(message.requestId)) {
-      // Running the same id twice at once would split one input across two
-      // transactions and two log trails (SPEC 7.3). The execution already in
-      // flight still owes Portal a result for this id, so the duplicate is
-      // dropped rather than queued behind it; Portal keeps it unacknowledged
-      // until that result arrives. If that result cannot be sent, the channel
-      // is closed and this process receives no further deliveries, so there is
-      // no path where Portal waits for an answer that was never attempted.
-      if (!this.duplicateLogged.has(message.requestId)) {
-        this.rememberDuplicate(message.requestId);
-        this.logger.warn(
-          {
-            ...ids,
-            code: 'DUPLICATE_REQUEST',
-            replayCount: message.replayCount,
-            reason: 'request is already in flight',
-          },
-          'duplicate delivery ignored',
-        );
-      }
-      return;
-    }
-    if (this.phase === 'shutting-down') {
-      // SPEC 3.5: a refused input gets a stable code rather than silence.
-      // Portal may already have the request on the wire and will not settle it
-      // until a result or its own deadline arrives, so dropping it here would
-      // spend the whole timeout budget to learn what this line already knows.
-      this.logger.warn(
-        {
-          ...ids,
-          code: 'SERVER_SHUTTING_DOWN',
-          reason: 'request arrived after shutdown started',
-        },
-        'request refused',
-      );
-      this.sendQuietly(
-        {
-          type: 'result',
-          requestId: message.requestId,
-          ok: false,
-          error: {
-            code: FRAMEWORK_SHUTDOWN,
-            message: 'server is shutting down',
-          },
-        },
-        'shutdown result',
-      );
-      return;
-    }
-    if (this.portalGeneration === undefined) {
-      // Executing is the only way to answer: the protocol has no "not ready"
-      // reply, and dropping would leave Portal replaying this request forever
-      // without ever getting a result. The missing handshake is recorded once so
-      // it stays diagnosable without logging once per request (SPEC 7.1).
-      if (!this.missingHelloLogged) {
-        this.missingHelloLogged = true;
-        this.logger.warn(
-          {
-            ...ids,
-            code: 'REQUEST_BEFORE_HELLO',
-            reason: 'no hello received from this portal',
-          },
-          'request received before hello',
-        );
-      }
-    }
-    const entry: PendingRequest = {
-      message,
-      started: false,
-      preStartCancel: undefined,
-      cancelledCode: undefined,
-    };
-    this.inFlight.set(message.requestId, entry);
-    // Added synchronously so a `shutdown` in the same batch has a fixed set of
-    // requests to wait for, including ones still inside the pre-start window.
-    const work = this.executeRequest(runtime, entry).catch((error: unknown) => {
-      // `executeRequest` is written not to throw; this keeps one unexpected
-      // throw from becoming an unhandled rejection in the IPC callback.
-      this.logger.error(
-        {
-          ...requestIds(message),
-          code: INTERNAL_ERROR,
-          reason: messageOf(error),
-        },
-        'request execution failed unexpectedly',
-      );
-    });
-    this.running.add(work);
-    // `work` already maps every failure to a log line, so it never rejects and
-    // a single fulfilled handler is enough to retire it from the drain set.
-    void work.then(() => {
-      this.running.delete(work);
-      return undefined;
-    });
-  }
-
   /**
-   * Records that a duplicate of `requestId` has been reported. Insertion order
-   * is the age order, so the oldest entry is the first one evicted.
+   * The request arrived before any `hello`. Executing is the only way to answer
+   * it: the protocol has no "not ready" reply, and dropping would leave Portal
+   * replaying this request forever without ever getting a result. The missing
+   * handshake is recorded once so it stays diagnosable without logging once per
+   * request (SPEC 7.1).
    */
-  private rememberDuplicate(requestId: string): void {
-    this.duplicateLogged.add(requestId);
-    if (this.duplicateLogged.size > DUPLICATE_LOG_MEMORY) {
-      const oldest = this.duplicateLogged.values().next();
-      if (!oldest.done) {
-        this.duplicateLogged.delete(oldest.value);
-      }
-    }
-  }
-
-  /**
-   * Runs one accepted request to a terminal state and reports it. Never
-   * rejects: its only caller is the IPC callback, which has no one to hand a
-   * failure to, and `run`'s shutdown wait relies on it settling.
-   */
-  private async executeRequest(
-    runtime: Runtime,
-    entry: PendingRequest,
-  ): Promise<void> {
-    const { message } = entry;
-    try {
-      // One microtask of grace: a cancel queued in the same batch as its
-      // request (in-memory delivery, or the channel's buffered flush at
-      // registration) lands here and saves the handler from running at all.
-      // Over real IPC each message is its own event-loop turn, so a cancel
-      // usually arrives after `started` — that window is the only cancel that
-      // can actually stop work (SPEC 3.4: JS cannot preempt a running handler),
-      // and widening it would delay every request on the hot path.
-      await Promise.resolve();
-      if (entry.preStartCancel !== undefined) {
-        this.logger.info(
-          {
-            ...requestIds(message),
-            code: entry.preStartCancel,
-            reason: 'cancelled before the handler started',
-          },
-          'cancelled request skipped',
-        );
-        return;
-      }
-      entry.started = true;
-      const startedAt = performance.now();
-      const outcome = await this.executeSafely(runtime, message);
-      if (
-        entry.cancelledCode !== undefined &&
-        !outcome.ok &&
-        outcome.error.code === entry.cancelledCode
-      ) {
-        // `dispatcher.cancel` invalidated the transaction and rolled it back,
-        // and Portal settled this id when it sent the cancel. A result now
-        // would be a late answer nobody can match, so it is dropped; the
-        // rollback is the visible outcome (SPEC 3.3, 3.6). The outcome code is
-        // checked, not just the flag: a cancel that lost the race to the commit
-        // left a real success behind, and suppressing that would hide it.
-        this.logger.warn(
-          {
-            ...requestIds(message),
-            code: entry.cancelledCode,
-            durationMs: elapsedSince(startedAt),
-            reason: 'result suppressed after cancel',
-          },
-          'cancelled request finished; result not sent',
-        );
-        return;
-      }
-      this.report(message, outcome, elapsedSince(startedAt));
-    } finally {
-      this.inFlight.delete(message.requestId);
-      // The id is terminal, so a later delivery of it is a fresh request rather
-      // than a duplicate of this one and deserves its own log line.
-      this.duplicateLogged.delete(message.requestId);
-    }
-  }
-
-  private async executeSafely(
-    runtime: Runtime,
-    message: RequestMessage,
-  ): Promise<ExecutorOutcome> {
-    try {
-      // `RequestMessage` already has every `ExecutorRequest` field with the
-      // same meaning, so it is passed as is; the extra `type`/`replayCount`
-      // only matter to the wire and the excess-property check does not apply
-      // to a non-literal argument. Portal's deadline stays authoritative: it
-      // settles this id at that instant, so a Server that ran longer would
-      // commit writes nobody is waiting for (SPEC 3.4, INV-007).
-      return await runtime.executor.execute(message);
-    } catch (error) {
-      // The executor contract forbids throwing, but an escaping throw still
-      // has to produce a result, or Portal waits for one that never comes.
-      return {
-        ok: false,
-        error: { code: INTERNAL_ERROR, message: messageOf(error) },
-      };
-    }
-  }
-
-  private report(
-    message: RequestMessage,
-    outcome: ExecutorOutcome,
-    durationMs: number,
-  ): void {
-    const ids = requestIds(message);
-    if (outcome.ok) {
-      const sessionId = outcome.sessionId;
-      const fields: Record<string, unknown> = { ...ids, durationMs };
-      if (sessionId !== undefined) {
-        fields.sessionId = sessionId;
-      }
-      this.logger.debug(fields, 'request completed');
-      // The outcome already has the shape of the message's payload half, so it
-      // is spread rather than copied field by field. An unbound success carries
-      // `sessionId: undefined` as an own property, which every channel either
-      // drops (JSON) or keeps with the same meaning as absence (SPEC 2).
-      this.sendQuietly(
-        { type: 'result', requestId: message.requestId, ...outcome },
-        'result',
-      );
+  private noteRequestBeforeHello(ids: RequestIdentity): void {
+    if (this.portalGeneration !== undefined || this.missingHelloLogged) {
       return;
     }
-    this.logger[failureLogLevel(outcome.error)](
+    this.missingHelloLogged = true;
+    this.logger.warn(
       {
         ...ids,
-        code: outcome.error.code,
-        reason: outcome.error.message,
-        durationMs,
+        code: 'REQUEST_BEFORE_HELLO',
+        reason: 'no hello received from this portal',
       },
-      'request failed',
-    );
-    this.sendQuietly(
-      { type: 'result', requestId: message.requestId, ...outcome },
-      'result',
+      'request received before hello',
     );
   }
 
-  private onCancel(runtime: Runtime, message: CancelMessage): void {
-    const entry = this.inFlight.get(message.requestId);
-    if (entry === undefined) {
-      // Nothing to cancel: the request already reached a terminal state, or it
-      // never arrived. Remembering the id would leak memory for the life of the
-      // process and could suppress a legitimate replay, so it is only logged.
-      this.logger.debug(
-        {
-          requestId: message.requestId,
-          code: message.code,
-          reason: 'no request in flight',
-        },
-        'cancel ignored',
-      );
-      return;
-    }
-    if (entry.started) {
-      // SPEC 3.3/3.6: a running handler cannot be preempted, but its
-      // transaction can be invalidated. Every later write is rejected and the
-      // transaction rolls back when the handler returns, so a cancel really
-      // cancels instead of merely muting the answer. A `false` return means the
-      // request went terminal in between; the outcome is then already owed or
-      // already answered, so nothing is recorded.
-      if (runtime.dispatcher.cancel(message.requestId, message.code)) {
-        entry.cancelledCode = message.code;
-        this.logger.warn(
-          {
-            ...requestIds(entry.message),
-            code: message.code,
-            reason: 'transaction invalidated while the handler runs',
-          },
-          'cancel applied to a running handler',
-        );
-        return;
-      }
-      this.logger.debug(
-        {
-          ...requestIds(entry.message),
-          code: message.code,
-          reason: 'request reached a terminal state before the cancel',
-        },
-        'cancel ignored',
-      );
-      return;
-    }
-    entry.preStartCancel = message.code;
-    this.logger.info(
-      { ...requestIds(entry.message), code: message.code },
-      'request cancelled before start',
-    );
-  }
-
-  private onShutdown(runtime: Runtime, message: ShutdownMessage): void {
+  private onShutdown(
+    runtime: Runtime,
+    runner: RequestRunner,
+    message: ShutdownMessage,
+  ): void {
     if (this.phase === 'shutting-down') {
       this.logger.warn(
         { code: 'SHUTDOWN_IN_PROGRESS', reason: 'shutdown already requested' },
@@ -697,10 +420,10 @@ class ServerProcess {
     // closed set of requests and nothing new can enter the backend.
     const budgetMs = this.shutdownBudgetMs(message);
     this.logger.info(
-      { pendingRequests: this.running.size, budgetMs },
+      { pendingRequests: runner.running, budgetMs },
       'server shutting down',
     );
-    void this.shutdown(runtime, budgetMs).catch((error: unknown) => {
+    void this.shutdown(runtime, runner, budgetMs).catch((error: unknown) => {
       // Nothing below `shutdown` is expected to throw, but a channel that
       // throws on close must still resolve the completion instead of hanging.
       this.logger.error(
@@ -711,7 +434,11 @@ class ServerProcess {
     });
   }
 
-  private async shutdown(runtime: Runtime, limitMs: number): Promise<void> {
+  private async shutdown(
+    runtime: Runtime,
+    runner: RequestRunner,
+    limitMs: number,
+  ): Promise<void> {
     const startedAt = performance.now();
     // One deadline for both steps, like `abort`: the Portal declared a single
     // budget for the whole close, so spending it twice would overrun it by
@@ -721,11 +448,12 @@ class ServerProcess {
     // SPEC 6.3 steps 2-3: every accepted request settles to a terminal state,
     // bounded by the per-request timeout the dispatcher already enforces, and
     // its result still goes out before `closed`.
-    await this.drain(limitMs);
+    await runner.drain(limitMs);
     // Step 4: close the backend before announcing, so Portal never restarts a
     // Server whose storage is still open.
     await this.closeStorage(
       runtime,
+      runner,
       Math.max(1, Math.round(deadlineAt - performance.now())),
     );
     this.sendQuietly({ type: 'closed', reason: 'shutdown' }, 'closed');
@@ -755,37 +483,16 @@ class ServerProcess {
   }
 
   /**
-   * Waits for the accepted requests to settle, but not forever. A backend whose
-   * `close` awaits its queue (SQLite does) makes `executor.close()` wait for the
-   * handler too, so an unbounded drain would postpone `closed` past any budget
-   * Portal is willing to wait for. Unfinished requests are reported rather than
-   * silently abandoned; their ids say which handler is holding the process.
-   */
-  private async drain(limitMs: number): Promise<void> {
-    const drained = await settleWithin(
-      Promise.allSettled(this.running),
-      limitMs,
-    );
-    if (drained.status === 'timeout') {
-      this.logger.error(
-        {
-          code: 'SHUTDOWN_DRAIN_TIMEOUT',
-          timeoutMs: limitMs,
-          pendingRequests: this.inFlight.size,
-          requestIds: [...this.inFlight.keys()],
-        },
-        'shutdown drain exceeded its budget; closing anyway',
-      );
-    }
-  }
-
-  /**
    * Closes the backend, which is mandatory (SPEC 6.3 step 4), but bounded: a
    * backend that waits for its queue would otherwise keep `closed` from ever
    * being sent when a handler never returns. The wait is abandoned, not the
    * close: the call is still made and its own failure is still logged.
    */
-  private async closeStorage(runtime: Runtime, limitMs: number): Promise<void> {
+  private async closeStorage(
+    runtime: Runtime,
+    runner: RequestRunner,
+    limitMs: number,
+  ): Promise<void> {
     // `settleWithin` consumes a rejection itself, so the failure is read from
     // the result instead of being mapped into a value first.
     const outcome = await settleWithin(runtime.executor.close(), limitMs);
@@ -794,8 +501,8 @@ class ServerProcess {
         {
           code: 'STORAGE_CLOSE_TIMEOUT',
           timeoutMs: limitMs,
-          pendingRequests: this.inFlight.size,
-          requestIds: [...this.inFlight.keys()],
+          pendingRequests: runner.pending,
+          requestIds: runner.pendingRequestIds,
         },
         'storage backend close exceeded its budget; continuing',
       );
@@ -812,7 +519,11 @@ class ServerProcess {
     }
   }
 
-  private onChannelClose(runtime: Runtime, reason: string): void {
+  private onChannelClose(
+    runtime: Runtime,
+    runner: RequestRunner,
+    reason: string,
+  ): void {
     if (this.phase === 'shutting-down') {
       // Our own `close` at the end of an orderly shutdown.
       return;
@@ -822,10 +533,14 @@ class ServerProcess {
       { code: 'IPC_CHANNEL_CLOSED', reason },
       'ipc channel closed; server stopping',
     );
-    void this.abort(runtime, reason);
+    void this.abort(runtime, runner, reason);
   }
 
-  private async abort(runtime: Runtime, reason: string): Promise<void> {
+  private async abort(
+    runtime: Runtime,
+    runner: RequestRunner,
+    reason: string,
+  ): Promise<void> {
     // Nobody can receive results any more. Settle the in-flight work first so
     // the backend is closed on a known state, then hand the reason to the
     // caller, which owns the exit code.
@@ -837,9 +552,10 @@ class ServerProcess {
     // steps, not one per step, so the total is what the constant promises.
     const limitMs = this.options.abortTimeoutMs ?? ABORT_TIMEOUT_MS;
     const deadlineAt = performance.now() + limitMs;
-    await this.drain(limitMs);
+    await runner.drain(limitMs);
     await this.closeStorage(
       runtime,
+      runner,
       Math.max(1, deadlineAt - performance.now()),
     );
     // On the parent-gone path the link is still open, and an open IPC channel
@@ -891,18 +607,6 @@ export function resolveShutdownBudgetMs(
     'running shutdown on the fallback budget',
   );
   return fallback;
-}
-
-function requestIds(message: RequestMessage): RequestIdentity {
-  const ids: RequestIdentity = {
-    requestId: message.requestId,
-    connectionId: message.connectionId,
-    clientRequestId: message.clientRequestId,
-  };
-  if (message.sessionId === undefined) {
-    return ids;
-  }
-  return { ...ids, sessionId: message.sessionId };
 }
 
 function elapsedSince(startedAt: number): number {

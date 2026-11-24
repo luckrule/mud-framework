@@ -1,0 +1,253 @@
+import { describe, expect, test } from 'bun:test';
+
+import type { IpcMessage } from '../ipc/protocol.ts';
+import { createJsonLogger } from '../logging/json-logger.ts';
+import { MemoryStorageBackend } from '../storage/memory.ts';
+import { sleep, tick } from '../test-support/common.ts';
+import { parseLine, requestMessage } from '../test-support/server-process.ts';
+import { Dispatcher } from './dispatcher.ts';
+import type { Handler } from './dispatcher.ts';
+import { LocalExecutor } from './executor.ts';
+import { RequestRunner } from './server-requests.ts';
+
+interface RunnerHarness {
+  readonly runner: RequestRunner;
+  /** Messages the runner handed to `send`, in order. */
+  readonly sent: IpcMessage[];
+  /** Parsed log lines, in emission order; debug lines included. */
+  readonly logs: () => Record<string, unknown>[];
+  readonly register: (method: string, handler: Handler) => void;
+}
+
+function startRunner(timeoutMs = 1000): RunnerHarness {
+  const backend = new MemoryStorageBackend();
+  const lines: string[] = [];
+  const logger = createJsonLogger({
+    // `request completed` and `cancel ignored` are debug lines; the runner's
+    // bookkeeping is only observable if the harness keeps them.
+    level: 'debug',
+    sink: (line) => {
+      lines.push(line);
+    },
+  });
+  const dispatcher = new Dispatcher({ backend, timeoutMs, logger });
+  const sent: IpcMessage[] = [];
+  const runner = new RequestRunner({
+    runtime: {
+      dispatcher,
+      executor: new LocalExecutor({ dispatcher }),
+      capabilities: backend.capabilities(),
+    },
+    logger,
+    send: (message) => {
+      sent.push(message);
+    },
+    accepting: () => true,
+    noteRequestBeforeHello: () => undefined,
+  });
+  return {
+    runner,
+    sent,
+    logs: () => lines.map(parseLine),
+    register: (method, handler) => {
+      dispatcher.register(method, handler);
+    },
+  };
+}
+
+describe('RequestRunner', () => {
+  test('accept runs the handler and answers with its result', async () => {
+    const harness = startRunner();
+    harness.register('echo', (_ctx, payload) => Promise.resolve(payload));
+
+    harness.runner.accept(requestMessage({ payload: 'ping' }));
+    await tick();
+
+    expect(harness.sent).toEqual([
+      { type: 'result', requestId: 'req-1', ok: true, result: 'ping' },
+    ]);
+    const completed = harness
+      .logs()
+      .filter((line) => line.msg === 'request completed');
+    expect(completed).toHaveLength(1);
+    expect(completed[0]).toMatchObject({ requestId: 'req-1' });
+  });
+
+  test('runs a duplicated request id once and logs the duplicate once', async () => {
+    const harness = startRunner();
+    let calls = 0;
+    const gate = Promise.withResolvers<void>();
+    harness.register('slow', async () => {
+      calls += 1;
+      await gate.promise;
+      return 'done';
+    });
+
+    harness.runner.accept(requestMessage({ method: 'slow', replayCount: 0 }));
+    harness.runner.accept(requestMessage({ method: 'slow', replayCount: 1 }));
+    gate.resolve();
+    await tick();
+
+    expect(calls).toBe(1);
+    expect(harness.sent).toEqual([
+      { type: 'result', requestId: 'req-1', ok: true, result: 'done' },
+    ]);
+    const duplicates = harness
+      .logs()
+      .filter((line) => line.code === 'DUPLICATE_REQUEST');
+    expect(duplicates).toHaveLength(1);
+    expect(duplicates[0]).toMatchObject({
+      level: 'warn',
+      requestId: 'req-1',
+      replayCount: 1,
+    });
+  });
+
+  test('cancel of a running request invalidates its transaction', async () => {
+    const harness = startRunner();
+    const entered = Promise.withResolvers<void>();
+    const gate = Promise.withResolvers<void>();
+    let lateWriteError = '';
+    harness.register('slow', async (ctx) => {
+      await ctx.storage.execute('INSERT 1');
+      entered.resolve();
+      await gate.promise;
+      try {
+        await ctx.storage.execute('INSERT 2');
+        lateWriteError = 'write was accepted';
+      } catch (error) {
+        lateWriteError = error instanceof Error ? error.message : String(error);
+      }
+      return 'done';
+    });
+
+    harness.runner.accept(requestMessage({ method: 'slow' }));
+    await entered.promise;
+    harness.runner.cancel({
+      type: 'cancel',
+      requestId: 'req-1',
+      code: 'FRAMEWORK_TIMEOUT',
+    });
+    gate.resolve();
+    await tick();
+
+    // The write after the cancel is rejected, which only happens when
+    // `dispatcher.cancel` invalidated the transaction; the handler still
+    // returns, and its outcome is neither answered nor committed.
+    expect(lateWriteError).toMatch(/expired/);
+    expect(harness.sent).toEqual([]);
+    const applied = harness
+      .logs()
+      .filter((line) => line.msg === 'cancel applied to a running handler');
+    expect(applied).toHaveLength(1);
+    expect(applied[0]).toMatchObject({
+      level: 'warn',
+      code: 'FRAMEWORK_TIMEOUT',
+      requestId: 'req-1',
+    });
+  });
+
+  test('cancel of an unknown request id is a no-op', () => {
+    const harness = startRunner();
+
+    harness.runner.cancel({
+      type: 'cancel',
+      requestId: 'req-missing',
+      code: 'FRAMEWORK_TIMEOUT',
+    });
+
+    expect(harness.sent).toEqual([]);
+    const ignored = harness
+      .logs()
+      .filter((line) => line.msg === 'cancel ignored');
+    expect(ignored).toHaveLength(1);
+    expect(ignored[0]).toMatchObject({
+      reason: 'no request in flight',
+      requestId: 'req-missing',
+    });
+    // No id is remembered: the cancel neither leaked a set entry nor claimed
+    // the id for a later delivery.
+    expect(harness.runner.pending).toBe(0);
+  });
+
+  test('drain waits for a running handler', async () => {
+    const harness = startRunner();
+    const gate = Promise.withResolvers<void>();
+    harness.register('slow', async () => {
+      await gate.promise;
+      return 'done';
+    });
+
+    harness.runner.accept(requestMessage({ method: 'slow' }));
+    await tick();
+    let drained = false;
+    const drain = harness.runner.drain(500).then(() => {
+      drained = true;
+      return undefined;
+    });
+
+    await sleep(10);
+    expect(drained).toBe(false);
+    gate.resolve();
+    await drain;
+    expect(drained).toBe(true);
+    expect(harness.sent).toEqual([
+      { type: 'result', requestId: 'req-1', ok: true, result: 'done' },
+    ]);
+  });
+
+  test('drain returns when the budget runs out and names what is left', async () => {
+    const harness = startRunner();
+    const gate = Promise.withResolvers<void>();
+    harness.register('stuck', async () => {
+      await gate.promise;
+      return 'late';
+    });
+
+    harness.runner.accept(requestMessage({ method: 'stuck' }));
+    await tick();
+    await harness.runner.drain(10);
+
+    const timeouts = harness
+      .logs()
+      .filter((line) => line.code === 'SHUTDOWN_DRAIN_TIMEOUT');
+    expect(timeouts).toHaveLength(1);
+    expect(timeouts[0]).toMatchObject({
+      level: 'error',
+      timeoutMs: 10,
+      pendingRequests: 1,
+      requestIds: ['req-1'],
+    });
+    gate.resolve();
+    await tick();
+  });
+
+  test('counts pending and running requests over a request lifecycle', async () => {
+    const harness = startRunner();
+    const gate = Promise.withResolvers<void>();
+    harness.register('slow', async () => {
+      await gate.promise;
+      return 'done';
+    });
+
+    expect(harness.runner.pending).toBe(0);
+    expect(harness.runner.running).toBe(0);
+
+    harness.runner.accept(requestMessage({ method: 'slow' }));
+    // Counted synchronously: a `shutdown` in the same batch must see the
+    // request even before its handler started.
+    expect(harness.runner.pending).toBe(1);
+    expect(harness.runner.running).toBe(1);
+    expect(harness.runner.pendingRequestIds).toEqual(['req-1']);
+
+    await tick();
+    expect(harness.runner.pending).toBe(1);
+    expect(harness.runner.running).toBe(1);
+
+    gate.resolve();
+    await tick();
+    expect(harness.runner.pending).toBe(0);
+    expect(harness.runner.running).toBe(0);
+    expect(harness.runner.pendingRequestIds).toEqual([]);
+  });
+});
