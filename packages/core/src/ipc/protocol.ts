@@ -7,6 +7,7 @@
  * validators, because a change to one must not silently change the other.
  */
 import { describeValue, isRecord, messageOf } from '../internal/guards.ts';
+import type { RequestIdentity } from '../runtime/identity.ts';
 import {
   type CapabilityCheck,
   checkWireCapabilities,
@@ -24,14 +25,8 @@ export interface HelloMessage {
 }
 
 /** Portal -> Server: deliver one Request (first delivery or replay). */
-export interface RequestMessage {
+export interface RequestMessage extends RequestIdentity {
   readonly type: 'request';
-  /** Allocated by Portal and kept unchanged across replay (SPEC 7.3). */
-  readonly requestId: string;
-  readonly connectionId: string;
-  readonly clientRequestId: string;
-  /** Absent while the connection is not yet bound to a Session. */
-  readonly sessionId?: string;
   readonly method: string;
   /**
    * Opaque to the framework. `unknown` already admits `undefined`, so a

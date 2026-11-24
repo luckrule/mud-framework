@@ -1,13 +1,9 @@
 import type { Dispatcher } from './dispatcher.ts';
+import type { RequestIdentity } from './identity.ts';
 import { describeFailure } from './wire-codes.ts';
 
 /** Everything an executor needs about a request; all ids are already assigned. */
-export interface ExecutorRequest {
-  /** Minted by the connection layer on entry (SPEC 7.3); MUST NOT be replaced. */
-  requestId: string;
-  connectionId: string;
-  clientRequestId: string;
-  sessionId?: string;
+export interface ExecutorRequest extends RequestIdentity {
   method: string;
   payload: unknown;
   /**
@@ -103,24 +99,21 @@ export class LocalExecutor implements RequestExecutor {
 
   async execute(request: ExecutorRequest): Promise<ExecutorOutcome> {
     try {
-      const { result, sessionId } = await this.dispatcher.dispatch(
-        request.method,
-        request.payload,
-        {
-          requestId: request.requestId,
-          connectionId: request.connectionId,
-          clientRequestId: request.clientRequestId,
-          sessionId: request.sessionId,
-          timeoutMs: request.timeoutMs,
-        },
+      // Everything except the handler arguments is dispatch metadata, so the
+      // split is expressed once here instead of field by field.
+      const { method, payload, ...meta } = request;
+      const { result, boundSessionId } = await this.dispatcher.dispatch(
+        method,
+        payload,
+        meta,
       );
-      // `sessionId` is present only when the handler bound this request to a
-      // Session; an unbound success must not carry an `undefined` field, or
+      // `boundSessionId` is present only when the handler bound this request to
+      // a Session; an unbound success must not carry an `undefined` field, or
       // the "absent means unbound" convention would be indistinguishable from
       // "bound to nothing" further down the IPC path (SPEC 2).
-      return sessionId === undefined
+      return boundSessionId === undefined
         ? { ok: true, result }
-        : { ok: true, result, sessionId };
+        : { ok: true, result, sessionId: boundSessionId };
     } catch (error) {
       return { ok: false, error: describeFailure(error) };
     }

@@ -1350,4 +1350,26 @@ describe('IpcExecutor', () => {
     expect(failureOf(await outcomePromise).code).toBe('FRAMEWORK_SHUTDOWN');
     expect(server.killCount).toBe(1);
   });
+
+  test('works without a logger option, using the default stdout logger', async () => {
+    // The default must be observable (SPEC §7.1, INV-013): an executor that is
+    // silent unless the caller injects a logger leaves crash, replay and
+    // shutdown events invisible in the documented minimal setup. This asserts
+    // the default is usable; the stdout side effect is the intended behaviour.
+    const server = new FakeServerProcess({ autoCloseOnShutdown: true });
+    const executor = new IpcExecutor({
+      spawn: () => server.handle,
+      timeoutMs: 1000,
+    });
+
+    const startPromise = executor.start();
+    server.send(readyMessage());
+    await startPromise;
+
+    const outcomePromise = executor.execute(request({ requestId: 'req-1' }));
+    server.send(successMessage('req-1', 'ok'));
+
+    expect(await outcomePromise).toEqual({ ok: true, result: 'ok' });
+    await executor.close();
+  });
 });

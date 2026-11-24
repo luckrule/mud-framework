@@ -15,6 +15,7 @@ import type { StorageBackend, StorageCapabilities } from '../storage/types.ts';
 import { Dispatcher } from './dispatcher.ts';
 import type { ExecutorOutcome } from './executor.ts';
 import { LocalExecutor } from './executor.ts';
+import type { RequestIdentity } from './identity.ts';
 import {
   FRAMEWORK_SHUTDOWN,
   INTERNAL_ERROR,
@@ -106,14 +107,6 @@ interface PendingRequest {
    * handler keeps running, but its outcome is neither committed nor answered.
    */
   cancelledCode: string | undefined;
-}
-
-interface RequestIds {
-  readonly requestId: string;
-  readonly connectionId: string;
-  readonly clientRequestId: string;
-  /** Absent while the connection is not yet bound to a Session. */
-  readonly sessionId?: string;
 }
 
 /**
@@ -654,18 +647,13 @@ class ServerProcess {
     message: RequestMessage,
   ): Promise<ExecutorOutcome> {
     try {
-      return await runtime.executor.execute({
-        requestId: message.requestId,
-        connectionId: message.connectionId,
-        clientRequestId: message.clientRequestId,
-        sessionId: message.sessionId,
-        method: message.method,
-        payload: message.payload,
-        // Portal's deadline is authoritative: it settles this id at that
-        // instant, so a Server that ran longer would commit writes nobody is
-        // waiting for (SPEC 3.4, INV-007). The dispatcher can only tighten.
-        timeoutMs: message.timeoutMs,
-      });
+      // `RequestMessage` already has every `ExecutorRequest` field with the
+      // same meaning, so it is passed as is; the extra `type`/`replayCount`
+      // only matter to the wire and the excess-property check does not apply
+      // to a non-literal argument. Portal's deadline stays authoritative: it
+      // settles this id at that instant, so a Server that ran longer would
+      // commit writes nobody is waiting for (SPEC 3.4, INV-007).
+      return await runtime.executor.execute(message);
     } catch (error) {
       // The executor contract forbids throwing, but an escaping throw still
       // has to produce a result, or Portal waits for one that never comes.
@@ -972,8 +960,8 @@ class ServerProcess {
   }
 }
 
-function requestIds(message: RequestMessage): RequestIds {
-  const ids: RequestIds = {
+function requestIds(message: RequestMessage): RequestIdentity {
+  const ids: RequestIdentity = {
     requestId: message.requestId,
     connectionId: message.connectionId,
     clientRequestId: message.clientRequestId,

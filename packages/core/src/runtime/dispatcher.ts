@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { jsonLoggerFactory } from '../logging/json-logger.ts';
 import type { Logger, LoggerFactory } from '../logging/types.ts';
 import type { StorageBackend, StorageTransaction } from '../storage/types.ts';
+import type { RequestIdentity } from './identity.ts';
 import { tightenTimeout } from './timeout.ts';
 import { FRAMEWORK_TIMEOUT, UNKNOWN_METHOD } from './wire-codes.ts';
 
@@ -10,12 +11,12 @@ import { FRAMEWORK_TIMEOUT, UNKNOWN_METHOD } from './wire-codes.ts';
  * What the caller knows about a request before it is dispatched. All optional:
  * a direct `dispatch` has no connection, and a replayed request supplies the
  * original `requestId` so the id survives the replay (SPEC 7.3).
+ *
+ * `sessionId` here means "this request already belongs to a Session", which is
+ * not the same thing as `DispatchResult.boundSessionId` ("the handler bound
+ * this request to one").
  */
-export interface DispatchMeta {
-  requestId?: string;
-  connectionId?: string;
-  sessionId?: string;
-  clientRequestId?: string;
+export type DispatchMeta = Partial<RequestIdentity> & {
   /**
    * A tighter deadline for this request only. It can shorten a request but
    * never extend one: the effective timeout is still
@@ -25,21 +26,9 @@ export interface DispatchMeta {
    * (SPEC 3.4).
    */
   timeoutMs?: number;
-}
+};
 
-export interface RequestContext {
-  /** Framework-assigned, never client-controlled, stable across replay. */
-  requestId: string;
-  /** Empty when the request did not arrive over a transport. */
-  connectionId: string;
-  /** The client's correlation key; empty when the caller supplied none. */
-  clientRequestId: string;
-  /**
-   * The Session this request arrived under, if the connection was already
-   * bound. A handler that starts a Session declares it through `bindSession`;
-   * that binding takes effect only after this request succeeds (SPEC 2).
-   */
-  sessionId?: string;
+export interface RequestContext extends RequestIdentity {
   /**
    * Binds the current connection to a Session. The framework stores the mapping
    * and routes by it; it does not validate the id — who a player is, and when a
@@ -60,12 +49,16 @@ export interface RequestContext {
  * bound, if any. Failures are still thrown — `instanceof` only works in
  * process, and `LocalExecutor` is the one place that turns them into the
  * cross-process `ExecutorOutcome` union.
+ *
+ * `boundSessionId` rather than `sessionId`: the input `DispatchMeta.sessionId`
+ * says "this request already belongs to a Session", and reusing the name for
+ * the output would suggest the result merely echoes the input.
  */
 export interface DispatchResult {
   /** The handler's return value. */
   result: unknown;
   /** Set when the handler bound the connection to a Session (SPEC 2). */
-  sessionId?: string;
+  boundSessionId?: string;
 }
 
 export type Handler = (
@@ -301,12 +294,12 @@ export class Dispatcher {
         () => undefined,
       );
       const result = await Promise.race([work, terminal.promise]);
-      const sessionId = binding.sessionId;
-      if (sessionId === undefined) {
+      const boundSessionId = binding.sessionId;
+      if (boundSessionId === undefined) {
         return { result };
       }
-      logger.debug({ sessionId }, 'session bound');
-      return { result, sessionId };
+      logger.debug({ sessionId: boundSessionId }, 'session bound');
+      return { result, boundSessionId };
     } finally {
       clearTimeout(timer);
       if (this.inFlight.get(requestId) === entry) {

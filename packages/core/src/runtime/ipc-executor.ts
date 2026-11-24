@@ -3,6 +3,7 @@ import type { IpcChannel } from '../ipc/channel.ts';
 import type { RequestMessage, ResultMessage } from '../ipc/protocol.ts';
 import { parseIpcMessage } from '../ipc/protocol.ts';
 import type { ServerExitInfo, SpawnedServer } from '../ipc/spawn-port.ts';
+import { createJsonLogger } from '../logging/json-logger.ts';
 import type { Logger } from '../logging/types.ts';
 import type {
   ExecutorOutcome,
@@ -79,6 +80,11 @@ export interface IpcExecutorOptions {
    * per-connection cap does not apply once a request left its queue.
    */
   maxPending?: number;
+  /**
+   * Defaults to a JSON logger writing to stdout with
+   * `component: 'ipc-executor'` bindings (SPEC §7.1). Supplying one only
+   * redirects where the events go; observability does not depend on it.
+   */
   logger?: Logger;
 }
 
@@ -228,9 +234,9 @@ export class IpcExecutor implements RequestExecutor {
       );
     }
     this.maxPending = maxPending;
-    // No concrete logger is imported here; a caller that wants observability
-    // injects one, and the default keeps the module dependency-free.
-    this.logger = options.logger ?? SILENT_LOGGER;
+    this.logger =
+      options.logger ??
+      createJsonLogger({ bindings: { component: 'ipc-executor' } });
     this.portalGeneration = nextPortalGeneration();
     // Until `ready` declares the backend ceiling, the Portal ceiling applies.
     this.effectiveTimeoutMs = options.timeoutMs;
@@ -1322,13 +1328,10 @@ function requestMessage(
 ): RequestMessage {
   const request = pending.request;
   return {
+    // The identity fields are the request's own and mean the same on the wire,
+    // so they are carried over rather than copied one by one.
+    ...request,
     type: 'request',
-    requestId: request.requestId,
-    connectionId: request.connectionId,
-    clientRequestId: request.clientRequestId,
-    sessionId: request.sessionId,
-    method: request.method,
-    payload: request.payload,
     // The Portal's deadline is authoritative, so the Server is given the time
     // actually left, not the original budget: a replay that arrives late must
     // be able to roll back on its own instead of writing after the Portal has
@@ -1349,16 +1352,3 @@ function nextPortalGeneration(): number {
   portalGenerationCounter += 1;
   return portalGenerationCounter;
 }
-
-/**
- * Used when the caller supplies no logger. Deliberately not a concrete logger
- * import: this module must not depend on a logging implementation, and a
- * deployment that wants observability passes its own `Logger`.
- */
-const SILENT_LOGGER: Logger = {
-  debug: () => undefined,
-  info: () => undefined,
-  warn: () => undefined,
-  error: () => undefined,
-  child: () => SILENT_LOGGER,
-};

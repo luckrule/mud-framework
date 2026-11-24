@@ -678,7 +678,7 @@ describe('Dispatcher.bindSession', () => {
 
     const outcome = await dispatcher.dispatch('login', null);
 
-    expect(outcome).toEqual({ result: 'welcome', sessionId: 'session-1' });
+    expect(outcome).toEqual({ result: 'welcome', boundSessionId: 'session-1' });
   });
 
   test('leaves the session id undefined when the handler binds nothing', async () => {
@@ -689,7 +689,7 @@ describe('Dispatcher.bindSession', () => {
     const outcome = await dispatcher.dispatch('look', null);
 
     expect(outcome.result).toBe('a rock');
-    expect(outcome.sessionId).toBeUndefined();
+    expect(outcome.boundSessionId).toBeUndefined();
   });
 
   test('does not commit the binding when the handler throws', async () => {
