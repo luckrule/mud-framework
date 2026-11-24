@@ -10,7 +10,7 @@ import type {
 } from '../ipc/protocol.ts';
 import { parseIpcMessage } from '../ipc/protocol.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
-import type { Logger, LoggerFactory } from '../logging/types.ts';
+import type { Logger } from '../logging/types.ts';
 import { checkBackendCapabilities } from '../storage/capabilities.ts';
 import type { StorageBackend, StorageCapabilities } from '../storage/types.ts';
 import { Dispatcher } from './dispatcher.ts';
@@ -305,7 +305,7 @@ class ServerProcess {
       dispatcher = new Dispatcher({
         backend,
         timeoutMs: this.options.timeoutMs,
-        loggerFactory: this.loggerFactory(),
+        logger: this.logger,
       });
       const runtime: Runtime = {
         dispatcher,
@@ -362,13 +362,6 @@ class ServerProcess {
       );
       throw failure;
     }
-  }
-
-  private loggerFactory(): LoggerFactory {
-    return {
-      create: (loggerOptions) =>
-        this.logger.child(loggerOptions?.bindings ?? {}),
-    };
   }
 
   private onMessage(runtime: Runtime, raw: unknown): void {

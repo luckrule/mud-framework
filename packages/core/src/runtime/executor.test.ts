@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
 import { createJsonLogger } from '../logging/json-logger.ts';
-import type { Logger, LoggerFactory } from '../logging/types.ts';
+import type { Logger } from '../logging/types.ts';
 import { MemoryStorageBackend } from '../storage/memory.ts';
 import { Dispatcher } from './dispatcher.ts';
 import { LocalExecutor } from './executor.ts';
@@ -17,10 +17,7 @@ function quietDispatcher(
   options: ConstructorParameters<typeof Dispatcher>[0],
 ): Dispatcher {
   const logger: Logger = createJsonLogger({ sink: () => undefined });
-  const loggerFactory: LoggerFactory = {
-    create: (loggerOptions) => logger.child(loggerOptions?.bindings ?? {}),
-  };
-  return new Dispatcher({ ...options, loggerFactory });
+  return new Dispatcher({ ...options, logger });
 }
 
 function request(overrides: Partial<ExecutorRequest> = {}): ExecutorRequest {

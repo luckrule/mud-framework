@@ -1,11 +1,5 @@
 import { messageOf } from '../internal/guards.ts';
-import type {
-  LogFields,
-  LogLevel,
-  Logger,
-  LoggerFactory,
-  LoggerOptions,
-} from './types.ts';
+import type { LogFields, LogLevel, Logger, LoggerOptions } from './types.ts';
 
 const LEVEL_ORDER: Record<LogLevel, number> = {
   debug: 10,
@@ -88,11 +82,6 @@ export class JsonLogger implements Logger {
 export function createJsonLogger(options?: LoggerOptions): Logger {
   return new JsonLogger(options);
 }
-
-/** Reusable factory so callers can inject one `LoggerFactory` per process. */
-export const jsonLoggerFactory: LoggerFactory = {
-  create: (options?: LoggerOptions): Logger => new JsonLogger(options),
-};
 
 function writeToStdout(line: string): void {
   // `Bun.stdout.write` returns a promise; a closed pipe must not surface as an

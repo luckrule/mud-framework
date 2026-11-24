@@ -39,14 +39,9 @@ export type {
   LogFields,
   LogLevel,
   Logger,
-  LoggerFactory,
   LoggerOptions,
 } from './logging/types.ts';
-export {
-  createJsonLogger,
-  jsonLoggerFactory,
-  JsonLogger,
-} from './logging/json-logger.ts';
+export { createJsonLogger } from './logging/json-logger.ts';
 export type { Codec, Envelope, ResponseEnvelope } from './runtime/codec.ts';
 export { JsonCodec } from './runtime/codec.ts';
 export type {

@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
 import { createJsonLogger } from '../logging/json-logger.ts';
-import type { Logger, LoggerFactory } from '../logging/types.ts';
+import type { Logger } from '../logging/types.ts';
 import { MemoryStorageBackend } from '../storage/memory.ts';
 import type {
   StorageBackend,
@@ -39,11 +39,8 @@ function quietDispatcher(
       lines.push(line);
     },
   });
-  const loggerFactory: LoggerFactory = {
-    create: (loggerOptions) => logger.child(loggerOptions?.bindings ?? {}),
-  };
   return {
-    dispatcher: new Dispatcher({ ...options, loggerFactory }),
+    dispatcher: new Dispatcher({ ...options, logger }),
     lines,
   };
 }
@@ -789,13 +786,10 @@ describe('Dispatcher.bindSession', () => {
         lines.push(line);
       },
     });
-    const loggerFactory: LoggerFactory = {
-      create: (loggerOptions) => logger.child(loggerOptions?.bindings ?? {}),
-    };
     const dispatcher = new Dispatcher({
       backend: new MemoryStorageBackend(),
       timeoutMs: 1000,
-      loggerFactory,
+      logger,
     });
     dispatcher.register('login', async (ctx) => {
       ctx.bindSession('session-9');

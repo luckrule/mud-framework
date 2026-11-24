@@ -88,9 +88,7 @@ async function harness(
   const dispatcher = new Dispatcher({
     backend,
     timeoutMs: options.timeoutMs ?? 1000,
-    loggerFactory: {
-      create: (loggerOptions) => logger.child(loggerOptions?.bindings ?? {}),
-    },
+    logger,
     createRequestId: options.createRequestId,
   });
   const layer = new ConnectionLayer({

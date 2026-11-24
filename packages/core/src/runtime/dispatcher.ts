@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
-import { jsonLoggerFactory } from '../logging/json-logger.ts';
-import type { Logger, LoggerFactory } from '../logging/types.ts';
+import { createJsonLogger } from '../logging/json-logger.ts';
+import type { Logger } from '../logging/types.ts';
 import type { StorageBackend, StorageTransaction } from '../storage/types.ts';
 import type { RequestIdentity } from './identity.ts';
 import { tightenTimeout } from './timeout.ts';
@@ -84,7 +84,7 @@ export interface DispatcherOptions {
   /** Defaults to `randomUUID`; injectable so tests get deterministic ids. */
   createRequestId?: () => string;
   /** Defaults to the JSON logger; tests inject a sink-backed one. */
-  loggerFactory?: LoggerFactory;
+  logger?: Logger;
 }
 
 interface Expiry {
@@ -129,8 +129,11 @@ export class Dispatcher {
     this.backend = options.backend;
     this.timeoutMs = options.timeoutMs;
     this.createRequestId = options.createRequestId ?? randomUUID;
-    this.logger = (options.loggerFactory ?? jsonLoggerFactory).create({
-      bindings: { component: 'dispatcher' },
+    // A child rather than a default-only binding: an injected logger must still
+    // carry `component: 'dispatcher'`, so every dispatcher line is identifiable
+    // whatever the caller bound.
+    this.logger = (options.logger ?? createJsonLogger()).child({
+      component: 'dispatcher',
     });
   }
 

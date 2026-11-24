@@ -26,7 +26,3 @@ export interface LoggerOptions {
   /** Fields merged into every event this logger emits. */
   bindings?: LogFields;
 }
-
-export interface LoggerFactory {
-  create(options?: LoggerOptions): Logger;
-}
