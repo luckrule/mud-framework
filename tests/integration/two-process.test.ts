@@ -71,6 +71,7 @@ function createPortal(options: {
   behavior: Behavior;
   timeoutMs?: number;
   startTimeoutMs?: number;
+  restartBackoffMs?: number;
 }): Portal {
   const logs = capturingLogger();
   // `process.execPath` is the running Bun binary; the child must be Bun because
@@ -90,6 +91,7 @@ function createPortal(options: {
     },
     timeoutMs: options.timeoutMs ?? 2000,
     startTimeoutMs: options.startTimeoutMs,
+    restartBackoffMs: options.restartBackoffMs,
     logger: logs.logger,
   });
   const transport = new WsTransport({ port: 0 });
@@ -502,11 +504,16 @@ describe('two-process integration', () => {
     const portal = createPortal({
       databasePath: database.path,
       behavior: 'boot-fail',
-      startTimeoutMs: 1500,
+      // Shortened from 1500/100 only to cut the fixed wait: with a 25ms base
+      // the retries before the 500ms deadline still step through the immediate
+      // restart and several backoffs (0, 25, 50, 100, 200, 400), so the same
+      // bounded-start path is exercised, not bypassed.
+      startTimeoutMs: 500,
+      restartBackoffMs: 25,
     });
     const started = portal.layer.start();
     try {
-      const outcome = await settleWithin(started, 4000);
+      const outcome = await settleWithin(started, 2000);
       // A readiness barrier that never lifts must fail the start, not leave the
       // caller waiting forever behind a restart loop.
       expect(outcome).toBe('rejected');
@@ -515,7 +522,9 @@ describe('two-process integration', () => {
 
       // The restart loop must stop with the failure: continuing to spawn on a
       // configuration error is the "unbounded restart" this scenario is for.
-      await sleep(500);
+      // 300ms is many retry cycles at this backoff base, so any restart that
+      // survived the failure would still be seen here.
+      await sleep(300);
       expect(portal.spawns()).toBe(attemptsAtFailure);
     } finally {
       // `close()` rejects a start still waiting for `ready`, so the race above
