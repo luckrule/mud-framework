@@ -4,6 +4,7 @@ import {
   FakeServerProcess,
   boundSuccessMessage,
   failureOf,
+  flushTicks,
   harness,
   readyMessage,
   request,
@@ -125,6 +126,188 @@ describe('IpcExecutor result', () => {
     expect(await outcomePromise).toEqual({ ok: true, result: 'ok' });
     const received = h.logs().find((line) => line.msg === 'result received');
     expect(received).not.toHaveProperty('sessionId');
+    await h.executor.close();
+  });
+
+  test('logs the request session of a late failure result', async () => {
+    const h = harness({ timeoutMs: 5000 });
+    const server = await started(h);
+
+    const outcomePromise = h.executor.execute(request({ requestId: 'req-1' }));
+    await h.executor.cancel('req-1', 'TRANSPORT_CLOSED');
+    await outcomePromise;
+
+    server.send({
+      type: 'result',
+      requestId: 'req-1',
+      requestSessionId: 'entry-1',
+      ok: false,
+      error: { code: 'FRAMEWORK_TIMEOUT', message: 'too late' },
+    });
+    await flushTicks();
+
+    const late = h.logs().find((line) => line.msg === 'late result discarded');
+    expect(late).toMatchObject({ requestId: 'req-1', sessionId: 'entry-1' });
+    await h.executor.close();
+  });
+
+  test('prefers the request echo over the binding of a late success', async () => {
+    const h = harness({ timeoutMs: 5000 });
+    const server = await started(h);
+
+    const outcomePromise = h.executor.execute(request({ requestId: 'req-1' }));
+    await h.executor.cancel('req-1', 'TRANSPORT_CLOSED');
+    await outcomePromise;
+
+    server.send({
+      type: 'result',
+      requestId: 'req-1',
+      requestSessionId: 'entry-1',
+      ok: true,
+      result: 'late',
+      sessionId: 'bound-1',
+    });
+    await flushTicks();
+
+    // The echo names the entry session, so it wins over a binding the discarded
+    // result still happens to carry.
+    const late = h.logs().find((line) => line.msg === 'late result discarded');
+    expect(late).toMatchObject({ requestId: 'req-1', sessionId: 'entry-1' });
+    await h.executor.close();
+  });
+
+  test('logs the echoed entry session of a late success that bound nothing', async () => {
+    const h = harness({ timeoutMs: 5000 });
+    const server = await started(h);
+
+    const outcomePromise = h.executor.execute(
+      request({ requestId: 'req-1', sessionId: 'entry-1' }),
+    );
+    await h.executor.cancel('req-1', 'TRANSPORT_CLOSED');
+    const outcome = await outcomePromise;
+
+    server.send({
+      type: 'result',
+      requestId: 'req-1',
+      requestSessionId: 'entry-1',
+      ok: true,
+      result: 'late',
+    });
+    await flushTicks();
+
+    // The entry session now exists only in the echo; the pending entry that
+    // held it was removed when the Portal settled the request.
+    const late = h.logs().find((line) => line.msg === 'late result discarded');
+    expect(late).toMatchObject({ requestId: 'req-1', sessionId: 'entry-1' });
+    expect(outcome).toEqual({
+      ok: false,
+      error: {
+        code: 'TRANSPORT_CLOSED',
+        message: 'request req-1 was cancelled',
+      },
+    });
+    expect(outcome).not.toHaveProperty('requestSessionId');
+    await h.executor.close();
+  });
+
+  test('leaves a late result without a session when the peer echoes nothing', async () => {
+    const h = harness({ timeoutMs: 5000 });
+    const server = await started(h);
+
+    const outcomePromise = h.executor.execute(
+      request({ requestId: 'req-1', sessionId: 'entry-1' }),
+    );
+    await h.executor.cancel('req-1', 'TRANSPORT_CLOSED');
+    await outcomePromise;
+
+    server.send(successMessage('req-1', 'late'));
+    await flushTicks();
+
+    // An older Server does not echo the entry session; the pending entry is
+    // gone, so the result itself carries nothing to log. Correlation falls back
+    // to the stable requestId (SPEC 7.3).
+    const late = h.logs().find((line) => line.msg === 'late result discarded');
+    expect(late).toBeDefined();
+    expect(late).not.toHaveProperty('sessionId');
+    await h.executor.close();
+  });
+
+  test('fills result received from the request echo when the entry had none', async () => {
+    const h = harness();
+    const server = await started(h);
+
+    const outcomePromise = h.executor.execute(request({ requestId: 'req-1' }));
+    server.send({
+      type: 'result',
+      requestId: 'req-1',
+      requestSessionId: 'entry-1',
+      ok: false,
+      error: { code: 'NOT_ENOUGH_GOLD', message: 'you cannot afford that' },
+    });
+
+    await outcomePromise;
+    const received = h.logs().find((line) => line.msg === 'result received');
+    expect(received).toMatchObject({ sessionId: 'entry-1' });
+    await h.executor.close();
+  });
+
+  test('lets a newly bound session override the request echo on result received', async () => {
+    const h = harness();
+    const server = await started(h);
+
+    const outcomePromise = h.executor.execute(
+      request({ requestId: 'req-1', sessionId: 'entry-1' }),
+    );
+    server.send({
+      type: 'result',
+      requestId: 'req-1',
+      requestSessionId: 'entry-1',
+      ok: true,
+      result: 'welcome',
+      sessionId: 'bound-1',
+    });
+
+    await outcomePromise;
+    const received = h.logs().find((line) => line.msg === 'result received');
+    expect(received).toMatchObject({ sessionId: 'bound-1' });
+    await h.executor.close();
+  });
+
+  test('keeps the request session echo out of the settled outcome', async () => {
+    const h = harness();
+    const server = await started(h);
+
+    const first = h.executor.execute(request({ requestId: 'req-1' }));
+    server.send({
+      type: 'result',
+      requestId: 'req-1',
+      requestSessionId: 'entry-1',
+      ok: true,
+      result: 'welcome',
+      sessionId: 'bound-1',
+    });
+    const firstOutcome = await first;
+    expect(firstOutcome).toEqual({
+      ok: true,
+      result: 'welcome',
+      sessionId: 'bound-1',
+    });
+    expect(firstOutcome).not.toHaveProperty('requestSessionId');
+
+    const second = h.executor.execute(request({ requestId: 'req-2' }));
+    server.send({
+      type: 'result',
+      requestId: 'req-2',
+      requestSessionId: 'entry-2',
+      ok: false,
+      error: { code: 'NOT_ENOUGH_GOLD', message: 'you cannot afford that' },
+    });
+    const secondOutcome = await second;
+    expect(secondOutcome).toEqual({
+      ok: false,
+      error: { code: 'NOT_ENOUGH_GOLD', message: 'you cannot afford that' },
+    });
+    expect(secondOutcome).not.toHaveProperty('requestSessionId');
     await h.executor.close();
   });
 

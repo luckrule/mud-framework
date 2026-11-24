@@ -23,7 +23,10 @@ interface RunnerHarness {
   ) => void;
 }
 
-function startRunner(timeoutMs = 1000): RunnerHarness {
+function startRunner(
+  timeoutMs = 1000,
+  accepting: () => boolean = () => true,
+): RunnerHarness {
   const backend = new MemoryStorageBackend();
   const lines: string[] = [];
   const logger = createJsonLogger({
@@ -46,7 +49,7 @@ function startRunner(timeoutMs = 1000): RunnerHarness {
     send: (message) => {
       sent.push(message);
     },
-    accepting: () => true,
+    accepting,
     noteRequestBeforeHello: () => undefined,
   });
   return {
@@ -75,6 +78,116 @@ describe('RequestRunner', () => {
       .filter((line) => line.msg === 'request completed');
     expect(completed).toHaveLength(1);
     expect(completed[0]).toMatchObject({ requestId: 'req-1' });
+  });
+
+  test('echoes the entry session id on a success result', async () => {
+    const harness = startRunner();
+    harness.register('echo', (_ctx, payload) => Promise.resolve(payload));
+
+    harness.runner.accept(requestMessage({ sessionId: 'entry-1' }));
+    await tick();
+
+    expect(harness.sent).toEqual([
+      {
+        type: 'result',
+        requestId: 'req-1',
+        requestSessionId: 'entry-1',
+        ok: true,
+        result: 'hi',
+      },
+    ]);
+  });
+
+  test('echoes the entry session id on a failure result', async () => {
+    const harness = startRunner();
+    harness.register('fail', () => Promise.reject(new Error('boom')));
+
+    harness.runner.accept(
+      requestMessage({ method: 'fail', sessionId: 'entry-1' }),
+    );
+    await tick();
+
+    expect(harness.sent).toHaveLength(1);
+    expect(harness.sent[0]).toMatchObject({
+      type: 'result',
+      requestId: 'req-1',
+      requestSessionId: 'entry-1',
+      ok: false,
+      error: { code: 'INTERNAL_ERROR' },
+    });
+  });
+
+  test('keeps a newly bound session distinct from the entry session', async () => {
+    const harness = startRunner();
+    harness.register('login', async (ctx) => {
+      ctx.bindSession('bound-1');
+      return 'welcome';
+    });
+
+    harness.runner.accept(
+      requestMessage({ method: 'login', sessionId: 'entry-1' }),
+    );
+    await tick();
+
+    expect(harness.sent).toEqual([
+      {
+        type: 'result',
+        requestId: 'req-1',
+        requestSessionId: 'entry-1',
+        ok: true,
+        result: 'welcome',
+        sessionId: 'bound-1',
+      },
+    ]);
+  });
+
+  test('omits requestSessionId when the request entered without a session', async () => {
+    const harness = startRunner();
+    harness.register('echo', (_ctx, payload) => Promise.resolve(payload));
+    harness.register('fail', () => Promise.reject(new Error('boom')));
+
+    harness.runner.accept(requestMessage());
+    harness.runner.accept(
+      requestMessage({ requestId: 'req-2', method: 'fail' }),
+    );
+    await tick();
+
+    expect(harness.sent).toHaveLength(2);
+    for (const message of harness.sent) {
+      expect(message).not.toHaveProperty('requestSessionId');
+    }
+  });
+
+  test('echoes the entry session id when refusing during shutdown', () => {
+    const harness = startRunner(1000, () => false);
+
+    harness.runner.accept(requestMessage({ sessionId: 'entry-1' }));
+
+    expect(harness.sent).toEqual([
+      {
+        type: 'result',
+        requestId: 'req-1',
+        requestSessionId: 'entry-1',
+        ok: false,
+        error: {
+          code: 'FRAMEWORK_SHUTDOWN',
+          message: 'server is shutting down',
+        },
+      },
+    ]);
+  });
+
+  test('omits requestSessionId when refusing a request without a session', () => {
+    const harness = startRunner(1000, () => false);
+
+    harness.runner.accept(requestMessage());
+
+    expect(harness.sent).toHaveLength(1);
+    expect(harness.sent[0]).toMatchObject({
+      ok: false,
+      error: { code: 'FRAMEWORK_SHUTDOWN' },
+    });
+    expect(harness.sent[0]).not.toHaveProperty('requestSessionId');
   });
 
   test('request completed names the Extension that registered the handler', async () => {

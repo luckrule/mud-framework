@@ -954,37 +954,53 @@ export class IpcExecutor implements RequestExecutor {
   }
 
   private onResult(message: ResultMessage): void {
+    // `requestSessionId` is envelope metadata for logging only: it must never
+    // reach the settled outcome. Splitting it off here with `type` and
+    // `requestId` is what keeps the outcome equal to `ExecutorOutcome`.
+    const {
+      type: _type,
+      requestId: _requestId,
+      requestSessionId,
+      ...outcome
+    } = message;
     const pending = this.buffer.get(message.requestId);
     if (pending === undefined) {
       // A result for a request that already reached a Portal-decided terminal
       // state. Expected, not an error (SPEC 7.3 keeps the id stable, so the
       // correlation still works — there is just nothing left to settle).
-      // The pending entry is gone, so a session id is recoverable only when
-      // this request's handler bound one and the result carries it. Failure
-      // results never do, and neither do success results whose entry already
-      // had a session but bound nothing new. `requestId` is stable (SPEC 7.3)
-      // and the connection layer records the entry session on its request
-      // line, so the log is still correlatable by that id.
+      // The pending entry is gone, so the Session comes from the result: the
+      // Server echoes the entry Session on every result, including failures.
+      // A Server that predates the echo only names a Session it just bound, and
+      // only on success. `requestId` is stable (SPEC 7.3) and the connection
+      // layer records the entry session on its request line, so even then the
+      // log stays correlatable by that id.
       const fields: LogFields = {
         requestId: message.requestId,
         reason: 'request is no longer buffered',
       };
-      if (message.ok && message.sessionId !== undefined) {
-        fields.sessionId = message.sessionId;
+      const sessionId =
+        requestSessionId ?? (message.ok ? message.sessionId : undefined);
+      if (sessionId !== undefined) {
+        fields.sessionId = sessionId;
       }
       this.logger.debug(fields, 'late result discarded');
       return;
     }
-    // The message is an `ExecutorOutcome` behind two envelope fields, so the
-    // outcome is split off rather than rebuilt field by field. Dropping the
-    // envelope is what keeps `requestId` and `type` out of the settled value.
-    const { type: _type, requestId: _requestId, ...outcome } = message;
     const fields: LogFields = {
       ...requestFields(pending.request),
       durationMs: Date.now() - pending.startedAt,
     };
+    // A fresh binding wins over the entry Session the connection layer already
+    // knew. The echo fallback is defensive: a compliant Server echoes the same
+    // entry Session the pending request holds, so it only serves a peer that
+    // resolves the entry Session itself or one that is non-compliant.
     if (message.ok && message.sessionId !== undefined) {
       fields.sessionId = message.sessionId;
+    } else if (
+      fields.sessionId === undefined &&
+      requestSessionId !== undefined
+    ) {
+      fields.sessionId = requestSessionId;
     }
     this.logger.debug(fields, 'result received');
     this.settle(pending, outcome);

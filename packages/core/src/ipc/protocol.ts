@@ -91,6 +91,16 @@ export interface ReadyMessage {
 export type ResultMessage = {
   readonly type: 'result';
   readonly requestId: string;
+  /**
+   * The Session the request carried on entry, echoed back by the Server so a
+   * result that arrives after the Portal settled the request still names it.
+   *
+   * Deliberately separate from the `sessionId` that `ExecutorOutcome` carries:
+   * that one is a Session the handler bound during this request and only a
+   * success can have it. A failure carries this echo and no `sessionId`.
+   * Omitted when the request entered with no Session.
+   */
+  readonly requestSessionId?: string;
 } & ExecutorOutcome;
 
 /** Server -> Portal: shutdown finished. */
@@ -217,10 +227,18 @@ function buildRequest(raw: Record<string, unknown>): RequestMessage {
 
 function buildResult(raw: Record<string, unknown>): ResultMessage {
   const requestId = readString(raw, 'result', 'requestId', true);
+  // Read for both outcomes: a failed result has no `sessionId` of its own, so
+  // the echo is the only Session it can name.
+  const requestSessionId = readOptionalString(
+    raw,
+    'result',
+    'requestSessionId',
+  );
   if (!readBoolean(raw, 'result', 'ok')) {
     return {
       type: 'result',
       requestId,
+      ...requestSessionEcho(requestSessionId),
       ok: false,
       error: readResultError(raw, 'result', 'error'),
     };
@@ -228,12 +246,23 @@ function buildResult(raw: Record<string, unknown>): ResultMessage {
   return {
     type: 'result',
     requestId,
+    ...requestSessionEcho(requestSessionId),
     ok: true,
     result: raw.result,
     // Absent means "no Session bound" (SPEC 2), so it is passed through as
     // `undefined` rather than defaulted to an empty string.
     sessionId: readOptionalString(raw, 'result', 'sessionId'),
   };
+}
+
+/**
+ * Keeps the parsed shape of a result from a peer that does not send the echo
+ * unchanged: an absent field is not the same own property as an `undefined` one.
+ */
+function requestSessionEcho(requestSessionId: string | undefined): {
+  requestSessionId?: string;
+} {
+  return requestSessionId === undefined ? {} : { requestSessionId };
 }
 
 function readResultError(

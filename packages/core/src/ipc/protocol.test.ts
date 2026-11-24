@@ -129,6 +129,133 @@ describe('parseIpcMessage', () => {
     });
   });
 
+  test('accepts a success result carrying the request session id', () => {
+    const parsed = parseIpcMessage({
+      type: 'result',
+      requestId: 'req-1',
+      requestSessionId: 'entry-1',
+      ok: true,
+      result: null,
+      sessionId: 'bound-1',
+    });
+
+    expect(parsed).toEqual({
+      ok: true,
+      message: {
+        type: 'result',
+        requestId: 'req-1',
+        requestSessionId: 'entry-1',
+        ok: true,
+        result: null,
+        sessionId: 'bound-1',
+      },
+    });
+  });
+
+  test('accepts a failed result carrying the request session id', () => {
+    const parsed = parseIpcMessage({
+      type: 'result',
+      requestId: 'req-1',
+      requestSessionId: 'entry-1',
+      ok: false,
+      error: { code: 'FRAMEWORK_TIMEOUT', message: 'timed out' },
+    });
+
+    expect(parsed).toEqual({
+      ok: true,
+      message: {
+        type: 'result',
+        requestId: 'req-1',
+        requestSessionId: 'entry-1',
+        ok: false,
+        error: { code: 'FRAMEWORK_TIMEOUT', message: 'timed out' },
+      },
+    });
+  });
+
+  test('rejects an empty request session id', () => {
+    expectRejected(
+      {
+        type: 'result',
+        requestId: 'req-1',
+        requestSessionId: '',
+        ok: true,
+        result: null,
+      },
+      'non-empty string',
+    );
+    expectRejected(
+      {
+        type: 'result',
+        requestId: 'req-1',
+        requestSessionId: '',
+        ok: false,
+        error: { code: 'FRAMEWORK_TIMEOUT', message: 'timed out' },
+      },
+      'non-empty string',
+    );
+  });
+
+  test('rejects a non-string request session id', () => {
+    expectRejected(
+      {
+        type: 'result',
+        requestId: 'req-1',
+        requestSessionId: 7,
+        ok: true,
+        result: null,
+      },
+      'requestSessionId',
+    );
+  });
+
+  test('keeps the result shape when requestSessionId is absent', () => {
+    // `toEqual` ignores an own `undefined` property, so a parser that always
+    // attached `requestSessionId: undefined` would pass. `toStrictEqual` plus
+    // the explicit property checks pin "absent" against that.
+    const success = parseIpcMessage({
+      type: 'result',
+      requestId: 'req-1',
+      ok: true,
+    });
+    expect(success).toStrictEqual({
+      ok: true,
+      message: {
+        type: 'result',
+        requestId: 'req-1',
+        ok: true,
+        result: undefined,
+        sessionId: undefined,
+      },
+    });
+    expect(success.ok).toBe(true);
+    if (success.ok) {
+      expect(success.message).not.toHaveProperty('requestSessionId');
+      expect('requestSessionId' in success.message).toBe(false);
+    }
+
+    const failed = parseIpcMessage({
+      type: 'result',
+      requestId: 'req-1',
+      ok: false,
+      error: { code: 'FRAMEWORK_TIMEOUT', message: 'timed out' },
+    });
+    expect(failed).toStrictEqual({
+      ok: true,
+      message: {
+        type: 'result',
+        requestId: 'req-1',
+        ok: false,
+        error: { code: 'FRAMEWORK_TIMEOUT', message: 'timed out' },
+      },
+    });
+    expect(failed.ok).toBe(true);
+    if (failed.ok) {
+      expect(failed.message).not.toHaveProperty('requestSessionId');
+      expect('requestSessionId' in failed.message).toBe(false);
+    }
+  });
+
   test('rejects an empty session id on a success result', () => {
     expectRejected(
       {
@@ -166,6 +293,34 @@ describe('parseIpcMessage', () => {
       ok: true,
       message: { type: 'hello', portalGeneration: 1 },
     });
+  });
+
+  test('drops unknown fields from a result', () => {
+    // SPEC/ADR promise an old Portal tolerates a newer peer's additions; the
+    // parsed shape must stay the documented one rather than pass them through.
+    const parsed = parseIpcMessage({
+      type: 'result',
+      requestId: 'req-1',
+      ok: true,
+      result: { hp: 3 },
+      sessionId: 'bound-1',
+      futureField: 'ignored',
+    });
+
+    expect(parsed).toStrictEqual({
+      ok: true,
+      message: {
+        type: 'result',
+        requestId: 'req-1',
+        ok: true,
+        result: { hp: 3 },
+        sessionId: 'bound-1',
+      },
+    });
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.message).not.toHaveProperty('futureField');
+    }
   });
 
   test('rejects an unknown type and names it', () => {

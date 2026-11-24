@@ -309,7 +309,7 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 
 边界：`extension` 字段只有 Server 侧在 handler 注册元数据可知时填充。Portal 不持有 handler 注册信息，其请求级日志（例如拒绝、队列满、超时、取消、重放）无法获知 Extension，不能按该字段过滤 Portal 日志；这些日志与 Server 侧日志依靠请求标识与 Connection ID 关联。
 
-边界：请求结算之后产生的日志（如 `late result discarded`）可能没有 Session ID。只有本次请求内由 handler 新绑定且成功的结果，才能从结果消息本身恢复 Session ID——请求进入框架时已带的 Session ID 不在结果消息里回传，失败结果也不带。其余已结算的日志用稳定的请求标识（§7.3）与同一请求的其它日志行关联。
+边界：请求结算之后产生的日志（如 `late result discarded`）依靠结果消息恢复 Session ID。结果消息回显请求进入框架时的入口 Session ID（`requestSessionId`，成功与失败结果都携带；入口无 Session 时不带），迟到结果用它填 `sessionId`；结果消息的 `sessionId` 仍只表示 handler 在本次请求内新绑定的 Session。只有旧对端不回显 `requestSessionId` 时，已结算的日志才退回用稳定的请求标识（§7.3）与同一请求的其它日志行关联。
 
 ### 7.2 错误码
 

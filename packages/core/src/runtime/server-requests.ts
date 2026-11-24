@@ -143,8 +143,7 @@ export class RequestRunner {
       );
       this.deps.send(
         {
-          type: 'result',
-          requestId: message.requestId,
+          ...resultEnvelope(message),
           ok: false,
           error: {
             code: FRAMEWORK_SHUTDOWN,
@@ -396,10 +395,7 @@ export class RequestRunner {
       // is spread rather than copied field by field. An unbound success carries
       // `sessionId: undefined` as an own property, which every channel either
       // drops (JSON) or keeps with the same meaning as absence (SPEC 2).
-      this.deps.send(
-        { type: 'result', requestId: message.requestId, ...outcome },
-        'result',
-      );
+      this.deps.send({ ...resultEnvelope(message), ...outcome }, 'result');
       return;
     }
     this.deps.logger[failureLogLevel(outcome.error)](
@@ -411,11 +407,29 @@ export class RequestRunner {
       },
       'request failed',
     );
-    this.deps.send(
-      { type: 'result', requestId: message.requestId, ...outcome },
-      'result',
-    );
+    this.deps.send({ ...resultEnvelope(message), ...outcome }, 'result');
   }
+}
+
+/**
+ * The correlation half of every result sent for `message`: its request id plus
+ * the Session it entered with, echoed so the Portal can name the Session of a
+ * result that arrives after its pending entry is gone. The echo is not an
+ * outcome field; a Session bound by the handler stays in `outcome.sessionId`.
+ */
+function resultEnvelope(message: RequestMessage): {
+  type: 'result';
+  requestId: string;
+  requestSessionId?: string;
+} {
+  if (message.sessionId === undefined) {
+    return { type: 'result', requestId: message.requestId };
+  }
+  return {
+    type: 'result',
+    requestId: message.requestId,
+    requestSessionId: message.sessionId,
+  };
 }
 
 function requestIds(message: RequestMessage): RequestIdentity {

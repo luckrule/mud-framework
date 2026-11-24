@@ -48,6 +48,10 @@ ADR-0002 决定了拆成两个进程，但没定两件事：两个进程之间�
 
 这段的旧公式是 `shutdownTimeoutMs × 2 + 退出等待上限 × 2`，与 Server 侧按 `4 × timeoutMs` 推导的预算不等；Server 的 `timeoutMs` 配得较大时，Portal 会 kill 一个正在正常关闭的 Server。这是修掉的真缺陷，不是可以简化的冗余：不要把这四段等待重新压回一个乘式。
 
+### 结果消息的两个 Session 字段
+
+`result` 上 `sessionId` 与 `requestSessionId` 语义不同：前者是 handler 在本次请求内新绑定的 Session，只有成功结果可能有；后者回显请求进入框架时已带的入口 Session，成功与失败结果都带，入口无 Session 时不带。加回显的原因是结果可能晚于 Portal 的结算（超时、取消、重放耗尽）：那时未确认缓冲里的条目已删除，Portal 只能从结果消息恢复 Session，而旧形状只覆盖"本次新绑定"，失败结果与"入口已有 Session 但未新绑定"的迟到结果都无从记录。`requestSessionId` 只属于线格式，不进入 `ExecutorOutcome` 或结算结果；旧 Server 不回显、旧 Portal 忽略未知字段，因此是加法兼容。`sessionId` 的语义不变。
+
 ### 确认的边界：框架做不到什么
 
 这一节写清楚能力的真实边界，避免把"已确认"读成更强的保证。
