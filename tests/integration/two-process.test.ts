@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -21,7 +21,13 @@ import { SqliteBackend } from '../../packages/storage-sqlite/src/index.ts';
  */
 const FIXTURE = join(import.meta.dir, 'fixtures', 'server-entry.ts');
 
-type Behavior = 'echo' | 'crash' | 'crash-once' | 'boot-fail';
+type Behavior =
+  | 'echo'
+  | 'crash'
+  | 'crash-once'
+  | 'boot-fail'
+  | 'extension-trial'
+  | 'required-extension-fail';
 
 interface TempDatabase {
   readonly path: string;
@@ -200,6 +206,24 @@ function attemptLog(databasePath: string): string[] {
   return readFileSync(`${databasePath}.attempts`, 'utf8')
     .split('\n')
     .filter((line) => line.length > 0);
+}
+
+/**
+ * The fixture writes the startup failure reason next to the database because
+ * its stderr is inherited and therefore unreadable here. `start()` rejects on
+ * its own deadline, which can fire while the last child is still exiting, so
+ * poll briefly instead of assuming the file is already there.
+ */
+async function startupFailure(databasePath: string): Promise<string> {
+  const path = `${databasePath}.startup-error`;
+  const deadline = Date.now() + 2000;
+  while (!existsSync(path)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`no startup failure reason was written to ${path}`);
+    }
+    await sleep(10);
+  }
+  return readFileSync(path, 'utf8');
 }
 
 function urlOf(portal: Portal): string {
@@ -466,6 +490,153 @@ describe('two-process integration', () => {
         await reader.close();
       }
     } finally {
+      await stopQuietly(portal);
+      database.remove();
+    }
+  });
+
+  test('an extension whose requirements SQLite meets registers and can bind a Session', async () => {
+    const database = tempDatabase();
+    const portal = createPortal({
+      databasePath: database.path,
+      behavior: 'extension-trial',
+    });
+    try {
+      await portal.layer.start();
+      const url = urlOf(portal);
+
+      // One socket for both requests: `bindSession` commits the route only
+      // after the first request succeeds, and the second request on the same
+      // connection must see it as `ctx.sessionId` (SPEC 2).
+      const socket = await openClient(url);
+      try {
+        const created = await callOnSocket(socket, {
+          id: 'create',
+          method: 'player.create',
+          payload: { name: 'alice', sessionId: 'session-alice' },
+        });
+        expect(created).toEqual({
+          id: 'create',
+          ok: true,
+          result: { created: 'alice', sessionId: 'session-alice' },
+        });
+
+        // The wire result carries only the handler value, so the Session id
+        // here comes from `ctx.sessionId` of the second request, not from the
+        // first request's reply.
+        const whoami = await callOnSocket(socket, {
+          id: 'whoami',
+          method: 'player.whoami',
+        });
+        expect(whoami).toEqual({
+          id: 'whoami',
+          ok: true,
+          result: { sessionId: 'session-alice' },
+        });
+      } finally {
+        socket.close();
+      }
+
+      await stopQuietly(portal);
+
+      // Separate reader, as in the write test above: the row proves the
+      // extension's transaction committed on the Server.
+      const reader = SqliteBackend.open({ filename: database.path });
+      try {
+        const rows = await reader.transaction((tx) =>
+          tx.query<{ name: string }>('SELECT name FROM players'),
+        );
+        expect(rows).toEqual([{ name: 'alice' }]);
+      } finally {
+        await reader.close();
+      }
+    } finally {
+      await stopQuietly(portal);
+      database.remove();
+    }
+  });
+
+  test('an optional extension skipped for unmet capabilities leaves no handlers behind, and the Server keeps serving', async () => {
+    const database = tempDatabase();
+    const portal = createPortal({
+      databasePath: database.path,
+      behavior: 'extension-trial',
+    });
+    try {
+      await portal.layer.start();
+      const url = urlOf(portal);
+
+      const socket = await openClient(url);
+      try {
+        // SQLite declares `concurrency: single`, so the pooled-only extension
+        // was never registered and its handler does not exist (SPEC 4.3).
+        const pooled = await callOnSocket(socket, {
+          id: 'pooled',
+          method: 'pooled.ping',
+        });
+        expect(pooled).toMatchObject({
+          id: 'pooled',
+          ok: false,
+          error: { code: 'UNKNOWN_METHOD' },
+        });
+
+        // The skipped extension does not take the process down: the same
+        // connection, on the next request, still reaches the satisfied one.
+        const created = await callOnSocket(socket, {
+          id: 'create',
+          method: 'player.create',
+          payload: { name: 'bob', sessionId: 'session-bob' },
+        });
+        expect(created).toEqual({
+          id: 'create',
+          ok: true,
+          result: { created: 'bob', sessionId: 'session-bob' },
+        });
+      } finally {
+        socket.close();
+      }
+
+      // A restart would mean the skip was treated as a crash; it is not.
+      expect(portal.spawns()).toBe(1);
+    } finally {
+      await stopQuietly(portal);
+      database.remove();
+    }
+  });
+
+  test('a required extension whose requirements are unmet refuses startup', async () => {
+    const database = tempDatabase();
+    const portal = createPortal({
+      databasePath: database.path,
+      behavior: 'required-extension-fail',
+      // Same bounded-start shape as the boot-fail case: short deadline and
+      // backoff so the retries before the failure complete quickly.
+      startTimeoutMs: 500,
+      restartBackoffMs: 25,
+    });
+    const started = portal.layer.start();
+    try {
+      const outcome = await settleWithin(started, 2000);
+      // SPEC 6.2 step 2 refuses the process before `ready`, so Portal must
+      // never see a ready Server and must fail the start.
+      expect(outcome).toBe('rejected');
+      expect(serverPids(portal.logs)).toEqual([]);
+      const attemptsAtFailure = portal.spawns();
+      expect(attemptsAtFailure).toBeGreaterThan(0);
+
+      // A configuration error must not become an unbounded restart loop.
+      await sleep(300);
+      expect(portal.spawns()).toBe(attemptsAtFailure);
+
+      // The refusal is provable, not inferred: the child's stderr goes to the
+      // inherited terminal, so the file the fixture writes next to the database
+      // is the only evidence of why startup was refused. It must name the
+      // required extension and the capability the backend could not provide.
+      const failure = await startupFailure(database.path);
+      expect(failure).toContain('required extension "pooled-only"');
+      expect(failure).toContain('concurrency');
+    } finally {
+      started.catch(() => undefined);
       await stopQuietly(portal);
       database.remove();
     }
