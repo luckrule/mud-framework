@@ -48,7 +48,7 @@ Handler 可以 await，框架的调度建立在 Promise 之上。
 
 **Session（会话）** — 玩家的一次逻辑在线期，由 Session ID 标识，可跨越多个 Connection（断线重连）。Session 是路由与状态归属的单位。
 
-连接层已做 Session 路由：保存 `sessionId → connectionId` 映射与重连顺序门。绑定由业务通过 `RequestContext.bindSession` 声明，只在请求成功时生效；框架不判断 id 是否合法。当前未实现：Session 超时回收——断线后 Session 保留多久由业务规则决定，框架不介入。这是已知缺口，不是文档过期——条目保留为目标契约。
+连接层已做 Session 路由：保存 `sessionId → connectionId` 映射与重连顺序门。绑定由业务通过 `RequestContext.bindSession` 声明，只在请求成功时生效；框架不判断 id 是否合法。边界：框架不持有 Session 状态，只持有活跃连接的路由，连接断开时该路由清除——路由对已断开的连接没有意义。Session 的业务状态与其保留窗口归业务进程，由业务配置决定何时结束；框架不介入。
 
 **Transport（传输）** — 传输实现的接口：接受连接、交付入站数据、写出发站数据、关闭。它只负责字节流与消息编解码，不含 Session 路由与输入缓冲——后者属于连接层进程。框架核心不依赖任何具体 Transport。
 
