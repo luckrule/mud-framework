@@ -37,7 +37,7 @@ bash scripts/ci.sh --skip-install   # 一次跑完以上四项
 允许的 `type`：`feat`、`fix`、`docs`、`style`、`refactor`、`perf`、`test`、`build`、`ci`、`chore`、`revert`。
 
 - `scope` 可选，括号内不得为空。
-- 破坏性变更在 `type` 或 `scope` 后加 `!`，如 `feat(core)!: ...`。
+- 破坏性变更 MUST 在 `type` 或 `scope` 后加 `!`，如 `refactor(core)!: ...`。破坏性变更包括公共 API 删除或改名、线格式变化、签名移除或改名；不得用 `docs:` 提交夹带 API 变更。
 - `: ` 之后为标题，长度 2–72 字符，首尾不得有空白。
 - 以 `Merge `、`Revert `、`fixup! `、`squash! `、`amend! ` 开头的提交信息由钩子放行，不校验。
 
