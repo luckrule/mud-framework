@@ -271,13 +271,19 @@ describe('parseIpcMessage', () => {
       capabilities: { ...capabilities, maxTransactionDurationMs: null },
     });
 
-    expect(parsed.ok).toBe(true);
-    if (parsed.ok && parsed.message.type === 'ready') {
-      // JSON turns Infinity into null, so both must land on the same value.
-      expect(parsed.message.capabilities.maxTransactionDurationMs).toBe(
-        Number.POSITIVE_INFINITY,
-      );
-    }
+    // JSON turns Infinity into null, so both must land on the same value. The
+    // whole message is asserted so a rejection cannot pass as a success.
+    expect(parsed).toEqual({
+      ok: true,
+      message: {
+        type: 'ready',
+        pid: 1,
+        capabilities: {
+          ...capabilities,
+          maxTransactionDurationMs: Number.POSITIVE_INFINITY,
+        },
+      },
+    });
   });
 
   test('keeps a positive finite transaction ceiling as is', () => {
@@ -287,10 +293,14 @@ describe('parseIpcMessage', () => {
       capabilities: { ...capabilities, maxTransactionDurationMs: 250 },
     });
 
-    expect(parsed.ok).toBe(true);
-    if (parsed.ok && parsed.message.type === 'ready') {
-      expect(parsed.message.capabilities.maxTransactionDurationMs).toBe(250);
-    }
+    expect(parsed).toEqual({
+      ok: true,
+      message: {
+        type: 'ready',
+        pid: 1,
+        capabilities: { ...capabilities, maxTransactionDurationMs: 250 },
+      },
+    });
   });
 
   test('rejects a transaction ceiling that would clamp the timeout', () => {

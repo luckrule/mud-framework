@@ -487,6 +487,62 @@ describe('ConnectionLayer', () => {
     await layer.stop();
   });
 
+  // One case per `return false` branch of `isExecutorOutcome` that the tests
+  // above do not reach. Every case asserts a reply, because a rejected outcome
+  // that produced no frame is exactly the silent drop SPEC 3.5 forbids.
+  //
+  // Two inputs are chosen to make their branch observable rather than merely
+  // exercised: `error: null` has no readable fields, so without the
+  // `isRecord(error)` guard `error.code` throws instead of rejecting cleanly;
+  // `code: { length: 5 }` would pass the length check on its own, so only the
+  // `typeof code === 'string'` guard refuses it.
+  const malformedOutcomes: readonly (readonly [string, unknown])[] = [
+    ['value is not an object at all', null],
+    ['ok is neither true nor false', { ok: 'yes' }],
+    ['error is not an object', { ok: false, error: null }],
+    [
+      'error code is not a string',
+      { ok: false, error: { code: { length: 5 }, message: 'boom' } },
+    ],
+    [
+      'error code is empty',
+      { ok: false, error: { code: '', message: 'boom' } },
+    ],
+    [
+      'error message is not a string',
+      { ok: false, error: { code: 'INTERNAL_ERROR', message: 7 } },
+    ],
+  ];
+
+  for (const [label, outcome] of malformedOutcomes) {
+    test(`answers an executor outcome whose ${label} instead of dropping the request`, async () => {
+      const transport = new FakeTransport();
+      const executor: RequestExecutor = {
+        start: () => Promise.resolve(),
+        execute: () => Promise.resolve(outcome as ExecutorOutcome),
+        cancel: () => Promise.resolve(),
+        close: () => Promise.resolve(),
+      };
+      const layer = new ConnectionLayer({ transport, executor });
+      await layer.start();
+      transport.connect('c1');
+
+      await transport.receive('c1', '{"id":"r1","method":"echo"}');
+
+      const frames = transport.sentTo('c1').map(parseFrame);
+      expect(frames).toHaveLength(1);
+      expect(frames[0]).toEqual({
+        id: 'r1',
+        ok: false,
+        error: {
+          code: 'INTERNAL_ERROR',
+          message: 'executor returned a malformed outcome',
+        },
+      });
+      await layer.stop();
+    });
+  }
+
   test('maps a throwing executor to INTERNAL_ERROR instead of dropping the request', async () => {
     const transport = new FakeTransport();
     const lines: string[] = [];

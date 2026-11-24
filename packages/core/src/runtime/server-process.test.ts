@@ -446,11 +446,10 @@ describe('runServerProcess extension capabilities', () => {
     await tick();
 
     const [outcome] = results(harness.messages);
-    expect(outcome.ok).toBe(false);
-    if (outcome.ok) {
-      throw new Error('expected a failure result');
-    }
-    expect(outcome.error.code).toBe('UNKNOWN_METHOD');
+    expect(outcome).toMatchObject({
+      ok: false,
+      error: { code: 'UNKNOWN_METHOD' },
+    });
     const skipped = harness
       .logs()
       .filter(
@@ -764,11 +763,10 @@ describe('runServerProcess requests', () => {
     await tick();
 
     const [outcome] = results(harness.messages);
-    expect(outcome.ok).toBe(false);
-    if (outcome.ok) {
-      throw new Error('expected a failure result');
-    }
-    expect(outcome.error.code).toBe('UNKNOWN_METHOD');
+    expect(outcome).toMatchObject({
+      ok: false,
+      error: { code: 'UNKNOWN_METHOD' },
+    });
     await harness.stop();
   });
 
@@ -820,17 +818,18 @@ describe('runServerProcess requests', () => {
         result: 'hi',
       },
     ]);
-    // The outcome is spread into the message, so an unbound success carries the
-    // key with `undefined` rather than omitting it. JSON drops the key and
-    // structured clone keeps it with the same meaning as absence (SPEC 2), so
-    // the wire assertion is on the value.
+    // `LocalExecutor` omits the key entirely for an unbound success, and both
+    // JSON and structured clone keep that shape, so "absent" is literally what
+    // "unbound" looks like on the wire (SPEC 2). `toBeUndefined` would also
+    // pass on a present-but-undefined key, i.e. on the shape this asserts
+    // against, so the assertion is on the key's presence.
     const raw = harness.messages.find(
       (message) => isRecord(message) && message.type === 'result',
     );
     if (!isRecord(raw)) {
       throw new Error('expected a raw result message');
     }
-    expect(raw.sessionId).toBeUndefined();
+    expect(raw).not.toHaveProperty('sessionId');
     await harness.stop();
   });
 
@@ -855,11 +854,10 @@ describe('runServerProcess requests', () => {
     await sleep(20);
 
     const [outcome] = results(harness.messages);
-    expect(outcome.ok).toBe(false);
-    if (outcome.ok) {
-      throw new Error('expected a failure result');
-    }
-    expect(outcome.error.code).toBe('FRAMEWORK_TIMEOUT');
+    expect(outcome).toMatchObject({
+      ok: false,
+      error: { code: 'FRAMEWORK_TIMEOUT' },
+    });
     // Let the abandoned handler settle before closing the backend.
     await sleep(40);
     await harness.stop();
@@ -1186,11 +1184,10 @@ describe('runServerProcess cancel', () => {
     await sleep(30);
 
     const [outcome] = results(harness.messages);
-    expect(outcome.ok).toBe(false);
-    if (outcome.ok) {
-      throw new Error('expected a failure result');
-    }
-    expect(outcome.error.code).toBe('FRAMEWORK_TIMEOUT');
+    expect(outcome).toMatchObject({
+      ok: false,
+      error: { code: 'FRAMEWORK_TIMEOUT' },
+    });
     // Let the abandoned handler settle so the rollback is observable.
     await sleep(60);
     const stats = backend.stats();
@@ -1221,11 +1218,10 @@ describe('runServerProcess cancel', () => {
     await sleep(30);
 
     const [outcome] = results(harness.messages);
-    expect(outcome.ok).toBe(false);
-    if (outcome.ok) {
-      throw new Error('expected a failure result');
-    }
-    expect(outcome.error.code).toBe('FRAMEWORK_TIMEOUT');
+    expect(outcome).toMatchObject({
+      ok: false,
+      error: { code: 'FRAMEWORK_TIMEOUT' },
+    });
     await sleep(60);
     await harness.stop();
   });
@@ -1308,11 +1304,10 @@ describe('runServerProcess lifecycle', () => {
     const outcomes = results(harness.messages);
     expect(outcomes).toHaveLength(2);
     for (const outcome of outcomes) {
-      expect(outcome.ok).toBe(false);
-      if (outcome.ok) {
-        throw new Error('expected a failure result');
-      }
-      expect(outcome.error.code).toBe('FRAMEWORK_SHUTDOWN');
+      expect(outcome).toMatchObject({
+        ok: false,
+        error: { code: 'FRAMEWORK_SHUTDOWN' },
+      });
     }
   });
 
