@@ -61,7 +61,7 @@ try {
     timeoutMs: 5000,
   });
 } catch (error) {
-  // 非零退出码是 Portal 判定"这次启动失败"的唯一依据。
+  // 将启动或链路失败映射为非零退出，供进程管理与诊断识别。
   console.error(
     'server stopped abnormally:',
     error instanceof Error ? error.message : String(error),
@@ -70,9 +70,9 @@ try {
 }
 ```
 
-`SqliteBackend.open` 不会创建父目录：示例中的 `./data` 必须预先存在，否则 `bun:sqlite` 以 `unable to open database file` 失败。
+示例的前置条件是 `./data` 目录已存在，且数据库已有业务表 `players (name TEXT NOT NULL)`。`SqliteBackend.open` 既不创建父目录，也不创建业务 schema；目录缺失会导致打开失败，表缺失会让 `player.create` 返回 `INTERNAL_ERROR`。schema 初始化与迁移属于应用，必须在接受业务请求前完成；可放在 Server 的 `createBackend` 中，但不得提前到 Portal 或 prepared 阶段。
 
-`runServerProcess` 返回的 Promise 就是退出信号：收到 `shutdown` 并正常收尾时 resolve，启动失败或链路断开时 reject。入口脚本必须把这个差别映射到退出码，否则 Portal 无法区分"正常关闭"与"崩溃"。
+`runServerProcess` 返回的 Promise 就是退出信号：收到 `shutdown` 并正常收尾时 resolve，启动失败或链路断开时 reject。入口脚本应把失败映射为非零退出码，供进程管理与诊断识别；Portal 也通过 IPC 断开与退出事件发现 Server 丢失，不只依赖退出码。
 
 ## 版本化入口（应用层）
 
@@ -149,15 +149,15 @@ Portal 侧 `IpcExecutor` 的 `timeoutMs` 决定请求何时在 Portal 结算；�
 ## 部署检查清单
 
 - **Portal 崩溃**：Server 的 IPC 链路断开，`createProcessChannel` 收到 `disconnect`，日志出现 `IPC_CHANNEL_CLOSED`（`reason: process disconnected`）；Server 排空在途请求、关闭后端，`runServerProcess` 以 `ServerChannelClosedError` reject。进程是否随之退出由入口脚本决定——上例把它映射为非零退出码，这是让 Portal 的崩溃处理看见"异常结束"而不是"正常关闭"的必要一步。它不会变成孤儿继续写存储。未确认输入随 Portal 一起丢失，这是 SPEC 6.1 允许的。
-- **`stop()` 的语义**：Portal 先停止接受输入，再排空已接收的请求（受 `ConnectionLayer.shutdownTimeoutMs` 约束），然后让 `IpcExecutor` 发送 `shutdown`；Server 停止接受、排空在途请求、关闭存储、回 `closed`；Portal 收到 `closed` 后等进程真正退出，超时则 `SIGKILL`。`stop()` resolve 时子进程通常已经退出，但这个保证是有界的：进程若卡在不可中断状态，Portal 等过一次有界的退出等待后记录 `server process did not exit within the wait; it may still be running` 并继续返回（默认值见 ADR-0004）。关闭执行器那一步的预算取 `ConnectionLayer.shutdownTimeoutMs` 与 `IpcExecutor` 声明的关闭预算（`closeBudgetMs`，公式见 ADR-0004）的较大者，所以默认配置下外层不会先于执行器放弃等待。Server 侧服从 Portal 在 `shutdown` 消息中声明的预算，把 Server 的 `timeoutMs` 配得比 Portal 大不再延长关闭时长。整条关闭路径因此有确定上界（`closeBudgetMs` 加少量余量），可以据此设置 systemd `TimeoutStopSec` 一类的外部强杀时限，并让它长于框架自己的等待，避免外部先杀掉一个正在正常关闭的 Server。
-- **确认没有孤儿进程**：`process.kill(pid, 0)` 抛 `ESRCH` 即进程已消失。`pid` 来自 Server 的 `ready` 消息（`IpcExecutor` 会把它记进 `server ready` 日志行的 `pid` 字段）。关闭后如果该 pid 仍存活，先看是否有 `server process did not exit within the wait` 或 `server did not finish shutting down; killing it` 日志——前者说明进程不可中断，后者说明优雅关闭超时后已发 `SIGKILL`。
-- **`maxPending`**：Portal 未确认缓冲的硬上限（默认值见 ADR-0004），超出后请求以 `FRAMEWORK_QUEUE_FULL` 拒绝。它兜住的是"Server 长期不可用而客户端持续写入"这一种 deadline 管不住的情况。
+- **`stop()` 的语义**：Portal 停止接受输入，排空已接受的输入（受 `ConnectionLayer.shutdownTimeoutMs` 约束）；仍在 Session 屏障前、尚未调用 executor 的请求以 `FRAMEWORK_SHUTDOWN` 结束，不绕过屏障执行。随后执行器关闭 Server：声明 `shutdown` 预算，Server 在该预算内排空并关闭存储、回 `closed`，Portal 再有界等待实际退出，必要时 kill 后再等。退出仍未确认时保留写者屏障并拒绝关闭，`ConnectionLayer` 尽力关闭传输后传播失败，不静默成功。`FRAMEWORK_SHUTDOWN` 本身没有阶段信息：明确未调度的请求未执行，可能已投递而未成功确认的请求则可能已执行或提交，不能仅凭错误码安全重试。外部停止时限必须覆盖连接层排空、执行器关闭、传输关闭三段完整上界，公式见 ADR-0004；`IpcExecutor.closeBudgetMs` 只是中间一段的预算。systemd `TimeoutStopSec` 等应长于完整上界；Server 的请求 `timeoutMs` 不改变 Portal 声明的关闭预算。
+- **确认没有孤儿进程**：`process.kill(pid, 0)` 抛 `ESRCH` 可用于检查该 pid 已消失。`pid` 来自 Server 的 `ready` 消息（普通启动会记入 `server ready` 日志）。框架内部只有 `observed: true` 的退出确认才解除写者屏障；等待超时说明尚未确认，不能仅凭日志诊断进程不可中断。退出 Promise 仍 pending 时，迟到确认可在执行器未到终态时恢复一次；一次性 `observed: false` 结果不保证自动恢复，需要部署方处理，不能另起写者绕过。
+- **`maxPending`**：Portal 未确认缓冲的硬上限（默认值见 ADR-0004），超出后请求以 `FRAMEWORK_QUEUE_FULL` 拒绝。deadline 在 Server 未就绪或不可用时仍会结算请求，只限制单条请求的驻留时间；总数上限控制同时在途的数量，不能用来延长请求的 deadline。
 
 ## 常见错误
 
 **入口脚本路径写错**：子进程以 `Module not found` 退出（退出码 1，错误在 stderr），Portal 看到的是 `ipc channel disconnected` 加一次 `server process lost`。随后按退避重试，直到 `startTimeoutMs`（默认 `max(10s, restartBackoffMs * 10)`）耗尽，`start()` reject 并停止重试。表现为"启动很慢然后失败"，不是立即失败；缩短 `startTimeoutMs` 可以让配置错误更快暴露。
 
-**Server 起来就崩**：退避从短间隔起倍增到上限，重置条件是稳定运行超过一个远大于退避上限与请求超时的窗口（默认值见 ADR-0004）。所以"起来、接第一个请求、崩"会持续计入同一条崩溃链，不会退回零退避。同一条请求的重放有上限（`maxReplays`，默认值见 ADR-0004），耗尽后以 `FRAMEWORK_REPLAY_EXHAUSTED` 结束，Portal 继续服务其他请求。
+**Server 起来就崩**：退避从短间隔起倍增到上限，重置条件是稳定运行超过一个远大于退避上限与请求超时的窗口（默认值见 ADR-0004）。所以"起来、接第一个请求、崩"会持续计入同一条崩溃链，不会退回零退避。同一条请求的重放有上限（`maxReplays`，默认值见 ADR-0004），耗尽后以 `FRAMEWORK_REPLAY_EXHAUSTED` 结束。初次 `start()` 仍有覆盖重试的总体 `startTimeoutMs`；自动恢复的每一代另有独立握手时限，旧代计时器不影响新代。请求的 deadline 不因重启而延长，退出未确认时也不会为恢复服务而绕过唯一写者屏障。
 
 **Portal 里直接开了存储**：不会立刻报错，但恢复语义失效——Portal 崩溃时已写入而 Server 未确认的部分无法重放也无法回滚（INV-002）。存储只能出现在 Server 的 `createBackend` 里。
 

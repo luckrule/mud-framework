@@ -48,7 +48,7 @@ Handler 可以 await，框架的调度建立在 Promise 之上。
 
 **Session（会话）** — 玩家的一次逻辑在线期，由 Session ID 标识，可跨越多个 Connection（断线重连）。Session 是路由与状态归属的单位。
 
-连接层已做 Session 路由：保存 `sessionId → connectionId` 映射与重连顺序门。绑定由业务通过 `RequestContext.bindSession` 声明，只在请求成功时生效；框架不判断 id 是否合法。边界：框架不持有 Session 状态，只持有活跃连接的路由，连接断开时该路由清除——路由对已断开的连接没有意义。Session 的业务状态与其保留窗口归业务进程，由业务配置决定何时结束；框架不介入。
+连接层保存 `sessionId → connectionId` 活跃路由，路由表是 Connection 当前绑定身份的唯一来源。绑定由业务通过 `RequestContext.bindSession` 声明，只在请求成功时生效；框架要求非空 id，但不判断其业务合法性。一个 Connection 同时只持有一个 Session；新 Connection 接管同一 Session 后，旧 Connection 保持连接但不再持有该 Session，只有再次显式绑定才会重新获得身份。连接断开时清除其路由，但不得因此丢弃该 Session 尚未结束的请求屏障（见 3.2）。边界：框架不持有 Session 的业务状态，其保留窗口与结束规则归业务进程。
 
 **Transport（传输）** — 传输实现的接口：接受连接、交付入站数据、写出发站数据、关闭。它只负责字节流与传输帧的编解码（交付入站数据、写出发站数据的一部分），不含 Envelope 编解码、Session 路由与输入缓冲；Envelope 与客户端线格式见 §5.4，其余职责属于连接层进程。框架核心不依赖任何具体 Transport。
 
@@ -72,7 +72,7 @@ Handler 可以 await，框架的调度建立在 Promise 之上。
 
 **Request Context（请求上下文）** — 随 Request 传入 Handler 的框架侧上下文，携带 Session ID、Connection ID、请求标识、事务句柄、中止信号、日志器与 Extension 名。Handler 的存储调用与日志调用 SHOULD 经由它，框架据此统一归属日志、统一判定事务是否仍有效。
 
-中止信号是标准 `AbortSignal`，在 Request 进入终态（超时、取消、断线）时 abort，`reason` 说明触发原因。它是通知而非抢占：handler 可把它传给 `fetch`、`Bun.sleep` 等接受信号的操作以提前停下，但忽略它也不会让写入生效——写入失效由事务句柄的检查保证，两者并存（见 3.6）。
+中止信号是标准 `AbortSignal`，超时、取消或断线时 abort，`reason` 说明触发原因；正常成功不会触发异常中止。它是通知而非抢占：handler 可把它传给接受信号的操作以提前停下。事务句柄在请求的任一终态后均失效，不依赖 handler 是否响应信号；这不撤销已经开始的 COMMIT 或框架外副作用（见 3.3、3.4）。
 
 **Terminal State（终态）** — Request 的结局，只有三类：成功、业务失败、框架失败（超时、取消、存储不可用、传输在完成前断开）。终态表示处理结束、结果已确定；它不等于已确认。
 
@@ -84,7 +84,7 @@ Handler 可以 await，框架的调度建立在 Promise 之上。
 
 ### 3.1 顺序
 
-同一 Connection 上的 Request MUST 严格有序：Request N 的全部效果（含其对存储的写入）对 Request N+1 可见之前，N+1 不得开始处理。
+同一 Connection 上的 Request MUST 按接收顺序推进：Request N 到达框架终态后，N+1 才能开始处理。成功终态必须发生在该请求的事务提交之后；超时、取消与已开始 COMMIT 的竞态边界见 3.4。
 
 理由：玩家的连续指令依赖前一条的结果（先"拿起剑"再"装备它"）。乱序会让业务状态不可推理，而且这类错误在业务层极难复现。框架不规定顺序的实现方式（串行 await、单消费者队列或其它），只规定可观测的结果。
 
@@ -92,9 +92,11 @@ Handler 可以 await，框架的调度建立在 Promise 之上。
 
 不同 Connection 之间 MUST 并发处理。
 
-同一 Session 重连到新 Connection 时，旧 Connection 上未完成的 Request 必须先有终态（完成或失败），新 Connection 才开始处理，避免同一 Session 出现两条处理线。
+同一已绑定 Session 的框架非终态请求 MUST 串行处理。请求按开始处理时的入口 Session 归属；旧 holder 被接管后，其新请求不再携带原 Session，已开始请求的入口身份不变。新 holder 上属于该 Session 的请求必须等已有请求的 executor Promise 到达终态，不得以等待超时为由并发放行。
 
-重连顺序已实现：新 Connection 绑定同一 Session 时，其后续请求等旧 Connection 的在途工作到达终态。边界：等待有超时上限（默认 10 秒），超时后放行并记 warn——旧 handler 可能永不返回（3.4 已禁止事务内无界等待，那是业务的违约），而永久等待会让整个 Session 卡死。框架不保证跨 Connection 的事务一致性，也不提供 Session 的业务状态。
+Session 的终态屏障独立于活跃路由：连续接管、旧连接断开或路由清除均 MUST NOT 丢弃尚未满足的先决屏障。绑定在成功结果返回后应用，不追溯改变本次请求的入口归属；首次从无 Session 发起的绑定请求不在目标 Session 的串行保证内。业务必须自行保护这种登录或绑定逻辑的共享状态。
+
+边界：终态不等于 JS handler 已停止。超时或取消后，非合作 handler 可能继续计算，其框架外副作用与已开始 COMMIT 的竞态不在串行保证内（见 3.4）；框架不提供跨 Connection 的事务一致性或 Session 业务状态。
 
 理由：跨连接串行会抹掉异步模型的全部收益；同 Session 并行则让"谁的状态更新生效"变得不可判定。
 
@@ -108,7 +110,9 @@ Handler 可以 await，框架的调度建立在 Promise 之上。
 - Handler 抛错、超时或被取消 → 回滚。
 - 同一 Request 内的多次存储调用 MUST 共享同一事务上下文，不得各自独立提交。
 
-上述提交与回滚以存储后端声明的事务能力为限，降级规则见 4.3。
+上述提交与回滚以存储后端声明的事务能力为限，降级规则见 4.3。取消或超时遇到已经开始的 COMMIT 时不能保证回滚，见 3.4。
+
+`RequestContext.storage` 只在本 Request 未到终态时有效。成功、业务失败或框架失败后，保留的事务句柄 MUST 拒绝后续读写，MUST NOT 借后续 Request 的事务继续操作；事务句柄失效不意味着正常成功要触发 `AbortSignal`。
 
 理由：Request 是业务能理解的原子单位。让业务手写事务边界会把事务管理成本扩散到每个 Handler。
 
@@ -120,12 +124,14 @@ Handler 内 MUST NOT 开启新事务。需要多段原子性的业务应拆成�
 
 超时后的语义：
 
-- 超时到达即把该 Request 置为终态（框架失败，超时错误码），并回滚其事务。
-- 该 Request 的事务上下文立即失效；此后 Handler 的任何写入 MUST 被拒绝，不得进入存储层。
+- 超时到达即把该 Request 置为终态（框架失败，超时错误码），并使其事务上下文失效。
+- 此后通过该上下文发起的读写 MUST 被拒绝，不得进入存储层。
 - 框架 MUST NOT 继续等待该 Handler。Connection 可以立即处理下一个 Request。
-- 卡住的 Handler 仍在后台运行（JS 无法强杀执行中的代码），但它已失去有效事务句柄，写入全部被丢弃，因此对存储没有可见效果，3.1 的顺序要求不受影响；它在内存中的副作用属于业务责任，框架不作保证。
+- 未进入提交阶段的事务在 handler 返回后尝试回滚，强度以 4.3 的后端声明为限；超时不保证事务已回滚或 handler 已停止。
 
-这是 JS 单线程模型的必然结果：无法抢占式终止 Handler，只能让它的写入失效。超时因此保证的是"结果确定且不再产生副作用"，不是"Handler 已停止"。超时到达时 `RequestContext.signal` 同时 abort（`reason` 为 `'timeout'`），那是给 handler 的提前停止通知，不改变上面这条边界。
+JS 无法抢占执行中的 Handler。超时保证结果确定与后续事务调用失效，不撤销已经发生的写入，也不保证框架外副作用停止。`RequestContext.signal` 同时 abort（`reason` 为 `'timeout'`），只是提前停止通知。
+
+已经开始的 COMMIT 是明确边界：`StorageBackend.transaction(fn)` 在 `fn` resolve 后提交，取消或超时可能发生在提交完成之前，框架没有中止该 COMMIT 的句柄。此时事务仍可能提交，并记录 `CANCEL_LOST_TO_COMMIT` 告警（ADR-0004）；MUST NOT 把超时或取消当作"未生效"的证明。
 
 事务内 MUST NOT 出现无界等待，包括：等待另一个 Request 的结果、等待用户输入、等待无超时的外部网络调用、等待一个无上界的锁。理由：事务持有后端资源或锁，一次无界等待会把单请求超时放大成整条连接、乃至整个后端的停顿。
 
@@ -139,13 +145,13 @@ Handler 内 MUST NOT 开启新事务。需要多段原子性的业务应拆成�
 
 Connection 在 Request 处理中关闭时，该 Request MUST 进入终态，不得无限期挂起。
 
-策略是取消，没有例外：中止信号触发，事务回滚，Request 以框架错误结束。选择"取消"而非"继续执行"的理由是：玩家已经看不到结果，继续写入只会产生无法解释的状态变更。
+策略是取消，没有例外：中止信号触发，事务上下文失效，Request 以框架错误结束。未进入提交阶段的事务在 handler 返回后尝试回滚；已经开始的 COMMIT 仍受 3.4 的边界约束。选择取消的理由是玩家已无法接收结果，不能让后续事务调用继续生效。
 
-本 SPEC 曾要求框架 MUST 允许 Extension 把某类 Request 声明为不可取消（例如已经进入不可回滚的外部副作用）。该承诺已撤回，当前不提供。撤回的原因在结构上：跨进程拆分让"不取消"无法安全兑现。Portal 在连接断开时先删除该连接持有的 Session 路由，再向 Server 发出取消；若 Server 拒绝取消并继续写入，Portal 并不知道——它已经把请求结算为失败。玩家此后重连并绑定同一 Session ID 时，路由已删，这次绑定被当作首次绑定，不触发重连顺序门（见 3.2），新连接上的请求会与仍在写存储的旧 handler 并发执行，违反 INV-004（同一 Session 在同一时刻只有一条处理线）。要正确支持不可取消，取消结果必须跨进程可见：Server 明确回复取消被拒绝，Portal 在收到该回复前不得结算请求、也不得让同一 Session 的新连接开始处理。这是未实现的协议扩展。因此不可取消声明连同三态 `cancel` 返回值一起撤出类型与实现：`HandlerOptions` 不再有 `cancellable`，`ExtensionRegistrar.register` 不再接收 options，`Dispatcher.cancel` 返回布尔。
+框架不提供不可取消声明。Portal 在断线时结算请求，并清除连接持有的路由；若 Server 可拒绝取消，Portal 就需要额外的取消确认协议才能区分"仍在执行"与"已到终态"，否则重连后的 Session 屏障无法据此决策。当前协议不提供这条分支。
 
-当前策略的边界：连接断开时一律取消。需要不可回滚副作用的业务应把该副作用放在请求之外（例如独立的幂等作业，由其自行保证重试安全），或接受超时、断线与重连竞争之间的不确定性。这不是替代方案的建议，而是框架当前的真实行为。
+需要不可回滚副作用的业务必须自行保证幂等与重试安全，不能把断线取消或超时当作副作用未发生的证明。
 
-关闭流程等待在途请求的终态：请求仍在执行集合中，`drain` 天然覆盖；等待有上限——正常关闭受 Portal 声明的关闭预算约束，链路中断后的 abort 路径受 `ABORT_TIMEOUT_MS` 约束，超时只放弃等待（见 6.3）。取消的实际语义是：中止信号触发、使后续写入失效、让结果不再送达，但不保证 handler 停止（JS 无法抢占执行中的代码，见 3.4），也不保证事务已回滚（见 3.3 与 ADR-0004）。
+关闭流程等待框架在途请求的终态，不等待非合作 handler 的全部后台计算。正常关闭受 Portal 声明的关闭预算约束，链路中断后的 abort 路径受 `ABORT_TIMEOUT_MS` 约束，超时只放弃等待（见 6.3）。取消使后续事务调用失效、让结果不再送达，不保证 handler 已停止、事务已回滚或已开始的 COMMIT 被撤销。
 
 断线不等于 Session 结束。Session 状态在业务进程侧保留一段时间（由配置决定），期间重连可恢复；超时未重连则按业务规则结束。
 
@@ -247,9 +253,9 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 
 默认 `JsonCodec` 的入站校验：解码结果必须是对象，`id` 与 `method` 必须是非空字符串；其余校验细节由 `Codec` 实现决定。
 
-连接层正常接受输入时，入站帧解码失败按非请求处理：连接层记录一条 warn（`code` 为 `INVALID_ENVELOPE`，字段含 `connectionId`、`rawLength`、`reason`），并以 `id` 为空字符串的失败响应回 `INVALID_ENVELOPE`——解码失败时不从坏帧中提取关联标识，一帧坏数据也不终止整条连接。坏帧的响应不得越过已接受请求的响应，已接受请求的响应顺序不因坏帧改变。
+连接层正常接受输入时，入站帧解码失败不构成 Request，但 MUST 占用有界输入队列的席位。取得席位的坏帧按连接顺序处理：记录一条 warn（`code` 为 `INVALID_ENVELOPE`，字段含 `connectionId`、`rawLength`、`reason`），并以 `id` 为空字符串的失败响应回 `INVALID_ENVELOPE`，不从坏帧中提取关联标识，也不因一帧坏数据终止连接。队列已满时，坏帧立即以 `id` 为空字符串的 `FRAMEWORK_QUEUE_FULL` 拒绝，不追加排队任务；这类拒绝响应可以越过已接受输入，只有已取得席位的输入遵守排队顺序。
 
-关闭流程中（连接层状态为 stopping 或 stopped）新到达、尚未进入 Input Queue 的输入一律以 `FRAMEWORK_SHUTDOWN` 拒绝，包括无法解码的帧，不进入请求处理；已接受并进入 Input Queue 的请求不受此规则影响，仍按 6.3 排空。能解码的帧回填其 `id`，无法解码的回 `id` 为空字符串。关闭期间未跟踪连接上的输入同样收到 `FRAMEWORK_SHUTDOWN`；未跟踪连接上、且不在关闭流程中的输入没有响应：连接层没有该连接的活跃记录，不为它解码或回写。
+关闭流程中（连接层状态为 stopping 或 stopped）新到达、尚未进入 Input Queue 的输入一律以 `FRAMEWORK_SHUTDOWN` 拒绝，包括无法解码的帧，不进入请求处理；已接受的输入按 6.3 排空或显式结算，不保证全部执行。能解码的帧回填其 `id`，无法解码的回 `id` 为空字符串。关闭期间未跟踪连接上的输入同样收到 `FRAMEWORK_SHUTDOWN`；未跟踪连接上、且不在关闭流程中的输入没有响应：连接层没有该连接的活跃记录，不为它解码或回写。
 
 `result` 无法被当前 `Codec` 编码时，框架用同一 `Codec` 编码一条 `INTERNAL_ERROR` 失败响应作为兜底；若该兜底仍无法编码，框架只能记录 `TRANSPORT_SEND_FAILED`，不承诺发出响应。
 
@@ -273,21 +279,28 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 
 就绪由两阶段握手表达（ADR-0007）：业务进程收到 `hello` 后先回 `prepared`，此时 MUST NOT 打开存储、注册 Extension 或执行 Handler；只有收到 `activate` 才执行第 1、2 步并安装请求处理器，然后发 `ready`。连接层在收到 `ready` 之后才开始接受连接。边界：`prepared` 只表示进程活着且等待激活，不表示可用；连接层不得向 prepared 的业务进程投递 Request。
 
-版本切换复用同一协议，顺序是契约：连接层先起新进程并等到 `prepared`，再停旧进程、等它 `closed` 且进程退出，然后才向新进程发 `activate` 并等 `ready`，最后把缓冲请求投给新进程。`activate` MUST NOT 在旧进程仍可能持有存储时发出（INV-002）；`closed` 只表示旧进程完成关闭流程，不表示它已释放存储，因此退出确认不可省略。切换期间连接层 MUST 继续接受请求并保留在未确认缓冲中，不得向即将退役的旧进程或尚未 `ready` 的新进程投递；这些请求在新进程 `ready` 后按 6.5 的顺序投递。切换失败时，旧进程未被 drain 则 MUST 继续服务；旧进程已退出则 MUST 以切换前的版本重新启动，不得留下无 Server 的状态或两个活跃 Server。旧进程退出未确认时，回滚重启 MUST 等到旧进程与已 `activate` 的新进程的退出都确认后才开始（与崩溃路径同构）。切换成功提升后，连接层 MUST 以新进程的 spawn 与 `codeVersion` 作为当前版本：此后崩溃重启的是刚提升的版本，新请求也盖上该版本；切换失败回滚则保持原版本。`close()` 在 `activate` 之后中止切换时，MUST 在返回前对已放弃的新进程执行有界的退出确认（等退出 → kill → 再等），确认失败则记 warn。
+初次 `start()` 的整体等待受 `startTimeoutMs` 约束，期间的失败重试不延长总时限；自动恢复启动的每一代另有同值的独立握手时限，从该代启动到 `ready`。计时器 MUST 绑定 generation，在该代 ready、丢失或关闭后失效，不得影响其他代或使终态执行器复活。切换的 prepared 与 ready 两个等待分别有界（ADR-0007）。
+
+版本切换复用同一协议，顺序是契约：连接层先起新进程并等到 `prepared`，再停旧进程、等它 `closed` 且退出被观测到，然后才向新进程发 `activate` 并等 `ready`，最后把缓冲请求投给新进程。`activate` MUST NOT 在旧进程仍可能持有存储时发出（INV-002）；`closed`、kill 返回与退出等待超时都不能代替退出确认。切换期间连接层 MUST 继续按容量与 deadline 接受、缓冲请求，不得向即将退役的旧进程或尚未 `ready` 的新进程投递；新进程 `ready` 后按 6.5 的顺序投递。
+
+切换失败时，旧进程未被 drain 则 MUST 继续服务；已经退役则使用切换前的 spawn 与 `codeVersion` 恢复。回滚重启 MUST 等到旧进程与已 `activate` 的新进程退出均被观测到；无法确认时保持写者屏障并显式失败，不得以恢复可用性为由启动另一写者。切换成功提升后，连接层 MUST 采纳目标 spawn 与 `codeVersion`，供后续崩溃重启与新请求使用；失败回滚不改变当前版本。`close()` 在 `activate` 之后中止切换时，MUST 对放弃的新进程执行有界的退出确认（等退出 → kill → 再等）；确认失败时关闭必须 reject，而不是只记日志后成功返回。
 
 ### 6.3 关闭顺序
 
-1. 连接层停止接受新连接。
-2. 对 Input Queue 中的请求执行显式策略：采用 3.5 的拒绝策略，或在关闭场景下排空；无论选哪种，行为必须可预期。
-3. 等待进行中的事务提交或回滚，受超时约束；超时后记 error 并继续关闭。
-4. 关闭存储后端。
-5. 关闭传输。
+1. 连接层停止接受新输入。
+2. 排空已接受输入，受连接层关闭预算约束；仍在 Session 屏障前、尚未调用 executor 的请求以 `FRAMEWORK_SHUTDOWN` 结束，不绕过屏障继续执行。
+3. 执行器等待已接受工作，并关闭 Server 与存储，所有等待有界；超时或失败必须可观测，不得当作已确认资源释放。
+4. 尽力关闭传输，即使执行器关闭已经失败也不得跳过。
 
-顺序颠倒会产生"事务已提交但连接已断"或"连接已断但写入丢失"这类无法归因的结果。
+`ConnectionLayer.stop()` MUST 在传输收尾后传播执行器关闭失败，不得以成功返回掩盖退出未确认。执行器有界返回不等于进程已经退出；旧写者的退出未被观测时 MUST NOT 启动新的写者。完整外部停止预算必须覆盖连接层排空、执行器关闭与传输关闭三段，不能只使用 `IpcExecutor.closeBudgetMs`（公式与常量来源见 ADR-0004）。
+
+顺序的理由是先结束业务调度，再释放存储与传输；但关闭错误码不证明请求未执行或未提交，阶段边界见 7.2。
 
 ### 6.4 崩溃恢复
 
 承诺：连接保活 + 未确认输入重放。终态与确认的区别见 §2 术语；重放缓冲的移除条件是确认，不是终态。
+
+恢复受唯一写者屏障约束：只有 `SpawnedServer` 报告退出 `observed: true` 才能解除旧写者屏障。退出 Promise 仍 pending 而等待超时时，框架必须保留引用，迟到的确认可在执行器仍可恢复时继续一次恢复；`close()` 或其它终态之后不得被迟到事件重新启动。若一次性退出结果是 `observed: false`，框架无法据此确认进程释放了存储，必须保持屏障，不承诺自动恢复；有界关闭仍无法确认退出时必须失败。恢复可用性不能优先于 INV-002，请求仍受各自 deadline 约束。
 
 语义是 at-least-once：同一个 Request 可能被执行多次。框架 MUST NOT 声称 exactly-once。
 
@@ -325,19 +338,21 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 
 **wire 码** 随 `error.code` 发给客户端（`ok: false` 时），属于对外契约，MUST 稳定可枚举：
 
-| 码                                 | 含义                                    |
-| ---------------------------------- | --------------------------------------- |
-| `FRAMEWORK_TIMEOUT`                | 请求超时                                |
-| `FRAMEWORK_QUEUE_FULL`             | 输入队列拒绝（见 3.5）                  |
-| `FRAMEWORK_SHUTDOWN`               | 框架正在关闭，请求未被执行              |
-| `FRAMEWORK_REPLAY_EXHAUSTED`       | 重放次数用尽，请求进入终态（见 6.5）    |
-| `FRAMEWORK_CAPABILITY_UNSUPPORTED` | 存储能力不满足 Extension 声明（见 4.3） |
-| `TRANSPORT_CLOSED`                 | 传输在请求完成前关闭                    |
-| `TRANSPORT_SEND_FAILED`            | 结果无法写回传输                        |
-| `STORAGE_UNAVAILABLE`              | 存储后端不可达                          |
-| `INVALID_ENVELOPE`                 | 入站帧无法解码                          |
-| `UNKNOWN_METHOD`                   | 没有该方法的 Handler                    |
-| `INTERNAL_ERROR`                   | 框架内部失败，含未声明的业务错误        |
+| 码                                 | 含义                                       |
+| ---------------------------------- | ------------------------------------------ |
+| `FRAMEWORK_TIMEOUT`                | 请求超时                                   |
+| `FRAMEWORK_QUEUE_FULL`             | 输入队列拒绝（见 3.5）                     |
+| `FRAMEWORK_SHUTDOWN`               | 因关闭未取得成功确认，不保证未执行或未提交 |
+| `FRAMEWORK_REPLAY_EXHAUSTED`       | 重放次数用尽，请求进入终态（见 6.5）       |
+| `FRAMEWORK_CAPABILITY_UNSUPPORTED` | 存储能力不满足 Extension 声明（见 4.3）    |
+| `TRANSPORT_CLOSED`                 | 传输在请求完成前关闭                       |
+| `TRANSPORT_SEND_FAILED`            | 结果无法写回传输                           |
+| `STORAGE_UNAVAILABLE`              | 存储后端不可达                             |
+| `INVALID_ENVELOPE`                 | 入站帧无法解码                             |
+| `UNKNOWN_METHOD`                   | 没有该方法的 Handler                       |
+| `INTERNAL_ERROR`                   | 框架内部失败，含未声明的业务错误           |
+
+`FRAMEWORK_SHUTDOWN` 必须区分发生阶段：关闭时拒绝的新输入，以及仍在 Session 屏障前、尚未调用 executor 就被关闭结算的请求，确定没有被调度执行；可能已投递给 Server 却未取得成功确认的请求，则可能已经执行或提交。此码本身不携带阶段信息，MUST NOT 仅凭它判断可无幂等保护地重试；恢复与重试仍须遵守 6.4 的业务幂等边界。
 
 `FRAMEWORK_CAPABILITY_UNSUPPORTED` 与 `STORAGE_UNAVAILABLE` 是预留码：当前没有任何路径产出它们，先占住名字，免得实现时另发明一个码让下游同时面对两套语义。
 

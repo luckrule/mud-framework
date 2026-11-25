@@ -28,7 +28,7 @@ ADR-0002 决定了拆成两个进程，但没定两件事：两个进程之间�
 
 重放缓冲放内存，不落盘。SPEC 6.1 已明确"连接层重启会断开连接，但不会丢失已提交的业务状态"，即 Portal 崩溃允许丢未确认输入。落盘会把这份承诺扩大到 Portal 侧，代价是每次接收都要多一次持久化写入，而收益只覆盖 Portal 自身崩溃——不在承诺内。
 
-内存缓冲必须有总数上限（`maxPending`，默认 10000），超出即以 `FRAMEWORK_QUEUE_FULL` 拒绝新请求。理由：缓冲规模本来由 deadline 自然收敛，但"Server 长期不可用而客户端持续写入"这一种情况里请求始终不被结算，deadline 管不住；通道又没有发送背压（见上），缺了这道上限内存增长就没有刹车。上限也不能取得太小：重启窗口内的批量输入会堆在这里，过小就会把正常流量误拒成队列满。
+内存缓冲必须有总数上限（`maxPending`，默认 10000），超出即以 `FRAMEWORK_QUEUE_FULL` 拒绝新请求。deadline 限制每条请求的驻留时间，包括 Server 尚未就绪或不可用的等待；它不限制同时到达的请求数量。通道没有发送背压，因此仍需总数上限控制突发输入与恢复窗口内的瞬时内存占用。上限不能代替 deadline，也不能保证重启窗口中的全部输入都被接受。
 
 确认 = 收到 `result`。Portal 自己判定的终态（超时、重放耗尽、关闭、取消）直接销账：Portal 就是连接层，这些终态发生时结果已经交回调用方，不存在"已终态未确认"的窗口。反过来，Server 判定终态但 `result` 未送达时，请求仍在缓冲里，重放会再来一次——这正是 at-least-once 的来源。
 
@@ -40,7 +40,9 @@ ADR-0002 决定了拆成两个进程，但没定两件事：两个进程之间�
 
 重放顺序：按 `connectionId` 分组，组内按接收序号升序（SPEC 6.5）。已知代价是一个坏请求会饿死同连接上的后续请求，直到它的重放预算耗尽。这是顺序约束的必然代价，不是漏发：顺序保证与"跳过坏请求继续后面"不可兼得。
 
-关闭预算：`IpcExecutor` 自己声明关闭的最坏耗时 `closeBudgetMs`，是六段串行等待之和，不能压成一个乘式：中止进行中的切换（`shutdownTimeoutMs`）、排空未确认请求（`shutdownTimeoutMs`）、等 Server 回 `closed`（`shutdownTimeoutMs + SHUTDOWN_ACK_SLACK_MS`）、等进程退出（`EXIT_WAIT_TIMEOUT_MS`）、`SIGKILL` 后再等一次（`EXIT_WAIT_TIMEOUT_MS`）、对被 `close()` 中止的切换所放弃且已 `activate` 的替换进程再做一次"等退出 → kill → 再等"（`2 × EXIT_WAIT_TIMEOUT_MS`）。默认值以 `ipc-budget.ts` 的常量为准：`shutdownTimeoutMs` 取 `DEFAULT_SHUTDOWN_TIMEOUT_MS`，另两个常量是 `EXIT_WAIT_TIMEOUT_MS` 与 `SHUTDOWN_ACK_SLACK_MS`。预算是 `closeBudget(shutdownTimeoutMs)`，即上述六段之和 `3 × shutdownTimeoutMs + SHUTDOWN_ACK_SLACK_MS + 4 × EXIT_WAIT_TIMEOUT_MS`；这里不写死数值。外层 `ConnectionLayer` 关闭执行器时取自身 `shutdownTimeoutMs` 与该预算加少量余量的较大者，而不是各用一个独立超时。理由是这几段等待必须串起来算：外层若只按自己的 `shutdownTimeoutMs` 计时，`stop()` 会在 Server 仍在写存储时返回，接着重开存储就是两个写者（INV-002）。
+关闭预算：`IpcExecutor` 自己声明关闭的最坏耗时 `closeBudgetMs`，是六段串行等待之和，不能压成一个乘式：中止进行中的切换（`shutdownTimeoutMs`）、排空未确认请求（`shutdownTimeoutMs`）、等 Server 回 `closed`（`shutdownTimeoutMs + SHUTDOWN_ACK_SLACK_MS`）、等进程退出（`EXIT_WAIT_TIMEOUT_MS`）、`SIGKILL` 后再等一次（`EXIT_WAIT_TIMEOUT_MS`）、对被 `close()` 中止的切换所放弃且已 `activate` 的替换进程再做一次"等退出 → kill → 再等"（`2 × EXIT_WAIT_TIMEOUT_MS`）。默认值以 `packages/core/src/shared/budget.ts` 的常量为准：`shutdownTimeoutMs` 取 `DEFAULT_SHUTDOWN_TIMEOUT_MS`，另两个常量是 `EXIT_WAIT_TIMEOUT_MS` 与 `SHUTDOWN_ACK_SLACK_MS`。预算是 `closeBudget(shutdownTimeoutMs)`，即上述六段之和 `3 × shutdownTimeoutMs + SHUTDOWN_ACK_SLACK_MS + 4 × EXIT_WAIT_TIMEOUT_MS`；这里不写死数值。外层 `ConnectionLayer` 关闭执行器时取自身 `shutdownTimeoutMs` 与该预算加关闭余量的较大者，避免外层先放弃执行器的退出确认。
+
+完整 `ConnectionLayer.stop()` 的外部预算还必须覆盖另外两段串行等待。记 `C = ConnectionLayer.shutdownTimeoutMs`、`E = RequestExecutor.closeBudgetMs`、`S = EXECUTOR_CLOSE_SLACK_MS`，上界为 `C + max(C, E + S) + C`：依次是连接层排空、执行器关闭、传输关闭。没有声明 E 的执行器三段均使用 C。S 以 `packages/core/src/portal/connection-layer.ts` 为准，不写死部署时限；systemd 等外部停止预算应长于完整上界，而不是仅长于 E。关闭失败仍要尽力收尾传输，再传播失败，不能把预算耗尽解释为存储已释放。
 
 预算单向派生：`shutdown` 消息携带 `timeoutMs`，由 Portal 声明自己愿意等 `closed` 多久；Server 的排空与关闭存储共享这一个 deadline，不再各自乘一次 `timeoutMs`，也不从自己的 `shutdownTimeoutMs` 推导。预算由 Portal 声明，Server 必须服从；缺该字段的消息被解析层拒绝，没有回退路径。因此 Server 侧配置的 `timeoutMs` 不再拉长或缩短关闭时长。
 
@@ -64,8 +66,8 @@ ADR-0002 决定了拆成两个进程，但没定两件事：两个进程之间�
 
 这一节写清楚能力的真实边界，避免把"已确认"读成更强的保证。
 
-- **取消不保证回滚**。`StorageBackend.transaction(fn)` 的提交发生在 `fn` resolve 之后。若取消或超时到达时 handler 已返回、COMMIT 尚未完成，框架没有回滚句柄，事务仍会提交。这个窗口由接口形状决定，关不掉。框架的责任是让它可见：记 `CANCEL_LOST_TO_COMMIT` 告警日志。要真正关掉需给 `StorageTransaction` 加 abort 能力，属破坏性接口变更（SPEC 8.2），当前不做。
-- **超时与取消保证"结果确定且不再产生副作用"，不保证"handler 已停止"**。JS 无法抢占执行中的代码（SPEC 3.4）。框架能让后续写入失效、让结果不再送达，但不能让 handler 停下来。
+- **取消与超时不保证回滚**。`StorageBackend.transaction(fn)` 的提交发生在 `fn` resolve 之后。若取消或超时到达时 COMMIT 已开始但尚未完成，框架没有中止该 COMMIT 的句柄，事务仍可能提交，并记录 `CANCEL_LOST_TO_COMMIT` 告警。当前保留这个接口边界，不增加提交中止能力；事务能力较弱时还须接受 SPEC 4.3 的降级。
+- **终态保证结果确定与事务句柄失效，不保证 handler 已停止或没有副作用**。成功、业务失败与框架失败后均拒绝保留句柄上的后续读写；正常成功不触发异常 abort。JS 无法抢占执行中的代码，框架外副作用与已经开始的 COMMIT 不会因此撤销（SPEC 3.3、3.4）。
 - **Portal 的 deadline 是权威**。发给 Server 的 `timeoutMs` 是剩余预算而非总预算，且 Server 只能收紧不能放松（取 `min(Server 配置, 后端上限, 收到的值)`）。否则会出现 Portal 已超时结算、Server 仍在提交；而超时路径不重放，这比 at-least-once 更糟——写入存在，却没有任何重试会再次覆盖它。
 - **业务错误码必须显式声明**。只有 `BusinessError` 的 `code` 与框架自身错误码进入 wire；驱动或运行时的偶然 `code`（`ENOENT`、`SQLITE_CONSTRAINT_UNIQUE`）不透传，统一降级为 `INTERNAL_ERROR`。否则第三方库升级会静默改变对外契约（INV-014）。
 

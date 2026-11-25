@@ -15,7 +15,7 @@ ADR-0004 的崩溃重启路径不受影响：那个路径上新进程起来时�
 - Portal 发 `activate`。
 - Server 才执行 `startServer`（后端、能力自检、降级告警、Extension 注册），随后安装请求处理器、置为 active，最后才发 `ready`。
 
-普通启动与切换启动走同一条路径：`IpcExecutor.launch()` 收到 `prepared` 立即回 `activate`。切换路径将来只是在 `prepared` 与 `activate` 之间插入"旧进程 drain 并退出"这一步，协议形状不变。
+普通启动、崩溃重启与版本切换共用这条握手。普通启动与崩溃重启在确认没有旧写者后，收到 `prepared` 即发送 `activate`；`switchTo` 则在 `prepared` 与 `activate` 之间退役旧进程并确认退出，协议形状不变。
 
 ### 这是破坏性的 IPC 协议变更，不做向后兼容
 
@@ -27,13 +27,13 @@ ADR-0004 的崩溃重启路径不受影响：那个路径上新进程起来时�
 
 - 一个 prepared 但从未被激活的进程不是写者，可以在旧进程仍持有存储时安全存在（INV-002）。
 - 切换窗口内如果 Portal 决定放弃，直接关掉这个进程即可，不需要排空、回滚或关闭后端——没有东西可关。
-- 激活失败（后端打不开、能力自检不过、必需 Extension 不满足）时 `startServer` 自行关闭它已打开的后端，进程以 `ServerStartupError` 退出；`prepared` 之后没有"半个写者"的中间态。
+- 激活失败（后端打不开、能力自检不过、必需 Extension 不满足）时，启动路径尝试关闭已打开的后端，并以 `ServerStartupError` 失败。已经发过 `prepared` 不代表后端初始化成功；已经发过 `activate` 的进程必须被视为可能持有存储，只有观测到退出才能解除写者屏障。
 
 `codeVersion` 在回 `prepared` 之前校验：`prepared` 与 `ready` 携带同一个值，非法值会让 Portal 无法解析。
 
 ### 边界：切换前旧进程必须已经 drain 并关闭
 
-协议只提供"准备好了"和"可以打开存储了"两个点，不规定谁在什么条件下发 `activate`。顺序责任在调用方：`activate` 只能在旧进程已停止接受请求、已排空在途请求、已关闭后端、已确认进程退出之后发出。ADR 先固定这条约束，避免下一阶段把"等旧进程"写成"等旧进程发 closed 就行"——`closed` 只说明 Server 完成了关闭流程，不说明进程已释放存储（ADR-0004 的退出等待就是为此存在）。
+协议只提供"准备好了"和"可以打开存储了"两个点，切换顺序由 `switchTo` 负责：先停止向旧进程投递请求，完成有界的排空与关闭等待，并确认进程退出，才能发 `activate`。`closed` 只说明 Server 完成了关闭流程，不说明进程已释放存储；kill 返回或退出等待超时也不是退出确认（ADR-0004）。
 
 ### 决定：`IpcExecutor.switchTo` 编排切换（顺序不可调换）
 
@@ -42,11 +42,11 @@ ADR-0004 的崩溃重启路径不受影响：那个路径上新进程起来时�
 1. 用本次切换提供的 `spawn` 起新进程，发 `hello`，等到 `prepared`（有界：`startTimeoutMs`）。prepared 进程不碰存储。
 2. 旧进程停止接收新请求（切换期间 `execute()` 仍接受并缓冲，不拒绝）；向旧进程发 `shutdown`（`timeoutMs = shutdownTimeoutMs`），等 `closed`，再等进程退出（`awaitPreviousClosed` 等 `closed`，`waitForExit` 等退出，必要时 kill 后再等一次）。
 3. 确认旧进程消失后，才向新进程发 `activate`，等 `ready`（有界：`startTimeoutMs`）。
-4. 把 `this.server` 切到新进程、`status = 'ready'`、`flush()` 把缓冲请求按 SPEC 6.5 投给新 generation；同时把本次切换的 `spawn` 与 `codeVersion` 记为当前版本。
+4. 提升替换进程为当前 Server，把缓冲请求按 SPEC 6.5 投给新 generation；同时采纳本次切换的 `spawn` 与 `codeVersion` 作为当前版本。
 
 理由就是 INV-002：新进程在 prepared 阶段不打开存储，`activate` 才打开。旧进程仍持有存储时 `activate` 新进程，就是两个写者。因此"等旧进程"必须是"已 closed **且**已退出"，不能只是 `closed`。步骤 2 与 3 之间没有可回退点：一旦发出 `activate`，新进程开始写存储。
 
-同时只允许一个切换；进行中再次调用直接拒绝。切换期间 `status = 'switching'`，`execute()` 照常接受请求并留在未确认缓冲里，`flush()` 在 `switching` 期间不投递（旧进程正在被 drain，投给它等于把请求送进即将退出的进程）。
+同时只允许一个切换；进行中再次调用直接拒绝。切换期间 `execute()` 仍按容量与 deadline 接受请求并留在未确认缓冲里，不投递给即将退役的旧进程或尚未 ready 的替换进程。
 
 ### 决定：两段式失败边界与回滚
 
@@ -56,11 +56,11 @@ ADR-0004 的崩溃重启路径不受影响：那个路径上新进程起来时�
 - 切换成功提升后，`spawn` 与 `codeVersion` 记为本次切换的目标值：此后崩溃重启的是刚提升的版本，新请求也盖上该版本（SPEC 6.4）。切换失败回滚则保持原版本。
 - 任何失败路径都有界，且在被放弃进程的退出未确认前不会启动新进程；退出确认由回滚或 close() 各自完成。
 
-`close()` 在切换期间必须能中止：中止信号会打断切换的每个 await，`doClose` 放弃新进程后按正常路径关闭旧进程，最终正常 `closed`。若被放弃的新进程已收到 `activate`（可能已持有存储），`doClose` 在返回前对它执行与 `shutdownServer` 相同的 `waitForExit` → `kill` → `waitForExit` 有界流程，仍未退出则记 warn。切换窗口内到达的请求最终要么在新进程成功，要么以稳定错误码结束（关闭时 `FRAMEWORK_SHUTDOWN`），不会挂到 deadline；回滚期间它们仍受自身 deadline 约束。
+`close()` 在切换期间必须能中止：放弃替换进程后，继续关闭原进程。对任何退出未确认的进程执行有界的"等退出 → kill → 再等"；仍无法确认时保留写者屏障并 reject 关闭，不能只记 warn 后宣称成功。等待超时但退出 Promise 仍 pending 时，迟到确认只允许在执行器尚可恢复时解除屏障；一次性 `observed: false` 结果不提供自动恢复依据。切换与回滚中的请求仍受自身 deadline 约束；关闭时尚未调度的请求显式失败，可能已投递的请求按 SPEC 7.2 的确认边界解释 `FRAMEWORK_SHUTDOWN`。
 
-### 边界：`activate` 前的双写者断言是防御性的，不是行为分支
+### 边界：`activate` 前的唯一写者屏障
 
-`VersionSwitch.activateReplacement` 在发 `activate` 前调用 `ServerSlot.assertNoOtherLiveServer`。原实现没有这一步，所以这是重构时新增的代码，但它不改变任何可观测行为：`retirePrevious` 只有在旧进程已确认退出（或本来就没有旧进程）时才返回 true，而 slot 的 current server 就是那个进程，因此到这一步不可能存在另一个存活的候选者。保留它是为了让 INV-002 有一个显式闸口——未来若调整编排顺序，断言失败会让切换 reject 并按既有失败边界回滚，而不是静默产生两个写者。断言失败时的 `op.failure` 写入与回滚路径因此当前不可达，不应据此推断存在新的失败模式。
+发出 `activate` 前必须排除所有退出未确认的其他写者。进程的 IPC 已 `closed` 不能使它通过这道屏障，kill 返回也不能；只有观测到退出才能解除约束。屏障未满足时不得激活，切换按前述失败边界结束或等待恢复，不以可用性为由放行（INV-002）。
 
 ### 观测
 
@@ -78,7 +78,7 @@ prepare 阶段父进程消失时直接失败退出，不触碰存储：`run()` �
 
 ### 边界：关闭尚未 `ready` 的 Server
 
-Portal 关闭一个尚未 `ready` 的 Server 走 kill，而不是 `shutdown` 消息：`IpcExecutor.shutdownServer` 只在 `server.ready` 时发 `shutdown`，否则直接 kill 并等退出。prepared 进程没有存储需要排空，也没有 `closed` 可回，消息往返只会拖长关闭。因此 Server 侧 `pendingShutdown` 分支（`shutdown` 在 `starting` 期间到达）只由直接构造的消息驱动——例如测试，或未来某个自己发 `shutdown` 的调用方——而不是普通 Portal 关闭路径。
+Portal 关闭一个尚未 `ready` 的 Server 走 kill 并确认退出，而不是等待 `shutdown` 确认。prepared 进程没有存储需要排空；已经 activate 但尚未 ready 的进程则可能正在打开存储，两者都不能把 kill 返回当作资源释放。普通 Portal 不向尚未 ready 的进程发送 `shutdown`；Server 接受 starting 期间直接到达的 `shutdown` 并在启动收尾后关闭，但这不是普通 Portal 的关闭路径。
 
 ## 后果
 
@@ -86,4 +86,4 @@ Portal 关闭一个尚未 `ready` 的 Server 走 kill，而不是 `shutdown` 消
 - 协议少了一处隐式保证："Server 活着"不再等于"Server 已就绪"。任何依赖 `hello` 之后立刻 `ready` 的调用方都要改；本仓库内只有 `IpcExecutor` 与测试替身。
 - 切换路径的正确性从"进程启动顺序"变成"消息发出顺序"，可以在 `activate` 处加观测点，而不必靠进程启动日志推断。
 - 切换窗口内请求延迟上升而非失败，代价由未确认缓冲（`maxPending`）兜底；切换失败时按上文两段边界决定"旧进程继续服务"还是"重启旧版本"。
-- 仍未实现：`codeVersion` 到入口的映射、真实双版本集成。`switchTo` 只编排进程替换，不解释版本兼容性（SPEC 6.4）。
+- `codeVersion` 到入口的映射属于应用与部署配置，不是 core 的职责。`switchTo` 只编排进程替换，不解释不同版本之间的兼容性（SPEC 6.4）。
