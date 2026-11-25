@@ -1,14 +1,14 @@
+import type { ExecutorOutcome } from '../shared/executor.ts';
 /**
  * Portal <-> Server IPC protocol (ADR-0002).
  *
  * This is a different protocol from the client wire format in
- * `runtime/codec.ts`: that one is JSON over a Transport, this one is an object
+ * `client/codec.ts`: that one is JSON over a Transport, this one is an object
  * channel with structured serialization. The two must not share types or
  * validators, because a change to one must not silently change the other.
  */
-import { describeValue, isRecord, messageOf } from '../internal/guards.ts';
-import type { ExecutorOutcome } from '../runtime/executor.ts';
-import type { RequestIdentity } from '../runtime/identity.ts';
+import { describeValue, isRecord, messageOf } from '../shared/guards.ts';
+import type { RequestIdentity } from '../shared/identity.ts';
 import {
   type CapabilityCheck,
   checkWireCapabilities,

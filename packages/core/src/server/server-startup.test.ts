@@ -1,0 +1,339 @@
+import { describe, expect, test } from 'bun:test';
+
+import type { IpcChannel } from '../ipc/channel.ts';
+import { createInMemoryChannelPair } from '../ipc/channel.ts';
+import { createJsonLogger } from '../logging/json-logger.ts';
+import { MemoryStorageBackend } from '../storage/memory.ts';
+import { rejectionOf } from '../testing/common.ts';
+import {
+  parseLine,
+  received,
+  requestMessage,
+} from '../testing/server-process.ts';
+import type { Extension } from './extension.ts';
+import type { ServerProcessOptions } from './server-process.ts';
+import {
+  type StartupDeps,
+  type StartupResult,
+  ServerStartupError,
+  startServer,
+} from './server-startup.ts';
+
+interface Harness {
+  /** The Portal end: observes what startup sent. */
+  portal: IpcChannel;
+  /** The Server end handed to `startServer`. */
+  channel: IpcChannel;
+  messages: unknown[];
+  logs: () => Record<string, unknown>[];
+  deps: (overrides?: Partial<ServerProcessOptions>) => StartupDeps;
+}
+
+function harness(extensions: readonly Extension[] = []): Harness {
+  const [portal, channel] = createInMemoryChannelPair();
+  const messages: unknown[] = [];
+  portal.onMessage((raw) => {
+    messages.push(raw);
+  });
+  const lines: string[] = [];
+  const logger = createJsonLogger({
+    sink: (line) => {
+      lines.push(line);
+    },
+  });
+  return {
+    portal,
+    channel,
+    messages,
+    logs: () => lines.map(parseLine),
+    deps: (overrides = {}) => ({
+      options: {
+        createBackend: () => new MemoryStorageBackend(),
+        extensions,
+        timeoutMs: 1000,
+        logger,
+        channel,
+        ...overrides,
+      },
+      logger,
+    }),
+  };
+}
+
+function echoExtension(name = 'echo'): Extension {
+  return {
+    name,
+    register: (registrar) => {
+      registrar.register('echo', (_ctx, payload) => Promise.resolve(payload));
+    },
+  };
+}
+
+describe('startServer', () => {
+  test('returns the runtime and sends nothing', async () => {
+    const backend = new MemoryStorageBackend({
+      capabilities: { concurrency: 'pooled' },
+    });
+    const test1 = harness([echoExtension()]);
+    const result: StartupResult = await startServer(
+      test1.deps({ createBackend: () => backend }),
+    );
+
+    // The readiness barrier belongs to the caller: sending it here would cross
+    // it before a request handler exists, and Portal is entitled to deliver the
+    // instant it sees `ready`.
+    expect(received(test1.messages)).toEqual([]);
+    expect(result.runtime.capabilities).toEqual(backend.capabilities());
+    expect(result.skippedExtensions).toBe(0);
+    // The extension registered against the returned dispatcher.
+    const outcome = await result.runtime.executor.execute({
+      requestId: 'req-1',
+      connectionId: 'c1',
+      clientRequestId: 'client-1',
+      method: 'echo',
+      payload: 'hi',
+      timeoutMs: 1000,
+    });
+    expect(outcome).toEqual({ ok: true, result: 'hi' });
+
+    await result.runtime.executor.close();
+  });
+
+  test('reports the backend declaration the caller will announce', async () => {
+    const backend = new MemoryStorageBackend();
+    const test1 = harness([echoExtension()]);
+    const { runtime } = await startServer(
+      test1.deps({ createBackend: () => backend, codeVersion: 'build-1' }),
+    );
+
+    expect(received(test1.messages)).toEqual([]);
+    expect(runtime.capabilities).toEqual(backend.capabilities());
+
+    await runtime.executor.close();
+  });
+
+  test('rejects an empty code version before creating the backend', async () => {
+    const test1 = harness();
+    let created = 0;
+
+    const error = await rejectionOf(
+      startServer(
+        test1.deps({
+          codeVersion: '',
+          createBackend: () => {
+            created += 1;
+            return new MemoryStorageBackend();
+          },
+        }),
+      ),
+    );
+
+    expect(error).toBeInstanceOf(ServerStartupError);
+    // Refused before the backend exists, so there is nothing to close and the
+    // process never reaches the point where it would send `ready`.
+    expect(created).toBe(0);
+    expect(received(test1.messages)).toEqual([]);
+    const failures = test1
+      .logs()
+      .filter((line) => line.code === 'SERVER_STARTUP_FAILED');
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatchObject({
+      level: 'error',
+      msg: 'server process failed to start',
+      code: 'SERVER_STARTUP_FAILED',
+      reason: 'codeVersion must be a non-empty string',
+    });
+  });
+
+  test('rejects a non-string code version at runtime', async () => {
+    const test1 = harness();
+
+    const error = await rejectionOf(
+      startServer(test1.deps({ codeVersion: 7 as unknown as string })),
+    );
+
+    expect(error).toBeInstanceOf(ServerStartupError);
+    expect(received(test1.messages)).toEqual([]);
+    expect(
+      test1.logs().filter((line) => line.code === 'SERVER_STARTUP_FAILED'),
+    ).toHaveLength(1);
+  });
+
+  test('tags an Extension handler with the Extension name in context and logs', async () => {
+    const test1 = harness([
+      {
+        name: 'banking',
+        register: (registrar) => {
+          registrar.register('deposit', async (ctx) => {
+            ctx.logger.info({ detail: 'seen' }, 'handler ran');
+            return ctx.extension;
+          });
+        },
+      },
+    ]);
+
+    const { runtime } = await startServer(test1.deps());
+    const outcome = await runtime.executor.execute({
+      requestId: 'req-1',
+      connectionId: 'c1',
+      clientRequestId: 'client-1',
+      method: 'deposit',
+      payload: null,
+      timeoutMs: 1000,
+    });
+
+    expect(outcome).toEqual({ ok: true, result: 'banking' });
+    const handlerLines = test1
+      .logs()
+      .filter((line) => line.msg === 'handler ran');
+    expect(handlerLines).toHaveLength(1);
+    expect(handlerLines[0]).toMatchObject({
+      extension: 'banking',
+      requestId: 'req-1',
+      connectionId: 'c1',
+      clientRequestId: 'client-1',
+    });
+
+    await runtime.executor.close();
+  });
+
+  test('leaves inbound handlers unattached so messages stay buffered', async () => {
+    // The readiness barrier and the handler are the caller's, in that order. A
+    // handler installed here would deliver requests before the caller can say
+    // the process is active.
+    const test1 = harness([echoExtension()]);
+    const { runtime } = await startServer(test1.deps());
+
+    test1.portal.send(requestMessage());
+    await Promise.resolve();
+
+    expect(received(test1.messages)).toEqual([]);
+
+    await runtime.executor.close();
+  });
+
+  test('throws ServerStartupError, sends no ready and closes the backend when the self-check fails', async () => {
+    const backend = new MemoryStorageBackend({
+      capabilities: { maxTransactionDurationMs: Number.NaN },
+    });
+    const test1 = harness([echoExtension()]);
+
+    const error = await rejectionOf(
+      startServer(test1.deps({ createBackend: () => backend })),
+    );
+
+    if (!(error instanceof ServerStartupError)) {
+      throw new Error(`expected ServerStartupError, got ${error.name}`);
+    }
+    expect(error.reason).toContain('maxTransactionDurationMs');
+    expect(received(test1.messages)).toEqual([]);
+    // The backend was created, so it must not stay open (SPEC 6.2).
+    expect(() => backend.capabilities()).toThrow(/closed/);
+    expect(
+      test1.logs().filter((line) => line.code === 'SERVER_STARTUP_FAILED'),
+    ).toHaveLength(1);
+  });
+
+  test('throws ServerStartupError when the backend cannot be created', async () => {
+    const test1 = harness();
+
+    const error = await rejectionOf(
+      startServer(
+        test1.deps({
+          createBackend: () => {
+            throw new Error('disk unavailable');
+          },
+        }),
+      ),
+    );
+
+    expect(error).toBeInstanceOf(ServerStartupError);
+    expect(error.message).toContain('disk unavailable');
+    expect(received(test1.messages)).toEqual([]);
+  });
+
+  test('reports every skipped extension and still returns a runtime', async () => {
+    const backend = new MemoryStorageBackend({
+      capabilities: { transactions: 'none', concurrency: 'single' },
+    });
+    const test1 = harness([
+      {
+        name: 'banking',
+        requires: { transactions: 'full' },
+        register: () => undefined,
+      },
+      {
+        name: 'reporting',
+        requires: { concurrency: 'pooled' },
+        register: () => undefined,
+      },
+    ]);
+
+    const result = await startServer(
+      test1.deps({ createBackend: () => backend }),
+    );
+
+    expect(result.skippedExtensions).toBe(2);
+    expect(received(test1.messages)).toEqual([]);
+    const warnings = test1
+      .logs()
+      .filter(
+        (line) =>
+          line.msg === 'no extension registered: every extension was skipped',
+      );
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatchObject({ total: 2, skipped: 2 });
+
+    await result.runtime.executor.close();
+  });
+
+  test('a required extension with unmet requirements throws without ready', async () => {
+    const backend = new MemoryStorageBackend({
+      capabilities: { transactions: 'limited' },
+    });
+    const test1 = harness([
+      {
+        name: 'banking',
+        requires: { transactions: 'full' },
+        required: true,
+        register: () => undefined,
+      },
+    ]);
+
+    const error = await rejectionOf(
+      startServer(test1.deps({ createBackend: () => backend })),
+    );
+
+    expect(error).toBeInstanceOf(ServerStartupError);
+    expect(received(test1.messages)).toEqual([]);
+    expect(() => backend.capabilities()).toThrow(/closed/);
+  });
+
+  test('warns once per degraded capability at startup', async () => {
+    const backend = new MemoryStorageBackend({
+      capabilities: {
+        transactions: 'full',
+        concurrency: 'single',
+        snapshotRead: true,
+        uniqueConstraint: true,
+      },
+    });
+    const test1 = harness();
+
+    const { runtime } = await startServer(
+      test1.deps({ createBackend: () => backend }),
+    );
+
+    const warnings = test1
+      .logs()
+      .filter((line) => line.msg === 'storage capability degraded');
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatchObject({
+      level: 'warn',
+      capability: 'concurrency',
+      declared: 'single',
+    });
+
+    await runtime.executor.close();
+  });
+});

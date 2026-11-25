@@ -10,7 +10,7 @@
  * mismatch would leave the Server ready and the Portal waiting for a barrier
  * that never arrives.
  */
-import { describeValue, isRecord } from '../internal/guards.ts';
+import { describeValue, isRecord } from '../shared/guards.ts';
 import type { StorageCapabilities } from './types.ts';
 
 /** Transaction modes a backend may declare (SPEC 4.2). */

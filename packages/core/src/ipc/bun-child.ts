@@ -1,7 +1,7 @@
-import { messageOf } from '../internal/guards.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import { safeLogger } from '../logging/safe-logger.ts';
 import type { Logger } from '../logging/types.ts';
+import { messageOf } from '../shared/guards.ts';
 import type { IpcChannel } from './channel.ts';
 import { IpcChannelClosedError } from './channel.ts';
 import type { IpcMessage } from './protocol.ts';

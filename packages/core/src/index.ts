@@ -33,7 +33,7 @@ export type {
 } from './storage/types.ts';
 export type { StorageRequirements } from './storage/requirements.ts';
 export { unmetRequirements } from './storage/requirements.ts';
-export type { Extension, ExtensionRegistrar } from './runtime/extension.ts';
+export type { Extension, ExtensionRegistrar } from './server/extension.ts';
 export type {
   Transport,
   TransportConnection,
@@ -46,8 +46,8 @@ export type {
   Handler,
   HandlerOptions,
   RequestContext,
-} from './runtime/dispatcher.ts';
-export { Dispatcher } from './runtime/dispatcher.ts';
+} from './server/dispatcher.ts';
+export { Dispatcher } from './server/dispatcher.ts';
 export type {
   LogFields,
   LogLevel,
@@ -56,14 +56,14 @@ export type {
 } from './logging/types.ts';
 export { createJsonLogger } from './logging/json-logger.ts';
 export { safeLogger } from './logging/safe-logger.ts';
-export type { Codec, Envelope, ResponseEnvelope } from './runtime/codec.ts';
-export { JsonCodec } from './runtime/codec.ts';
+export type { Codec, Envelope, ResponseEnvelope } from './client/codec.ts';
+export { JsonCodec } from './client/codec.ts';
 export type {
   ExecutorOutcome,
   ExecutorRequest,
   RequestExecutor,
-} from './runtime/executor.ts';
-export { LocalExecutor } from './runtime/executor.ts';
+} from './shared/executor.ts';
+export { LocalExecutor } from './server/local-executor.ts';
 export {
   BusinessError,
   FRAMEWORK_CAPABILITY_UNSUPPORTED,
@@ -84,18 +84,18 @@ export {
   describeFailure,
   failureLogLevel,
   isFrameworkCode,
-} from './runtime/wire-codes.ts';
-export type { ConnectionLayerOptions } from './runtime/connection-layer.ts';
-export { ConnectionLayer } from './runtime/connection-layer.ts';
-export type { IpcExecutorOptions } from './runtime/ipc-executor-options.ts';
-export { IpcExecutor } from './runtime/ipc-executor.ts';
+} from './shared/wire-codes.ts';
+export type { ConnectionLayerOptions } from './portal/connection-layer.ts';
+export { ConnectionLayer } from './portal/connection-layer.ts';
+export type { IpcExecutorOptions } from './portal/executor/ipc-executor-options.ts';
+export { IpcExecutor } from './portal/executor/ipc-executor.ts';
 export type { ServerExitInfo, SpawnedServer } from './ipc/spawn-port.ts';
-export type { ServerProcessOptions } from './runtime/server-process.ts';
+export type { ServerProcessOptions } from './server/server-process.ts';
 export {
   runServerProcess,
   ServerChannelClosedError,
-} from './runtime/server-process.ts';
-export { ServerStartupError } from './runtime/server-startup.ts';
+} from './server/server-process.ts';
+export { ServerStartupError } from './server/server-startup.ts';
 export type { IpcChannel } from './ipc/channel.ts';
 export { IpcChannelClosedError } from './ipc/channel.ts';
 export type { IpcMessage, IpcParseResult } from './ipc/protocol.ts';

@@ -1,4 +1,4 @@
-import { messageOf } from '../internal/guards.ts';
+import { messageOf } from '../shared/guards.ts';
 import type { LogFields, LogLevel, Logger, LoggerOptions } from './types.ts';
 
 const LEVEL_ORDER: Record<LogLevel, number> = {
