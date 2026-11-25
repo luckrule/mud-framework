@@ -28,7 +28,7 @@ bun run test         # 包测试与仓库集成测试
 bash scripts/ci.sh --skip-install   # 一次跑完以上四项
 ```
 
-测试分层：`bun run test:unit` 跑各包测试（core 使用内存假后端与假传输，后端/传输包使用各自真实实现）；`bun run test:integration` 跑仓库集成测试（真实后端、真实传输与子进程）；`bun run smoke:package` 是发布前的手动 smoke，使用真实装配，不在 CI 门禁内。
+测试分层：`bun run test:unit` 跑各包测试（core 使用内存假后端与假传输，后端/传输包使用各自真实实现）；`bun run test:integration` 跑仓库集成测试（真实后端、真实传输与子进程）。
 
 `pre-commit` 钩子会自动执行 `bash scripts/ci.sh --skip-install`，不通过则拒绝提交。CI 调用同一脚本，本地通过即与 CI 一致。
 

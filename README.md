@@ -20,7 +20,7 @@
 mud-framework/
 ├── .githooks/         pre-commit 与 commit-msg 钩子
 ├── .github/           CI 配置与 PR 模板
-├── benchmarks/        手动性能基准，不接入 CI
+├── benchmarks/        手动 logger 性能基准，不接入 CI
 ├── docs/              规格、不变量与协作规范
 ├── examples/          最小双进程示例，从仓库根可直接运行
 ├── packages/          四个包：core、connector-ws、storage-sqlite，以及 private 的 test-support（仅测试辅助）

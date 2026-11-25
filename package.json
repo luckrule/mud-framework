@@ -14,10 +14,7 @@
     "test": "bun test --parallel",
     "test:unit": "bun test packages --parallel",
     "test:integration": "bun test tests/integration --parallel",
-    "smoke:package": "bun run scripts/package-smoke/index.ts",
-    "bench": "bun run benchmarks/logger.ts && bun run benchmarks/e2e.ts",
     "bench:logger": "bun run benchmarks/logger.ts",
-    "bench:e2e": "bun run benchmarks/e2e.ts",
     "prepare": "git config core.hooksPath .githooks || true"
   },
   "devDependencies": {
