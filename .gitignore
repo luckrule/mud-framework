@@ -8,6 +8,7 @@ logs/
 # local data
 *.sqlite
 examples/minimal/data/
+examples/game-slice/data/
 
 # environment
 .env
