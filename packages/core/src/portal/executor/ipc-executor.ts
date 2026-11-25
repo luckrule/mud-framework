@@ -1,9 +1,8 @@
 import { failure } from '../../ipc/outbound.ts';
-import type { ResultMessage } from '../../ipc/protocol.ts';
 import type { SpawnedServer } from '../../ipc/spawn-port.ts';
 import { createJsonLogger } from '../../logging/json-logger.ts';
 import { safeLogger } from '../../logging/safe-logger.ts';
-import type { LogFields, Logger } from '../../logging/types.ts';
+import type { Logger } from '../../logging/types.ts';
 import {
   DEFAULT_MAX_PENDING,
   DEFAULT_MAX_REPLAYS,
@@ -19,34 +18,23 @@ import type {
 } from '../../shared/executor.ts';
 import { messageOf } from '../../shared/guards.ts';
 import { requestLogFields } from '../../shared/identity.ts';
-import { effectiveTimeoutMs, tightenTimeout } from '../../shared/timeout.ts';
+import { tightenTimeout } from '../../shared/timeout.ts';
 import {
   FRAMEWORK_QUEUE_FULL,
   FRAMEWORK_SHUTDOWN,
   INTERNAL_ERROR,
 } from '../../shared/wire-codes.ts';
-import type { DeliveryHost } from './delivery-ledger.ts';
 import { DeliveryLedger } from './delivery-ledger.ts';
 import { ipcExecutorHealth } from './executor-health.ts';
 import type { ShutdownHost } from './executor-shutdown.ts';
 import { doClose } from './executor-shutdown.ts';
 import type { IpcExecutorOptions } from './ipc-executor-options.ts';
-import type { MessageHost } from './ipc-inbound.ts';
-import { onServerMessage } from './ipc-inbound.ts';
 import { PendingBuffer } from './ipc-pending.ts';
 import { RestartPolicy } from './restart-policy.ts';
-import type { ServerHandlers } from './server-launcher.ts';
-import {
-  ClosedWaiter,
-  attachServer,
-  buildServer,
-  closeChannelQuietly,
-  killQuietly,
-  waitForExit,
-} from './server-launcher.ts';
 import type { ServerState } from './server-slot.ts';
 import { ServerSlot } from './server-slot.ts';
-import type { SwitchHost, SwitchOperation } from './version-switch.ts';
+import { ServerSupervisor } from './server-supervisor.ts';
+import type { SwitchDeps, SwitchOperation } from './version-switch.ts';
 import { VersionSwitch } from './version-switch.ts';
 
 export type { IpcExecutorOptions };
@@ -68,49 +56,24 @@ export type { IpcExecutorOptions };
  * `execute` never throws and always settles by the request deadline, because
  * the connection layer advances a connection's ordered chain on settlement and
  * a hanging promise would stall every later request on that connection.
+ *
+ * The process lifecycle lives in `ServerSupervisor`; this class owns the
+ * admission and settlement surface those processes serve.
  */
-export class IpcExecutor implements RequestExecutor {
-  /**
-   * The factory the next launch uses. A successful `switchTo` replaces it, so a
-   * crash after the switch restarts the process factory that was actually
-   * running rather than the one the executor was constructed with.
-   */
-  private spawn: () => SpawnedServer;
-  private readonly portalTimeoutMs: number;
-  private readonly maxReplays: number;
-  private readonly shutdownTimeoutMs: number;
-  private readonly startTimeoutMs: number;
-  private readonly logger: Logger;
+export class IpcExecutor implements RequestExecutor, SwitchDeps {
+  readonly shutdownTimeoutMs: number;
+  readonly startTimeoutMs: number;
+  readonly logger: Logger;
   private readonly buffer: PendingBuffer;
   /** Delivery, deadlines and settlement: everything that resolves a pending entry. */
   private readonly ledger: DeliveryLedger;
   /** Sole owner of `status`, `server`, the generation counter and `switching`. */
-  private readonly slot = new ServerSlot<SwitchOperation>();
+  readonly slot = new ServerSlot<SwitchOperation>();
   /** The `switchTo` sequence; it writes state only through `slot`. */
   private readonly versionSwitch: VersionSwitch;
-  /** The Server→Portal handlers' view of this executor. */
-  private readonly messageHost: MessageHost;
-  private effectiveTimeoutMs: number;
-  /** The crash streak, its backoff and the stability window that ends it. */
-  private readonly restart: RestartPolicy;
-  private startTimer: ReturnType<typeof setTimeout> | undefined;
-  private generationTimer:
-    | { server: ServerState; timer: ReturnType<typeof setTimeout> }
-    | undefined;
-  private startWaiter:
-    | { resolve: () => void; reject: (error: Error) => void }
-    | undefined;
-  private readonly closedWaiter = new ClosedWaiter();
+  /** Launch, crash recovery, restart backoff and Server→Portal messages. */
+  private readonly supervisor: ServerSupervisor;
   private closePromise: Promise<void> | undefined;
-  private pendingRecovery: { backoffMs: number; blocked: boolean } | undefined;
-  /**
-   * Set when a close could not confirm every exit. Unlike `pendingRecovery` it
-   * is never lifted by a late exit: the close is already terminal, and the
-   * unconfirmed writer is exactly what health must keep reporting (INV-002).
-   */
-  private closeBlocked = false;
-  /** Separates the first start from a restart when deriving health. */
-  private handshakeCompleted = false;
 
   constructor(options: IpcExecutorOptions) {
     if (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) {
@@ -131,17 +94,6 @@ export class IpcExecutor implements RequestExecutor {
         `restartBackoffMs must be a positive finite number, got ${restartBackoffMs}`,
       );
     }
-    this.spawn = options.spawn;
-    this.portalTimeoutMs = options.timeoutMs;
-    this.maxReplays = maxReplays;
-    // Defaults must exceed the backoff cap (5000ms) and the longest request,
-    // otherwise a Server that dies on its first request would reset the streak
-    // before it crashed and restart with zero backoff every time.
-    this.restart = new RestartPolicy({
-      baseBackoffMs: restartBackoffMs,
-      stableResetMs:
-        options.stableResetMs ?? Math.max(30_000, options.timeoutMs),
-    });
     this.shutdownTimeoutMs =
       options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
     const startTimeoutMs =
@@ -161,185 +113,78 @@ export class IpcExecutor implements RequestExecutor {
       options.logger ??
         createJsonLogger({ bindings: { component: 'ipc-executor' } }),
     );
-    // Until `ready` declares the backend ceiling, the Portal ceiling applies.
-    this.effectiveTimeoutMs = options.timeoutMs;
-    // The host is a live view, not a snapshot: the getter and the method read
-    // this executor's state when the ledger decides, so a value captured here
-    // could not go stale across a status transition.
-    const slot = this.slot;
-    const host: DeliveryHost = {
+    // Defaults must exceed the backoff cap (5000ms) and the longest request,
+    // otherwise a Server that dies on its first request would reset the streak
+    // before it crashed and restart with zero backoff every time.
+    const restart = new RestartPolicy({
+      baseBackoffMs: restartBackoffMs,
+      stableResetMs:
+        options.stableResetMs ?? Math.max(30_000, options.timeoutMs),
+    });
+    // The callbacks read live state when the ledger decides, so a value
+    // captured here could not go stale across a status transition.
+    this.ledger = new DeliveryLedger({
+      buffer: this.buffer,
       logger: this.logger,
-      maxReplays: this.maxReplays,
-      get isTerminal(): boolean {
-        return slot.isTerminal;
-      },
-      currentServer: () => slot.server,
-      onServerLost: (server, code, signal, reason) => {
-        this.onServerLost(server, code, signal, reason);
-      },
-    };
-    this.ledger = new DeliveryLedger({ buffer: this.buffer, host });
-    this.versionSwitch = new VersionSwitch(this.switchHost());
-    this.messageHost = this.messageHostOf();
-  }
-
-  /**
-   * The switch's view of this executor. Every member reads live state or calls
-   * back into the executor, so the switch never holds a stale status or Server.
-   */
-  private switchHost(): SwitchHost {
-    return {
-      logger: this.logger,
-      slot: this.slot,
-      startTimeoutMs: this.startTimeoutMs,
-      shutdownTimeoutMs: this.shutdownTimeoutMs,
-      adoptSpawn: (spawn) => {
-        this.spawn = spawn;
-      },
-      attach: (server) => {
-        this.slot.track(server);
-        attachServer(server, this.serverHandlers(server));
-      },
-      pump: () => {
-        this.pump();
-      },
+      maxReplays,
+      isTerminal: () => this.slot.isTerminal,
       currentServer: () => this.slot.server,
-      recordAbandoned: (server) => {
-        this.slot.track(server);
+      onServerLost: (server, code, signal, reason) => {
+        this.supervisor.onServerLost(server, code, signal, reason);
       },
-      resolveClosed: (server) => {
-        this.resolveClosed(server);
-      },
-      clearRestartTimer: () => {
-        this.restart.clearRestartTimer();
-      },
-      startStableTimer: () => {
-        this.restart.startStableClock();
-      },
-      adoptCeiling: (declaredMaxDurationMs) => {
-        this.adoptCeiling(declaredMaxDurationMs);
-      },
-      recoverAfterExits: () => {
-        this.recoverAfterExits(this.restart.nextBackoffMs());
-      },
-    };
+    });
+    this.versionSwitch = new VersionSwitch(this);
+    this.supervisor = new ServerSupervisor({
+      logger: this.logger,
+      slot: this.slot,
+      ledger: this.ledger,
+      versionSwitch: this.versionSwitch,
+      restart,
+      startTimeoutMs,
+      portalTimeoutMs: options.timeoutMs,
+      spawn: options.spawn,
+    });
   }
 
   /**
-   * The message handlers' view of this executor. Every member reads live state
-   * or calls back into the executor, so the handlers never hold a stale status
-   * or Server.
+   * The switch's dependencies. They delegate to the process supervisor, which
+   * owns launching, delivery and the restart clock.
    */
-  private messageHostOf(): MessageHost {
-    return {
-      logger: this.logger,
-      slot: this.slot,
-      adoptReady: (server, declaredMaxDurationMs) => {
-        this.clearGenerationTimer(server);
-        this.slot.markReady(server);
-        // The crash streak ends only after a stable run, not at the handshake:
-        // a Server that reaches `ready` and then dies on its first request
-        // would otherwise reset the backoff and restart immediately, forever.
-        this.restart.startStableClock();
-        this.adoptCeiling(declaredMaxDurationMs);
-        return this.effectiveTimeoutMs;
-      },
-      pump: () => {
-        this.pump();
-      },
-      resolveStart: () => {
-        this.resolveStart();
-      },
-      onResult: (message) => {
-        this.onResult(message);
-      },
-      onServerLost: (server, code, signal, reason) => {
-        this.onServerLost(server, code, signal, reason);
-      },
-      resolveClosed: (server) => {
-        this.resolveClosed(server);
-      },
-    };
+  adoptSpawn(spawn: () => SpawnedServer): void {
+    this.supervisor.adoptSpawn(spawn);
+  }
+
+  attach(server: ServerState): void {
+    this.supervisor.attach(server);
+  }
+
+  pump(): void {
+    this.supervisor.pump();
+  }
+
+  resolveClosed(server: ServerState): void {
+    this.supervisor.resolveClosed(server);
+  }
+
+  clearRestartTimer(): void {
+    this.supervisor.clearRestartTimer();
+  }
+
+  startStableTimer(): void {
+    this.supervisor.startStableClock();
+  }
+
+  adoptCeiling(declaredMaxDurationMs: number): void {
+    this.supervisor.adoptCeiling(declaredMaxDurationMs);
+  }
+
+  recoverAfterExits(): void {
+    this.supervisor.recoverAfterExits();
   }
 
   /** Spawns the Server, sends `hello` and resolves once the Server is `ready`. */
-  async start(): Promise<void> {
-    if (this.slot.status !== 'idle') {
-      throw new Error(`ipc executor cannot start while ${this.slot.status}`);
-    }
-    this.slot.beginStart();
-    const ready = new Promise<void>((resolve, reject) => {
-      this.startWaiter = { resolve, reject };
-    });
-    // Bounded from the first launch: without this a Server that never reaches
-    // the handshake (a broken entry script, a failing spawn) leaves `start`
-    // pending forever while the restart loop keeps spawning processes.
-    this.startTimer = setTimeout(() => {
-      this.onStartTimeout();
-    }, this.startTimeoutMs);
-    this.launch();
-    await ready;
-  }
-
-  /**
-   * Gives up on a Server that never became ready. The restart loop is stopped
-   * rather than left running: continuing to spawn would keep burning CPU and
-   * ports on a configuration error, and the caller already has the failure.
-   */
-  private onStartTimeout(generation?: ServerState): void {
-    if (
-      this.slot.isTerminal ||
-      (generation === undefined
-        ? this.startWaiter === undefined
-        : this.slot.server !== generation || generation.ready)
-    ) {
-      return;
-    }
-    this.clearStartTimer();
-    this.clearGenerationTimer(generation);
-    const attempts = this.restart.attempts;
-    this.restart.clearRestartTimer();
-    this.restart.clearStableClock();
-    this.slot.markFailed();
-    this.logger.error(
-      { timeoutMs: this.startTimeoutMs, attempts },
-      'server did not become ready before the start timeout',
-    );
-    // A Server that is up but never handshook has no owner any more; leaving it
-    // running would be an orphan writer (INV-002).
-    const server = this.slot.server;
-    if (server !== undefined && this.slot.clearIfCurrent(server)) {
-      this.abandonServer(server);
-    }
-    this.ledger.failAllPending(
-      INTERNAL_ERROR,
-      `ipc executor failed to start: server did not become ready within ${this.startTimeoutMs}ms`,
-      'executor failed to start',
-    );
-    this.rejectStart(
-      new Error(
-        `ipc executor failed to start: server did not become ready within ${this.startTimeoutMs}ms`,
-      ),
-    );
-  }
-
-  /** Closes the link and kills the process, without the graceful handshake. */
-  private abandonServer(server: ServerState): void {
-    // Marked closed first so the exit that follows does not run `onServerLost`
-    // again: it would log a second "server process lost" error for a crash this
-    // timeout already reported.
-    server.closed = true;
-    if (!server.exited) {
-      try {
-        server.kill();
-      } catch (error) {
-        this.logger.warn(
-          { pid: server.pid, reason: messageOf(error) },
-          'server could not be killed after the start timeout',
-        );
-      }
-    }
-    closeChannelQuietly(server, 'start timeout', this.logger);
+  start(): Promise<void> {
+    return this.supervisor.start();
   }
 
   execute(request: ExecutorRequest): Promise<ExecutorOutcome> {
@@ -395,7 +240,7 @@ export class IpcExecutor implements RequestExecutor {
         failure(FRAMEWORK_SHUTDOWN, 'ipc executor is shutting down'),
       );
     }
-    if (this.pendingRecovery?.blocked) {
+    if (this.supervisor.recoveryBlocked) {
       return Promise.resolve(
         failure(
           INTERNAL_ERROR,
@@ -437,7 +282,7 @@ export class IpcExecutor implements RequestExecutor {
       // A caller-supplied deadline may only tighten the ceiling this executor
       // already promised; otherwise the buffer would outlive the caller's own
       // terminal state and replay work for an answer nobody reads (SPEC 3.4).
-      tightenTimeout(this.effectiveTimeoutMs, request.timeoutMs),
+      tightenTimeout(this.supervisor.effectiveTimeoutMs, request.timeoutMs),
     );
     if (pending === undefined) {
       // Unreachable after the pre-check above, but `add` owns the cap and may
@@ -462,7 +307,7 @@ export class IpcExecutor implements RequestExecutor {
         // Queued until a Server is ready; a no-op otherwise. During a switch
         // this is the whole policy: the request waits for the new generation
         // rather than reaching a process that is about to be retired.
-        this.pump();
+        this.supervisor.pump();
       }
     } catch (error) {
       // Delivery is defensive against a throwing channel or callback. The
@@ -512,10 +357,9 @@ export class IpcExecutor implements RequestExecutor {
     const server = this.slot.server;
     return ipcExecutorHealth({
       status: this.slot.status,
-      handshakeCompleted: this.handshakeCompleted,
+      handshakeCompleted: this.supervisor.handshakeCompleted,
       serverReady: server !== undefined && server.ready && !server.closed,
-      recoveryBlocked:
-        this.pendingRecovery?.blocked === true || this.closeBlocked,
+      recoveryBlocked: this.supervisor.recoveryBlocked,
     });
   }
 
@@ -571,10 +415,11 @@ export class IpcExecutor implements RequestExecutor {
 
   /**
    * The close sequence's view of this executor. Every member reads live state
-   * or calls back into the executor, so a step never holds a stale status,
-   * Server or start waiter.
+   * or calls back into the owner, so a step never holds a stale status, Server
+   * or start waiter.
    */
   private shutdownHost(): ShutdownHost {
+    const supervisor = this.supervisor;
     return {
       logger: this.logger,
       slot: this.slot,
@@ -594,331 +439,31 @@ export class IpcExecutor implements RequestExecutor {
       },
       restart: {
         clearRestartTimer: () => {
-          this.restart.clearRestartTimer();
+          supervisor.clearRestartTimer();
         },
         clearStableClock: () => {
-          this.restart.clearStableClock();
+          supervisor.clearStableClock();
         },
       },
       recovery: {
         clear: () => {
-          this.pendingRecovery = undefined;
-          this.closeBlocked = false;
+          supervisor.clearRecoveryBarrier();
         },
         block: () => {
-          this.closeBlocked = true;
+          supervisor.blockRecoveryBarrier();
         },
       },
       waiters: {
         clearStartTimer: () => {
-          this.clearStartTimer();
-          this.clearGenerationTimer();
+          supervisor.clearStartTimers();
         },
         rejectStart: (error) => {
-          this.rejectStart(error);
+          supervisor.rejectStart(error);
         },
         waitForClosed: (server, waitMs) =>
-          this.closedWaiter.waitForClosed(server, waitMs),
+          supervisor.waitForClosed(server, waitMs),
       },
       listPendingExits: () => this.slot.pendingExits,
     };
-  }
-
-  private resolveClosed(server: ServerState): void {
-    this.closedWaiter.resolve(server);
-  }
-
-  private resolveStart(): void {
-    this.handshakeCompleted = true;
-    const waiter = this.startWaiter;
-    this.startWaiter = undefined;
-    this.clearStartTimer();
-    waiter?.resolve();
-  }
-
-  private rejectStart(error: Error): void {
-    const waiter = this.startWaiter;
-    this.startWaiter = undefined;
-    this.clearStartTimer();
-    waiter?.reject(error);
-  }
-
-  private clearStartTimer(): void {
-    if (this.startTimer === undefined) {
-      return;
-    }
-    clearTimeout(this.startTimer);
-    this.startTimer = undefined;
-  }
-
-  private clearGenerationTimer(server?: ServerState): void {
-    if (
-      this.generationTimer === undefined ||
-      (server !== undefined && this.generationTimer.server !== server)
-    ) {
-      return;
-    }
-    clearTimeout(this.generationTimer.timer);
-    this.generationTimer = undefined;
-  }
-
-  private launch(): void {
-    if (this.slot.isTerminal || this.slot.pendingExits.length > 0) {
-      return;
-    }
-    let spawned: SpawnedServer;
-    try {
-      spawned = this.spawn();
-    } catch (error) {
-      // A failed spawn is another crash: keep buffering and back off.
-      const backoffMs = this.restart.nextBackoffMs();
-      this.logger.error(
-        { reason: messageOf(error), backoffMs },
-        'server spawn failed',
-      );
-      this.slot.beginStart();
-      this.scheduleRestart(backoffMs);
-      return;
-    }
-    const server = buildServer(spawned, this.slot.nextGeneration());
-    this.slot.trackSpawning(server);
-    this.clearGenerationTimer();
-    this.generationTimer = {
-      server,
-      timer: setTimeout(() => {
-        if (this.generationTimer?.server === server) {
-          this.onStartTimeout(server);
-        }
-      }, this.startTimeoutMs),
-    };
-    attachServer(server, this.serverHandlers(server));
-    try {
-      server.channel.send({ type: 'hello' });
-    } catch (error) {
-      this.onServerLost(
-        server,
-        null,
-        null,
-        `hello failed: ${messageOf(error)}`,
-      );
-    }
-  }
-
-  /**
-   * Binds this executor's handlers to one process, so a staged process is
-   * observed exactly like the current one.
-   */
-  private serverHandlers(server: ServerState): ServerHandlers {
-    return {
-      onMessage: (raw) => {
-        onServerMessage(this.messageHost, server, raw);
-      },
-      onLost: (code, signal, reason) => {
-        this.onServerLost(server, code, signal, reason);
-      },
-      onExit: () => {
-        this.slot.confirmExit(server);
-        this.resumeRecovery();
-      },
-    };
-  }
-
-  /**
-   * Applies the backend's declared request ceiling to the buffered requests.
-   * Only ever tightens: a later Server declaring a longer ceiling must not
-   * extend a deadline the Portal already promised, or a crash loop could keep a
-   * request alive past its original ceiling (SPEC 3.4).
-   */
-  private adoptCeiling(declaredMaxDurationMs: number): void {
-    this.effectiveTimeoutMs = effectiveTimeoutMs(
-      this.portalTimeoutMs,
-      declaredMaxDurationMs,
-    );
-    this.ledger.tightenDeadlines(this.effectiveTimeoutMs);
-  }
-
-  private onResult(message: ResultMessage): void {
-    // `requestSessionId` is envelope metadata for logging only: it must never
-    // reach the settled outcome. Splitting it off here with `type` and
-    // `requestId` is what keeps the outcome equal to `ExecutorOutcome`.
-    const {
-      type: _type,
-      requestId: _requestId,
-      requestSessionId,
-      ...outcome
-    } = message;
-    const pending = this.buffer.get(message.requestId);
-    if (pending === undefined) {
-      // A result for a request that already reached a Portal-decided terminal
-      // state. Expected, not an error (SPEC 7.3 keeps the id stable, so the
-      // correlation still works — there is just nothing left to settle).
-      // The pending entry is gone, so the Session comes from the result's echo
-      // of the entry Session, which the Server sends on every result including
-      // failures.
-      const fields: LogFields = {
-        requestId: message.requestId,
-        reason: 'request is no longer buffered',
-      };
-      if (requestSessionId !== undefined) {
-        fields.sessionId = requestSessionId;
-      }
-      this.logger.debug(fields, 'late result discarded');
-      return;
-    }
-    const fields: LogFields = {
-      ...requestLogFields(pending.request),
-      durationMs: Date.now() - pending.startedAt,
-    };
-    // `sessionId` stays the entry Session from `requestLogFields`; a routing
-    // change is reported separately, never as a replacement id.
-    if (message.ok && message.sessionChange !== undefined) {
-      fields.sessionChange = message.sessionChange;
-    }
-    this.logger.debug(fields, 'result received');
-    this.ledger.settle(pending, outcome);
-  }
-
-  private onServerLost(
-    server: ServerState,
-    code: number | null,
-    signal: string | null,
-    reason: string,
-  ): void {
-    if (server.closed) {
-      return;
-    }
-    server.closed = true;
-    server.closedSignal.resolve();
-    this.clearGenerationTimer(server);
-    // The switch owns the loss of a process it staged or is retiring; the
-    // branches and their order live there. A promoted process that dies is an
-    // ordinary crash, so this returns false and the crash path below runs.
-    if (this.versionSwitch.onServerLost(server, reason)) {
-      return;
-    }
-    // A stable clock from the dead generation must not end the crash streak.
-    this.restart.clearStableClock();
-    if (server.retiring) {
-      // A switch retired this process but had already settled (promoted or
-      // rolled back) before its exit landed. Its exit is expected: no crash
-      // line and no restart beside the current Server.
-      this.resolveClosed(server);
-      return;
-    }
-    this.slot.clearIfCurrent(server);
-    // A close that is waiting for `closed` will never get it now.
-    this.resolveClosed(server);
-    if (!server.exited) {
-      // The link died but the process may still be running: it can no longer
-      // be reached or asked to stop, and restarting beside it would give the
-      // storage two writers (INV-002). Kill before spawning a replacement, and
-      // wait for it to actually go: SIGKILL returning is not the process
-      // releasing its storage.
-      this.logger.warn(
-        { pid: server.pid, reason },
-        'server channel lost while the process was alive; killing it',
-      );
-      killQuietly(server, this.logger);
-    }
-    if (this.slot.isTerminal) {
-      // SPEC 6.3: no restart while shutting down; nothing can complete these.
-      this.ledger.failAllPending(
-        FRAMEWORK_SHUTDOWN,
-        'server process exited during shutdown',
-        'server lost during shutdown',
-      );
-      return;
-    }
-    const backoffMs = this.restart.nextBackoffMs();
-    this.logger.error(
-      { pid: server.pid, exitCode: code, signal, backoffMs, reason },
-      'server process lost',
-    );
-    this.recoverAfterExits(backoffMs);
-  }
-
-  private recoverAfterExits(backoffMs: number): void {
-    if (this.slot.isTerminal) {
-      return;
-    }
-    this.slot.beginStart();
-    const recovery = { backoffMs, blocked: false };
-    this.pendingRecovery = recovery;
-    const pending = this.slot.pendingExits;
-    if (pending.length === 0) {
-      this.resumeRecovery();
-      return;
-    }
-    void Promise.all(
-      pending.map(async (server) => {
-        const exited = await waitForExit(server, this.logger);
-        this.slot.confirmExit(server);
-        return exited;
-      }),
-    ).then((exited) => {
-      if (this.pendingRecovery !== recovery || this.slot.isTerminal) {
-        return undefined;
-      }
-      if (exited.every(Boolean)) {
-        this.resumeRecovery();
-      } else {
-        recovery.blocked = true;
-        this.logger.error(
-          { pendingExits: this.slot.pendingExits.length },
-          'server recovery blocked: process exit is unconfirmed',
-        );
-        this.ledger.failAllPending(
-          INTERNAL_ERROR,
-          'server recovery blocked: process exit is unconfirmed',
-          'server exit is unconfirmed',
-        );
-      }
-      return undefined;
-    });
-  }
-
-  private resumeRecovery(): void {
-    if (
-      this.slot.isTerminal ||
-      this.slot.pendingExits.length > 0 ||
-      this.pendingRecovery === undefined
-    ) {
-      return;
-    }
-    const { backoffMs } = this.pendingRecovery;
-    this.pendingRecovery = undefined;
-    this.scheduleRestart(backoffMs);
-  }
-
-  /**
-   * Arms the restart unless the executor is already shutting down. The terminal
-   * check stays here because it is the process state machine's decision, not the
-   * policy's: a `RestartPolicy` never reads the slot.
-   */
-  private scheduleRestart(backoffMs: number): void {
-    if (this.slot.isTerminal) {
-      return;
-    }
-    this.restart.scheduleRestart(backoffMs, () => {
-      this.launch();
-    });
-  }
-
-  /**
-   * Re-delivers the buffered requests when the Server is not ready or a switch
-   * is in progress. The hot path sends a single request directly through
-   * `ledger.deliver`; this is the catch-up path after a barrier or a failed
-   * switch.
-   *
-   * The switching gate stays here because it is executor state: while a
-   * replacement is being staged or the previous process is being retired,
-   * delivering now would send a request to a process the switch is draining.
-   * It stays buffered until the replacement is promoted and this runs again.
-   */
-  private pump(): void {
-    if (this.slot.status === 'switching') {
-      return;
-    }
-    this.ledger.flush(this.slot.server);
   }
 }

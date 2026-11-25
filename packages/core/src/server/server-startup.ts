@@ -7,7 +7,7 @@ import type { StorageBackend, StorageCapabilities } from '../storage/types.ts';
 import { Dispatcher } from './dispatcher.ts';
 import type { Extension, ExtensionRegistrar } from './extension.ts';
 import { LocalExecutor } from './local-executor.ts';
-import type { ServerProcessOptions } from './server-process.ts';
+import type { ServerProcessOptions } from './server-process-options.ts';
 
 /**
  * The process could not reach the readiness barrier: backend creation, the

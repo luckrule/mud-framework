@@ -1,6 +1,6 @@
 import { createProcessChannel } from '../ipc/bun-child.ts';
 import type { IpcChannel } from '../ipc/channel.ts';
-import { preparedMessage, readyMessage } from '../ipc/outbound.ts';
+import { preparedMessage } from '../ipc/outbound.ts';
 import type {
   CancelMessage,
   IpcMessage,
@@ -13,59 +13,20 @@ import { safeLogger } from '../logging/safe-logger.ts';
 import type { Logger } from '../logging/types.ts';
 import { messageOf } from '../shared/guards.ts';
 import { requestLogFields } from '../shared/identity.ts';
-import { elapsedMs, settleWithin } from '../shared/timeout.ts';
-import type { StorageBackend } from '../storage/types.ts';
-import type { DispatcherOptions } from './dispatcher.ts';
-import type { Extension } from './extension.ts';
-import { RequestRunner } from './request-runner.ts';
+import type { RequestRunner } from './request-runner.ts';
+import type { ActivationDeps } from './server-activation.ts';
+import { startAndServe } from './server-activation.ts';
+import {
+  handleChannelClose,
+  handleParentGone,
+  ParentWatch,
+} from './server-liveness.ts';
+import type { ServerProcessOptions } from './server-process-options.ts';
+import { ABORT_TIMEOUT_MS, ServerShutdown } from './server-shutdown.ts';
 import type { Runtime } from './server-startup.ts';
-import { ServerStartupError, startServer } from './server-startup.ts';
+import { ServerStartupError } from './server-startup.ts';
 
-export interface ServerProcessOptions {
-  /** Builds the storage backend. Called once per process start. */
-  createBackend: () => Promise<StorageBackend> | StorageBackend;
-  /**
-   * Extensions in registration order. Each is checked against the backend
-   * before its `register` runs (SPEC 4.3).
-   */
-  extensions: readonly Extension[];
-  /** Framework-side request ceiling; effective = min(this, backend max). */
-  timeoutMs: number;
-  /**
-   * Optional access policy for every registered handler (SPEC 3.7). Forwarded
-   * unchanged to the dispatcher this process creates; returning false refuses
-   * a request with `FORBIDDEN` before its transaction opens.
-   */
-  authorize?: DispatcherOptions['authorize'];
-  logger?: Logger;
-  /**
-   * The IPC channel; defaults to the real process channel.
-   *
-   * At most one `runServerProcess` per OS process may use the real channel:
-   * `createProcessChannel` is a process-level singleton and a second one throws.
-   * Two Servers in one process would receive each other's requests and both
-   * write to storage (INV-002).
-   */
-  channel?: IpcChannel;
-  /**
-   * Overrides the budget for each abort step (see `ABORT_TIMEOUT_MS`). Exists
-   * for tests, which would otherwise have to wait the real 5s; a deployment has
-   * no reason to set it.
-   */
-  abortTimeoutMs?: number;
-  /**
-   * Overrides the parent-liveness poll interval. 0 disables the poll, which is
-   * what a test harness with an in-memory channel needs: there is no real
-   * parent to watch, and a background timer would outlive the test.
-   */
-  parentCheckIntervalMs?: number;
-  /**
-   * Reads the current parent pid. Defaults to `process.ppid`; injectable so a
-   * test can simulate a reparented process, which cannot be done for real from
-   * inside the test process.
-   */
-  readParentPid?: () => number;
-}
+export type { ServerProcessOptions };
 
 /**
  * The link to Portal went away without `shutdown`. The process has no one left
@@ -81,24 +42,6 @@ export class ServerChannelClosedError extends Error {
     this.reason = reason;
   }
 }
-
-/**
- * Budget for each step of an abort (Portal died, nobody can read a result).
- * Deliberately a fixed value unrelated to `timeoutMs`: nobody is waiting for
- * this process, and every second of a long wait is a second this orphaned
- * process keeps writing to storage beside the next Server (INV-002). A short
- * cap is the right trade: a handler that cannot finish in 5s is abandoned
- * rather than honoured.
- */
-const ABORT_TIMEOUT_MS = 5000;
-
-/**
- * How often the Server checks whether Portal is still alive. `process.ppid`
- * changing means the parent died and this process was reparented; the IPC
- * `disconnect` event does not fire for an abrupt parent death, so without this
- * poll an orphan could keep running (and writing) indefinitely.
- */
-const PARENT_CHECK_INTERVAL_MS = 500;
 
 /**
  * Where the two-phase activation has got to (ADR-0007). Only `active` may run
@@ -150,6 +93,8 @@ class ServerProcess {
    * process before that happened; rejects when startup failed.
    */
   private readonly activation = Promise.withResolvers<void>();
+  private readonly shutdown: ServerShutdown;
+  private readonly parentWatch: ParentWatch;
   private phase: Phase = 'awaiting-hello';
   /**
    * True once input that arrived before `ready` has been reported. A request or
@@ -158,8 +103,6 @@ class ServerProcess {
    * One flag for both: they are the same fault.
    */
   private preReadyInputLogged = false;
-  /** Set while the parent-liveness poll is installed; cleared on completion. */
-  private parentTimer: ReturnType<typeof setInterval> | undefined;
   /**
    * The running backend and dispatcher. Stored because the parent-liveness poll
    * fires outside the message flow, where the runtime is not a parameter.
@@ -193,6 +136,32 @@ class ServerProcess {
     );
     this.channel =
       options.channel ?? createProcessChannel({ logger: this.logger });
+    this.shutdown = new ServerShutdown({
+      logger: this.logger,
+      channel: this.channel,
+      readAbortBudgetMs: () => options.abortTimeoutMs ?? ABORT_TIMEOUT_MS,
+      sendQuietly: (message, what) => {
+        this.sendQuietly(message, what);
+      },
+      markShuttingDown: () => {
+        this.enterShuttingDown();
+      },
+      complete: () => {
+        this.completion.resolve();
+      },
+      rejectCompletion: (reason) => {
+        this.completion.reject(new ServerChannelClosedError(reason));
+      },
+    });
+    this.parentWatch = new ParentWatch(
+      {
+        parentCheckIntervalMs: options.parentCheckIntervalMs,
+        readParentPid: options.readParentPid,
+      },
+      () => {
+        this.onParentGone();
+      },
+    );
     // A startup failure throws out of `run` before it awaits the completion,
     // so a later rejection there must not surface as an unhandled rejection.
     void this.completion.promise.catch(() => undefined);
@@ -203,7 +172,7 @@ class ServerProcess {
     try {
       await this.begin();
     } catch (error) {
-      this.stopParentWatch();
+      this.parentWatch.stop();
       // The failure is already reported. Marking the close as ours keeps the
       // early `onClose` handler from logging a second, misleading
       // `IPC_CHANNEL_CLOSED` for the link this line closes.
@@ -216,7 +185,7 @@ class ServerProcess {
     } finally {
       // Also on the failure paths (a closed channel rejects): a live interval
       // would keep the process alive after the caller already got its answer.
-      this.stopParentWatch();
+      this.parentWatch.stop();
     }
   }
 
@@ -236,74 +205,20 @@ class ServerProcess {
     this.channel.onClose((reason) => {
       this.onChannelClose(reason);
     });
-    this.startParentWatch();
+    this.parentWatch.start();
     await this.activation.promise;
   }
 
-  /**
-   * Watches for the Portal dying without closing the link. `process.ppid` is
-   * read on an interval because an abrupt parent death (SIGKILL) reparents this
-   * process without firing `disconnect`; without the poll the orphan would keep
-   * running and, worse, keep writing to storage beside the next Server
-   * (INV-002). The timer is unref'd so it never keeps the process alive.
-   */
-  private startParentWatch(): void {
-    const intervalMs =
-      this.options.parentCheckIntervalMs ?? PARENT_CHECK_INTERVAL_MS;
-    if (intervalMs <= 0) {
-      return;
-    }
-    const readParentPid = this.options.readParentPid ?? (() => process.ppid);
-    const parentPid = readParentPid();
-    this.parentTimer = setInterval(() => {
-      if (readParentPid() === parentPid) {
-        return;
-      }
-      this.stopParentWatch();
-      this.onParentGone();
-    }, intervalMs);
-    this.parentTimer.unref();
-  }
-
-  private stopParentWatch(): void {
-    if (this.parentTimer === undefined) {
-      return;
-    }
-    clearInterval(this.parentTimer);
-    this.parentTimer = undefined;
-  }
-
   private onParentGone(): void {
-    const previous = this.phase;
-    if (previous === 'shutting-down') {
-      return;
-    }
-    this.phase = 'shutting-down';
-    this.parentGoneReason = 'the parent process is gone';
-    this.logger.error(
-      { code: 'IPC_PARENT_GONE', reason: 'the parent process is gone' },
-      'parent process gone; server stopping',
-    );
-    const runtime = this.runtime;
-    const runner = this.runner;
-    if (runtime !== undefined && runner !== undefined) {
-      void this.abort(runtime, runner, 'the parent process is gone');
-      return;
-    }
-    if (previous === 'starting') {
-      // `startServer` is mid-flight and owns what it opened: it closes the
-      // backend and rejects the activation when it finishes, so rejecting here
-      // would let the caller exit the process while that close is in flight.
-      return;
-    }
-    // ADR-0007: before activation there is no storage to drain, but `run()` is
-    // parked on `activation.promise`, so rejecting it is what makes the process
-    // return instead of outliving the Portal that started it. Closing the link
-    // is what lets the event loop empty; without it an orphan lingers.
-    this.activation.reject(
-      new ServerChannelClosedError('the parent process is gone'),
-    );
-    this.channel.close('the parent process is gone');
+    handleParentGone({
+      ...this.closeDeps(),
+      recordParentGone: (reason) => {
+        this.parentGoneReason = reason;
+      },
+      closeChannel: (reason) => {
+        this.channel.close(reason);
+      },
+    });
   }
 
   /**
@@ -330,130 +245,6 @@ class ServerProcess {
       this.phase = 'shutting-down';
       this.activation.reject(error);
     }
-  }
-
-  /**
-   * Whether the process has begun closing. Reads the field through a method so
-   * a phase set inside a synchronously delivered handler is not narrowed away
-   * by the compiler.
-   */
-  private isShuttingDown(): boolean {
-    return this.phase === 'shutting-down';
-  }
-
-  /**
-   * Runs once `activate` arrives: opens the runtime through `startServer`
-   * (SPEC 6.2), attaches the request handlers, marks the process active and
-   * only then sends `ready`. The pre-activation handlers stay installed until
-   * the new ones are in place, so a request that arrives during the start is
-   * ignored instead of meeting a half-built Server.
-   */
-  private async startAndServe(): Promise<void> {
-    this.phase = 'starting';
-    let runtime: Runtime;
-    try {
-      ({ runtime } = await startServer({
-        options: this.options,
-        logger: this.logger,
-      }));
-    } catch (error) {
-      // `startServer` closed whatever it opened. A link that died during the
-      // start is reported as what it is: the peer is gone, not that the
-      // configuration was refused. The same holds for a parent that vanished
-      // mid-start.
-      const gone = this.channelClosedReason ?? this.parentGoneReason;
-      throw gone === undefined ? error : new ServerChannelClosedError(gone);
-    }
-    const runner = new RequestRunner({
-      runtime,
-      logger: this.logger,
-      send: (message, what) => this.sendQuietly(message, what),
-      // The phase stays in this class: `shutdown` owns it, and the runner only
-      // asks.
-      accepting: () => this.phase === 'active',
-    });
-    this.runtime = runtime;
-    this.runner = runner;
-    try {
-      this.channel.onMessage((raw) => {
-        this.onMessage(raw);
-      });
-      this.channel.onClose((reason) => {
-        this.onChannelClose(reason);
-      });
-    } catch (error) {
-      // The channel is outside code: a registration that throws must not leave
-      // the backend open. The original error is the one worth reporting, so a
-      // failure to close does not replace it.
-      await runtime.executor.close().catch(() => undefined);
-      throw error;
-    }
-    // Registration above can deliver what arrived while this was starting. A
-    // dead link wins over a parked shutdown: nobody can receive `closed`, so
-    // the close has to be an abort. Both are applied before the phase check,
-    // because a shutdown parked during `startServer` already set the phase and
-    // would otherwise be left without a drain.
-    if (this.channelClosedReason !== undefined) {
-      this.phase = 'shutting-down';
-      this.activation.resolve();
-      void this.abort(runtime, runner, this.channelClosedReason);
-      return;
-    }
-    if (this.parentGoneReason !== undefined) {
-      // The poll fired during the start. Nobody is left to announce readiness
-      // to, and the backend this start just opened must be closed here: the
-      // poll could not do it because the runtime did not exist yet.
-      this.phase = 'shutting-down';
-      this.activation.resolve();
-      void this.abort(runtime, runner, this.parentGoneReason);
-      return;
-    }
-    const pendingShutdown = this.pendingShutdown;
-    if (pendingShutdown !== undefined) {
-      this.activation.resolve();
-      this.beginShutdown(runtime, runner, pendingShutdown);
-      return;
-    }
-    if (this.isShuttingDown()) {
-      // A `shutdown` delivered at registration found the runtime and started
-      // its own drain; there is nothing left to begin.
-      this.activation.resolve();
-      return;
-    }
-    // SPEC 6.2 step 3, in this order and no other: the handler is installed, the
-    // phase says requests may run, and only then is the barrier crossed. A
-    // Portal is entitled to deliver the instant it sees `ready`, so anything
-    // sent before this point would arrive with nowhere to go and be dropped.
-    this.phase = 'active';
-    try {
-      this.sendBarrier(
-        readyMessage(process.pid, runtime.capabilities),
-        'ready',
-      );
-    } catch (error) {
-      // The barrier was never crossed, so this process is not a Server anyone
-      // can use: leaving the backend open would keep a writer alive beside the
-      // replacement (INV-002), and leaving the phase `active` would promise work
-      // this process cannot deliver. Rejecting the activation is what makes
-      // `run()` end as a startup failure instead of parking forever.
-      //
-      // The drain is here for the channel that delivers `ready` and only then
-      // throws: a request flushed by that delivery may already be running, and
-      // the backend must not close under it.
-      this.phase = 'shutting-down';
-      await this.drainAndClose(
-        runtime,
-        runner,
-        this.options.abortTimeoutMs ?? ABORT_TIMEOUT_MS,
-      );
-      this.activation.reject(error);
-      return;
-    }
-    this.logger.info(
-      { pid: process.pid, capabilities: runtime.capabilities },
-      'server process ready',
-    );
-    this.activation.resolve();
   }
 
   private onMessage(raw: unknown): void {
@@ -522,7 +313,7 @@ class ServerProcess {
         { pid: process.pid },
         'activation received; starting server',
       );
-      void this.startAndServe().catch((error: unknown) => {
+      void startAndServe(this.activationDeps()).catch((error: unknown) => {
         this.activation.reject(error);
       });
       return;
@@ -604,7 +395,7 @@ class ServerProcess {
     const runtime = this.runtime;
     const runner = this.runner;
     if (runtime !== undefined && runner !== undefined) {
-      this.beginShutdown(runtime, runner, message);
+      this.shutdown.begin(runtime, runner, message);
       return;
     }
     if (this.phase === 'starting') {
@@ -631,182 +422,82 @@ class ServerProcess {
     this.activation.resolve();
   }
 
-  private beginShutdown(
-    runtime: Runtime,
-    runner: RequestRunner,
-    message: ShutdownMessage,
-  ): void {
-    this.phase = 'shutting-down';
-    // SPEC 6.3 step 1: stop accepting before draining, so the drain below has a
-    // closed set of requests and nothing new can enter the backend.
-    const budgetMs = message.timeoutMs;
-    this.logger.info(
-      { pendingRequests: runner.running, budgetMs },
-      'server shutting down',
-    );
-    void this.shutdown(runtime, runner, budgetMs).catch((error: unknown) => {
-      // Nothing below `shutdown` is expected to throw, but a channel that
-      // throws on close must still resolve the completion instead of hanging.
-      this.logger.error(
-        { code: 'SHUTDOWN_FAILED', reason: messageOf(error) },
-        'server shutdown failed',
-      );
-      this.completion.resolve();
+  private onChannelClose(reason: string): void {
+    handleChannelClose(reason, {
+      ...this.closeDeps(),
+      recordChannelClosed: (value) => {
+        this.channelClosedReason = value;
+      },
     });
   }
 
-  private async shutdown(
-    runtime: Runtime,
-    runner: RequestRunner,
-    limitMs: number,
-  ): Promise<void> {
-    const startedAt = performance.now();
-    // SPEC 6.3 steps 2-3: every accepted request settles to a terminal state,
-    // bounded by the per-request timeout the dispatcher already enforces, and
-    // its result still goes out before `closed`. Step 4 closes the backend
-    // before announcing, so Portal never restarts a Server whose storage is
-    // still open.
-    await this.drainAndClose(runtime, runner, limitMs);
-    this.sendQuietly({ type: 'closed', reason: 'shutdown' }, 'closed');
-    // Step 5: the link itself goes last, after the final message.
-    this.channel.close('shutdown complete');
-    this.logger.info(
-      { durationMs: elapsedMs(startedAt) },
-      'server process stopped',
-    );
-    this.completion.resolve();
-  }
-
-  /**
-   * Drains and closes the backend under one deadline: the caller declared a
-   * single budget for the whole close, so the second step spends what the first
-   * left rather than a second full one.
-   */
-  private async drainAndClose(
-    runtime: Runtime,
-    runner: RequestRunner,
-    limitMs: number,
-  ): Promise<void> {
-    const deadlineAt = performance.now() + limitMs;
-    await runner.drain(limitMs);
-    await this.closeStorage(
-      runtime,
-      runner,
-      Math.max(1, Math.round(deadlineAt - performance.now())),
-    );
-  }
-
-  /**
-   * Closes the backend, which is mandatory (SPEC 6.3 step 4), but bounded: a
-   * backend that waits for its queue would otherwise keep `closed` from ever
-   * being sent when a handler never returns. The wait is abandoned, not the
-   * close: the call is still made and its own failure is still logged.
-   */
-  private async closeStorage(
-    runtime: Runtime,
-    runner: RequestRunner,
-    limitMs: number,
-  ): Promise<void> {
-    // `settleWithin` consumes a rejection itself, so the failure is read from
-    // the result instead of being mapped into a value first.
-    const outcome = await settleWithin(runtime.executor.close(), limitMs);
-    if (outcome.status === 'timeout') {
-      this.logger.error(
-        {
-          code: 'STORAGE_CLOSE_TIMEOUT',
-          timeoutMs: limitMs,
-          pendingRequests: runner.pending,
-          requestIds: runner.pendingRequestIds,
-        },
-        'storage backend close exceeded its budget; continuing',
-      );
-      return;
-    }
-    if (outcome.status === 'rejected') {
-      this.logger.error(
-        {
-          code: 'STORAGE_CLOSE_FAILED',
-          reason: messageOf(outcome.error),
-        },
-        'storage backend could not be closed',
-      );
-    }
-  }
-
-  private onChannelClose(reason: string): void {
-    // Recorded for the activation path: a start that finishes after the death
-    // must close the storage it just opened instead of announcing readiness.
-    this.channelClosedReason = reason;
-    if (this.phase === 'shutting-down') {
-      // Our own `close` at the end of an orderly shutdown, or the close that an
-      // abort already issued.
-      return;
-    }
-    const runtime = this.runtime;
-    const runner = this.runner;
-    if (runtime === undefined || runner === undefined) {
-      // ADR-0007: no storage is open before `ready`, so failing here cannot
-      // leave a second writer behind (INV-002). During `starting` the run
-      // itself closes whatever it just opened; rejecting here as well would let
-      // the caller exit the process while that close is still in flight.
-      this.logger.error(
-        { code: 'IPC_CHANNEL_CLOSED', reason },
-        'ipc channel closed before ready; server stopping',
-      );
-      if (this.phase !== 'starting') {
-        this.phase = 'shutting-down';
-        this.activation.reject(new ServerChannelClosedError(reason));
-      }
-      return;
-    }
+  private enterShuttingDown(): void {
     this.phase = 'shutting-down';
-    this.logger.error(
-      { code: 'IPC_CHANNEL_CLOSED', reason },
-      'ipc channel closed; server stopping',
-    );
-    void this.abort(runtime, runner, reason);
   }
 
-  private async abort(
-    runtime: Runtime,
-    runner: RequestRunner,
-    reason: string,
-  ): Promise<void> {
-    // Nobody can receive results any more. Settle the in-flight work first so
-    // the backend is closed on a known state, then hand the reason to the
-    // caller, which owns the exit code.
-    //
-    // The budget is fixed and short (ABORT_TIMEOUT_MS), not derived from
-    // `timeoutMs`: Portal is gone, so nobody is waiting for this process, and a
-    // long wait only extends the window in which this orphan and the next
-    // Server both hold the storage (INV-002). It is one deadline shared by both
-    // steps, not one per step, so the total is what the constant promises.
-    const limitMs = this.options.abortTimeoutMs ?? ABORT_TIMEOUT_MS;
-    try {
-      await this.drainAndClose(runtime, runner, limitMs);
-    } catch (error) {
-      // Every caller uses `void abort(...)`, so a throw here would be an
-      // unhandled rejection while `completion` never settles.
-      this.logger.error(
-        { code: 'ABORT_DRAIN_FAILED', reason: messageOf(error) },
-        'server abort drain failed',
-      );
-    }
-    // On the parent-gone path the link is still open, and an open IPC channel
-    // keeps the event loop alive: the whole point is that an orphaned process
-    // goes away rather than lingering as a second writer (INV-002). The
-    // injected channel is outside code, so a close that throws must not keep
-    // `completion` from rejecting: the failure is logged for diagnosis and the
-    // process still ends.
-    try {
-      this.channel.close('aborting');
-    } catch (error) {
-      this.logger.error(
-        { code: 'ABORT_CHANNEL_CLOSE_FAILED', reason: messageOf(error) },
-        'ipc channel could not be closed while aborting',
-      );
-    }
-    this.completion.reject(new ServerChannelClosedError(reason));
+  /**
+   * The deps both liveness paths share: they read the phase and the running
+   * pieces, and fail the process through the same completion.
+   */
+  private closeDeps() {
+    return {
+      logger: this.logger,
+      isShuttingDown: () => this.phase === 'shutting-down',
+      isStarting: () => this.phase === 'starting',
+      enterShuttingDown: () => {
+        this.enterShuttingDown();
+      },
+      runtime: () => this.runtime,
+      runner: () => this.runner,
+      abort: (runtime: Runtime, runner: RequestRunner, reason: string) =>
+        this.shutdown.abort(runtime, runner, reason),
+      channelClosedError: (reason: string) =>
+        new ServerChannelClosedError(reason),
+      rejectActivation: (error: Error) => {
+        this.activation.reject(error);
+      },
+    };
+  }
+
+  private activationDeps(): ActivationDeps {
+    return {
+      options: this.options,
+      logger: this.logger,
+      channel: this.channel,
+      shutdown: this.shutdown,
+      activation: this.activation,
+      beginStarting: () => {
+        this.phase = 'starting';
+      },
+      activate: () => {
+        this.phase = 'active';
+      },
+      enterShuttingDown: () => {
+        this.enterShuttingDown();
+      },
+      isShuttingDown: () => this.phase === 'shutting-down',
+      isActive: () => this.phase === 'active',
+      attach: (runtime, runner) => {
+        this.runtime = runtime;
+        this.runner = runner;
+      },
+      pendingShutdown: () => this.pendingShutdown,
+      channelClosedReason: () => this.channelClosedReason,
+      parentGoneReason: () => this.parentGoneReason,
+      sendBarrier: (message, what) => {
+        this.sendBarrier(message, what);
+      },
+      sendQuietly: (message, what) => {
+        this.sendQuietly(message, what);
+      },
+      onMessage: (raw) => {
+        this.onMessage(raw);
+      },
+      onChannelClose: (reason) => {
+        this.onChannelClose(reason);
+      },
+      channelClosedError: (reason) => new ServerChannelClosedError(reason),
+    };
   }
 
   private sendQuietly(message: IpcMessage, what: string): void {

@@ -6,15 +6,11 @@ import type { ServerSlot, ServerState } from './server-slot.ts';
 import type { SwitchOperation } from './version-switch.ts';
 
 /**
- * What the Server→Portal handlers need from their owner. Every member reads or
- * calls back into live executor state, so a decision taken here is the owner's
- * state at that moment, not a snapshot.
- *
- * Deliberately narrow: the process state machine is only visible through
- * `slot`, and everything that is not a message-level decision — delivery,
- * settlement, crash recovery, restart backoff — stays behind a callback.
+ * The owner-side operations one inbound message may need. `ServerSupervisor`
+ * implements them directly: each member is a real operation or live state, not
+ * a getter over another object.
  */
-export interface MessageHost {
+export interface ServerMessageContext {
   readonly logger: Logger;
   /** Sole owner of `status`, `server` and the in-flight switch. */
   readonly slot: ServerSlot<SwitchOperation>;
@@ -45,19 +41,18 @@ export interface MessageHost {
  * The Server→Portal half of the split: one raw message parsed, then dispatched
  * to the handshake, result or shutdown branch it belongs to.
  *
- * Kept out of the executor because none of it decides what happens next beyond
- * the message itself: which process a message belongs to arrives as `server`,
- * and every consequence (activation, readiness, settlement, loss) is a host
- * call.
+ * Pure dispatch: which process a message belongs to arrives as `server`, and
+ * every consequence (activation, readiness, settlement, loss) is a context
+ * operation.
  */
 export function onServerMessage(
-  host: MessageHost,
   server: ServerState,
   raw: unknown,
+  context: ServerMessageContext,
 ): void {
   const parsed = parseIpcMessage(raw);
   if (!parsed.ok) {
-    host.logger.warn(
+    context.logger.warn(
       { pid: server.pid, reason: parsed.reason },
       'ipc message rejected',
     );
@@ -66,21 +61,21 @@ export function onServerMessage(
   const message = parsed.message;
   switch (message.type) {
     case 'prepared':
-      onPrepared(host, server, message.pid);
+      onPrepared(context, server, message.pid);
       return;
     case 'ready':
       onReady(
-        host,
+        context,
         server,
         message.pid,
         message.capabilities.maxTransactionDurationMs,
       );
       return;
     case 'result':
-      host.onResult(message);
+      context.onResult(message);
       return;
     case 'closed':
-      onClosed(host, server, message.reason);
+      onClosed(context, server, message.reason);
       return;
     case 'hello':
     case 'request':
@@ -88,7 +83,7 @@ export function onServerMessage(
     case 'shutdown':
     case 'activate':
       // Valid shape, wrong direction: a Server must not send these.
-      host.logger.warn(
+      context.logger.warn(
         { pid: server.pid, reason: `unexpected "${message.type}" message` },
         'ipc message rejected',
       );
@@ -96,7 +91,7 @@ export function onServerMessage(
 }
 
 function onClosed(
-  host: MessageHost,
+  context: ServerMessageContext,
   server: ServerState,
   reason: string,
 ): void {
@@ -106,19 +101,19 @@ function onClosed(
     // its own signal for this before it may activate the replacement
     // (INV-002). A `close()` that took over may also be waiting, so wake it.
     server.shutdownAcknowledged = true;
-    host.resolveClosed(server);
+    context.resolveClosed(server);
     return;
   }
-  if (host.slot.status === 'closing') {
+  if (context.slot.status === 'closing') {
     server.shutdownAcknowledged = true;
     // Another generation's `closed` must not end a wait for the current Server.
-    host.resolveClosed(server);
+    context.resolveClosed(server);
     return;
   }
-  if (host.slot.switching?.staged === server) {
+  if (context.slot.switching?.staged === server) {
     // A prepared process has no storage to close, so this is not a shutdown
     // ack; the exit that follows is what the switch reacts to.
-    host.logger.warn(
+    context.logger.warn(
       { pid: server.pid, reason },
       'replacement server closed before activation',
     );
@@ -127,7 +122,7 @@ function onClosed(
   // Unsolicited: the process exit that follows is what actually matters,
   // and it arrives through `exited`/`onClose`. Not a shutdown ack, so
   // close() must still be able to kill a process that stays alive.
-  host.logger.warn(
+  context.logger.warn(
     { pid: server.pid, reason },
     'server closed without being asked',
   );
@@ -140,16 +135,20 @@ function onClosed(
  * its staged process instead and activates it only after the previous one has
  * exited.
  */
-function onPrepared(host: MessageHost, server: ServerState, pid: number): void {
-  const op = host.slot.switching;
+function onPrepared(
+  context: ServerMessageContext,
+  server: ServerState,
+  pid: number,
+): void {
+  const op = context.slot.switching;
   if (op?.staged === server) {
     server.pid = pid;
     op.prepared.seen = true;
     op.prepared.resolve();
     return;
   }
-  if (host.slot.server !== server || server.closed) {
-    host.logger.debug(
+  if (context.slot.server !== server || server.closed) {
+    context.logger.debug(
       { pid },
       'prepared from a server generation already given up',
     );
@@ -157,21 +156,21 @@ function onPrepared(host: MessageHost, server: ServerState, pid: number): void {
   }
   if (server.ready) {
     // Out of order: this generation already opened its storage.
-    host.logger.warn({ pid }, 'prepared received after ready; ignored');
+    context.logger.warn({ pid }, 'prepared received after ready; ignored');
     return;
   }
-  if (host.slot.isTerminal) {
+  if (context.slot.isTerminal) {
     // Nothing may open storage while the Portal is closing: there would be
     // nowhere to drain it. The shutdown path kills this process.
-    host.logger.debug({ pid }, 'prepared ignored while closing');
+    context.logger.debug({ pid }, 'prepared ignored while closing');
     return;
   }
   server.pid = pid;
   try {
-    host.slot.assertNoOtherLiveServer(server);
+    context.slot.assertNoOtherLiveServer(server);
     server.channel.send({ type: 'activate' });
   } catch (error) {
-    host.onServerLost(
+    context.onServerLost(
       server,
       null,
       null,
@@ -179,16 +178,16 @@ function onPrepared(host: MessageHost, server: ServerState, pid: number): void {
     );
     return;
   }
-  host.logger.debug({ pid }, 'server prepared; activating');
+  context.logger.debug({ pid }, 'server prepared; activating');
 }
 
 function onReady(
-  host: MessageHost,
+  context: ServerMessageContext,
   server: ServerState,
   pid: number,
   declaredMaxDurationMs: number,
 ): void {
-  const op = host.slot.switching;
+  const op = context.slot.switching;
   if (op?.staged === server) {
     server.ready = true;
     server.pid = pid;
@@ -197,25 +196,25 @@ function onReady(
     op.ready.resolve();
     return;
   }
-  if (host.slot.server !== server || server.closed) {
-    host.logger.debug(
+  if (context.slot.server !== server || server.closed) {
+    context.logger.debug(
       { pid },
       'ready from a server generation already given up',
     );
     return;
   }
   if (server.ready) {
-    host.logger.debug({ pid }, 'duplicate ready ignored');
+    context.logger.debug({ pid }, 'duplicate ready ignored');
     return;
   }
   server.ready = true;
   server.pid = pid;
   server.declaredMaxDurationMs = declaredMaxDurationMs;
-  if (host.slot.isTerminal) {
+  if (context.slot.isTerminal) {
     return;
   }
-  const effectiveTimeoutMs = host.adoptReady(server, declaredMaxDurationMs);
-  host.logger.info({ pid, effectiveTimeoutMs }, 'server ready');
-  host.resolveStart();
-  host.pump();
+  const effectiveTimeoutMs = context.adoptReady(server, declaredMaxDurationMs);
+  context.logger.info({ pid, effectiveTimeoutMs }, 'server ready');
+  context.resolveStart();
+  context.pump();
 }

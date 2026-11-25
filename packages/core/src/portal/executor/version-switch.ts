@@ -72,19 +72,15 @@ export interface SwitchOperation {
 }
 
 /**
- * The switch's view of the executor, projected from the executor's own
- * capabilities rather than a minimal replaceable dependency: crash backoff,
- * the stability clock, delivery, the abandoned-process list and the timers all
- * come from the executor, so another owner would have to reproduce that
- * behaviour, not just satisfy these signatures. It is split out so the four
- * steps of the sequence and their two failure boundaries live in one file, not
- * so the switch can run on a different host.
+ * The switch's dependencies: the operations it actually calls. `IpcExecutor`
+ * implements them; there is no getter and no adapter object between the switch
+ * and its owner.
  *
  * The switch never writes `status` or `server` directly; it only asks the slot
  * for a semantic transition, so a state write cannot skip the meaning attached
  * to it.
  */
-export interface SwitchHost {
+export interface SwitchDeps {
   readonly logger: Logger;
   readonly slot: ServerSlot<SwitchOperation>;
   readonly startTimeoutMs: number;
@@ -98,14 +94,6 @@ export interface SwitchHost {
   attach(server: ServerState): void;
   /** Delivers the buffered requests to the current generation. */
   pump(): void;
-  currentServer(): ServerState | undefined;
-  /**
-   * Hands a process to `close()`, which confirms its exit before returning. A
-   * replacement that received `activate` may hold storage, and a process a
-   * rollback waits on has the same problem: that wait is a floating promise
-   * `close()` cannot join.
-   */
-  recordAbandoned(server: ServerState): void;
   /** Wakes the `closed` wait a `close()` may be parked on, for that Server only. */
   resolveClosed(server: ServerState): void;
   clearRestartTimer(): void;
@@ -122,15 +110,15 @@ export interface SwitchHost {
  *
  * Split from the executor so the four steps and their two failure boundaries
  * live in one place: everything executor-specific (the process factory, the
- * generation counter, the timers, delivery) arrives through `SwitchHost`. The
+ * generation counter, the timers, delivery) arrives through `SwitchDeps`. The
  * executor keeps the ordinary start/restart/close paths and the handshake
  * branches that do not belong to a switch.
  */
 export class VersionSwitch {
-  private readonly host: SwitchHost;
+  private readonly deps: SwitchDeps;
 
-  constructor(host: SwitchHost) {
-    this.host = host;
+  constructor(deps: SwitchDeps) {
+    this.deps = deps;
   }
 
   /**
@@ -151,7 +139,7 @@ export class VersionSwitch {
    * to the crash-restart path with the previous spawn and rejects as well.
    */
   switchTo(options: { spawn: () => SpawnedServer }): Promise<void> {
-    const slot = this.host.slot;
+    const slot = this.deps.slot;
     if (slot.switching !== undefined) {
       return Promise.reject(
         new Error('an ipc executor switch is already in progress'),
@@ -202,7 +190,7 @@ export class VersionSwitch {
       failure: undefined,
     };
     slot.beginSwitch(op);
-    this.host.logger.info({}, 'server switch started');
+    this.deps.logger.info({}, 'server switch started');
     void this.runSwitch(op);
     return deferred.promise;
   }
@@ -217,13 +205,13 @@ export class VersionSwitch {
    * death is expected during its own retirement.
    */
   onServerLost(server: ServerState, reason: string): boolean {
-    const op = this.host.slot.switching;
+    const op = this.deps.slot.switching;
     if (op?.staged === server && !op.promoted) {
       // The replacement died while the switch was waiting on it. Record the
       // loss; the switch's own await reacts to `closedSignal` and reports it.
       op.stagedLost ??= new Error(`replacement server lost: ${reason}`);
       if (!server.exited) {
-        killQuietly(server, this.host.logger);
+        killQuietly(server, this.deps.logger);
       }
       return true;
     }
@@ -246,7 +234,7 @@ export class VersionSwitch {
       if (server.retiring || op.previousGone) {
         op.previousGone = true;
         if (!server.exited) {
-          killQuietly(server, this.host.logger);
+          killQuietly(server, this.deps.logger);
           this.recordPendingExit(op, server);
         }
         return true;
@@ -255,10 +243,10 @@ export class VersionSwitch {
       // Server to fall back to, so it fails and the crash path restarts.
       op.previousLost = true;
       op.previousGone = true;
-      this.host.slot.clearIfCurrent(server);
-      this.host.resolveClosed(server);
+      this.deps.slot.clearIfCurrent(server);
+      this.deps.resolveClosed(server);
       if (!server.exited) {
-        killQuietly(server, this.host.logger);
+        killQuietly(server, this.deps.logger);
         this.recordPendingExit(op, server);
       }
       op.abort(
@@ -276,12 +264,12 @@ export class VersionSwitch {
    * abandons what it spawned and never restarts or promotes anything.
    */
   async abortSwitchForClose(): Promise<void> {
-    const op = this.host.slot.switching;
+    const op = this.deps.slot.switching;
     if (op === undefined) {
       return;
     }
     op.abort(new Error('ipc executor is closing: server switch aborted'), true);
-    const done = await settleWithin(op.completion, this.host.shutdownTimeoutMs);
+    const done = await settleWithin(op.completion, this.deps.shutdownTimeoutMs);
     if (done.status === 'timeout') {
       // The switch's own awaits are bounded by `startTimeoutMs`; a completion
       // that outlives the shutdown budget means a process it staged is still
@@ -293,21 +281,21 @@ export class VersionSwitch {
         staged.closed = true;
         staged.closedSignal.resolve();
         if (!staged.exited) {
-          killQuietly(staged, this.host.logger);
+          killQuietly(staged, this.deps.logger);
         }
         closeChannelQuietly(
           staged,
           'switch aborted by close',
-          this.host.logger,
+          this.deps.logger,
         );
         if (op.activated) {
           // The switch's abort path only kills; `close()` must confirm this
           // exit itself before it returns (INV-002).
-          this.host.recordAbandoned(staged);
+          this.recordAbandoned(staged);
         }
       }
-      this.host.logger.warn(
-        { timeoutMs: this.host.shutdownTimeoutMs },
+      this.deps.logger.warn(
+        { timeoutMs: this.deps.shutdownTimeoutMs },
         'server switch did not finish before the shutdown timeout',
       );
     }
@@ -343,10 +331,10 @@ export class VersionSwitch {
       op.failure = new Error(`spawn failed: ${messageOf(error)}`);
       return false;
     }
-    const server = buildServer(spawned, this.host.slot.nextGeneration());
+    const server = buildServer(spawned, this.deps.slot.nextGeneration());
     server.staged = true;
     op.staged = server;
-    this.host.attach(server);
+    this.deps.attach(server);
     try {
       server.channel.send({ type: 'hello' });
     } catch (error) {
@@ -358,7 +346,7 @@ export class VersionSwitch {
       op,
       op.prepared,
       'prepared',
-      this.host.startTimeoutMs,
+      this.deps.startTimeoutMs,
     );
   }
 
@@ -369,7 +357,7 @@ export class VersionSwitch {
    */
   private async retirePrevious(op: SwitchOperation): Promise<boolean> {
     const previous = op.previous;
-    const logger = this.host.logger;
+    const logger = this.deps.logger;
     op.phase = 'retiring';
     if (previous === undefined) {
       op.previousGone = true;
@@ -381,7 +369,7 @@ export class VersionSwitch {
         previous.shutdownSent = true;
         previous.channel.send({
           type: 'shutdown',
-          timeoutMs: this.host.shutdownTimeoutMs,
+          timeoutMs: this.deps.shutdownTimeoutMs,
         });
       } catch (error) {
         // The process died between the switch and this send; the channel close
@@ -400,7 +388,7 @@ export class VersionSwitch {
         logger.warn(
           {
             pid: previous.pid,
-            timeoutMs: this.host.shutdownTimeoutMs + SHUTDOWN_ACK_SLACK_MS,
+            timeoutMs: this.deps.shutdownTimeoutMs + SHUTDOWN_ACK_SLACK_MS,
             ready: previous.ready,
           },
           'server did not finish shutting down; killing it',
@@ -459,7 +447,7 @@ export class VersionSwitch {
     // INV-002: retained processes from earlier failures also block activation,
     // even when this switch confirmed its own previous process's exit.
     try {
-      this.host.slot.assertNoOtherLiveServer(staged);
+      this.deps.slot.assertNoOtherLiveServer(staged);
     } catch (error) {
       op.failure = toError(error);
       return;
@@ -477,7 +465,7 @@ export class VersionSwitch {
       op,
       op.ready,
       'become ready',
-      this.host.startTimeoutMs,
+      this.deps.startTimeoutMs,
     );
     if (!ready || op.abortError !== undefined) {
       return;
@@ -498,25 +486,25 @@ export class VersionSwitch {
     // the only thing that releases the buffered requests to it.
     staged.staged = false;
     op.promoted = true;
-    this.host.slot.markReady(staged);
+    this.deps.slot.markReady(staged);
     // A crash after this point restarts the process factory that is now
     // serving. A rollback keeps the old one because this only runs after the
     // promotion succeeded.
-    this.host.adoptSpawn(op.spawn);
-    this.host.clearRestartTimer();
-    this.host.startStableTimer();
+    this.deps.adoptSpawn(op.spawn);
+    this.deps.clearRestartTimer();
+    this.deps.startStableTimer();
     if (staged.declaredMaxDurationMs !== undefined) {
-      this.host.adoptCeiling(staged.declaredMaxDurationMs);
+      this.deps.adoptCeiling(staged.declaredMaxDurationMs);
     }
-    this.host.logger.info({ pid: staged.pid }, 'replacement server ready');
-    this.host.pump();
+    this.deps.logger.info({ pid: staged.pid }, 'replacement server ready');
+    this.deps.pump();
     if (op.promotedLost) {
       // The first flush killed the promoted process; `onServerLost` already
       // took the crash path (restart scheduled), so this is not a completed
       // switch and `finishSwitch` rejects it.
       return;
     }
-    this.host.logger.info({ pid: staged.pid }, 'server switch completed');
+    this.deps.logger.info({ pid: staged.pid }, 'server switch completed');
   }
 
   /**
@@ -547,7 +535,7 @@ export class VersionSwitch {
       timeoutMs,
     );
     if (outcome.status === 'timeout') {
-      this.host.logger.warn(
+      this.deps.logger.warn(
         { pid: staged.pid, timeoutMs, expected: what },
         'replacement server did not reach its barrier before the switch timeout',
       );
@@ -581,7 +569,7 @@ export class VersionSwitch {
     if (previous.closed || previous.shutdownAcknowledged) {
       return true;
     }
-    const waitMs = this.host.shutdownTimeoutMs + SHUTDOWN_ACK_SLACK_MS;
+    const waitMs = this.deps.shutdownTimeoutMs + SHUTDOWN_ACK_SLACK_MS;
     const outcome = await settleWithin(
       Promise.race([
         previous.closedSignal.promise.then(() => 'closed' as const),
@@ -614,7 +602,7 @@ export class VersionSwitch {
         this.recordPendingExit(op, staged);
       }
     }
-    this.host.slot.releaseSwitch(op);
+    this.deps.slot.releaseSwitch(op);
     if (op.promoted) {
       if (op.promotedLost) {
         // Promotion succeeded, but the process died before the switch could
@@ -649,14 +637,14 @@ export class VersionSwitch {
       // before returning. The previous Server is `shutdownServer`'s job, so it
       // is not listed here even when its exit was not observed.
       if (abandoned !== undefined && op.activated) {
-        this.host.recordAbandoned(abandoned);
+        this.recordAbandoned(abandoned);
       }
       op.markComplete();
       return;
     }
     const reason = op.failure === undefined ? 'unknown' : messageOf(op.failure);
     if (op.previousGone || op.previousLost) {
-      this.host.logger.warn(
+      this.deps.logger.warn(
         {
           reason,
           phase: op.phase,
@@ -668,20 +656,30 @@ export class VersionSwitch {
       );
       this.rollbackToPrevious(op.exitsPending);
     } else {
-      this.host.logger.warn(
+      this.deps.logger.warn(
         {
           reason,
           phase: op.phase,
-          pid: this.host.currentServer()?.pid,
+          pid: this.deps.slot.server?.pid,
         },
         'server switch failed; the previous server keeps serving',
       );
-      if (!this.host.slot.isTerminal) {
-        this.host.slot.resumeServing();
-        this.host.pump();
+      if (!this.deps.slot.isTerminal) {
+        this.deps.slot.resumeServing();
+        this.deps.pump();
       }
     }
     op.markComplete();
+  }
+
+  /**
+   * Hands a process to `close()`, which confirms its exit before returning. A
+   * replacement that received `activate` may hold storage, and a process a
+   * rollback waits on has the same problem: that wait is a floating promise
+   * `close()` cannot join.
+   */
+  private recordAbandoned(server: ServerState): void {
+    this.deps.slot.track(server);
   }
 
   /**
@@ -704,9 +702,9 @@ export class VersionSwitch {
     server.closed = true;
     server.closedSignal.resolve();
     if (!server.exited) {
-      killQuietly(server, this.host.logger);
+      killQuietly(server, this.deps.logger);
     }
-    closeChannelQuietly(server, 'switch abandoned', this.host.logger);
+    closeChannelQuietly(server, 'switch abandoned', this.deps.logger);
   }
 
   /**
@@ -721,13 +719,13 @@ export class VersionSwitch {
    * write to the same storage (INV-002).
    */
   private rollbackToPrevious(pendingExits: readonly ServerState[]): void {
-    if (this.host.slot.isTerminal) {
+    if (this.deps.slot.isTerminal) {
       return;
     }
     for (const server of pendingExits) {
-      this.host.recordAbandoned(server);
+      this.recordAbandoned(server);
     }
-    this.host.recoverAfterExits();
+    this.deps.recoverAfterExits();
   }
 }
 

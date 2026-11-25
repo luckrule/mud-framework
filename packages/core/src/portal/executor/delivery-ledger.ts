@@ -1,5 +1,6 @@
 import { failure, requestMessage } from '../../ipc/outbound.ts';
-import type { Logger } from '../../logging/types.ts';
+import type { ResultMessage } from '../../ipc/protocol.ts';
+import type { LogFields, Logger } from '../../logging/types.ts';
 import type { ExecutorOutcome } from '../../shared/executor.ts';
 import { messageOf } from '../../shared/guards.ts';
 import { requestLogFields } from '../../shared/identity.ts';
@@ -11,54 +12,57 @@ import {
 import type { PendingBuffer, PendingRequest } from './ipc-pending.ts';
 import type { ServerState } from './server-slot.ts';
 
-/**
- * What the ledger needs from its owner. Everything here is a read or a
- * notification: the ledger never caches one of these values, so a decision it
- * makes is the owner's state at that moment.
- */
-export interface DeliveryHost {
-  readonly logger: Logger;
+interface DeliveryLedgerOptions {
+  buffer: PendingBuffer;
+  logger: Logger;
   /** Max replays of one request before it reaches a terminal state. */
-  readonly maxReplays: number;
+  maxReplays: number;
   /** True once no Server may receive work any more (shutdown, failed start). */
-  readonly isTerminal: boolean;
+  isTerminal: () => boolean;
   /** The Server a cancel may be addressed to; `undefined` between generations. */
-  currentServer(): ServerState | undefined;
+  currentServer: () => ServerState | undefined;
   /** A send failed: the owner decides whether that is a crash or a retirement. */
-  onServerLost(
+  onServerLost: (
     server: ServerState,
     code: number | null,
     signal: string | null,
     reason: string,
-  ): void;
-}
-
-interface DeliveryLedgerOptions {
-  buffer: PendingBuffer;
-  host: DeliveryHost;
+  ) => void;
 }
 
 /**
  * Delivery and settlement for the unacknowledged buffer: the SPEC 6.5 delivery
- * loop, the replay budget, per-request deadlines, the cancel send, and the one
- * place a pending request's promise is resolved.
+ * loop, the replay budget, per-request deadlines, the cancel send, result
+ * acceptance, and the one place a pending request's promise is resolved.
  *
  * Split from the executor because all of it is policy over the buffer and the
  * channel, none of it is the state machine: which Server may receive arrives as
  * an argument, whether the executor is shutting down and what a dead channel
- * means arrive through `DeliveryHost`. `status`, `server` and `switching` are
- * not visible here, so delivery cannot start a restart or promote a generation
- * on its own.
+ * means arrive as callbacks. `status`, `server` and `switching` are not visible
+ * here, so delivery cannot start a restart or promote a generation on its own.
  */
 export class DeliveryLedger {
   private readonly buffer: PendingBuffer;
-  private readonly host: DeliveryHost;
+  private readonly logger: Logger;
+  private readonly maxReplays: number;
+  private readonly isTerminal: () => boolean;
+  private readonly currentServer: () => ServerState | undefined;
+  private readonly onServerLost: (
+    server: ServerState,
+    code: number | null,
+    signal: string | null,
+    reason: string,
+  ) => void;
   /** Woken when the buffer empties; the close path waits on it to drain. */
   private drainedWaiter: (() => void) | undefined;
 
   constructor(options: DeliveryLedgerOptions) {
     this.buffer = options.buffer;
-    this.host = options.host;
+    this.logger = options.logger;
+    this.maxReplays = options.maxReplays;
+    this.isTerminal = options.isTerminal;
+    this.currentServer = options.currentServer;
+    this.onServerLost = options.onServerLost;
   }
 
   /**
@@ -67,7 +71,7 @@ export class DeliveryLedger {
    *
    * `server` is the caller's decision: a switch is executor state, and
    * delivering to the process it is draining would race the retirement. Whether
-   * the executor is shutting down is read live from the host.
+   * the executor is shutting down is read live through `isTerminal`.
    *
    * A request that keeps killing the process starves the later requests on its
    * connection: every flush stops at it (its replay budget runs out, and the
@@ -87,7 +91,7 @@ export class DeliveryLedger {
     ) {
       return;
     }
-    if (this.host.isTerminal) {
+    if (this.isTerminal()) {
       return;
     }
     for (const pending of this.buffer.undelivered(server.generation)) {
@@ -106,10 +110,10 @@ export class DeliveryLedger {
     // The count is only committed after a successful send: a send that dies on
     // a closing channel did not reach any Server and must not burn budget.
     const replayCount = isReplay ? pending.replayCount + 1 : 0;
-    if (replayCount > this.host.maxReplays) {
+    if (replayCount > this.maxReplays) {
       // SPEC 6.5: a request that keeps killing the process must stop being
       // retried, otherwise one bad input becomes a crash loop.
-      this.host.logger.error(
+      this.logger.error(
         {
           ...requestLogFields(pending.request),
           replayCount: pending.replayCount,
@@ -121,7 +125,7 @@ export class DeliveryLedger {
         pending,
         failure(
           FRAMEWORK_REPLAY_EXHAUSTED,
-          `request ${pending.request.requestId} exceeded ${this.host.maxReplays} replays`,
+          `request ${pending.request.requestId} exceeded ${this.maxReplays} replays`,
         ),
       );
       return true;
@@ -135,18 +139,13 @@ export class DeliveryLedger {
         ),
       );
     } catch (error) {
-      this.host.onServerLost(
-        server,
-        null,
-        null,
-        `send failed: ${messageOf(error)}`,
-      );
+      this.onServerLost(server, null, null, `send failed: ${messageOf(error)}`);
       return false;
     }
     pending.replayCount = replayCount;
     pending.sentOn = server.generation;
     if (isReplay) {
-      this.host.logger.warn(
+      this.logger.warn(
         {
           ...requestLogFields(pending.request),
           replayCount,
@@ -169,6 +168,48 @@ export class DeliveryLedger {
     }, remaining);
   }
 
+  /**
+   * Accepts a `result` message: it settles the buffered entry, or is discarded
+   * when the request already reached a Portal-decided terminal state (SPEC 7.3
+   * keeps the id stable, so the correlation still works — there is just nothing
+   * left to settle).
+   *
+   * `requestSessionId` is envelope metadata for logging only: it must never
+   * reach the settled outcome. Splitting it off with `type` and `requestId` is
+   * what keeps the outcome equal to `ExecutorOutcome`.
+   */
+  acceptResult(message: ResultMessage): void {
+    const {
+      type: _type,
+      requestId: _requestId,
+      requestSessionId,
+      ...outcome
+    } = message;
+    const pending = this.buffer.get(message.requestId);
+    if (pending === undefined) {
+      const fields: LogFields = {
+        requestId: message.requestId,
+        reason: 'request is no longer buffered',
+      };
+      if (requestSessionId !== undefined) {
+        fields.sessionId = requestSessionId;
+      }
+      this.logger.debug(fields, 'late result discarded');
+      return;
+    }
+    const fields: LogFields = {
+      ...requestLogFields(pending.request),
+      durationMs: Date.now() - pending.startedAt,
+    };
+    // `sessionId` stays the entry Session from `requestLogFields`; a routing
+    // change is reported separately, never as a replacement id.
+    if (message.ok && message.sessionChange !== undefined) {
+      fields.sessionChange = message.sessionChange;
+    }
+    this.logger.debug(fields, 'result received');
+    this.settle(pending, outcome);
+  }
+
   private onDeadline(pending: PendingRequest): void {
     if (this.buffer.get(pending.request.requestId) !== pending) {
       return;
@@ -176,7 +217,7 @@ export class DeliveryLedger {
     pending.timer = undefined;
     // warn, not error: the connection layer records the failed outcome at error
     // level, and one request failure should not produce two error lines.
-    this.host.logger.warn(
+    this.logger.warn(
       {
         ...requestLogFields(pending.request),
         code: FRAMEWORK_TIMEOUT,
@@ -203,7 +244,7 @@ export class DeliveryLedger {
    * gone has no one left to tell.
    */
   cancelOnServer(pending: PendingRequest, code: string): void {
-    const server = this.host.currentServer();
+    const server = this.currentServer();
     if (
       server === undefined ||
       !server.ready ||
@@ -218,7 +259,7 @@ export class DeliveryLedger {
         code,
       });
     } catch (error) {
-      this.host.logger.warn(
+      this.logger.warn(
         {
           ...requestLogFields(pending.request),
           code,
@@ -257,7 +298,7 @@ export class DeliveryLedger {
    * `reason` is log-only and names the call site.
    */
   failUndelivered(reason: string): void {
-    const server = this.host.currentServer();
+    const server = this.currentServer();
     this.failWhere(
       (pending) =>
         server === undefined || server.closed || pending.sentOn === undefined,
@@ -313,7 +354,7 @@ export class DeliveryLedger {
       }
       // warn, not error: the connection layer records the failed outcome at
       // error level, and one request failure should not produce two error lines.
-      this.host.logger.warn(
+      this.logger.warn(
         {
           ...requestLogFields(pending.request),
           code,
