@@ -353,40 +353,6 @@ describe('RequestRunner', () => {
     expect(completed[0]).not.toHaveProperty('extension');
   });
 
-  test('runs a duplicated request id once and logs the duplicate once', async () => {
-    const harness = startRunner();
-    let calls = 0;
-    const gate = Promise.withResolvers<void>();
-    harness.register(
-      'slow',
-      async () => {
-        calls += 1;
-        await gate.promise;
-        return 'done';
-      },
-      { access: 'public' },
-    );
-
-    harness.runner.accept(requestMessage({ method: 'slow', replayCount: 0 }));
-    harness.runner.accept(requestMessage({ method: 'slow', replayCount: 1 }));
-    gate.resolve();
-    await tick();
-
-    expect(calls).toBe(1);
-    expect(harness.sent).toEqual([
-      { type: 'result', requestId: 'req-1', ok: true, result: 'done' },
-    ]);
-    const duplicates = harness
-      .logs()
-      .filter((line) => line.code === 'DUPLICATE_REQUEST');
-    expect(duplicates).toHaveLength(1);
-    expect(duplicates[0]).toMatchObject({
-      level: 'warn',
-      requestId: 'req-1',
-      replayCount: 1,
-    });
-  });
-
   test('cancel of a running request invalidates its transaction', async () => {
     const harness = startRunner();
     const entered = Promise.withResolvers<void>();

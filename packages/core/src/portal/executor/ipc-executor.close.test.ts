@@ -464,18 +464,9 @@ describe('IpcExecutor close', () => {
     }
     const declaredGraceMs = shutdown.timeoutMs;
     const shutdownTimeoutMs = 30;
-    const exitWaitMs = 2000;
-    const ackSlackMs = 250;
     // The grace is exactly `shutdownTimeoutMs`, so neither side can be retuned
-    // without the other noticing.
+    // without the other noticing. The full budget is pinned by the test above.
     expect(declaredGraceMs).toBe(shutdownTimeoutMs);
-    // The budget has to contain the Server's share plus every other step this
-    // side performs; a budget that dropped below that would start killing
-    // Servers that were closing correctly. The grace is the third
-    // `shutdownTimeoutMs` term (switch abort, drain, grace).
-    expect(h.executor.closeBudgetMs).toBe(
-      shutdownTimeoutMs * 3 + ackSlackMs + exitWaitMs * 4,
-    );
   });
 
   test('fails pending requests instead of waiting past its own close budget', async () => {

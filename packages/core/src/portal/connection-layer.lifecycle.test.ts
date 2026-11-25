@@ -241,32 +241,7 @@ describe('ConnectionLayer lifecycle', () => {
     expect(transportStarted).toBe(false);
   });
 
-  test('closes the executor when the transport fails to start', async () => {
-    let executorClosed = false;
-    const transport: Transport = {
-      start: () => Promise.reject(new Error('port already in use')),
-      stop: () => Promise.resolve(),
-    };
-    const executor: RequestExecutor = {
-      start: () => Promise.resolve(),
-      execute: () => Promise.resolve({ ok: true, result: null }),
-      cancel: () => Promise.resolve(),
-      close: () => {
-        executorClosed = true;
-        return Promise.resolve();
-      },
-      health: () => ({ state: 'ready', ready: true }),
-    };
-    const layer = new ConnectionLayer({ transport, executor });
-
-    const error = await rejectionOf(layer.start());
-
-    // A Server process started for a layer that never came up has no owner.
-    expect(error.message).toMatch(/port already in use/);
-    expect(executorClosed).toBe(true);
-  });
-
-  test('closes the executor after a failed start (2b)', async () => {
+  test('closes the executor once when the transport fails to start', async () => {
     const order: string[] = [];
     const { executor, closeCalls } = scriptedExecutor(order);
     const transport: Transport = {
@@ -275,7 +250,11 @@ describe('ConnectionLayer lifecycle', () => {
     };
     const layer = new ConnectionLayer({ transport, executor });
 
-    await rejectionOf(layer.start());
+    const error = await rejectionOf(layer.start());
+
+    // A Server process started for a layer that never came up has no owner.
+    expect(error.message).toMatch(/port already in use/);
+    expect(closeCalls()).toBe(1);
     // The failed start already released the executor; a stop must not leak it
     // either, and must not close it a second time.
     await layer.stop();

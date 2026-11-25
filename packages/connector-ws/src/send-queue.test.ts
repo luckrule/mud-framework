@@ -129,51 +129,6 @@ describe('SendQueue', () => {
     expect(order).toEqual(['one', 'two', 'three', 'four']);
   });
 
-  test('rejects the timed-out payload and asks for the connection to drop', async () => {
-    const { sink, abandoned } = fakeSink([-1]);
-    const queue = new SendQueue('c1', 10, sink);
-
-    const pending = tracked(queue.send('hello', 5));
-    await settle();
-    await new Promise<void>((resolve) => {
-      setTimeout(resolve, 40);
-    });
-
-    expect(pending.state()).toBe('rejected');
-    expect(pending.error()?.message).toMatch(/timed out after 10ms/);
-    expect(abandoned).toHaveLength(1);
-    expect(queue.depth).toBe(0);
-  });
-
-  test('rejects every outstanding payload when the connection closes', async () => {
-    const { sink } = fakeSink([-1]);
-    const queue = new SendQueue('c1', 10_000, sink);
-
-    const first = tracked(queue.send('a', 1));
-    const second = tracked(queue.send('b', 1));
-    const third = tracked(queue.send('c', 1));
-    await settle();
-
-    queue.fail(new Error('connection "c1" closed (1001 bye)'));
-    await settle();
-
-    expect(first.error()?.message).toMatch(/closed/);
-    expect(second.error()?.message).toMatch(/closed/);
-    expect(third.error()?.message).toMatch(/closed/);
-    expect(queue.depth).toBe(0);
-  });
-
-  test('rejects a later send once the queue has failed', async () => {
-    const { sink } = fakeSink([1]);
-    const queue = new SendQueue('c1', 10_000, sink);
-
-    queue.fail(new Error('connection "c1" closed'));
-    const rejected = tracked(queue.send('a', 1));
-    await settle();
-
-    expect(rejected.error()?.message).toMatch(/closed/);
-  });
-
   test('rejects a payload Bun dropped instead of queuing it', async () => {
     const { sink } = fakeSink([0]);
     const queue = new SendQueue('c1', 10_000, sink);

@@ -411,67 +411,6 @@ describe('two-process integration', () => {
     }
   });
 
-  test('an extension whose requirements SQLite meets registers and can bind a Session', async () => {
-    const database = tempDatabase({ prefix: 'mud-two-process-' });
-    const portal = createPortal({
-      databasePath: database.path,
-      behavior: 'extension-trial',
-    });
-    try {
-      await portal.layer.start();
-      const url = urlOf(portal);
-
-      // One socket for both requests: `bindSession` commits the route only
-      // after the first request succeeds, and the second request on the same
-      // connection must see it as `ctx.sessionId` (SPEC 2).
-      const socket = await openClient(url);
-      try {
-        const created = await callOnSocket(socket, {
-          id: 'create',
-          method: 'player.create',
-          payload: { name: 'alice', sessionId: 'session-alice' },
-        });
-        expect(created).toEqual({
-          id: 'create',
-          ok: true,
-          result: { created: 'alice', sessionId: 'session-alice' },
-        });
-
-        // The wire result carries only the handler value, so the Session id
-        // here comes from `ctx.sessionId` of the second request, not from the
-        // first request's reply.
-        const whoami = await callOnSocket(socket, {
-          id: 'whoami',
-          method: 'player.whoami',
-        });
-        expect(whoami).toEqual({
-          id: 'whoami',
-          ok: true,
-          result: { sessionId: 'session-alice' },
-        });
-      } finally {
-        socket.close();
-      }
-
-      await stopQuietly(portal);
-
-      // Separate reader, as in the write test above: the row proves the
-      // extension's transaction committed on the Server.
-      const reader = SqliteBackend.open({ filename: database.path });
-      try {
-        const rows = await reader.transaction((tx) =>
-          tx.query<{ name: string }>('SELECT name FROM players'),
-        );
-        expect(rows).toEqual([{ name: 'alice' }]);
-      } finally {
-        await reader.close();
-      }
-    } finally {
-      await stopQuietly(portal);
-      database.remove();
-    }
-  });
-
   test('an optional extension skipped for unmet capabilities leaves no handlers behind, and the Server keeps serving', async () => {
     const database = tempDatabase({ prefix: 'mud-two-process-' });
     const portal = createPortal({

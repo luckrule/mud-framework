@@ -38,252 +38,259 @@ function fakeServer(overrides: Partial<ServerState> = {}): ServerState {
   };
 }
 
+interface Fixture {
+  slot: ServerSlot;
+  previous: ServerState;
+  staged: ServerState;
+  replacement: ServerState;
+  op: { staged: ServerState; previous: ServerState };
+}
+
+function fixture(): Fixture {
+  const previous = fakeServer({ generation: 1 });
+  const staged = fakeServer({ generation: 2 });
+  const replacement = fakeServer({ generation: 3 });
+  return {
+    slot: new ServerSlot(),
+    previous,
+    staged,
+    replacement,
+    op: { staged, previous },
+  };
+}
+
+type ServerRef = 'none' | 'previous' | 'staged' | 'replacement';
+
+interface TransitionRow {
+  name: string;
+  apply: (f: Fixture) => void;
+  status: ServerSlot['status'];
+  server: ServerRef;
+  switching: boolean;
+  terminal: boolean;
+}
+
+const TRANSITIONS: readonly TransitionRow[] = [
+  {
+    name: 'a fresh slot is idle',
+    apply: () => {},
+    status: 'idle',
+    server: 'none',
+    switching: false,
+    terminal: false,
+  },
+  {
+    name: 'beginStart moves to starting without a server',
+    apply: (f) => f.slot.beginStart(),
+    status: 'starting',
+    server: 'none',
+    switching: false,
+    terminal: false,
+  },
+  {
+    name: 'trackSpawning records the server and keeps starting',
+    apply: (f) => {
+      f.slot.beginStart();
+      f.slot.trackSpawning(f.staged);
+    },
+    status: 'starting',
+    server: 'staged',
+    switching: false,
+    terminal: false,
+  },
+  {
+    name: 'markReady records the server and moves to ready',
+    apply: (f) => f.slot.markReady(f.staged),
+    status: 'ready',
+    server: 'staged',
+    switching: false,
+    terminal: false,
+  },
+  {
+    name: 'beginSwitch records the operation and moves to switching',
+    apply: (f) => f.slot.beginSwitch(f.op),
+    status: 'switching',
+    server: 'none',
+    switching: true,
+    terminal: false,
+  },
+  {
+    name: 'markReady promotes the replacement and keeps the switch in flight',
+    apply: (f) => {
+      f.slot.beginSwitch(f.op);
+      f.slot.markReady(f.replacement);
+    },
+    status: 'ready',
+    server: 'replacement',
+    switching: true,
+    terminal: false,
+  },
+  {
+    name: 'resumeServing returns to ready and keeps the serving server',
+    apply: (f) => {
+      f.slot.markReady(f.previous);
+      f.slot.beginSwitch(f.op);
+      f.slot.resumeServing();
+    },
+    status: 'ready',
+    server: 'previous',
+    switching: true,
+    terminal: false,
+  },
+  {
+    name: 'markClosing moves to closing and becomes terminal',
+    apply: (f) => f.slot.markClosing(),
+    status: 'closing',
+    server: 'none',
+    switching: false,
+    terminal: true,
+  },
+  {
+    name: 'markClosed moves to closed and is terminal',
+    apply: (f) => f.slot.markClosed(),
+    status: 'closed',
+    server: 'none',
+    switching: false,
+    terminal: true,
+  },
+  {
+    name: 'markFailed moves to failed and is terminal',
+    apply: (f) => f.slot.markFailed(),
+    status: 'failed',
+    server: 'none',
+    switching: false,
+    terminal: true,
+  },
+  {
+    name: 'beginStart moves a failed slot back to starting and keeps the dead server',
+    apply: (f) => {
+      f.slot.markReady(f.previous);
+      f.slot.markFailed();
+      f.slot.beginStart();
+    },
+    status: 'starting',
+    server: 'previous',
+    switching: false,
+    terminal: false,
+  },
+];
+
 describe('ServerSlot status transitions', () => {
-  test('a fresh slot is idle with no server and no switch', () => {
-    const slot = new ServerSlot();
+  for (const row of TRANSITIONS) {
+    test(row.name, () => {
+      const f = fixture();
+      row.apply(f);
 
-    expect(slot.status).toBe('idle');
-    expect(slot.server).toBeUndefined();
-    expect(slot.switching).toBeUndefined();
-    expect(slot.isTerminal).toBe(false);
-  });
-
-  test('beginStart moves to starting and does not create a server', () => {
-    const slot = new ServerSlot();
-
-    slot.beginStart();
-
-    expect(slot.status).toBe('starting');
-    expect(slot.server).toBeUndefined();
-  });
-
-  test('trackSpawning records the server and keeps the starting status', () => {
-    const slot = new ServerSlot();
-    const server = fakeServer();
-
-    slot.beginStart();
-    slot.trackSpawning(server);
-
-    expect(slot.status).toBe('starting');
-    expect(slot.server).toBe(server);
-  });
-
-  test('markReady records the server and moves to ready', () => {
-    const slot = new ServerSlot();
-    const server = fakeServer();
-
-    slot.markReady(server);
-
-    expect(slot.status).toBe('ready');
-    expect(slot.server).toBe(server);
-  });
-
-  test('beginSwitch records the operation and moves to switching', () => {
-    const slot = new ServerSlot();
-    const op = { staged: fakeServer(), previous: fakeServer() };
-
-    slot.beginSwitch(op);
-
-    expect(slot.status).toBe('switching');
-    expect(slot.switching).toBe(op);
-  });
-
-  test('markReady promotes the replacement and keeps the switch in flight', () => {
-    const slot = new ServerSlot();
-    const op = { staged: fakeServer(), previous: fakeServer() };
-    const replacement = fakeServer({ generation: 2 });
-
-    slot.beginSwitch(op);
-    slot.markReady(replacement);
-
-    expect(slot.status).toBe('ready');
-    expect(slot.server).toBe(replacement);
-    expect(slot.switching).toBe(op);
-  });
-
-  test('resumeServing returns to ready and keeps the serving server', () => {
-    const slot = new ServerSlot();
-    const previous = fakeServer();
-    const op = { staged: fakeServer(), previous };
-
-    slot.markReady(previous);
-    slot.beginSwitch(op);
-    slot.resumeServing();
-
-    expect(slot.status).toBe('ready');
-    expect(slot.server).toBe(previous);
-  });
-
-  test('markClosing moves to closing', () => {
-    const slot = new ServerSlot();
-
-    slot.markClosing();
-
-    expect(slot.status).toBe('closing');
-  });
-
-  test('markClosed moves to closed', () => {
-    const slot = new ServerSlot();
-
-    slot.markClosed();
-
-    expect(slot.status).toBe('closed');
-  });
-
-  test('markFailed moves to failed', () => {
-    const slot = new ServerSlot();
-
-    slot.markFailed();
-
-    expect(slot.status).toBe('failed');
-  });
-
-  test('beginStart moves a failed slot back to starting', () => {
-    const slot = new ServerSlot();
-    const lost = fakeServer();
-
-    slot.markReady(lost);
-    slot.markFailed();
-    slot.beginStart();
-
-    expect(slot.status).toBe('starting');
-    // The dead server is still the identity the crash path compares against.
-    expect(slot.server).toBe(lost);
-  });
-});
-
-describe('ServerSlot isTerminal', () => {
-  test('idle is not terminal', () => {
-    expect(new ServerSlot().isTerminal).toBe(false);
-  });
-
-  test('starting is not terminal', () => {
-    const slot = new ServerSlot();
-    slot.beginStart();
-
-    expect(slot.isTerminal).toBe(false);
-  });
-
-  test('ready is not terminal', () => {
-    const slot = new ServerSlot();
-    slot.markReady(fakeServer());
-
-    expect(slot.isTerminal).toBe(false);
-  });
-
-  test('switching is not terminal', () => {
-    const slot = new ServerSlot();
-    slot.beginSwitch({ staged: fakeServer(), previous: fakeServer() });
-
-    expect(slot.isTerminal).toBe(false);
-  });
-
-  test('closing is terminal', () => {
-    const slot = new ServerSlot();
-    slot.markClosing();
-
-    expect(slot.isTerminal).toBe(true);
-  });
-
-  test('closed is terminal', () => {
-    const slot = new ServerSlot();
-    slot.markClosed();
-
-    expect(slot.isTerminal).toBe(true);
-  });
-
-  test('failed is terminal', () => {
-    const slot = new ServerSlot();
-    slot.markFailed();
-
-    expect(slot.isTerminal).toBe(true);
-  });
+      expect(f.slot.status).toBe(row.status);
+      expect(f.slot.server).toBe(
+        row.server === 'none' ? undefined : f[row.server],
+      );
+      expect(f.slot.switching).toBe(row.switching ? f.op : undefined);
+      expect(f.slot.isTerminal).toBe(row.terminal);
+    });
+  }
 });
 
 describe('ServerSlot nextGeneration', () => {
-  test('generations start at one and increase strictly', () => {
-    const slot = new ServerSlot();
+  test('starts at one, increases strictly and survives a status change', () => {
+    const f = fixture();
 
-    const first = slot.nextGeneration();
-    const second = slot.nextGeneration();
-    const third = slot.nextGeneration();
+    const first = f.slot.nextGeneration();
+    const second = f.slot.nextGeneration();
+    f.slot.markReady(f.staged);
+    f.slot.markClosed();
 
     expect(first).toBe(1);
     expect(second).toBeGreaterThan(first);
-    expect(third).toBeGreaterThan(second);
-  });
-
-  test('generations are not reset by a status change', () => {
-    const slot = new ServerSlot();
-    slot.nextGeneration();
-    slot.markReady(fakeServer({ generation: 1 }));
-    slot.markClosed();
-
-    expect(slot.nextGeneration()).toBe(2);
+    expect(f.slot.nextGeneration()).toBeGreaterThan(second);
   });
 });
+
+interface ReleaseRow {
+  name: string;
+  release: 'current' | 'other';
+  switching: boolean;
+}
+
+const RELEASE_CASES: readonly ReleaseRow[] = [
+  {
+    name: 'releasing the in-flight operation clears it',
+    release: 'current',
+    switching: false,
+  },
+  {
+    name: 'releasing another operation leaves the in-flight one in place',
+    release: 'other',
+    switching: true,
+  },
+];
 
 describe('ServerSlot releaseSwitch', () => {
-  test('releasing the in-flight operation clears it', () => {
-    const slot = new ServerSlot();
-    const op = { staged: fakeServer(), previous: fakeServer() };
-    slot.beginSwitch(op);
+  for (const row of RELEASE_CASES) {
+    test(row.name, () => {
+      const f = fixture();
+      const other = {
+        staged: fakeServer({ generation: 4 }),
+        previous: fakeServer({ generation: 5 }),
+      };
+      f.slot.beginSwitch(f.op);
 
-    slot.releaseSwitch(op);
+      f.slot.releaseSwitch(row.release === 'current' ? f.op : other);
 
-    expect(slot.switching).toBeUndefined();
-  });
-
-  test('releasing another operation leaves the in-flight one in place', () => {
-    const slot = new ServerSlot();
-    const op = { staged: fakeServer(), previous: fakeServer() };
-    const other = { staged: fakeServer(), previous: fakeServer() };
-    slot.beginSwitch(op);
-
-    slot.releaseSwitch(other);
-
-    expect(slot.switching).toBe(op);
-  });
-
-  test('releasing a switch does not change the status', () => {
-    const slot = new ServerSlot();
-    const op = { staged: fakeServer(), previous: fakeServer() };
-    slot.beginSwitch(op);
-
-    slot.releaseSwitch(op);
-
-    // The switch's own finish step still has to report its outcome.
-    expect(slot.status).toBe('switching');
-  });
+      expect(f.slot.switching).toBe(row.switching ? f.op : undefined);
+      // The switch's own finish step still has to report its outcome.
+      expect(f.slot.status).toBe('switching');
+    });
+  }
 });
 
+interface ClearRow {
+  name: string;
+  setup: (f: Fixture) => void;
+  target: (f: Fixture) => ServerState;
+  cleared: boolean;
+  server: ServerRef;
+}
+
+const CLEAR_CASES: readonly ClearRow[] = [
+  {
+    name: 'clears the current server and reports true',
+    setup: (f) => f.slot.markReady(f.previous),
+    target: (f) => f.previous,
+    cleared: true,
+    server: 'none',
+  },
+  {
+    name: 'leaves a promoted replacement in place and reports false',
+    setup: (f) => {
+      f.slot.markReady(f.previous);
+      f.slot.markReady(f.replacement);
+    },
+    target: (f) => f.previous,
+    cleared: false,
+    server: 'replacement',
+  },
+  {
+    name: 'reports false when no server is current',
+    setup: () => {},
+    target: (f) => f.staged,
+    cleared: false,
+    server: 'none',
+  },
+];
+
 describe('ServerSlot clearIfCurrent', () => {
-  test('clears the current server and reports true', () => {
-    const slot = new ServerSlot();
-    const server = fakeServer();
-    slot.markReady(server);
+  for (const row of CLEAR_CASES) {
+    test(row.name, () => {
+      const f = fixture();
+      row.setup(f);
 
-    expect(slot.clearIfCurrent(server)).toBe(true);
-    expect(slot.server).toBeUndefined();
-  });
-
-  test('leaves a promoted replacement in place and reports false', () => {
-    const slot = new ServerSlot();
-    const stale = fakeServer({ generation: 1 });
-    const replacement = fakeServer({ generation: 2 });
-    slot.markReady(stale);
-    slot.markReady(replacement);
-
-    expect(slot.clearIfCurrent(stale)).toBe(false);
-    expect(slot.server).toBe(replacement);
-  });
-
-  test('reports false when no server is current', () => {
-    const slot = new ServerSlot();
-
-    expect(slot.clearIfCurrent(fakeServer())).toBe(false);
-    expect(slot.server).toBeUndefined();
-  });
+      expect(f.slot.clearIfCurrent(row.target(f))).toBe(row.cleared);
+      expect(f.slot.server).toBe(
+        row.server === 'none' ? undefined : f[row.server],
+      );
+    });
+  }
 });
 
 describe('ServerSlot assertNoOtherLiveServer', () => {

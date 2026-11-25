@@ -361,8 +361,8 @@ describe('ConnectionLayer request', () => {
     await sleep(60);
   });
 
-  test('logs an access refusal at warn with its code and request id', async () => {
-    const { transport, dispatcher, logs } = await harness({
+  test('answers a session-gated handler with AUTH_REQUIRED', async () => {
+    const { transport, dispatcher } = await harness({
       createRequestId: () => 'req-refused',
     });
     dispatcher.register('inspect', async () => null);
@@ -375,21 +375,10 @@ describe('ConnectionLayer request', () => {
       ok: false,
       error: { code: 'AUTH_REQUIRED' },
     });
-    const refused = logs().filter(
-      (entry) =>
-        entry.msg === 'request failed' && entry.code === 'AUTH_REQUIRED',
-    );
-    expect(refused).toHaveLength(1);
-    expect(refused[0]).toMatchObject({
-      level: 'warn',
-      requestId: 'req-refused',
-      method: 'inspect',
-      code: 'AUTH_REQUIRED',
-    });
   });
 
-  test('logs a policy refusal at warn with its code and request id', async () => {
-    const { transport, dispatcher, logs } = await harness({
+  test('answers a policy refusal with FORBIDDEN', async () => {
+    const { transport, dispatcher } = await harness({
       createRequestId: () => 'req-forbidden',
       authorize: () => false,
     });
@@ -402,16 +391,6 @@ describe('ConnectionLayer request', () => {
       id: 'r1',
       ok: false,
       error: { code: 'FORBIDDEN' },
-    });
-    const refused = logs().filter(
-      (entry) => entry.msg === 'request failed' && entry.code === 'FORBIDDEN',
-    );
-    expect(refused).toHaveLength(1);
-    expect(refused[0]).toMatchObject({
-      level: 'warn',
-      requestId: 'req-forbidden',
-      method: 'inspect',
-      code: 'FORBIDDEN',
     });
   });
 

@@ -195,52 +195,6 @@ describe('ConnectionLayer session routing (SPEC 3.2, INV-004)', () => {
     await layer.stop();
   });
 
-  test('rebinding the same session on one connection is idempotent', async () => {
-    const { transport, layer, logs } = sessionHarness();
-    await layer.start();
-    transport.connect('c1');
-
-    await transport.receive('c1', '{"id":"1","method":"bind"}');
-    await transport.receive('c1', '{"id":"2","method":"bind"}');
-    await transport.receive('c1', '{"id":"3","method":"bind"}');
-
-    // A long-lived connection binds once; repeating it must not log per
-    // request or turn into a self-handoff.
-    expect(
-      logs().filter((entry) => entry.msg === 'session bound'),
-    ).toHaveLength(1);
-    expect(
-      logs().filter(
-        (entry) => entry.msg === 'session rebound to a new connection',
-      ),
-    ).toHaveLength(0);
-    await layer.stop();
-  });
-
-  test('binding a new session on one connection drops the old route', async () => {
-    let bound = 's1';
-    const { transport, layer, logs } = sessionHarness({
-      sessionOf: (method) => (method === 'bind' ? bound : undefined),
-    });
-    await layer.start();
-    transport.connect('c1');
-
-    await transport.receive('c1', '{"id":"1","method":"bind"}');
-    bound = 's2';
-    await transport.receive('c1', '{"id":"2","method":"bind"}');
-    // c1 no longer holds s1, so this is a first binding, not a handoff.
-    transport.connect('c2');
-    bound = 's1';
-    await transport.receive('c2', '{"id":"3","method":"bind"}');
-
-    expect(
-      logs().filter(
-        (entry) => entry.msg === 'session rebound to a new connection',
-      ),
-    ).toHaveLength(0);
-    await layer.stop();
-  });
-
   test('a reconnecting connection waits for the previous connection to settle', async () => {
     const { transport, layer, controlled } = sessionHarness();
     await layer.start();
@@ -796,147 +750,111 @@ describe('ConnectionLayer session routing (SPEC 3.2, INV-004)', () => {
     await layer.stop();
   });
 
-  test('a failed unbind keeps the route', async () => {
-    const { transport, dispatcher, layer } = await harness();
-    dispatcher.register(
-      'login',
-      async (ctx) => {
-        ctx.bindSession('s1');
-        return null;
-      },
-      { access: 'public', mayChangeSession: true },
-    );
-    dispatcher.register(
-      'logout',
-      async (ctx) => {
-        ctx.unbindSession();
-        throw new Error('logout refused');
-      },
-      { access: 'public', mayChangeSession: true },
-    );
-    dispatcher.register('protected', async (ctx) => ctx.sessionId ?? null);
-    transport.connect('c1');
+  test.each(['failed', 'timed-out'] as const)(
+    'a %s unbind keeps the route',
+    async (mode) => {
+      const { transport, dispatcher, layer } =
+        mode === 'timed-out'
+          ? await harness({ timeoutMs: 20 })
+          : await harness();
+      const handlerDone = Promise.withResolvers<void>();
+      dispatcher.register(
+        'login',
+        async (ctx) => {
+          ctx.bindSession('s1');
+          return null;
+        },
+        { access: 'public', mayChangeSession: true },
+      );
+      dispatcher.register(
+        'logout',
+        async (ctx) => {
+          ctx.unbindSession();
+          if (mode === 'failed') {
+            throw new Error('logout refused');
+          }
+          await sleep(50);
+          handlerDone.resolve();
+          return 'bye';
+        },
+        { access: 'public', mayChangeSession: true },
+      );
+      dispatcher.register('protected', async (ctx) => ctx.sessionId ?? null);
+      transport.connect('c1');
 
-    await transport.receive('c1', '{"id":"1","method":"login"}');
-    await transport.receive('c1', '{"id":"2","method":"logout"}');
-    expect(lastFrame(transport, 'c1')).toMatchObject({
-      id: '2',
-      ok: false,
-      error: { code: 'INTERNAL_ERROR' },
-    });
+      await sleep(1);
+      await transport.receive('c1', '{"id":"1","method":"login"}');
+      await sleep(1);
+      await transport.receive('c1', '{"id":"2","method":"logout"}');
+      expect(lastFrame(transport, 'c1')).toMatchObject({
+        id: '2',
+        ok: false,
+        error: {
+          code: mode === 'failed' ? 'INTERNAL_ERROR' : 'FRAMEWORK_TIMEOUT',
+        },
+      });
 
-    await transport.receive('c1', '{"id":"3","method":"protected"}');
-    expect(lastFrame(transport, 'c1')).toEqual({
-      id: '3',
-      ok: true,
-      result: 's1',
-    });
-    await layer.stop();
-  });
+      if (mode === 'timed-out') {
+        // The abandoned handler returns after the deadline; it must not apply
+        // its change then either (SPEC 2: only a successful request commits).
+        await handlerDone.promise;
+      }
 
-  test('a timed-out unbind keeps the route', async () => {
-    const { transport, dispatcher, layer } = await harness({ timeoutMs: 20 });
-    const handlerDone = Promise.withResolvers<void>();
-    dispatcher.register(
-      'login',
-      async (ctx) => {
-        ctx.bindSession('s1');
-        return null;
-      },
-      { access: 'public', mayChangeSession: true },
-    );
-    dispatcher.register(
-      'logout',
-      async (ctx) => {
-        ctx.unbindSession();
-        await sleep(50);
-        handlerDone.resolve();
-        return 'bye';
-      },
-      { access: 'public', mayChangeSession: true },
-    );
-    dispatcher.register('protected', async (ctx) => ctx.sessionId ?? null);
-    transport.connect('c1');
+      await transport.receive('c1', '{"id":"3","method":"protected"}');
+      expect(lastFrame(transport, 'c1')).toEqual({
+        id: '3',
+        ok: true,
+        result: 's1',
+      });
+      await layer.stop();
+    },
+  );
 
-    await sleep(1);
-    await transport.receive('c1', '{"id":"1","method":"login"}');
-    await sleep(1);
-    await transport.receive('c1', '{"id":"2","method":"logout"}');
-    expect(lastFrame(transport, 'c1')).toMatchObject({
-      id: '2',
-      ok: false,
-      error: { code: 'FRAMEWORK_TIMEOUT' },
-    });
+  test.each(['failed', 'timed-out'] as const)(
+    'a %s bind leaves the connection unbound',
+    async (mode) => {
+      const { transport, dispatcher, layer } =
+        mode === 'timed-out'
+          ? await harness({ timeoutMs: 20 })
+          : await harness();
+      const handlerDone = Promise.withResolvers<void>();
+      dispatcher.register(
+        'login',
+        async (ctx) => {
+          ctx.bindSession(mode === 'failed' ? 'half-made' : 'too-late');
+          if (mode === 'failed') {
+            throw new Error('login refused');
+          }
+          await sleep(50);
+          handlerDone.resolve();
+          return 'late';
+        },
+        { access: 'public', mayChangeSession: true },
+      );
+      dispatcher.register('protected', async (ctx) => ctx.sessionId ?? null);
+      transport.connect('c1');
 
-    // The abandoned handler returns after the deadline; it must not apply its
-    // change then either (SPEC 2: only a successful request commits).
-    await handlerDone.promise;
+      await transport.receive('c1', '{"id":"1","method":"login"}');
+      expect(lastFrame(transport, 'c1')).toMatchObject({
+        id: '1',
+        ok: false,
+        error: {
+          code: mode === 'failed' ? 'INTERNAL_ERROR' : 'FRAMEWORK_TIMEOUT',
+        },
+      });
+      if (mode === 'timed-out') {
+        await handlerDone.promise;
+      }
 
-    await transport.receive('c1', '{"id":"3","method":"protected"}');
-    expect(lastFrame(transport, 'c1')).toEqual({
-      id: '3',
-      ok: true,
-      result: 's1',
-    });
-    await layer.stop();
-  });
-
-  test('a failed bind leaves the connection unbound', async () => {
-    const { transport, dispatcher, layer } = await harness();
-    dispatcher.register(
-      'login',
-      async (ctx) => {
-        ctx.bindSession('half-made');
-        throw new Error('login refused');
-      },
-      { access: 'public', mayChangeSession: true },
-    );
-    dispatcher.register('protected', async (ctx) => ctx.sessionId ?? null);
-    transport.connect('c1');
-
-    await transport.receive('c1', '{"id":"1","method":"login"}');
-    await transport.receive('c1', '{"id":"2","method":"protected"}');
-
-    // The failure is reported, and no route outlived it: the later request
-    // entered without a Session and the gate refused it.
-    expect(lastFrame(transport, 'c1')).toMatchObject({
-      id: '2',
-      ok: false,
-      error: { code: 'AUTH_REQUIRED' },
-    });
-    await layer.stop();
-  });
-
-  test('a timed-out bind leaves the connection unbound', async () => {
-    const { transport, dispatcher, layer } = await harness({ timeoutMs: 20 });
-    const handlerDone = Promise.withResolvers<void>();
-    dispatcher.register(
-      'login',
-      async (ctx) => {
-        ctx.bindSession('too-late');
-        await sleep(50);
-        handlerDone.resolve();
-        return 'late';
-      },
-      { access: 'public', mayChangeSession: true },
-    );
-    dispatcher.register('protected', async (ctx) => ctx.sessionId ?? null);
-    transport.connect('c1');
-
-    await transport.receive('c1', '{"id":"1","method":"login"}');
-    expect(lastFrame(transport, 'c1')).toMatchObject({
-      id: '1',
-      ok: false,
-      error: { code: 'FRAMEWORK_TIMEOUT' },
-    });
-    await handlerDone.promise;
-
-    await transport.receive('c1', '{"id":"2","method":"protected"}');
-    expect(lastFrame(transport, 'c1')).toMatchObject({
-      id: '2',
-      ok: false,
-      error: { code: 'AUTH_REQUIRED' },
-    });
-    await layer.stop();
-  });
+      await transport.receive('c1', '{"id":"2","method":"protected"}');
+      // The failure is reported, and no route outlived it: the later request
+      // entered without a Session and the gate refused it.
+      expect(lastFrame(transport, 'c1')).toMatchObject({
+        id: '2',
+        ok: false,
+        error: { code: 'AUTH_REQUIRED' },
+      });
+      await layer.stop();
+    },
+  );
 });

@@ -26,10 +26,11 @@ import { SqliteBackend } from '../../packages/storage-sqlite/src/index.ts';
  * deployment path, not a mocked channel.
  *
  * Every row gets its own temp database and an ephemeral WebSocket port. The
- * graceful rows install the SIGTERM shutdown pattern documented in
- * docs/INTEGRATION.md, extended to SIGINT/SIGHUP; the default rows install
- * none, so the OS terminates the Portal and the Server's orphan detection is
- * the only thing that can stop it.
+ * graceful row installs the SIGTERM shutdown pattern documented in
+ * docs/INTEGRATION.md; the default rows install none, so the OS terminates the
+ * Portal and the Server's orphan detection is the only thing that can stop it.
+ * SIGINT/SIGHUP are left out: they take the same fixture paths as the SIGTERM
+ * rows and each row costs a real Portal and Server spawn.
  *
  * The signal delivery under test is POSIX-only. The win32 exit-code branch in
  * `diedFromSignal` is kept for completeness but has not been exercised here.
@@ -63,28 +64,8 @@ const SIGNAL_SCENARIOS: readonly SignalScenario[] = [
     mode: 'graceful',
   },
   {
-    label: 'SIGINT with the graceful shutdown handler',
-    signal: 'SIGINT',
-    mode: 'graceful',
-  },
-  {
-    label: 'SIGHUP with the graceful shutdown handler',
-    signal: 'SIGHUP',
-    mode: 'graceful',
-  },
-  {
     label: 'SIGTERM with the OS default action and no Portal handler',
     signal: 'SIGTERM',
-    mode: 'default',
-  },
-  {
-    label: 'SIGINT with the OS default action and no Portal handler',
-    signal: 'SIGINT',
-    mode: 'default',
-  },
-  {
-    label: 'SIGHUP with the OS default action and no Portal handler',
-    signal: 'SIGHUP',
     mode: 'default',
   },
   {

@@ -29,14 +29,7 @@ function countingLaunch(): { launch: () => void; calls: () => number } {
 }
 
 describe('RestartPolicy backoff', () => {
-  test('the first restart of a streak is immediate', () => {
-    const policy = makePolicy();
-
-    expect(policy.nextBackoffMs()).toBe(0);
-    expect(policy.attempts).toBe(1);
-  });
-
-  test('later restarts double from the base', () => {
+  test('the first restart is immediate and later ones double from the base', () => {
     const policy = makePolicy();
 
     const backoffs = [
@@ -68,18 +61,16 @@ describe('RestartPolicy backoff', () => {
       MAX_RESTART_BACKOFF_MS,
     ]);
     expect(policy.attempts).toBe(10);
-  });
 
-  test('a base above the cap is capped on the second restart', () => {
-    const policy = makePolicy({ baseBackoffMs: MAX_RESTART_BACKOFF_MS * 2 });
-
-    expect(policy.nextBackoffMs()).toBe(0);
-    expect(policy.nextBackoffMs()).toBe(MAX_RESTART_BACKOFF_MS);
+    // A base above the cap is capped on the second restart.
+    const capped = makePolicy({ baseBackoffMs: MAX_RESTART_BACKOFF_MS * 2 });
+    expect(capped.nextBackoffMs()).toBe(0);
+    expect(capped.nextBackoffMs()).toBe(MAX_RESTART_BACKOFF_MS);
   });
 });
 
 describe('RestartPolicy stability window', () => {
-  test('the streak survives until the window expires', () => {
+  test('the streak survives until the window expires, then resets to immediate', () => {
     jest.useFakeTimers();
     try {
       const policy = makePolicy();
@@ -92,20 +83,6 @@ describe('RestartPolicy stability window', () => {
 
       jest.advanceTimersByTime(1);
       expect(policy.attempts).toBe(0);
-    } finally {
-      jest.useRealTimers();
-    }
-  });
-
-  test('a streak that ends restarts from the immediate backoff', () => {
-    jest.useFakeTimers();
-    try {
-      const policy = makePolicy();
-      policy.nextBackoffMs();
-      policy.nextBackoffMs();
-      policy.startStableClock();
-
-      jest.advanceTimersByTime(STABLE_RESET_MS);
 
       expect(policy.nextBackoffMs()).toBe(0);
       expect(policy.attempts).toBe(1);
@@ -114,7 +91,7 @@ describe('RestartPolicy stability window', () => {
     }
   });
 
-  test('restarting the stable clock postpones the reset', () => {
+  test('restarting the clock postpones the reset, and clearing it never arms it', () => {
     jest.useFakeTimers();
     try {
       const policy = makePolicy();
@@ -129,40 +106,25 @@ describe('RestartPolicy stability window', () => {
       jest.advanceTimersByTime(STABLE_RESET_MS / 2);
       expect(policy.attempts).toBe(1);
 
-      jest.advanceTimersByTime(STABLE_RESET_MS / 2);
-      expect(policy.attempts).toBe(0);
-    } finally {
-      jest.useRealTimers();
-    }
-  });
-
-  test('clearing the stable clock keeps the streak', () => {
-    jest.useFakeTimers();
-    try {
-      const policy = makePolicy();
-      policy.nextBackoffMs();
-      policy.startStableClock();
-
+      // Clearing the armed clock keeps the streak and leaves no timer behind.
       policy.clearStableClock();
       jest.advanceTimersByTime(STABLE_RESET_MS * 2);
-
       expect(policy.attempts).toBe(1);
       expect(jest.getTimerCount()).toBe(0);
     } finally {
       jest.useRealTimers();
     }
-  });
 
-  test('clearing an expired stable clock changes nothing', () => {
     jest.useFakeTimers();
     try {
-      const policy = makePolicy();
-      policy.nextBackoffMs();
-      policy.startStableClock();
+      // Clearing an expired clock changes nothing and does not throw.
+      const expired = makePolicy();
+      expired.nextBackoffMs();
+      expired.startStableClock();
       jest.advanceTimersByTime(STABLE_RESET_MS);
 
-      expect(() => policy.clearStableClock()).not.toThrow();
-      expect(policy.attempts).toBe(0);
+      expect(() => expired.clearStableClock()).not.toThrow();
+      expect(expired.attempts).toBe(0);
     } finally {
       jest.useRealTimers();
     }
@@ -170,10 +132,12 @@ describe('RestartPolicy stability window', () => {
 });
 
 describe('RestartPolicy restart scheduling', () => {
-  test('runs the launch once after the backoff', () => {
+  test('runs the launch exactly once after the backoff, never before it', () => {
     jest.useFakeTimers();
     try {
       const policy = makePolicy();
+      // Clearing an unarmed timer is a no-op and does not break a later schedule.
+      policy.clearRestartTimer();
       const { launch, calls } = countingLaunch();
 
       policy.scheduleRestart(250, launch);
@@ -189,14 +153,12 @@ describe('RestartPolicy restart scheduling', () => {
     } finally {
       jest.useRealTimers();
     }
-  });
 
-  test('an immediate restart still waits for the timer', () => {
     jest.useFakeTimers();
     try {
+      // An immediate restart still waits for the timer.
       const policy = makePolicy();
       const { launch, calls } = countingLaunch();
-
       policy.scheduleRestart(0, launch);
       expect(calls()).toBe(0);
 
@@ -232,34 +194,22 @@ describe('RestartPolicy restart scheduling', () => {
     }
   });
 
-  test('clearing the restart timer prevents the launch', () => {
+  test('clearing the restart timer prevents the launch and leaves the stable clock running', () => {
     jest.useFakeTimers();
     try {
       const policy = makePolicy();
       const { launch, calls } = countingLaunch();
-
+      policy.nextBackoffMs();
+      policy.startStableClock();
       policy.scheduleRestart(100, launch);
+
       policy.clearRestartTimer();
-      jest.advanceTimersByTime(10_000);
+      jest.advanceTimersByTime(STABLE_RESET_MS);
 
       expect(calls()).toBe(0);
+      // The stable clock did expire, so the streak reset as usual.
+      expect(policy.attempts).toBe(0);
       expect(jest.getTimerCount()).toBe(0);
-    } finally {
-      jest.useRealTimers();
-    }
-  });
-
-  test('clearing an unarmed restart timer is a no-op', () => {
-    const policy = makePolicy();
-
-    expect(() => policy.clearRestartTimer()).not.toThrow();
-    // A later schedule still arms and runs.
-    jest.useFakeTimers();
-    try {
-      const { launch, calls } = countingLaunch();
-      policy.scheduleRestart(100, launch);
-      jest.advanceTimersByTime(100);
-      expect(calls()).toBe(1);
     } finally {
       jest.useRealTimers();
     }
@@ -285,25 +235,6 @@ describe('RestartPolicy restart scheduling', () => {
 
       jest.advanceTimersByTime(100);
       expect(calls).toBe(2);
-    } finally {
-      jest.useRealTimers();
-    }
-  });
-
-  test('clearing the restart timer leaves the stable clock running', () => {
-    jest.useFakeTimers();
-    try {
-      const policy = makePolicy();
-      const { launch, calls } = countingLaunch();
-      policy.nextBackoffMs();
-      policy.startStableClock();
-      policy.scheduleRestart(100, launch);
-
-      policy.clearRestartTimer();
-      jest.advanceTimersByTime(STABLE_RESET_MS);
-
-      expect(calls()).toBe(0);
-      expect(policy.attempts).toBe(0);
     } finally {
       jest.useRealTimers();
     }

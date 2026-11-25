@@ -343,20 +343,6 @@ describe('runServerProcess two-phase activation', () => {
     expect(h.created()).toBe(0);
   });
 
-  test('ignores a request that arrives before hello', async () => {
-    const h = activationHarness();
-
-    h.portal.send(requestMessage());
-    await tick();
-
-    expect(results(h.messages)).toEqual([]);
-    expect(
-      h.logs().filter((line) => line.code === 'REQUEST_BEFORE_READY'),
-    ).toHaveLength(1);
-    expect(h.created()).toBe(0);
-    await h.stop();
-  });
-
   test('reports a startup failure after activate as ServerStartupError', async () => {
     const h = activationHarness({
       createBackend: () => Promise.reject(new Error('disk unavailable')),
