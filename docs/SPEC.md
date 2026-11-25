@@ -271,7 +271,9 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 
 连接层 MUST NOT 在业务进程就绪之前接受输入。理由：否则第一批玩家会收到"框架正在启动"这类本不该存在的错误。
 
-就绪由两阶段握手表达（ADR-0007）：业务进程收到 `hello` 后先回 `prepared`，此时 MUST NOT 打开存储、注册 Extension 或执行 Handler；只有收到 `activate` 才执行第 1、2 步并安装请求处理器，然后发 `ready`。连接层在收到 `ready` 之后才开始接受连接。边界：`prepared` 只表示进程活着且等待激活，不表示可用；连接层不得向 prepared 的业务进程投递 Request，切换场景中旧进程关闭与新进程 `activate` 的先后由调用方保证（INV-002）。
+就绪由两阶段握手表达（ADR-0007）：业务进程收到 `hello` 后先回 `prepared`，此时 MUST NOT 打开存储、注册 Extension 或执行 Handler；只有收到 `activate` 才执行第 1、2 步并安装请求处理器，然后发 `ready`。连接层在收到 `ready` 之后才开始接受连接。边界：`prepared` 只表示进程活着且等待激活，不表示可用；连接层不得向 prepared 的业务进程投递 Request。
+
+版本切换复用同一协议，顺序是契约：连接层先起新进程并等到 `prepared`，再停旧进程、等它 `closed` 且进程退出，然后才向新进程发 `activate` 并等 `ready`，最后把缓冲请求投给新进程。`activate` MUST NOT 在旧进程仍可能持有存储时发出（INV-002）；`closed` 只表示旧进程完成关闭流程，不表示它已释放存储，因此退出确认不可省略。切换期间连接层 MUST 继续接受请求并保留在未确认缓冲中，不得向即将退役的旧进程或尚未 `ready` 的新进程投递；这些请求在新进程 `ready` 后按 6.5 的顺序投递。切换失败时，旧进程未被 drain 则 MUST 继续服务；旧进程已退出则 MUST 以切换前的版本重新启动，不得留下无 Server 的状态或两个活跃 Server。旧进程退出未确认时，回滚重启 MUST 等到旧进程与已 `activate` 的新进程的退出都确认后才开始（与崩溃路径同构）。切换成功提升后，连接层 MUST 以新进程的 spawn 与 `codeVersion` 作为当前版本：此后崩溃重启的是刚提升的版本，新请求也盖上该版本；切换失败回滚则保持原版本。`close()` 在 `activate` 之后中止切换时，MUST 在返回前对已放弃的新进程执行有界的退出确认（等退出 → kill → 再等），确认失败则记 warn。
 
 ### 6.3 关闭顺序
 
@@ -293,7 +295,7 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 
 理由：at-least-once 是"连接保活"这一承诺的直接代价——只要允许重放，重复执行就无法在框架层排除。这也是双进程架构存在的理由：单进程崩溃会同时带走连接与状态，无从重放。
 
-代码版本只回显，不判兼容：`prepared`、`ready` 与 `request` 上的 `codeVersion` 是应用提供的 opaque 非空字符串。`prepared` 与 `ready` 报告同一个值——该 Server 正在运行的代码版本；`request` 记录 Portal 接受该请求时的版本，重放沿用该值而不是替换 Server 的版本。Portal 在自身配置了版本、且 `ready` 带了一个不同版本时记 warn（`expectedCodeVersion`、`actualCodeVersion`、`pid`）；Server 在处理 `replayCount > 0` 的请求、且请求版本与自身版本都存在且不同时记 warn（请求标识字段、`requestCodeVersion`、`serverCodeVersion`、`replayCount`）。两侧都不因不匹配失败、拒绝、取消请求或改变重放策略。跨版本重放只保证 at-least-once 与可观测，不保证行为兼容；是否允许带版本热修、如何发布，由部署方决定。
+代码版本只回显，不判兼容：`prepared`、`ready` 与 `request` 上的 `codeVersion` 是应用提供的 opaque 非空字符串。`prepared` 与 `ready` 报告同一个值——该 Server 正在运行的代码版本；`request` 记录 Portal 接受该请求时的版本，重放沿用该值而不是替换 Server 的版本。Portal 在自身配置了版本、且 `ready` 带了一个不同版本时记 warn（`expectedCodeVersion`、`actualCodeVersion`、`pid`）；Server 在处理 `replayCount > 0` 的请求、且请求版本与自身版本都存在且不同时记 warn（请求标识字段、`requestCodeVersion`、`serverCodeVersion`、`replayCount`）。两侧都不因不匹配失败、拒绝、取消请求或改变重放策略。跨版本重放只保证 at-least-once 与可观测，不保证行为兼容；是否允许带版本热修、如何发布，由部署方决定。切换成功后 Portal 的"自身版本"变为切换目标版本（`switchTo` 的 `codeVersion`），崩溃重启也使用目标 spawn；切换失败回滚则不变。
 
 ### 6.5 重放的顺序约束
 

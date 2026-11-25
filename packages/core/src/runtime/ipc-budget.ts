@@ -43,27 +43,42 @@ export const SHUTDOWN_ACK_SLACK_MS = 250;
 export const DEFAULT_MAX_PENDING = 10_000;
 
 /**
- * The four sequential waits a close performs, summed. See ADR-0004.
+ * The sequential waits a close performs, summed. See ADR-0004.
  *
- * 1. drain the requests buffered but not yet acknowledged —
+ * 1. interrupt a `switchTo` in flight and wait for it to release its staged
+ *    process — `shutdownTimeoutMs` (see `abortSwitchForClose`);
+ * 2. drain the requests buffered but not yet acknowledged —
  *    `shutdownTimeoutMs`;
- * 2. send `shutdown` and wait for the Server's `closed` — the declared grace
+ * 3. send `shutdown` and wait for the Server's `closed` — the declared grace
  *    plus `SHUTDOWN_ACK_SLACK_MS` (see `waitForClosed`);
- * 3. wait for the process to exit — `EXIT_WAIT_TIMEOUT_MS`;
- * 4. if it did not, kill it and wait once more — `EXIT_WAIT_TIMEOUT_MS`.
+ * 4. wait for the process to exit — `EXIT_WAIT_TIMEOUT_MS`;
+ * 5. if it did not, kill it and wait once more — `EXIT_WAIT_TIMEOUT_MS`;
+ * 6. confirm the exit of a replacement a `close()`-aborted switch abandoned,
+ *    which may already hold storage: wait → kill → wait once more —
+ *    `2 * EXIT_WAIT_TIMEOUT_MS` (see `confirmAbandonedExits`).
  *
  * The two shutdown timeouts are not the same wait: one is Portal's own drain,
  * the other is the Server's graceful close, which is why both are counted.
  *
- * Step 2's grace is also the budget declared to the Server in the `shutdown`
- * message, so the Server's whole graceful close fits inside step 2 by
+ * Step 3's grace is also the budget declared to the Server in the `shutdown`
+ * message, so the Server's whole graceful close fits inside step 3 by
  * construction — that is what keeps a correctly closing Server from being
- * killed by step 4.
+ * killed by step 5.
  */
 export function closeBudget(shutdownTimeoutMs: number): number {
+  // Step 1 and 2 share the same declared bound, so they are counted twice.
+  const switchAbortMs = shutdownTimeoutMs;
   const drainMs = shutdownTimeoutMs;
   const gracefulCloseMs = shutdownTimeoutMs + SHUTDOWN_ACK_SLACK_MS;
   const exitWaitMs = EXIT_WAIT_TIMEOUT_MS;
   const postKillExitWaitMs = EXIT_WAIT_TIMEOUT_MS;
-  return drainMs + gracefulCloseMs + exitWaitMs + postKillExitWaitMs;
+  const abandonedExitWaitMs = EXIT_WAIT_TIMEOUT_MS * 2;
+  return (
+    switchAbortMs +
+    drainMs +
+    gracefulCloseMs +
+    exitWaitMs +
+    postKillExitWaitMs +
+    abandonedExitWaitMs
+  );
 }

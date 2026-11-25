@@ -62,17 +62,20 @@ export async function waitFor(
   return poll();
 }
 
-export function preparedMessage(pid = 4242): IpcMessage {
-  return { type: 'prepared', pid };
+export function preparedMessage(pid = 4242, codeVersion?: string): IpcMessage {
+  return codeVersion === undefined
+    ? { type: 'prepared', pid }
+    : { type: 'prepared', pid, codeVersion };
 }
 
 export function readyMessage(
   maxTransactionDurationMs = 5000,
   codeVersion?: string,
+  pid = 4242,
 ): IpcMessage {
   return {
     type: 'ready',
-    pid: 4242,
+    pid,
     capabilities: {
       transactions: 'full',
       concurrency: 'pooled',
@@ -188,6 +191,24 @@ export interface FakeServerOptions {
    * channel close wins the race against the promise continuation.
    */
   closeChannelOnExit?: boolean;
+  /** Ignore `hello`: models a spawn that never reaches `prepared`. */
+  silentOnHello?: boolean;
+  /** Answer `activate` with `ready` (after `prepared`). Default false. */
+  readyOnActivate?: boolean;
+  /** Reported in `prepared`/`ready`; defaults to 4242. */
+  pid?: number;
+  /** Echoed in `prepared`/`ready`, like a deployment that declared a version. */
+  codeVersion?: string;
+  /** Shared event log for cross-process ordering assertions. */
+  timeline?: string[];
+  /** Prefix for this process's timeline entries. */
+  label?: string;
+  /**
+   * Hold delivered requests and answer them with a success only when `shutdown`
+   * arrives, before `closed`. Models a Server draining its in-flight work during
+   * a switch, so the test can assert where a request settled.
+   */
+  holdRequests?: boolean;
 }
 
 /**
@@ -205,6 +226,15 @@ export class FakeServerProcess {
   private readonly crashOnActivate: boolean;
   private readonly killExits: boolean;
   private readonly closeChannelOnExit: boolean;
+  private readonly silentOnHello: boolean;
+  private readonly readyOnActivate: boolean;
+  private readonly pid: number;
+  private readonly codeVersion: string | undefined;
+  private readonly timeline: string[] | undefined;
+  private readonly label: string;
+  private readonly holdRequests: boolean;
+  /** Request ids delivered while `holdRequests` is on, in arrival order. */
+  private readonly held: string[] = [];
   private exitRecorded = false;
   private exitInfo: ServerExitInfo | undefined;
   private requestCount = 0;
@@ -219,6 +249,13 @@ export class FakeServerProcess {
     this.crashOnActivate = options.crashOnActivate ?? false;
     this.killExits = options.killExits ?? true;
     this.closeChannelOnExit = options.closeChannelOnExit ?? false;
+    this.silentOnHello = options.silentOnHello ?? false;
+    this.readyOnActivate = options.readyOnActivate ?? false;
+    this.pid = options.pid ?? 4242;
+    this.codeVersion = options.codeVersion;
+    this.timeline = options.timeline;
+    this.label = options.label ?? `server-${String(this.pid)}`;
+    this.holdRequests = options.holdRequests ?? false;
     this.channel = server;
     this.handle = {
       channel: portal,
@@ -241,15 +278,32 @@ export class FakeServerProcess {
       if (!parsed.ok) {
         return;
       }
+      this.mark(`recv:${parsed.message.type}`);
       if (parsed.message.type === 'request') {
         this.requestCount += 1;
+        if (this.holdRequests) {
+          this.held.push(parsed.message.requestId);
+        }
         if (this.requestCount === this.closeOnRequestAt) {
           // A crash while handling a request: the link dies mid-flush.
           this.channel.close('test crash on request');
         }
       }
       if (this.autoCloseOnShutdown && parsed.message.type === 'shutdown') {
+        if (this.holdRequests) {
+          // Drain first: every held request settles before `closed`, like a
+          // Server that finishes in-flight work during its graceful close.
+          for (const requestId of this.held.splice(0)) {
+            this.send({
+              type: 'result',
+              requestId,
+              ok: true,
+              result: `drained-${requestId}`,
+            });
+          }
+        }
         this.send({ type: 'closed', reason: 'test shutdown' });
+        this.mark('closed');
         // The real Server exits after `closed`; without this the executor would
         // wait out its exit timeout on every close().
         if (this.exitOnShutdown) {
@@ -257,13 +311,25 @@ export class FakeServerProcess {
         }
       }
       if (this.autoPrepare && parsed.message.type === 'hello') {
-        this.send(preparedMessage());
+        if (!this.silentOnHello) {
+          this.send(preparedMessage(this.pid, this.codeVersion));
+        }
       }
-      if (this.crashOnActivate && parsed.message.type === 'activate') {
-        this.send(readyMessage());
-        this.recordExit({ code: 1, signal: null, observed: true });
+      if (parsed.message.type === 'activate') {
+        this.mark('activate');
+        if (this.crashOnActivate) {
+          this.send(readyMessage(5000, this.codeVersion, this.pid));
+          this.recordExit({ code: 1, signal: null, observed: true });
+        } else if (this.readyOnActivate) {
+          this.send(readyMessage(5000, this.codeVersion, this.pid));
+        }
       }
     });
+  }
+
+  /** Appends one entry to the shared timeline, when a test supplied one. */
+  private mark(event: string): void {
+    this.timeline?.push(`${this.label}:${event}`);
   }
 
   send(message: IpcMessage): void {
@@ -325,6 +391,7 @@ export class FakeServerProcess {
     }
     this.exitRecorded = true;
     this.exitInfo = info;
+    this.mark('exit');
     if (this.closeChannelOnExit) {
       // Mirrors `spawnBunServer`: `markClosed` runs before `exit.resolve`, so
       // the Portal's `onClose` sees the exit synchronously while the promise's
@@ -352,12 +419,26 @@ export interface HarnessOptions {
   maxPending?: number;
   closeChannelOnExit?: boolean;
   codeVersion?: string;
+  /** Answer `activate` with `ready` for the initial spawn. */
+  readyOnActivate?: boolean;
+  /** Hold delivered requests until `shutdown` for the initial spawn. */
+  holdRequests?: boolean;
+  /** Shared event log forwarded to every fake this harness spawns. */
+  timeline?: string[];
+  /** Label for the initial fake's timeline entries; defaults per pid. */
+  label?: string;
 }
 
 export interface Harness {
   executor: IpcExecutor;
   servers: FakeServerProcess[];
   logs: () => Record<string, unknown>[];
+  /**
+   * Builds a fake process with the harness defaults plus overrides, recording
+   * it in `servers`. `switchTo` supplies its own spawn, so a test uses this to
+   * describe the replacement instead of relying on the initial factory.
+   */
+  makeServer: (overrides?: Partial<FakeServerOptions>) => SpawnedServer;
 }
 
 export function harness(options: Partial<HarnessOptions> = {}): Harness {
@@ -371,19 +452,27 @@ export function harness(options: Partial<HarnessOptions> = {}): Harness {
       },
     });
   const servers: FakeServerProcess[] = [];
+  const makeServer = (
+    overrides: Partial<FakeServerOptions> = {},
+  ): SpawnedServer => {
+    const server = new FakeServerProcess({
+      autoCloseOnShutdown: options.autoClose ?? true,
+      exitOnShutdown: options.exitOnShutdown,
+      autoPrepare: options.autoPrepare,
+      crashOnActivate: options.crashOnActivate,
+      killExits: options.killExits,
+      closeChannelOnExit: options.closeChannelOnExit,
+      readyOnActivate: options.readyOnActivate,
+      holdRequests: options.holdRequests,
+      timeline: options.timeline,
+      label: options.label,
+      ...overrides,
+    });
+    servers.push(server);
+    return server.handle;
+  };
   const executor = new IpcExecutor({
-    spawn: () => {
-      const server = new FakeServerProcess({
-        autoCloseOnShutdown: options.autoClose ?? true,
-        exitOnShutdown: options.exitOnShutdown,
-        autoPrepare: options.autoPrepare,
-        crashOnActivate: options.crashOnActivate,
-        killExits: options.killExits,
-        closeChannelOnExit: options.closeChannelOnExit,
-      });
-      servers.push(server);
-      return server.handle;
-    },
+    spawn: () => makeServer(),
     timeoutMs: options.timeoutMs ?? 1000,
     maxReplays: options.maxReplays,
     restartBackoffMs: options.restartBackoffMs,
@@ -398,6 +487,7 @@ export function harness(options: Partial<HarnessOptions> = {}): Harness {
     executor,
     servers,
     logs: () => lines.map((line) => parseJsonLine(line, 'log line')),
+    makeServer,
   };
 }
 

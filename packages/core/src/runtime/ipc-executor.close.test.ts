@@ -394,13 +394,15 @@ describe('IpcExecutor close', () => {
     }
   });
 
-  test('exposes a close budget covering the drain, grace and exit wait', async () => {
+  test('exposes a close budget covering the switch abort, drain, grace and exit waits', async () => {
     const h = harness({ timeoutMs: 5000, shutdownTimeoutMs: 30 });
 
-    // drain + grace (+ the IPC-hop slack) + two bounded exit waits (the second
-    // after the kill): a caller must give the executor at least this much, or it
-    // returns while the Server is still writing.
-    expect(h.executor.closeBudgetMs).toBe(30 * 2 + 250 + 2000 * 2);
+    // switch abort + drain + grace (+ the IPC-hop slack) + two bounded exit
+    // waits for the current Server (the second after the kill) + the bounded
+    // wait→kill→wait for an abandoned activated replacement: a caller must give
+    // the executor at least this much, or it returns while a Server is still
+    // writing.
+    expect(h.executor.closeBudgetMs).toBe(30 * 3 + 250 + 2000 * 4);
     await h.executor.close();
   });
 
@@ -433,9 +435,10 @@ describe('IpcExecutor close', () => {
     expect(declaredGraceMs).toBe(shutdownTimeoutMs);
     // The budget has to contain the Server's share plus every other step this
     // side performs; a budget that dropped below that would start killing
-    // Servers that were closing correctly.
+    // Servers that were closing correctly. The grace is the third
+    // `shutdownTimeoutMs` term (switch abort, drain, grace).
     expect(h.executor.closeBudgetMs).toBe(
-      shutdownTimeoutMs + declaredGraceMs + ackSlackMs + exitWaitMs * 2,
+      shutdownTimeoutMs * 3 + ackSlackMs + exitWaitMs * 4,
     );
   });
 

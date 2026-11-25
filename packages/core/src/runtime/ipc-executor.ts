@@ -103,8 +103,19 @@ export interface IpcExecutorOptions {
  * because the Server never became ready within `startTimeoutMs`. It is distinct
  * from `closed` so `execute` can report a different message and so a failed
  * start cannot be mistaken for an orderly shutdown.
+ *
+ * `switching` is not terminal: a replacement is being prepared or the previous
+ * process is being retired. Requests keep arriving and stay buffered; only the
+ * promotion to the new generation delivers them.
  */
-type Status = 'idle' | 'starting' | 'ready' | 'closing' | 'closed' | 'failed';
+type Status =
+  | 'idle'
+  | 'starting'
+  | 'ready'
+  | 'switching'
+  | 'closing'
+  | 'closed'
+  | 'failed';
 
 interface ServerState {
   readonly generation: number;
@@ -125,6 +136,84 @@ interface ServerState {
   /** Set when the Server answered `shutdown` with `closed`. */
   shutdownAcknowledged: boolean;
   pid: number | undefined;
+  /**
+   * Owned by a `switchTo` in progress: not the current Server, so losing it
+   * fails the switch instead of triggering the crash-restart path.
+   */
+  staged: boolean;
+  /**
+   * The previous Server a `switchTo` is draining. Its exit is expected, so it
+   * must not be reported as a crash or restarted.
+   */
+  retiring: boolean;
+  /** Capabilities the Server declared in `ready`; absent before it. */
+  declaredMaxDurationMs: number | undefined;
+  /** `codeVersion` the Server reported in `prepared`/`ready`. */
+  reportedCodeVersion: string | undefined;
+  /** True once a `shutdown` was sent, so a switch and `close()` cannot both send one. */
+  shutdownSent: boolean;
+  /** Resolves once `closed` arrived or the process is known to be gone. */
+  readonly closedSignal: PromiseWithResolvers<void>;
+}
+
+/** A bounded wait for `prepared` or `ready` from the staged process. */
+interface SwitchBarrier {
+  readonly promise: Promise<void>;
+  resolve: () => void;
+  seen: boolean;
+}
+
+/**
+ * One `switchTo` in flight. It owns the staged process and the previous one,
+ * the barriers it waits for, and the abort signal `close()` uses to interrupt
+ * the sequence at any await.
+ */
+interface SwitchOperation {
+  readonly spawn: () => SpawnedServer;
+  readonly targetCodeVersion: string | undefined;
+  resolve: () => void;
+  reject: (error: Error) => void;
+  /** Resolves once the switch and its cleanup are done, whatever the outcome. */
+  readonly completion: Promise<void>;
+  readonly markComplete: () => void;
+  /** Resolves (never rejects) when the switch is interrupted, so a race cannot leak. */
+  readonly abortSignal: Promise<void>;
+  /**
+   * Interrupts an in-flight switch. `byClose` marks the case where `close()`
+   * owns the cleanup: the switch then only abandons what it staged.
+   */
+  abort: (error: Error, byClose: boolean) => void;
+  abortError: Error | undefined;
+  /** True when `close()` interrupted the switch and owns the cleanup. */
+  closeAborted: boolean;
+  settled: boolean;
+  phase: 'preparing' | 'retiring' | 'activating';
+  /** The process being promoted; not the current Server until `ready`. */
+  staged: ServerState | undefined;
+  /** The Server being replaced; only retired after its exit is confirmed. */
+  previous: ServerState | undefined;
+  /** True once the previous process can no longer serve. */
+  previousGone: boolean;
+  /** True when the previous process died on its own before it was retired. */
+  previousLost: boolean;
+  /**
+   * Processes this switch killed or abandoned without observing their exit.
+   * They may still hold storage, so no restart may begin until each is
+   * confirmed gone — the same gate the crash path applies (INV-002).
+   */
+  exitsPending: ServerState[];
+  /** True once the replacement was promoted to the current Server. */
+  promoted: boolean;
+  /** True when the promoted replacement was lost before the switch settled. */
+  promotedLost: boolean;
+  /** True once `activate` was sent, so the staged process may hold storage. */
+  activated: boolean;
+  stagedLost: Error | undefined;
+  readonly prepared: SwitchBarrier;
+  readonly ready: SwitchBarrier;
+  /** Why the switch is failing; read by `runSwitch` to pick the failure path. */
+  failure: Error | undefined;
+  versionWarned: boolean;
 }
 
 /**
@@ -146,14 +235,20 @@ interface ServerState {
  * a hanging promise would stall every later request on that connection.
  */
 export class IpcExecutor implements RequestExecutor {
-  private readonly spawn: () => SpawnedServer;
+  /**
+   * The factory the next launch uses. A successful `switchTo` replaces it, so a
+   * crash after the switch restarts the code that was actually running rather
+   * than the version the executor was constructed with (SPEC 6.4).
+   */
+  private spawn: () => SpawnedServer;
   private readonly portalTimeoutMs: number;
   private readonly maxReplays: number;
   private readonly restartBackoffMs: number;
   private readonly stableResetMs: number;
   private readonly shutdownTimeoutMs: number;
   private readonly startTimeoutMs: number;
-  private readonly codeVersion: string | undefined;
+  /** Stamped on new requests and compared against `ready`; follows `spawn`. */
+  private codeVersion: string | undefined;
   private readonly logger: Logger;
   private readonly portalGeneration: number;
   private readonly buffer: PendingBuffer;
@@ -177,6 +272,15 @@ export class IpcExecutor implements RequestExecutor {
   private closedTimer: ReturnType<typeof setTimeout> | undefined;
   private drainedWaiter: (() => void) | undefined;
   private closePromise: Promise<void> | undefined;
+  /** The `switchTo` in flight, if any; only one at a time. */
+  private switching: SwitchOperation | undefined;
+  /**
+   * Processes a `close()`-aborted switch abandoned, kept until their exit is
+   * confirmed. `doClose` drains this list before it returns: an abandoned
+   * replacement may have received `activate`, so its exit is what says the
+   * storage is released (INV-002).
+   */
+  private readonly abandonedForClose: ServerState[] = [];
 
   constructor(options: IpcExecutorOptions) {
     if (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) {
@@ -452,13 +556,20 @@ export class IpcExecutor implements RequestExecutor {
     this.armTimer(pending);
     try {
       const server = this.server;
-      if (server !== undefined && server.ready && !server.closed) {
+      if (
+        this.status !== 'switching' &&
+        server !== undefined &&
+        server.ready &&
+        !server.closed
+      ) {
         // Nothing older can be undelivered while the Server is ready: every
         // flush completes or leaves no Server. Sending only this request keeps
         // the hot path O(1) instead of scanning the buffer per request.
         this.deliver(server, pending);
       } else {
-        // Queued until a Server is ready; a no-op otherwise.
+        // Queued until a Server is ready; a no-op otherwise. During a switch
+        // this is the whole policy: the request waits for the new generation
+        // rather than reaching a process that is about to be retired.
         this.flush();
       }
     } catch (error) {
@@ -531,6 +642,587 @@ export class IpcExecutor implements RequestExecutor {
   }
 
   /**
+   * Replaces the Server process with one built from `spawn` without dropping
+   * the recovery barrier (ADR-0007, INV-002).
+   *
+   * The order is the whole point and cannot be rearranged: spawn and wait for
+   * `prepared` (no storage is opened yet), retire the current process and wait
+   * for it to exit, and only then send `activate` and wait for `ready`. A
+   * prepared Server is not a writer, so it may exist beside the old one; an
+   * activated one is, so `activate` must never be sent while the old process
+   * could still hold storage. Requests keep arriving during the switch and stay
+   * in the unacknowledged buffer (SPEC 6.5) — they are delivered to the new
+   * generation once it is ready, not failed.
+   *
+   * Failure before the old process is retired leaves it serving and rejects the
+   * switch. Failure after that point has no live Server left, so it falls back
+   * to the crash-restart path with the previous spawn and rejects as well.
+   */
+  switchTo(options: {
+    spawn: () => SpawnedServer;
+    codeVersion?: string;
+  }): Promise<void> {
+    if (this.switching !== undefined) {
+      return Promise.reject(
+        new Error('an ipc executor switch is already in progress'),
+      );
+    }
+    if (this.status !== 'ready') {
+      return Promise.reject(
+        new Error(`ipc executor cannot switch while ${this.status}`),
+      );
+    }
+    if (
+      options.codeVersion !== undefined &&
+      (typeof options.codeVersion !== 'string' ||
+        options.codeVersion.length === 0)
+    ) {
+      return Promise.reject(
+        new Error('codeVersion must be a non-empty string'),
+      );
+    }
+    const deferred = Promise.withResolvers<void>();
+    const completion = Promise.withResolvers<void>();
+    const abortSignal = Promise.withResolvers<void>();
+    const op: SwitchOperation = {
+      spawn: options.spawn,
+      targetCodeVersion: options.codeVersion,
+      resolve: deferred.resolve,
+      reject: deferred.reject,
+      completion: completion.promise,
+      markComplete: completion.resolve,
+      abortSignal: abortSignal.promise,
+      abort: (error, byClose) => {
+        if (op.abortError !== undefined) {
+          return;
+        }
+        op.abortError = error;
+        op.closeAborted = byClose;
+        abortSignal.resolve();
+      },
+      abortError: undefined,
+      closeAborted: false,
+      settled: false,
+      phase: 'preparing',
+      staged: undefined,
+      previous: this.server,
+      previousGone: false,
+      previousLost: false,
+      exitsPending: [],
+      promoted: false,
+      promotedLost: false,
+      activated: false,
+      stagedLost: undefined,
+      prepared: newBarrier(),
+      ready: newBarrier(),
+      failure: undefined,
+      versionWarned: false,
+    };
+    this.switching = op;
+    this.status = 'switching';
+    this.logger.info(
+      {
+        fromCodeVersion: this.codeVersion,
+        toCodeVersion: options.codeVersion,
+      },
+      'server switch started',
+    );
+    void this.runSwitch(op);
+    return deferred.promise;
+  }
+
+  /** The switch sequence; always settles `op` and clears `this.switching`. */
+  private async runSwitch(op: SwitchOperation): Promise<void> {
+    try {
+      if (!(await this.stageReplacement(op))) {
+        return;
+      }
+      if (!(await this.retirePrevious(op))) {
+        return;
+      }
+      await this.activateReplacement(op);
+    } catch (error) {
+      op.failure ??= toError(error);
+    } finally {
+      this.finishSwitch(op);
+    }
+  }
+
+  /**
+   * Spawns the replacement and waits for `prepared`, bounded by
+   * `startTimeoutMs`. A process that never prepares is abandoned (killed) and
+   * the previous Server is untouched, so the switch can fail without an outage.
+   */
+  private async stageReplacement(op: SwitchOperation): Promise<boolean> {
+    let spawned: SpawnedServer;
+    try {
+      spawned = op.spawn();
+    } catch (error) {
+      op.failure = new Error(`spawn failed: ${messageOf(error)}`);
+      return false;
+    }
+    const server = this.buildServer(spawned);
+    server.staged = true;
+    op.staged = server;
+    this.attachServer(server);
+    try {
+      server.channel.send({
+        type: 'hello',
+        portalGeneration: this.portalGeneration,
+      });
+    } catch (error) {
+      op.stagedLost = new Error(`hello failed: ${messageOf(error)}`);
+      op.failure = op.stagedLost;
+      return false;
+    }
+    return this.awaitBarrier(op, op.prepared, 'prepared', this.startTimeoutMs);
+  }
+
+  /**
+   * Stops the current Server and waits until it is known to be gone. Nothing is
+   * activated until this resolves true: `closed` says the Server finished
+   * writing, and the exit wait is what says the storage is released (INV-002).
+   */
+  private async retirePrevious(op: SwitchOperation): Promise<boolean> {
+    const previous = op.previous;
+    op.phase = 'retiring';
+    if (previous === undefined) {
+      op.previousGone = true;
+      return true;
+    }
+    previous.retiring = true;
+    if (!previous.closed && previous.ready) {
+      try {
+        previous.shutdownSent = true;
+        previous.channel.send({
+          type: 'shutdown',
+          timeoutMs: this.shutdownTimeoutMs,
+        });
+      } catch (error) {
+        // The process died between the switch and this send; the channel close
+        // handler reports the same thing.
+        this.logger.warn(
+          { pid: previous.pid, reason: messageOf(error) },
+          'shutdown message could not be sent',
+        );
+      }
+      const acknowledged = await this.awaitPreviousClosed(op, previous);
+      if (op.abortError !== undefined) {
+        op.failure = op.abortError;
+        return false;
+      }
+      if (!acknowledged && !previous.closed) {
+        this.logger.warn(
+          {
+            pid: previous.pid,
+            timeoutMs: this.shutdownTimeoutMs + SHUTDOWN_ACK_SLACK_MS,
+            ready: previous.ready,
+          },
+          'server did not finish shutting down; killing it',
+        );
+        this.killQuietly(previous);
+      }
+    }
+    let exited = await this.waitForExit(previous);
+    if (!exited) {
+      this.logger.warn(
+        { pid: previous.pid, timeoutMs: EXIT_WAIT_TIMEOUT_MS },
+        'server process did not exit; killing it before switching',
+      );
+      this.killQuietly(previous);
+      exited = await this.waitForExit(previous);
+    }
+    this.closeChannelQuietly(previous, 'portal is switching servers');
+    if (op.abortError !== undefined) {
+      // `close()` took over while the old process was exiting. Its own path
+      // finishes the shutdown, including the exit wait, so nothing is recorded
+      // here and nothing may be activated now. Whether the exit was observed is
+      // `exitsPending`'s business, not this flag's.
+      op.failure = op.abortError;
+      op.previousGone = true;
+      return false;
+    }
+    if (!exited) {
+      // Killed but its exit could not be observed. It cannot be treated as
+      // serving any more, so the switch fails and rolls back — but the restart
+      // waits for this exit like the crash path does, because the process may
+      // still hold storage (INV-002).
+      op.failure = new Error(
+        'previous server process did not exit before the switch',
+      );
+      op.previousGone = true;
+      op.exitsPending.push(previous);
+      return false;
+    }
+    op.previousGone = true;
+    this.logger.info({ pid: previous.pid }, 'previous server retired');
+    return true;
+  }
+
+  /**
+   * Opens the replacement's storage and waits for `ready`, bounded by
+   * `startTimeoutMs`. This is the first moment the new process can write, which
+   * is why it comes last.
+   */
+  private async activateReplacement(op: SwitchOperation): Promise<void> {
+    const staged = op.staged;
+    op.phase = 'activating';
+    if (staged === undefined) {
+      op.failure = new Error('the replacement was never spawned');
+      return;
+    }
+    try {
+      staged.channel.send({ type: 'activate' });
+      op.activated = true;
+    } catch (error) {
+      op.stagedLost = new Error(`activate failed: ${messageOf(error)}`);
+      op.failure = op.stagedLost;
+      return;
+    }
+    const ready = await this.awaitBarrier(
+      op,
+      op.ready,
+      'become ready',
+      this.startTimeoutMs,
+    );
+    if (!ready || op.abortError !== undefined) {
+      return;
+    }
+    if (staged.closed || staged.exited) {
+      // The barrier resolved, but the process died before this continuation
+      // ran. Promoting a dead generation would leave `status = 'ready'` with no
+      // Server behind it — a state only a crash could leave, and only after the
+      // switch had already reported success. Fail the switch instead, so the
+      // ordinary rollback restarts.
+      op.stagedLost ??= new Error(
+        'replacement server exited before it could be promoted',
+      );
+      op.failure ??= op.stagedLost;
+      return;
+    }
+    // Promote: the replacement becomes the current Server and the barrier is
+    // the only thing that releases the buffered requests to it.
+    staged.staged = false;
+    op.promoted = true;
+    this.server = staged;
+    this.status = 'ready';
+    // A crash after this point restarts the code that is now serving, and new
+    // requests carry its version. A switch that declares no target keeps the
+    // version it had, matching the expected version used for the staged
+    // process. A rollback keeps the old values because this only runs after the
+    // promotion succeeded (SPEC 6.4).
+    this.spawn = op.spawn;
+    this.codeVersion = op.targetCodeVersion ?? this.codeVersion;
+    this.clearRestartTimer();
+    this.startStableTimer();
+    if (staged.declaredMaxDurationMs !== undefined) {
+      this.adoptCeiling(staged.declaredMaxDurationMs);
+    }
+    this.logger.info(
+      { pid: staged.pid, codeVersion: staged.reportedCodeVersion },
+      'replacement server ready',
+    );
+    this.flush();
+    if (op.promotedLost) {
+      // The first flush killed the promoted process; `onServerLost` already
+      // took the crash path (restart scheduled), so this is not a completed
+      // switch and `finishSwitch` rejects it.
+      return;
+    }
+    this.logger.info(
+      { pid: staged.pid, codeVersion: staged.reportedCodeVersion },
+      'server switch completed',
+    );
+  }
+
+  /**
+   * Waits for one handshake barrier, racing the process's exit, an abort from
+   * `close()` and the timeout. On any non-barrier outcome it records the reason
+   * in `op.failure`, which `finishSwitch` turns into the rejection.
+   */
+  private async awaitBarrier(
+    op: SwitchOperation,
+    barrier: SwitchBarrier,
+    what: string,
+    timeoutMs: number,
+  ): Promise<boolean> {
+    if (barrier.seen) {
+      return true;
+    }
+    const staged = op.staged;
+    if (staged === undefined) {
+      op.failure ??= new Error('the replacement was never spawned');
+      return false;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => {
+        resolve('timeout');
+      }, timeoutMs);
+    });
+    const raced = Promise.race([
+      barrier.promise.then(() => 'barrier' as const),
+      op.abortSignal.then(() => 'aborted' as const),
+      staged.closedSignal.promise.then(() => 'lost' as const),
+    ]);
+    const result = await Promise.race([raced, timeout]);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+    if (result === 'barrier') {
+      return true;
+    }
+    if (result === 'timeout') {
+      this.logger.warn(
+        { pid: staged.pid, timeoutMs, expected: what },
+        'replacement server did not reach its barrier before the switch timeout',
+      );
+      op.failure ??= new Error(
+        `replacement did not ${what} within ${timeoutMs}ms`,
+      );
+      return false;
+    }
+    if (result === 'aborted') {
+      op.failure ??= op.abortError;
+      return false;
+    }
+    op.stagedLost ??= new Error(`replacement server exited before ${what}`);
+    op.failure ??= op.stagedLost;
+    return false;
+  }
+
+  /** Waits for `closed` from the retiring process, bounded and abortable. */
+  private async awaitPreviousClosed(
+    op: SwitchOperation,
+    previous: ServerState,
+  ): Promise<boolean> {
+    if (previous.closed || previous.shutdownAcknowledged) {
+      return true;
+    }
+    const waitMs = this.shutdownTimeoutMs + SHUTDOWN_ACK_SLACK_MS;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => {
+        resolve('timeout');
+      }, waitMs);
+    });
+    const raced = Promise.race([
+      previous.closedSignal.promise.then(() => 'closed' as const),
+      op.abortSignal.then(() => 'aborted' as const),
+    ]);
+    const result = await Promise.race([raced, timeout]);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+    return result === 'closed';
+  }
+
+  /**
+   * Ends a switch: abandons anything staged, settles the caller, then picks the
+   * recovery path. Failure before the old process stopped serving leaves it
+   * serving; failure after that (or after it was lost) has no live Server, so it
+   * restarts the previous version through the crash path. An abort from
+   * `close()` does neither: `doClose` owns the cleanup from there.
+   */
+  private finishSwitch(op: SwitchOperation): void {
+    const staged = op.staged;
+    let abandoned: ServerState | undefined;
+    if (staged !== undefined && !op.promoted) {
+      // Never promoted: no storage the Portal owns, so abandoning it cannot
+      // leave a writer behind — unless `activate` already went out, in which
+      // case the process may have opened storage and its exit must be awaited
+      // before any restart (INV-002).
+      abandoned = staged;
+      this.abandonStaged(staged);
+      op.staged = undefined;
+      if (op.activated) {
+        this.recordPendingExit(op, staged);
+      }
+    }
+    if (this.switching === op) {
+      this.switching = undefined;
+    }
+    if (op.promoted) {
+      op.settled = true;
+      if (op.promotedLost) {
+        // Promotion succeeded, but the process died before the switch could
+        // report it. `onServerLost` already owns the recovery (crash path:
+        // restart with the promoted spawn), so no rollback runs here — the
+        // switch only refuses to call this a success.
+        op.reject(
+          op.abortError ??
+            op.stagedLost ??
+            op.failure ??
+            new Error('the promoted replacement server was lost'),
+        );
+      } else {
+        op.resolve();
+      }
+      op.markComplete();
+      return;
+    }
+    if (!op.settled) {
+      op.settled = true;
+      op.reject(
+        op.abortError ??
+          op.failure ??
+          new Error('ipc executor switch ended unexpectedly'),
+      );
+    }
+    if (op.previous !== undefined && !op.previousGone) {
+      // The previous Server can still serve; it is still the current one, so it
+      // must be restartable again if it later crashes.
+      op.previous.retiring = false;
+    }
+    if (op.closeAborted) {
+      // `doClose` owns the rest: it shuts down whatever Server is left and
+      // confirms the exit of an abandoned replacement that received `activate`
+      // before returning. The previous Server is `shutdownServer`'s job, so it
+      // is not listed here even when its exit was not observed.
+      if (abandoned !== undefined && op.activated) {
+        this.recordAbandonedForClose(abandoned);
+      }
+      op.markComplete();
+      return;
+    }
+    const reason = op.failure === undefined ? 'unknown' : messageOf(op.failure);
+    if (op.previousGone || op.previousLost) {
+      this.logger.warn(
+        {
+          reason,
+          phase: op.phase,
+          codeVersion: this.codeVersion,
+          pendingExits: op.exitsPending.length,
+        },
+        op.previousLost
+          ? 'server switch failed because the previous server was lost; restarting the previous version'
+          : 'server switch failed after the previous server retired; restarting the previous version',
+      );
+      this.rollbackToPrevious(op.exitsPending);
+    } else {
+      this.logger.warn(
+        { reason, phase: op.phase, pid: this.currentPid() },
+        'server switch failed; the previous server keeps serving',
+      );
+      if (!this.isTerminal) {
+        this.status = 'ready';
+        this.flush();
+      }
+    }
+    op.markComplete();
+  }
+
+  /**
+   * Remembers a process whose exit this switch has not observed. It may still
+   * hold storage, so the rollback restart must wait for it, exactly like the
+   * crash path waits for the process it just killed (INV-002).
+   */
+  private recordPendingExit(op: SwitchOperation, server: ServerState): void {
+    if (!server.exited && !op.exitsPending.includes(server)) {
+      op.exitsPending.push(server);
+    }
+  }
+
+  /**
+   * Hands a process to `doClose`, which confirms its exit before returning.
+   * A `close()`-abandoned replacement that received `activate` may hold storage;
+   * a process a rollback is waiting on has the same problem, because that wait
+   * is a floating promise `close()` cannot join.
+   */
+  private recordAbandonedForClose(server: ServerState): void {
+    if (!this.abandonedForClose.includes(server)) {
+      this.abandonedForClose.push(server);
+    }
+  }
+
+  /** Drops a process from the close list once its exit was confirmed. */
+  private forgetAbandonedForClose(server: ServerState): void {
+    const index = this.abandonedForClose.indexOf(server);
+    if (index !== -1) {
+      this.abandonedForClose.splice(index, 1);
+    }
+  }
+
+  /** Closes and kills a staged process the switch no longer needs. */
+  private abandonStaged(server: ServerState): void {
+    server.staged = false;
+    if (server.closed) {
+      return;
+    }
+    server.closed = true;
+    server.closedSignal.resolve();
+    if (!server.exited) {
+      this.killQuietly(server);
+    }
+    this.closeChannelQuietly(server, 'switch abandoned');
+  }
+
+  /**
+   * Restarts the previous version after the old process was already retired or
+   * lost. Reuses the crash path (`starting` → `launch`/`scheduleRestart`) so the
+   * buffered requests are not left without a Server.
+   *
+   * `pendingExits` are processes this switch killed or abandoned without
+   * observing their exit: the previous one when it vanished mid-switch, and the
+   * replacement if it already received `activate`. The restart is deferred
+   * until each is confirmed gone, mirroring the crash path, so no two processes
+   * write to the same storage (INV-002).
+   */
+  private rollbackToPrevious(pendingExits: readonly ServerState[]): void {
+    if (this.isTerminal) {
+      return;
+    }
+    this.status = 'starting';
+    const backoffMs = this.nextBackoffMs();
+    if (pendingExits.length === 0) {
+      this.scheduleRestart(backoffMs);
+      return;
+    }
+    // `close()` cannot join the wait below (it is a floating promise), so it
+    // must confirm these exits itself. Without this a close landing in the
+    // window between the rollback starting and the exit being observed would
+    // return while the process could still hold storage (INV-002).
+    for (const server of pendingExits) {
+      this.recordAbandonedForClose(server);
+    }
+    void Promise.all(
+      pendingExits.map((server) => this.waitForExit(server)),
+    ).then(() => {
+      for (const server of pendingExits) {
+        this.forgetAbandonedForClose(server);
+      }
+      this.scheduleRestart(backoffMs);
+      return undefined;
+    });
+  }
+
+  private killQuietly(server: ServerState): void {
+    try {
+      server.kill();
+    } catch (error) {
+      this.logger.warn(
+        { pid: server.pid, reason: messageOf(error) },
+        'server could not be killed',
+      );
+    }
+  }
+
+  private closeChannelQuietly(server: ServerState, reason: string): void {
+    try {
+      server.channel.close(reason);
+    } catch (error) {
+      this.logger.debug(
+        { reason: messageOf(error) },
+        'ipc channel close failed',
+      );
+    }
+  }
+
+  private currentPid(): number | undefined {
+    return this.server?.pid;
+  }
+
+  /**
    * The worst case `doClose` can take, derived from the steps it actually runs
    * (see `closeBudget` in `ipc-budget.ts`).
    */
@@ -573,6 +1265,10 @@ export class IpcExecutor implements RequestExecutor {
     this.clearRestartTimer();
     this.clearStableTimer();
     this.clearStartTimer();
+    // A switch in flight must not keep spawning, activating or restarting: it is
+    // interrupted here and its staged process abandoned, so `close()` ends with
+    // at most one Server to shut down and no orphan writer (INV-002).
+    await this.abortSwitchForClose();
     const server = this.server;
     // A Request that never reached a live Server cannot complete, so it fails
     // now instead of burning its whole deadline. Delivered ones are given
@@ -629,6 +1325,7 @@ export class IpcExecutor implements RequestExecutor {
       );
     }
     await this.shutdownServer();
+    await this.confirmAbandonedExits();
     this.failAllPending(
       FRAMEWORK_SHUTDOWN,
       'ipc executor closed',
@@ -641,17 +1338,90 @@ export class IpcExecutor implements RequestExecutor {
     );
   }
 
+  /**
+   * Confirms the exit of every process a `close()`-aborted switch abandoned,
+   * with the same bounded wait → kill → wait flow `shutdownServer` uses.
+   *
+   * A replacement that already received `activate` may hold storage, and the
+   * switch's own abort path only issues the kill. `close()` must not return
+   * while such a process could still be writing (INV-002); a process that
+   * survives the second wait is logged rather than waited on forever.
+   */
+  private async confirmAbandonedExits(): Promise<void> {
+    const pending = this.abandonedForClose.splice(0);
+    // Parallel, not sequential: these are independent processes, and the budget
+    // counts one bounded wait→kill→wait, not one per process.
+    await Promise.all(
+      pending.map(async (server) => {
+        const exited = await this.waitForExit(server);
+        if (exited) {
+          return;
+        }
+        this.logger.warn(
+          { pid: server.pid, timeoutMs: EXIT_WAIT_TIMEOUT_MS },
+          'abandoned replacement did not exit; killing it before close returns',
+        );
+        this.killQuietly(server);
+        const afterKill = await this.waitForExit(server);
+        if (!afterKill) {
+          this.logger.warn(
+            { pid: server.pid, timeoutMs: EXIT_WAIT_TIMEOUT_MS },
+            'abandoned replacement is still running after a kill; close cannot confirm its exit',
+          );
+        }
+      }),
+    );
+  }
+
+  /**
+   * Interrupts a `switchTo` in flight and waits (bounded) for it to release its
+   * staged process. `close()` owns the old Server from here, so the switch only
+   * abandons what it spawned and never restarts or promotes anything.
+   */
+  private async abortSwitchForClose(): Promise<void> {
+    const op = this.switching;
+    if (op === undefined) {
+      return;
+    }
+    op.abort(new Error('ipc executor is closing: server switch aborted'), true);
+    const done = await settleWithin(op.completion, this.shutdownTimeoutMs);
+    if (done.status === 'timeout') {
+      // The switch's own awaits are bounded by `startTimeoutMs`; a completion
+      // that outlives the shutdown budget means a process it staged is still
+      // around. Kill it directly so `close()` does not leave an orphan, and
+      // hand it to `doClose` when it may hold storage.
+      const staged = op.staged;
+      if (staged !== undefined && !staged.closed) {
+        staged.staged = false;
+        staged.closed = true;
+        staged.closedSignal.resolve();
+        if (!staged.exited) {
+          this.killQuietly(staged);
+        }
+        this.closeChannelQuietly(staged, 'switch aborted by close');
+        if (op.activated) {
+          this.recordAbandonedForClose(staged);
+        }
+      }
+      this.logger.warn(
+        { timeoutMs: this.shutdownTimeoutMs },
+        'server switch did not finish before the shutdown timeout',
+      );
+    }
+  }
+
   private async shutdownServer(): Promise<void> {
     const server = this.server;
     if (server === undefined) {
       return;
     }
     if (!server.closed) {
-      if (server.ready) {
+      if (server.ready && !server.shutdownSent) {
         try {
           // The Server gets exactly the grace `waitForClosed` will wait for, so
           // its drain and backend close share one deadline that ends with the
           // Portal's patience rather than twice its own request ceiling.
+          server.shutdownSent = true;
           server.channel.send({
             type: 'shutdown',
             timeoutMs: this.shutdownTimeoutMs,
@@ -664,6 +1434,8 @@ export class IpcExecutor implements RequestExecutor {
             'shutdown message could not be sent',
           );
         }
+      }
+      if (server.ready) {
         await this.waitForClosed(server);
       }
       if (!server.closed && !server.shutdownAcknowledged) {
@@ -849,8 +1621,28 @@ export class IpcExecutor implements RequestExecutor {
       this.scheduleRestart(backoffMs);
       return;
     }
+    const server = this.buildServer(spawned);
+    this.server = server;
+    this.attachServer(server);
+    try {
+      server.channel.send({
+        type: 'hello',
+        portalGeneration: this.portalGeneration,
+      });
+    } catch (error) {
+      this.onServerLost(
+        server,
+        null,
+        null,
+        `hello failed: ${messageOf(error)}`,
+      );
+    }
+  }
+
+  /** Wraps a spawn result in the executor's own per-process bookkeeping. */
+  private buildServer(spawned: SpawnedServer): ServerState {
     this.generation += 1;
-    const server: ServerState = {
+    return {
       generation: this.generation,
       channel: spawned.channel,
       kill: () => {
@@ -863,8 +1655,21 @@ export class IpcExecutor implements RequestExecutor {
       exited: false,
       shutdownAcknowledged: false,
       pid: undefined,
+      staged: false,
+      retiring: false,
+      declaredMaxDurationMs: undefined,
+      reportedCodeVersion: undefined,
+      shutdownSent: false,
+      closedSignal: Promise.withResolvers<void>(),
     };
-    this.server = server;
+  }
+
+  /**
+   * Installs the message, close and exit handlers on one process. Shared by the
+   * ordinary start/restart path and by `switchTo`, so a staged process is
+   * observed exactly like the current one.
+   */
+  private attachServer(server: ServerState): void {
     // Handlers before the handshake: a `ready` that beats the registration is
     // still delivered (the channel queues it), but registering first keeps the
     // real Bun channel from dropping an early message.
@@ -911,19 +1716,6 @@ export class IpcExecutor implements RequestExecutor {
           : 'server exit could not be observed',
       );
     })();
-    try {
-      server.channel.send({
-        type: 'hello',
-        portalGeneration: this.portalGeneration,
-      });
-    } catch (error) {
-      this.onServerLost(
-        server,
-        null,
-        null,
-        `hello failed: ${messageOf(error)}`,
-      );
-    }
   }
 
   private onServerMessage(server: ServerState, raw: unknown): void {
@@ -938,7 +1730,7 @@ export class IpcExecutor implements RequestExecutor {
     const message = parsed.message;
     switch (message.type) {
       case 'prepared':
-        this.onPrepared(server, message.pid);
+        this.onPrepared(server, message.pid, message.codeVersion);
         return;
       case 'ready':
         this.onReady(
@@ -952,18 +1744,7 @@ export class IpcExecutor implements RequestExecutor {
         this.onResult(message);
         return;
       case 'closed':
-        if (this.status === 'closing') {
-          server.shutdownAcknowledged = true;
-          this.resolveClosed();
-          return;
-        }
-        // Unsolicited: the process exit that follows is what actually matters,
-        // and it arrives through `exited`/`onClose`. Not a shutdown ack, so
-        // close() must still be able to kill a process that stays alive.
-        this.logger.warn(
-          { pid: server.pid, reason: message.reason },
-          'server closed without being asked',
-        );
+        this.onClosed(server, message.reason);
         return;
       case 'hello':
       case 'request':
@@ -978,13 +1759,65 @@ export class IpcExecutor implements RequestExecutor {
     }
   }
 
+  private onClosed(server: ServerState, reason: string): void {
+    server.closedSignal.resolve();
+    if (server.retiring) {
+      // The previous process finished its graceful close; the switch waits on
+      // its own signal for this before it may activate the replacement
+      // (INV-002). A `close()` that took over may also be waiting, so wake it.
+      server.shutdownAcknowledged = true;
+      this.resolveClosed();
+      return;
+    }
+    if (this.status === 'closing') {
+      server.shutdownAcknowledged = true;
+      this.resolveClosed();
+      return;
+    }
+    if (this.switching?.staged === server) {
+      // A prepared process has no storage to close, so this is not a shutdown
+      // ack; the exit that follows is what the switch reacts to.
+      this.logger.warn(
+        { pid: server.pid, reason },
+        'replacement server closed before activation',
+      );
+      return;
+    }
+    // Unsolicited: the process exit that follows is what actually matters,
+    // and it arrives through `exited`/`onClose`. Not a shutdown ack, so
+    // close() must still be able to kill a process that stays alive.
+    this.logger.warn(
+      { pid: server.pid, reason },
+      'server closed without being asked',
+    );
+  }
+
   /**
    * The Server accepted the handshake and is waiting for activation (ADR-0007):
    * it holds no storage yet, so the only thing that can happen now is opening
-   * it. Sending `activate` at once is the ordinary-start path; the ordering
-   * that retires an old process first belongs to the caller that has one.
+   * it. Sending `activate` at once is the ordinary-start path; a `switchTo`
+   * owns its staged process instead and activates it only after the previous
+   * one has exited.
    */
-  private onPrepared(server: ServerState, pid: number): void {
+  private onPrepared(
+    server: ServerState,
+    pid: number,
+    codeVersion: string | undefined,
+  ): void {
+    const op = this.switching;
+    if (op?.staged === server) {
+      server.pid = pid;
+      server.reportedCodeVersion = codeVersion;
+      this.warnOnVersionMismatch(
+        pid,
+        op.targetCodeVersion ?? this.codeVersion,
+        codeVersion,
+        op,
+      );
+      op.prepared.seen = true;
+      op.prepared.resolve();
+      return;
+    }
     if (this.server !== server || server.closed) {
       this.logger.debug(
         { pid },
@@ -1004,6 +1837,7 @@ export class IpcExecutor implements RequestExecutor {
       return;
     }
     server.pid = pid;
+    server.reportedCodeVersion = codeVersion;
     try {
       server.channel.send({ type: 'activate' });
     } catch (error) {
@@ -1024,6 +1858,22 @@ export class IpcExecutor implements RequestExecutor {
     declaredMaxDurationMs: number,
     actualCodeVersion: string | undefined,
   ): void {
+    const op = this.switching;
+    if (op?.staged === server) {
+      server.ready = true;
+      server.pid = pid;
+      server.declaredMaxDurationMs = declaredMaxDurationMs;
+      server.reportedCodeVersion = actualCodeVersion;
+      this.warnOnVersionMismatch(
+        pid,
+        op.targetCodeVersion ?? this.codeVersion,
+        actualCodeVersion,
+        op,
+      );
+      op.ready.seen = true;
+      op.ready.resolve();
+      return;
+    }
     if (this.server !== server || server.closed) {
       this.logger.debug(
         { pid },
@@ -1037,24 +1887,13 @@ export class IpcExecutor implements RequestExecutor {
     }
     server.ready = true;
     server.pid = pid;
+    server.declaredMaxDurationMs = declaredMaxDurationMs;
+    server.reportedCodeVersion = actualCodeVersion;
     // Reported, not enforced: a Server built from different code may still be
     // the only process available, and refusing it would turn a deployment
     // mismatch into an outage (SPEC 6.4). A deployment that declared no version
     // says nothing, so silence is not a mismatch.
-    if (
-      this.codeVersion !== undefined &&
-      actualCodeVersion !== undefined &&
-      actualCodeVersion !== this.codeVersion
-    ) {
-      this.logger.warn(
-        {
-          pid,
-          expectedCodeVersion: this.codeVersion,
-          actualCodeVersion,
-        },
-        'server code version differs from the portal version',
-      );
-    }
+    this.warnOnVersionMismatch(pid, this.codeVersion, actualCodeVersion);
     if (this.isTerminal) {
       return;
     }
@@ -1063,15 +1902,55 @@ export class IpcExecutor implements RequestExecutor {
     // Server that reaches `ready` and then dies on its first request would
     // otherwise reset the backoff and restart immediately, forever.
     this.startStableTimer();
+    this.adoptCeiling(declaredMaxDurationMs);
+    this.logger.info(
+      { pid, effectiveTimeoutMs: this.effectiveTimeoutMs },
+      'server ready',
+    );
+    this.resolveStart();
+    this.flush();
+  }
+
+  /**
+   * Warns when a Server reports a code version other than the one expected
+   * (SPEC 6.4). A missing value on either side says nothing, so silence is not
+   * a mismatch. `op` records the warning so a switch does not log the same
+   * mismatch for both `prepared` and `ready`.
+   */
+  private warnOnVersionMismatch(
+    pid: number,
+    expected: string | undefined,
+    actual: string | undefined,
+    op?: SwitchOperation,
+  ): void {
+    if (expected === undefined || actual === undefined || actual === expected) {
+      return;
+    }
+    if (op !== undefined) {
+      if (op.versionWarned) {
+        return;
+      }
+      op.versionWarned = true;
+    }
+    this.logger.warn(
+      { pid, expectedCodeVersion: expected, actualCodeVersion: actual },
+      'server code version differs from the portal version',
+    );
+  }
+
+  /**
+   * Applies the backend's declared request ceiling to the buffered requests.
+   * Only ever tightens: a later Server declaring a longer ceiling must not
+   * extend a deadline the Portal already promised, or a crash loop could keep a
+   * request alive past its original ceiling (SPEC 3.4).
+   */
+  private adoptCeiling(declaredMaxDurationMs: number): void {
     const declared = effectiveTimeoutMs(
       this.portalTimeoutMs,
       declaredMaxDurationMs,
     );
     this.effectiveTimeoutMs = declared;
     for (const pending of this.buffer.values()) {
-      // Only ever tighten. A later Server declaring a longer ceiling must not
-      // extend a deadline the Portal already promised, or a crash loop could
-      // keep a request alive past its original ceiling (SPEC 3.4).
       const tightened = Math.min(pending.effectiveTimeoutMs, declared);
       if (tightened === pending.effectiveTimeoutMs) {
         continue;
@@ -1080,12 +1959,6 @@ export class IpcExecutor implements RequestExecutor {
       pending.deadlineAt = pending.startedAt + tightened;
       this.armTimer(pending);
     }
-    this.logger.info(
-      { pid, effectiveTimeoutMs: this.effectiveTimeoutMs },
-      'server ready',
-    );
-    this.resolveStart();
-    this.flush();
   }
 
   private onResult(message: ResultMessage): void {
@@ -1139,8 +2012,67 @@ export class IpcExecutor implements RequestExecutor {
       return;
     }
     server.closed = true;
+    server.closedSignal.resolve();
+    const op = this.switching;
+    if (op?.staged === server && !op.promoted) {
+      // The replacement died while the switch was waiting on it. Record the
+      // loss; the switch's own await reacts to `closedSignal` and reports it.
+      op.stagedLost ??= new Error(`replacement server lost: ${reason}`);
+      if (!server.exited) {
+        this.killQuietly(server);
+      }
+      return;
+    }
+    if (op?.staged === server) {
+      // Promoted, but the switch has not settled yet: this is an ordinary crash
+      // of the current Server, handled by the crash path below (clear
+      // `this.server`, wait for the exit, schedule the restart). The switch must
+      // not report success for a process that is already gone.
+      op.promotedLost = true;
+      op.stagedLost ??= new Error(
+        `replacement server lost after promotion: ${reason}`,
+      );
+      op.failure ??= op.stagedLost;
+    }
+    if (op?.previous === server) {
+      // The old process died during its own retirement. That is the expected
+      // exit, not a crash: do not restart beside it or log a crash. It is not
+      // "lost" either — the switch asked it to stop.
+      if (server.retiring || op.previousGone) {
+        op.previousGone = true;
+        if (!server.exited) {
+          this.killQuietly(server);
+          this.recordPendingExit(op, server);
+        }
+        return;
+      }
+      // It crashed before the switch retired it. The switch has no previous
+      // Server to fall back to, so it fails and the crash path restarts.
+      op.previousLost = true;
+      op.previousGone = true;
+      if (this.server === server) {
+        this.server = undefined;
+      }
+      this.resolveClosed();
+      if (!server.exited) {
+        this.killQuietly(server);
+        this.recordPendingExit(op, server);
+      }
+      op.abort(
+        new Error(`previous server lost during the switch: ${reason}`),
+        false,
+      );
+      return;
+    }
     // A stable clock from the dead generation must not end the crash streak.
     this.clearStableTimer();
+    if (server.retiring) {
+      // A switch retired this process but had already settled (promoted or
+      // rolled back) before its exit landed. Its exit is expected: no crash
+      // line and no restart beside the current Server.
+      this.resolveClosed();
+      return;
+    }
     if (this.server === server) {
       this.server = undefined;
     }
@@ -1156,14 +2088,7 @@ export class IpcExecutor implements RequestExecutor {
         { pid: server.pid, reason },
         'server channel lost while the process was alive; killing it',
       );
-      try {
-        server.kill();
-      } catch (error) {
-        this.logger.warn(
-          { pid: server.pid, reason: messageOf(error) },
-          'server could not be killed after losing its channel',
-        );
-      }
+      this.killQuietly(server);
     }
     if (this.isTerminal) {
       // SPEC 6.3: no restart while shutting down; nothing can complete these.
@@ -1255,6 +2180,12 @@ export class IpcExecutor implements RequestExecutor {
    * That is the necessary cost of the SPEC 6.5 ordering guarantee, not a drop.
    */
   private flush(): void {
+    if (this.status === 'switching') {
+      // The current Server is about to be retired; delivering now would send a
+      // request to a process the switch is draining. It stays buffered until
+      // the replacement is promoted and this method runs again.
+      return;
+    }
     const server = this.server;
     if (server === undefined || !server.ready) {
       return;
@@ -1448,4 +2379,18 @@ function requestFields(request: ExecutorRequest): LogFields {
     fields.sessionId = request.sessionId;
   }
   return fields;
+}
+
+/** A one-shot, never-rejecting barrier for one handshake step. */
+function newBarrier(): SwitchBarrier {
+  const deferred = Promise.withResolvers<void>();
+  return {
+    promise: deferred.promise,
+    resolve: deferred.resolve,
+    seen: false,
+  };
+}
+
+function toError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(messageOf(error));
 }

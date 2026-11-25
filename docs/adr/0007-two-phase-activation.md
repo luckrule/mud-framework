@@ -33,13 +33,34 @@ ADR-0004 的崩溃重启路径不受影响：那个路径上新进程起来时�
 
 ### 边界：切换前旧进程必须已经 drain 并关闭
 
-协议只提供"准备好了"和"可以打开存储了"两个点，不规定谁在什么条件下发 `activate`。顺序责任在调用方：`activate` 只能在旧进程已停止接受请求、已排空在途请求、已关闭后端、已确认进程退出之后发出。本阶段只实现"收到 `prepared` 立即 `activate`"这一普通启动适配；真正的 switchTo/drain 状态机属于下一阶段，届时 `activate` 的发出条件由它掌握。ADR 先固定这条约束，避免下一阶段把"等旧进程"写成"等旧进程发 closed 就行"——`closed` 只说明 Server 完成了关闭流程，不说明进程已释放存储（ADR-0004 的退出等待就是为此存在）。
+协议只提供"准备好了"和"可以打开存储了"两个点，不规定谁在什么条件下发 `activate`。顺序责任在调用方：`activate` 只能在旧进程已停止接受请求、已排空在途请求、已关闭后端、已确认进程退出之后发出。ADR 先固定这条约束，避免下一阶段把"等旧进程"写成"等旧进程发 closed 就行"——`closed` 只说明 Server 完成了关闭流程，不说明进程已释放存储（ADR-0004 的退出等待就是为此存在）。
 
-### 边界：切换窗口内的请求缓冲与回滚
+### 决定：`IpcExecutor.switchTo` 编排切换（顺序不可调换）
 
-- 请求不投递给 prepared 的 Server。Portal 的未确认缓冲（`maxPending`）继续持有它们，等新 generation `ready` 后按原顺序重放（SPEC 6.5）。切换窗口因此不引入新的缓冲层，代价是这段时间的请求延迟上升而不是失败。
-- 回滚即"不发 `activate`"。prepared 进程没有写过任何东西，放弃它不需要补偿；旧进程若还在服务，继续服务即可。已经发出的 `activate` 无法撤回——那一刻起新进程开始写存储，回滚退化为崩溃恢复路径（重放），不再是切换回滚。
-- 请求在 `prepared` 与 `ready` 之间到达 Server 时（Portal 违约，或旧 Portal 的行为）一律忽略并记 warn：没有后端与 handler，执行无从谈起，也不能假装成功。`shutdown` 在 prepare 阶段直接关闭链路并完成，不打开后端。
+`switchTo({ spawn, codeVersion? })` 在 `status === 'ready'` 时启动一次切换，按固定四步执行，任一步的顺序都不能调换：
+
+1. 用本次切换提供的 `spawn` 起新进程，发 `hello`，等到 `prepared`（有界：`startTimeoutMs`）。prepared 进程不碰存储。
+2. 旧进程停止接收新请求（切换期间 `execute()` 仍接受并缓冲，不拒绝）；向旧进程发 `shutdown`（`timeoutMs = shutdownTimeoutMs`），等 `closed`，再等进程退出（`awaitPreviousClosed` 等 `closed`，`waitForExit` 等退出，必要时 kill 后再等一次）。
+3. 确认旧进程消失后，才向新进程发 `activate`，等 `ready`（有界：`startTimeoutMs`）。
+4. 把 `this.server` 切到新进程、`status = 'ready'`、`flush()` 把缓冲请求按 SPEC 6.5 投给新 generation；同时把本次切换的 `spawn` 与 `codeVersion` 记为当前版本。
+
+理由就是 INV-002：新进程在 prepared 阶段不打开存储，`activate` 才打开。旧进程仍持有存储时 `activate` 新进程，就是两个写者。因此"等旧进程"必须是"已 closed **且**已退出"，不能只是 `closed`。步骤 2 与 3 之间没有可回退点：一旦发出 `activate`，新进程开始写存储。
+
+同时只允许一个切换；进行中再次调用直接拒绝。切换期间 `status = 'switching'`，`execute()` 照常接受请求并留在未确认缓冲里，`flush()` 在 `switching` 期间不投递（旧进程正在被 drain，投给它等于把请求送进即将退出的进程）。
+
+### 决定：两段式失败边界与回滚
+
+- 旧进程 drain 之前失败（spawn 抛错、prepared 超时、hello 失败、新进程在 prepared 前死亡）：放弃并杀掉新进程，旧进程从未被打断，继续服务，切换 reject。
+- 旧进程已 drain 并退出之后失败（activate 失败、ready 超时、新进程在 ready 前死亡）：此刻没有可用 Server。回滚为"用切换前的 spawn/codeVersion 重新启动"，复用现有重启路径（`status = 'starting'` → `launch`/`scheduleRestart`），并 reject 本次切换，保证缓冲请求不会永久挂起。重启前必须逐个 `waitForExit` 所有退出未确认的进程（旧进程与已 `activate` 的新进程），与崩溃路径同构（INV-002）。
+- 旧进程在切换途中自己崩溃：切换失败，走同一重启路径；不把它的退出误记成普通崩溃并再排一次重启。
+- 切换成功提升后，`spawn` 与 `codeVersion` 记为本次切换的目标值：此后崩溃重启的是刚提升的版本，新请求也盖上该版本（SPEC 6.4）。切换失败回滚则保持原版本。
+- 任何失败路径都有界，且在被放弃进程的退出未确认前不会启动新进程；退出确认由回滚或 close() 各自完成。
+
+`close()` 在切换期间必须能中止：中止信号会打断切换的每个 await，`doClose` 放弃新进程后按正常路径关闭旧进程，最终正常 `closed`。若被放弃的新进程已收到 `activate`（可能已持有存储），`doClose` 在返回前对它执行与 `shutdownServer` 相同的 `waitForExit` → `kill` → `waitForExit` 有界流程，仍未退出则记 warn。切换窗口内到达的请求最终要么在新进程成功，要么以稳定错误码结束（关闭时 `FRAMEWORK_SHUTDOWN`），不会挂到 deadline；回滚期间它们仍受自身 deadline 约束。
+
+### 观测
+
+切换开始（`fromCodeVersion`/`toCodeVersion`）、旧进程已 drain、新进程 ready、切换完成、切换失败与回滚原因各记一行。`ready` 的 `codeVersion` 与目标版本不一致时记 warn；`prepared` 可提前比对，同一次切换只告警一次。字段名沿用现有契约风格，不逐请求刷屏。
 
 ### 边界：父进程监控与 `ready` 重发
 
@@ -60,4 +81,5 @@ Portal 关闭一个尚未 `ready` 的 Server 走 kill，而不是 `shutdown` 消
 - 启动多一个 IPC 往返。普通启动因此多一次消息，代价固定且远小于后端初始化。
 - 协议少了一处隐式保证："Server 活着"不再等于"Server 已就绪"。任何依赖 `hello` 之后立刻 `ready` 的调用方都要改；本仓库内只有 `IpcExecutor` 与测试替身。
 - 切换路径的正确性从"进程启动顺序"变成"消息发出顺序"，可以在 `activate` 处加观测点，而不必靠进程启动日志推断。
-- 未实现的部分（下一阶段）：`IpcExecutor.switchTo`、旧进程 drain/退出编排、失败回滚、`codeVersion` 到入口的映射、真实双版本集成。本 ADR 固定它们的边界，不实现它们。
+- 切换窗口内请求延迟上升而非失败，代价由未确认缓冲（`maxPending`）兜底；切换失败时按上文两段边界决定"旧进程继续服务"还是"重启旧版本"。
+- 仍未实现：`codeVersion` 到入口的映射、真实双版本集成。`switchTo` 只编排进程替换，不解释版本兼容性（SPEC 6.4）。
