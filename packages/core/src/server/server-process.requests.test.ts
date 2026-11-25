@@ -143,7 +143,7 @@ describe('runServerProcess requests', () => {
         result: 'hi',
       },
     ]);
-    // `LocalExecutor` omits the key entirely for an unbound success, and both
+    // `DispatcherExecutor` omits the key entirely for an unbound success, and both
     // JSON and structured clone keep that shape, so "absent" is literally what
     // "unbound" looks like on the wire (SPEC 2). `toBeUndefined` would also
     // pass on a present-but-undefined key, i.e. on the shape this asserts

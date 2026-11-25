@@ -58,9 +58,10 @@ export interface ExecutorHealth {
 }
 
 /**
- * The seam between the connection layer and whoever executes handlers. In
- * process that is `LocalExecutor` over a `Dispatcher`; the two-process design
- * puts an IPC-backed executor behind the same interface.
+ * The seam between the connection layer and whoever executes handlers. The
+ * Connection process uses an IPC-backed executor; inside the Server process a
+ * `Dispatcher`-backed adapter implements the same interface for the request
+ * runner.
  */
 export interface RequestExecutor {
   /**

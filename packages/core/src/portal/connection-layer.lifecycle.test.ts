@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 
 import { createJsonLogger } from '../logging/json-logger.ts';
+import { DispatcherExecutor } from '../server/dispatcher-executor.ts';
 import { Dispatcher } from '../server/dispatcher.ts';
-import { LocalExecutor } from '../server/local-executor.ts';
 import type { RequestExecutor } from '../shared/executor.ts';
 import { rejectionOf } from '../testing/common.ts';
 import { harness, scriptedExecutor } from '../testing/connection-layer.ts';
@@ -24,7 +24,7 @@ describe('ConnectionLayer lifecycle', () => {
       logger,
     });
     const layer = new ConnectionLayer({
-      executor: new LocalExecutor({ dispatcher }),
+      executor: new DispatcherExecutor({ dispatcher }),
       transport: {
         start: async (handlers) => {
           entered.resolve();
@@ -70,7 +70,7 @@ describe('ConnectionLayer lifecycle', () => {
       timeoutMs: 1000,
       logger,
     });
-    const local = new LocalExecutor({ dispatcher });
+    const local = new DispatcherExecutor({ dispatcher });
     let ready = false;
     let closedBeforeReady = false;
     let closes = 0;

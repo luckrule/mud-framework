@@ -84,7 +84,7 @@ try {
 
 Handler 默认 `access: 'session'`：请求没有 Session 时以 `AUTH_REQUIRED` 拒绝，且不会打开事务或执行 Handler。登录/注册这类入口声明 `access: 'public'` 并加 `mayChangeSession: true`，在 handler 内校验凭据后调用 `ctx.bindSession(id)`；绑定只在请求成功后生效。退出登录同理：public + `mayChangeSession: true` 的 handler 调 `ctx.unbindSession()`，成功后路由被移除，失败时保留。
 
-凭据校验、用户数据、Session ID 的生成与保留策略属于消费方，框架不提供用户库或登录协议。需要更细的授权判断时，单进程装配给 `Dispatcher` 注入 `authorize(ctx, method, payload)`，双进程装配把它传给 `runServerProcess`：它在 Session 检查之后、事务之前执行，只看到请求身份、`AbortSignal` 与日志器；返回 false 得到 `FORBIDDEN`，抛错按 `INTERNAL_ERROR` 处理，决策受请求 deadline 约束。
+凭据校验、用户数据、Session ID 的生成与保留策略属于消费方，框架不提供用户库或登录协议。需要更细的授权判断时，把 `authorize(ctx, method, payload)` 传给 `runServerProcess`：它在 Session 检查之后、事务之前执行，只看到请求身份、`AbortSignal` 与日志器；返回 false 得到 `FORBIDDEN`，抛错按 `INTERNAL_ERROR` 处理，决策受请求 deadline 约束。
 
 `runServerProcess` 返回的 Promise 就是退出信号：收到 `shutdown` 并正常收尾时 resolve，启动失败或链路断开时 reject。入口脚本应把失败映射为非零退出码；Portal 也通过 IPC 断开与退出事件发现 Server 丢失。
 

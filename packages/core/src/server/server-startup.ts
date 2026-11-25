@@ -1,12 +1,13 @@
 import type { Logger } from '../logging/types.ts';
+import type { RequestExecutor } from '../shared/executor.ts';
 import { messageOf } from '../shared/guards.ts';
 import { checkBackendCapabilities } from '../storage/capabilities.ts';
 import { degradations } from '../storage/degradations.ts';
 import { unmetRequirements } from '../storage/requirements.ts';
 import type { StorageBackend, StorageCapabilities } from '../storage/types.ts';
+import { DispatcherExecutor } from './dispatcher-executor.ts';
 import { Dispatcher } from './dispatcher.ts';
 import type { Extension, ExtensionRegistrar } from './extension.ts';
-import { LocalExecutor } from './local-executor.ts';
 import type { ServerProcessOptions } from './server-process-options.ts';
 
 /**
@@ -29,7 +30,7 @@ export class ServerStartupError extends Error {
 /** The running pieces a started Server hands to the process that owns it. */
 export interface Runtime {
   readonly dispatcher: Dispatcher;
-  readonly executor: LocalExecutor;
+  readonly executor: RequestExecutor;
   readonly capabilities: StorageCapabilities;
 }
 
@@ -95,7 +96,7 @@ export async function startServer(deps: StartupDeps): Promise<StartupResult> {
     });
     const runtime: Runtime = {
       dispatcher,
-      executor: new LocalExecutor({ dispatcher }),
+      executor: new DispatcherExecutor({ dispatcher }),
       capabilities: checked.capabilities,
     };
     // SPEC 6.2 step 2: every Extension is checked against the backend and

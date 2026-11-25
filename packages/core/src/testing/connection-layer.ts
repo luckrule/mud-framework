@@ -5,8 +5,8 @@ import { isRecord, parseFrame } from 'mud-framework-test-support';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import type { Logger, LogLevel } from '../logging/types.ts';
 import { ConnectionLayer } from '../portal/connection-layer.ts';
+import { DispatcherExecutor } from '../server/dispatcher-executor.ts';
 import { Dispatcher } from '../server/dispatcher.ts';
-import { LocalExecutor } from '../server/local-executor.ts';
 import type { Codec, Envelope, ResponseEnvelope } from '../shared/codec.ts';
 import type {
   ExecutorRequest,
@@ -76,7 +76,7 @@ export async function harness(
   });
   const layer = new ConnectionLayer({
     transport,
-    executor: new LocalExecutor({ dispatcher }),
+    executor: new DispatcherExecutor({ dispatcher }),
     codec: options.codec,
     logger,
     createRequestId: options.createRequestId,

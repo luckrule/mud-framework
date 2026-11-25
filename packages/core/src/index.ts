@@ -45,15 +45,12 @@ export type {
 } from './transport/types.ts';
 export type {
   AccessContext,
-  DispatchMeta,
-  DispatchResult,
   DispatcherOptions,
   Handler,
   HandlerAccess,
   HandlerOptions,
   RequestContext,
 } from './server/dispatcher.ts';
-export { Dispatcher } from './server/dispatcher.ts';
 export type {
   LogFields,
   LogLevel,
@@ -72,7 +69,6 @@ export type {
   RequestExecutor,
   SessionChange,
 } from './shared/executor.ts';
-export { LocalExecutor } from './server/local-executor.ts';
 export {
   AUTH_REQUIRED,
   AuthenticationRequiredError,

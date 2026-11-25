@@ -62,8 +62,8 @@ export interface RequestContext extends RequestIdentity {
 /**
  * What a successful dispatch yields: the handler's value plus the Session
  * change it declared, if any. Failures are still thrown — `instanceof` only
- * works in process, and `LocalExecutor` is the one place that turns them into
- * the cross-process `ExecutorOutcome` union.
+ * works in process, and the Server's dispatcher-backed executor is the one
+ * place that turns them into the cross-process `ExecutorOutcome` union.
  *
  * The change was recorded, not applied: the caller owns the routing table and
  * commits it only after this result arrives (SPEC 2).

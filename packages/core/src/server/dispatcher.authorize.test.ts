@@ -16,8 +16,8 @@ import {
   parseLines,
   quietDispatcher,
 } from '../testing/dispatcher.ts';
+import { DispatcherExecutor } from './dispatcher-executor.ts';
 import type { AccessContext } from './dispatcher.ts';
-import { LocalExecutor } from './local-executor.ts';
 
 function harness(
   authorize: (
@@ -211,7 +211,7 @@ describe('Dispatcher access policy (SPEC 3.7)', () => {
       throw new Error('policy exploded');
     });
     dispatcher.register('look', async () => null, { access: 'public' });
-    const executor = new LocalExecutor({ dispatcher });
+    const executor = new DispatcherExecutor({ dispatcher });
 
     const outcome = await executor.execute({
       requestId: 'r1',
@@ -247,7 +247,7 @@ describe('Dispatcher access policy (SPEC 3.7)', () => {
       },
       { access: 'public' },
     );
-    const executor = new LocalExecutor({ dispatcher });
+    const executor = new DispatcherExecutor({ dispatcher });
 
     const outcome = await executor.execute({
       requestId: 'r1',
@@ -273,7 +273,7 @@ describe('Dispatcher access policy (SPEC 3.7)', () => {
       throw new BusinessError('POLICY_SAYS_NO', 'not a business refusal');
     });
     dispatcher.register('look', async () => null, { access: 'public' });
-    const executor = new LocalExecutor({ dispatcher });
+    const executor = new DispatcherExecutor({ dispatcher });
 
     const outcome = await executor.execute({
       requestId: 'r1',
