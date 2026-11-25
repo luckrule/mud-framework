@@ -13,14 +13,13 @@ SPEC 原 §5.2 要求传输实现导出 `TransportCapabilities`：二进制帧�
 - 删除 `TransportCapabilities` 及其公共导出。
 - 从 `Transport` 接口删除 `capabilities()`；接口只保留 `start`、`stop` 与传输的职责边界（接受连接、交付入站数据、写出发站数据、关闭，见 SPEC 5.2）。
 - 删除 SPEC 原 §5.2 与 §5.3，原 §5.4、§5.5 重编号为 §5.2、§5.3；SPEC 5.1 只保留接口边界。
-- `INV-019` 标注废弃，保留编号不复用。
 - 存储能力声明保留：`StorageCapabilities` 驱动事务超时、降级告警与 Extension 的 `requires` 校验，后端能力有真实差异，降级有对象（SPEC 4.2、4.3）。
 
 传输不需要能力协商。框架的顺序、队列上限、重放与 Session 路由都在连接层实现（SPEC 5.2），不按传输能力分叉。能力声明只有在框架为每种声明准备好替代实现时才是契约；否则它只是让传输作者以为声明弱能力会触发降级，而框架并不会。按当前契约，无法承担接口职责的传输不受支持；不要为它设计框架未实现的降级模式。
 
 ## 后果
 
-移除是破坏性变更：公共导出 `TransportCapabilities` 与接口方法 `Transport.capabilities()` 消失。仓库内所有传输实现（`WsTransport`、`FakeTransport`）已在同一次提交 `bc9e6b8` 中同步更新。导入该类型或调用该方法的代码需要删除引用；实现方多保留一个 `capabilities()` 方法不会阻止其满足收窄后的接口。SPEC 8.2 已相应规定，改动 `Transport` 接口签名按重大变更处理，必须同步升级所有传输实现。
+移除是破坏性变更：公共导出 `TransportCapabilities` 与接口方法 `Transport.capabilities()` 消失，所有传输实现 MUST 同步收窄（SPEC 8.2）。
 
 运行时行为不变：移除前没有任何框架路径读取这些声明，队列拒绝、顺序与重放都不依赖它们。
 

@@ -20,14 +20,10 @@ const CODES = {
   FRAMEWORK_SHUTDOWN: 'FRAMEWORK_SHUTDOWN',
   /** SPEC 7.2/6.5: the replay budget ran out; the request reached a terminal state. */
   FRAMEWORK_REPLAY_EXHAUSTED: 'FRAMEWORK_REPLAY_EXHAUSTED',
-  /** SPEC 7.2/4.3: a reserved code, no path produces it yet. */
-  FRAMEWORK_CAPABILITY_UNSUPPORTED: 'FRAMEWORK_CAPABILITY_UNSUPPORTED',
   /** SPEC 7.2: the transport closed before the request finished. */
   TRANSPORT_CLOSED: 'TRANSPORT_CLOSED',
   /** SPEC 7.2: the result could not be written back to the transport. */
   TRANSPORT_SEND_FAILED: 'TRANSPORT_SEND_FAILED',
-  /** SPEC 7.2: a reserved code, no path produces it yet. */
-  STORAGE_UNAVAILABLE: 'STORAGE_UNAVAILABLE',
   /** SPEC 7.2: an inbound frame could not be decoded. */
   INVALID_ENVELOPE: 'INVALID_ENVELOPE',
   /** SPEC 7.2: no handler is registered for the method. */
@@ -44,11 +40,8 @@ export const FRAMEWORK_TIMEOUT = CODES.FRAMEWORK_TIMEOUT;
 export const FRAMEWORK_QUEUE_FULL = CODES.FRAMEWORK_QUEUE_FULL;
 export const FRAMEWORK_SHUTDOWN = CODES.FRAMEWORK_SHUTDOWN;
 export const FRAMEWORK_REPLAY_EXHAUSTED = CODES.FRAMEWORK_REPLAY_EXHAUSTED;
-export const FRAMEWORK_CAPABILITY_UNSUPPORTED =
-  CODES.FRAMEWORK_CAPABILITY_UNSUPPORTED;
 export const TRANSPORT_CLOSED = CODES.TRANSPORT_CLOSED;
 export const TRANSPORT_SEND_FAILED = CODES.TRANSPORT_SEND_FAILED;
-export const STORAGE_UNAVAILABLE = CODES.STORAGE_UNAVAILABLE;
 export const INVALID_ENVELOPE = CODES.INVALID_ENVELOPE;
 export const UNKNOWN_METHOD = CODES.UNKNOWN_METHOD;
 export const INTERNAL_ERROR = CODES.INTERNAL_ERROR;

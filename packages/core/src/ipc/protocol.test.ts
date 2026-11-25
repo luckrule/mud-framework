@@ -12,7 +12,7 @@ const capabilities = {
 } as const;
 
 const validMessages: IpcMessage[] = [
-  { type: 'hello', portalGeneration: 3 },
+  { type: 'hello' },
   {
     type: 'request',
     requestId: 'req-1',
@@ -105,50 +105,19 @@ describe('parseIpcMessage', () => {
     });
   });
 
-  test('accepts a prepared message carrying a code version', () => {
-    const parsed = parseIpcMessage({
-      type: 'prepared',
-      pid: 4242,
-      codeVersion: 'build-7',
-    });
-
-    expect(parsed).toEqual({
-      ok: true,
-      message: { type: 'prepared', pid: 4242, codeVersion: 'build-7' },
-    });
-  });
-
-  test('reports no code version when the peer sent none', () => {
+  test('accepts a prepared message', () => {
     const parsed = parseIpcMessage({ type: 'prepared', pid: 4242 });
 
-    // `toEqual` ignores undefined own keys, so this pins the value, not the
-    // message shape: whether the parsed object carries a `codeVersion` key is
-    // not part of the contract.
     expect(parsed).toEqual({
       ok: true,
-      message: { type: 'prepared', pid: 4242, codeVersion: undefined },
+      message: { type: 'prepared', pid: 4242 },
     });
-    expect(parsed.ok).toBe(true);
-    if (parsed.ok && parsed.message.type === 'prepared') {
-      expect(parsed.message.codeVersion).toBeUndefined();
-    }
   });
 
   test('rejects a prepared without a usable pid', () => {
     for (const pid of [undefined, 0, -1, 1.5, '4242']) {
       expectRejected({ type: 'prepared', pid }, 'pid');
     }
-  });
-
-  test('rejects a prepared with an invalid code version', () => {
-    expectRejected(
-      { type: 'prepared', pid: 4242, codeVersion: '' },
-      'non-empty string',
-    );
-    expectRejected(
-      { type: 'prepared', pid: 4242, codeVersion: 7 },
-      'codeVersion',
-    );
   });
 
   test('accepts activate and drops extra fields', () => {
@@ -158,151 +127,6 @@ describe('parseIpcMessage', () => {
       ok: true,
       message: { type: 'activate' },
     });
-  });
-
-  test('accepts a request carrying a code version', () => {
-    const parsed = parseIpcMessage({
-      type: 'request',
-      requestId: 'req-1',
-      connectionId: 'conn-1',
-      clientRequestId: 'client-1',
-      method: 'look',
-      timeoutMs: 100,
-      replayCount: 1,
-      codeVersion: 'build-7',
-    });
-
-    expect(parsed).toEqual({
-      ok: true,
-      message: {
-        type: 'request',
-        requestId: 'req-1',
-        connectionId: 'conn-1',
-        clientRequestId: 'client-1',
-        sessionId: undefined,
-        method: 'look',
-        payload: undefined,
-        timeoutMs: 100,
-        replayCount: 1,
-        codeVersion: 'build-7',
-      },
-    });
-  });
-
-  test('accepts a ready carrying a code version', () => {
-    const parsed = parseIpcMessage({
-      type: 'ready',
-      pid: 4242,
-      capabilities,
-      codeVersion: 'build-7',
-    });
-
-    expect(parsed).toEqual({
-      ok: true,
-      message: {
-        type: 'ready',
-        pid: 4242,
-        capabilities,
-        codeVersion: 'build-7',
-      },
-    });
-  });
-
-  test('rejects an empty code version', () => {
-    expectRejected(
-      {
-        type: 'request',
-        requestId: 'req-1',
-        connectionId: 'conn-1',
-        clientRequestId: 'client-1',
-        method: 'look',
-        timeoutMs: 100,
-        replayCount: 0,
-        codeVersion: '',
-      },
-      'non-empty string',
-    );
-    expectRejected(
-      { type: 'ready', pid: 4242, capabilities, codeVersion: '' },
-      'non-empty string',
-    );
-  });
-
-  test('rejects a non-string code version', () => {
-    expectRejected(
-      {
-        type: 'request',
-        requestId: 'req-1',
-        connectionId: 'conn-1',
-        clientRequestId: 'client-1',
-        method: 'look',
-        timeoutMs: 100,
-        replayCount: 0,
-        codeVersion: 7,
-      },
-      'codeVersion',
-    );
-    expectRejected(
-      { type: 'ready', pid: 4242, capabilities, codeVersion: 7 },
-      'codeVersion',
-    );
-  });
-
-  test('reports no code version on a request when the peer sent none', () => {
-    const parsed = parseIpcMessage({
-      type: 'request',
-      requestId: 'req-1',
-      connectionId: 'conn-1',
-      clientRequestId: 'client-1',
-      method: 'ping',
-      timeoutMs: 250,
-      replayCount: 0,
-    });
-
-    // Value only: `toEqual` ignores undefined own keys, so the presence of the
-    // key itself is not what this asserts.
-    expect(parsed).toEqual({
-      ok: true,
-      message: {
-        type: 'request',
-        requestId: 'req-1',
-        connectionId: 'conn-1',
-        clientRequestId: 'client-1',
-        sessionId: undefined,
-        method: 'ping',
-        payload: undefined,
-        timeoutMs: 250,
-        replayCount: 0,
-        codeVersion: undefined,
-      },
-    });
-    expect(parsed.ok).toBe(true);
-    if (parsed.ok && parsed.message.type === 'request') {
-      expect(parsed.message.codeVersion).toBeUndefined();
-    }
-  });
-
-  test('reports no code version on ready when the peer sent none', () => {
-    const parsed = parseIpcMessage({
-      type: 'ready',
-      pid: 4242,
-      capabilities,
-    });
-
-    // Value only, same as the other absent-version cases.
-    expect(parsed).toEqual({
-      ok: true,
-      message: {
-        type: 'ready',
-        pid: 4242,
-        capabilities,
-        codeVersion: undefined,
-      },
-    });
-    expect(parsed.ok).toBe(true);
-    if (parsed.ok && parsed.message.type === 'ready') {
-      expect(parsed.message.codeVersion).toBeUndefined();
-    }
   });
 
   test('keeps a success result that carries no value', () => {
@@ -583,13 +407,12 @@ describe('parseIpcMessage', () => {
   test('keeps extra fields out of the parsed message', () => {
     const parsed = parseIpcMessage({
       type: 'hello',
-      portalGeneration: 1,
       futureField: 'ignored',
     });
 
     expect(parsed).toEqual({
       ok: true,
-      message: { type: 'hello', portalGeneration: 1 },
+      message: { type: 'hello' },
     });
   });
 
@@ -742,7 +565,6 @@ describe('parseIpcMessage', () => {
         type: 'ready',
         pid: 1,
         capabilities: { ...capabilities, maxTransactionDurationMs: 250 },
-        codeVersion: undefined,
       },
     });
   });
@@ -817,7 +639,7 @@ describe('parseIpcMessage', () => {
       Number.NaN,
       true,
       [],
-      [{ type: 'hello', portalGeneration: 1 }],
+      [{ type: 'hello' }],
       new Map(),
       Symbol('x'),
       () => undefined,

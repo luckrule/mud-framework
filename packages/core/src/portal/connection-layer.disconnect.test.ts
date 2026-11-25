@@ -104,7 +104,7 @@ describe('ConnectionLayer disconnect', () => {
       execute: () =>
         Promise.resolve({
           ok: false,
-          error: { code: 'STORAGE_UNAVAILABLE', message: 'backend is gone' },
+          error: { code: 'INTERNAL_ERROR', message: 'backend is gone' },
         }),
       cancel: () => Promise.resolve(),
       close: () => Promise.resolve(),

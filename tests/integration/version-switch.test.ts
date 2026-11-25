@@ -20,7 +20,6 @@ import {
   spawnBunServer,
 } from '../../packages/core/src/index.ts';
 import type { Logger, SpawnedServer } from '../../packages/core/src/index.ts';
-import { SqliteBackend } from '../../packages/storage-sqlite/src/index.ts';
 
 /**
  * `IpcExecutor.switchTo` against real processes, a real WebSocket and a real
@@ -28,17 +27,9 @@ import { SqliteBackend } from '../../packages/storage-sqlite/src/index.ts';
  * the parts only the deployment path can break — spawning a second Bun child,
  * waiting for the old one to actually exit, `activate` reaching a process that
  * has not opened storage yet — are not covered there (ADR-0007).
- *
- * Both "builds" are the same fixture file started with a different
- * `codeVersion` argument. That argument is what the Server reports in
- * `prepared`/`ready`, what the `version` handler echoes, and what a row in the
- * `version` table records when the backend opens, so one file can stand in for
- * two builds without duplicating the entry.
  */
 const FIXTURE = join(import.meta.dir, 'fixtures', 'server-entry.ts');
 
-const BUILD_1 = 'build-1';
-const BUILD_2 = 'build-2';
 const REQUEST_TIMEOUT_MS = 10_000;
 const START_TIMEOUT_MS = 10_000;
 const SWITCH_TIMEOUT_MS = 15_000;
@@ -64,7 +55,6 @@ interface Portal {
 
 function serverCommand(
   databasePath: string,
-  codeVersion: string,
   behavior: Behavior = 'echo',
   startDelayMs = 0,
 ): string[] {
@@ -76,23 +66,16 @@ function serverCommand(
     FIXTURE,
     behavior,
     databasePath,
-    codeVersion,
     String(startDelayMs),
   ];
 }
 
 function spawnFor(
   databasePath: string,
-  codeVersion: string,
   behavior: Behavior = 'echo',
   startDelayMs = 0,
 ): () => SpawnedServer {
-  const command = serverCommand(
-    databasePath,
-    codeVersion,
-    behavior,
-    startDelayMs,
-  );
+  const command = serverCommand(databasePath, behavior, startDelayMs);
   return () => spawnBunServer({ command });
 }
 
@@ -108,8 +91,7 @@ function createPortal(databasePath: string): Portal {
     },
   });
   const executor = new IpcExecutor({
-    spawn: spawnFor(databasePath, BUILD_1),
-    codeVersion: BUILD_1,
+    spawn: spawnFor(databasePath),
     timeoutMs: REQUEST_TIMEOUT_MS,
     startTimeoutMs: START_TIMEOUT_MS,
     logger,
@@ -220,23 +202,6 @@ function expectGone(pid: number): void {
   expect(code).toBe('ESRCH');
 }
 
-interface VersionRow {
-  readonly code_version: string;
-  readonly pid: number;
-}
-
-/** Read through a second backend, so the rows are not the Server's own view. */
-async function readVersions(databasePath: string): Promise<VersionRow[]> {
-  const reader = SqliteBackend.open({ filename: databasePath });
-  try {
-    return await reader.transaction((tx) =>
-      tx.query<VersionRow>('SELECT code_version, pid FROM version ORDER BY id'),
-    );
-  } finally {
-    await reader.close();
-  }
-}
-
 /** Always releases the Portal and every Server pid it reported. */
 async function stopQuietly(portal: Portal): Promise<void> {
   try {
@@ -256,7 +221,7 @@ async function stopQuietly(portal: Portal): Promise<void> {
 
 describe('version switch with real processes', () => {
   test(
-    'switchTo replaces the Server without dropping a live WebSocket, and the next request is served by the new build',
+    'switchTo replaces the Server without dropping a live WebSocket',
     async () => {
       const database = tempDatabase({ prefix: 'mud-version-switch-' });
       const portal = createPortal(database.path);
@@ -268,13 +233,10 @@ describe('version switch with real processes', () => {
 
         const before = await sendRequest(socket, {
           id: 'before',
-          method: 'version',
+          method: 'echo',
+          payload: 'before',
         });
-        expect(before).toEqual({
-          id: 'before',
-          ok: true,
-          result: { codeVersion: BUILD_1 },
-        });
+        expect(before).toEqual({ id: 'before', ok: true, result: 'before' });
         const oldPid = requirePid(portal.lines, 'server ready');
 
         let settled = false;
@@ -283,8 +245,7 @@ describe('version switch with real processes', () => {
           // The replacement holds `activate` for a moment before it can report
           // `ready`, so the request below lands inside the switching window on
           // every machine instead of racing a fast spawn.
-          spawn: spawnFor(database.path, BUILD_2, 'echo', SWITCH_HOLD_MS),
-          codeVersion: BUILD_2,
+          spawn: spawnFor(database.path, 'echo', SWITCH_HOLD_MS),
         });
         // Observed, not awaited: the assertion below proves the switch was still
         // in flight when the request was accepted. `catch` first so a rejection
@@ -297,7 +258,11 @@ describe('version switch with real processes', () => {
 
         // Accepted while `status === 'switching'`: it must stay in the
         // unacknowledged buffer and be delivered to the new generation.
-        const during = sendRequest(socket, { id: 'during', method: 'version' });
+        const during = sendRequest(socket, {
+          id: 'during',
+          method: 'echo',
+          payload: 'during',
+        });
         expect(settled).toBe(false);
 
         await withDeadline(switching, SWITCH_TIMEOUT_MS, 'switchTo');
@@ -312,24 +277,21 @@ describe('version switch with real processes', () => {
         expect(await during).toEqual({
           id: 'during',
           ok: true,
-          result: { codeVersion: BUILD_2 },
+          result: 'during',
         });
 
         const after = await sendRequest(socket, {
           id: 'after',
-          method: 'version',
+          method: 'echo',
+          payload: 'after',
         });
-        expect(after).toEqual({
-          id: 'after',
-          ok: true,
-          result: { codeVersion: BUILD_2 },
-        });
+        expect(after).toEqual({ id: 'after', ok: true, result: 'after' });
         expect(dropped()).toBe(false);
 
         // The order the switch promises: the old process is retired before the
-        // replacement is activated, and the replacement reports the target
-        // version (ADR-0007 step 2 before step 3). Both lines are required, so a
-        // missing one cannot turn the ordering check into a tautology.
+        // replacement is activated (ADR-0007 step 2 before step 3). Both lines
+        // are required, so a missing one cannot turn the ordering check into a
+        // tautology.
         const retiredAt = lineIndex(portal.lines, 'previous server retired');
         const replacementReadyAt = lineIndex(
           portal.lines,
@@ -337,9 +299,9 @@ describe('version switch with real processes', () => {
         );
         expect(retiredAt).toBeGreaterThanOrEqual(0);
         expect(replacementReadyAt).toBeGreaterThan(retiredAt);
-        expect(lineOf(portal.lines, 'server switch completed')).toMatchObject({
-          codeVersion: BUILD_2,
-        });
+        expect(
+          portal.lines.some((line) => line.msg === 'server switch completed'),
+        ).toBe(true);
         // The in-flight request waited in the buffer instead of timing out or
         // being replayed onto a generation it never reached.
         expect(
@@ -351,25 +313,10 @@ describe('version switch with real processes', () => {
 
         const newPid = requirePid(portal.lines, 'replacement server ready');
         expect(newPid).not.toBe(oldPid);
-        // The pid reported for the replacement is the one its own row recorded,
-        // so "the new process is alive" refers to the build-2 writer.
-        expect(
-          lineOf(portal.lines, 'replacement server ready').codeVersion,
-        ).toBe(BUILD_2);
         // The switch waits for the old process's exit before it activates the
         // new one (INV-002), so by the time it resolves the pid must be gone.
         expectGone(oldPid);
         expect(isProcessAlive(newPid)).toBe(true);
-
-        await stopQuietly(portal);
-
-        // One row per process that actually opened storage, in start order: the
-        // build-2 row exists only because `activate` reached it after build-1
-        // exited.
-        expect(await readVersions(database.path)).toEqual([
-          { code_version: BUILD_1, pid: oldPid },
-          { code_version: BUILD_2, pid: newPid },
-        ]);
       } finally {
         socket?.close();
         await stopQuietly(portal);
@@ -380,7 +327,7 @@ describe('version switch with real processes', () => {
   );
 
   test(
-    'a replacement that fails to boot is rejected, leaves the old build serving, and never opens storage',
+    'a replacement that fails to boot is rejected and leaves the old process serving',
     async () => {
       const database = tempDatabase({ prefix: 'mud-version-switch-' });
       const portal = createPortal(database.path);
@@ -392,20 +339,16 @@ describe('version switch with real processes', () => {
 
         const before = await sendRequest(socket, {
           id: 'before',
-          method: 'version',
+          method: 'echo',
+          payload: 'before',
         });
-        expect(before).toEqual({
-          id: 'before',
-          ok: true,
-          result: { codeVersion: BUILD_1 },
-        });
+        expect(before).toEqual({ id: 'before', ok: true, result: 'before' });
         const oldPid = requirePid(portal.lines, 'server ready');
 
         const error = await withDeadline(
           rejectionOf(
             portal.executor.switchTo({
-              spawn: spawnFor(database.path, BUILD_2, 'boot-fail'),
-              codeVersion: BUILD_2,
+              spawn: spawnFor(database.path, 'boot-fail'),
             }),
           ),
           SWITCH_TIMEOUT_MS,
@@ -427,13 +370,10 @@ describe('version switch with real processes', () => {
         expect(dropped()).toBe(false);
         const after = await sendRequest(socket, {
           id: 'after',
-          method: 'version',
+          method: 'echo',
+          payload: 'after',
         });
-        expect(after).toEqual({
-          id: 'after',
-          ok: true,
-          result: { codeVersion: BUILD_1 },
-        });
+        expect(after).toEqual({ id: 'after', ok: true, result: 'after' });
         // No crash restart: the failed replacement is not a lost current Server.
         expect(pidsOf(portal.lines, 'server ready')).toEqual([oldPid]);
         expect(pidsOf(portal.lines, 'replacement server ready')).toEqual([]);
@@ -445,14 +385,6 @@ describe('version switch with real processes', () => {
             'server switch failed; the previous server keeps serving',
           ).phase,
         ).toBe('preparing');
-
-        await stopQuietly(portal);
-
-        // Only build-1 ever opened the storage. A row for build-2 would mean a
-        // process that never became ready still wrote to the shared file.
-        expect(await readVersions(database.path)).toEqual([
-          { code_version: BUILD_1, pid: oldPid },
-        ]);
       } finally {
         socket?.close();
         await stopQuietly(portal);

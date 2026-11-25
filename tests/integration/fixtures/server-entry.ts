@@ -12,12 +12,9 @@ import { SqliteBackend } from '../../../packages/storage-sqlite/src/index.ts';
  * `spawnBunServer`, so it must run under Bun: the `ipc` serialization is
  * Bun-only, and a Node child's messages never reach the Portal.
  *
- * argv: [behavior, databasePath, codeVersion?, startDelayMs?]. The optional
- * `codeVersion` is the version this process declares to `runServerProcess`, so
- * one fixture file can stand in for two builds; without it the process behaves
- * exactly as before (no `version` table, `version` reports null). The optional
- * `startDelayMs` is spent after `activate` and before `ready`, which lets a
- * switch test hold the switching window open.
+ * argv: [behavior, databasePath, startDelayMs?]. The optional `startDelayMs` is
+ * spent after `activate` and before `ready`, which lets a switch test hold the
+ * switching window open.
  *
  * `boot-fail` exits non-zero before the readiness barrier so Portal's
  * bounded-start behaviour can be observed;
@@ -200,17 +197,10 @@ if (databasePath === undefined) {
 }
 
 /**
- * The version this process claims to be. A real deployment gets it from the
- * entry it was built from (docs/INTEGRATION.md); the fixture takes it from argv
- * so a single file can play two builds in a switch test.
- */
-const codeVersion = process.argv[4];
-
-/**
  * Milliseconds to wait inside `createBackend`, i.e. after `activate` and before
  * the process reports `ready`. Tests use it to hold a switch open deliberately.
  */
-const startDelayMs = Number(process.argv[5] ?? '0');
+const startDelayMs = Number(process.argv[4] ?? '0');
 
 const extensions: Extension[] = [
   {
@@ -222,13 +212,6 @@ const extensions: Extension[] = [
       dispatcher.register('echo', (_ctx, payload) => Promise.resolve(payload), {
         access: 'public',
       });
-      // Answers with the build this process was started from, so a client on one
-      // socket can tell which process served a request across a switch.
-      dispatcher.register(
-        'version',
-        () => Promise.resolve({ codeVersion: codeVersion ?? null }),
-        { access: 'public' },
-      );
       dispatcher.register(
         'store',
         async (ctx, payload) => {
@@ -307,36 +290,14 @@ if (behavior === 'required-extension-fail') {
 }
 
 /**
- * One row per process that actually opened the storage, written as part of
- * `createBackend` — which runs only after `activate` (ADR-0007). A process that
- * never gets past `prepared` therefore leaves no row, so the table is evidence
- * of which builds were writers and in which order.
- *
- * Absent `codeVersion` keeps the fixture's previous behaviour: no table, no row.
- *
- * `startDelayMs` (argv 5) delays the backend open so a switch stays in
- * `switching` long enough for a test to send a request into that window on
- * purpose. It is honoured only when `codeVersion` is set, so the other
- * behaviours are unaffected.
+ * `startDelayMs` delays the backend open so a switch stays in `switching` long
+ * enough for a test to send a request into that window on purpose.
  */
 async function openBackend(): Promise<SqliteBackend> {
-  if (codeVersion !== undefined && startDelayMs > 0) {
+  if (startDelayMs > 0) {
     await Bun.sleep(startDelayMs);
   }
-  const backend = SqliteBackend.open({ filename: databasePath });
-  if (codeVersion === undefined) {
-    return backend;
-  }
-  await backend.transaction(async (tx) => {
-    await tx.execute(
-      'CREATE TABLE IF NOT EXISTS version (id INTEGER PRIMARY KEY AUTOINCREMENT, code_version TEXT NOT NULL, pid INTEGER NOT NULL)',
-    );
-    await tx.execute('INSERT INTO version (code_version, pid) VALUES (?, ?)', [
-      codeVersion,
-      process.pid,
-    ]);
-  });
-  return backend;
+  return SqliteBackend.open({ filename: databasePath });
 }
 
 /**
@@ -354,7 +315,6 @@ try {
     extensions,
     timeoutMs: 2000,
     ...(authorize === undefined ? {} : { authorize }),
-    ...(codeVersion === undefined ? {} : { codeVersion }),
   });
 } catch (error) {
   // stderr is inherited by Portal, so this line stays visible without touching

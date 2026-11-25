@@ -4,7 +4,7 @@ import type { IpcChannel } from './channel.ts';
 import { createInMemoryChannelPair, IpcChannelClosedError } from './channel.ts';
 import type { IpcMessage } from './protocol.ts';
 
-const hello: IpcMessage = { type: 'hello', portalGeneration: 1 };
+const hello: IpcMessage = { type: 'hello' };
 const shutdown: IpcMessage = { type: 'shutdown', timeoutMs: 5000 };
 
 function receive(channel: IpcChannel): unknown[] {

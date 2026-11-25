@@ -55,7 +55,6 @@ export function buildServer(
     staged: false,
     retiring: false,
     declaredMaxDurationMs: undefined,
-    reportedCodeVersion: undefined,
     shutdownSent: false,
     closedSignal: Promise.withResolvers<void>(),
   };

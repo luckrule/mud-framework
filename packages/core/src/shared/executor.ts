@@ -10,14 +10,6 @@ export interface ExecutorRequest extends RequestIdentity {
    * rolls back at the same instant instead of writing after this side gave up.
    */
   timeoutMs?: number;
-  /**
-   * Opaque application code version stamped on the Request. `IpcExecutor` fills
-   * it from its own configuration when the caller left it unset and keeps it
-   * across replays; a caller-supplied value must be a non-empty string, and an
-   * invalid one fails the request with `INTERNAL_ERROR` instead of being sent.
-   * It is never interpreted by the framework (SPEC 6.4).
-   */
-  codeVersion?: string;
 }
 
 /**

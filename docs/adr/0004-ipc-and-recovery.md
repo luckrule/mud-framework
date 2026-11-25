@@ -48,19 +48,9 @@ ADR-0002 决定了拆成两个进程，但没定两件事：两个进程之间�
 
 `SHUTDOWN_ACK_SLACK_MS` 是对齐而非余量：Server 的计时从收到 `shutdown` 开始，比 Portal 的 `waitForClosed` 晚一个 IPC 跳。两侧取同一值时 Portal 的定时器总是先到，Server 用满预算就会被杀在正常关闭途中。
 
-这段的旧公式是 `shutdownTimeoutMs × 2 + 退出等待上限 × 2`，与 Server 侧按自身 `timeoutMs` 推导的预算不等；Server 的 `timeoutMs` 配得较大时，Portal 会 kill 一个正在正常关闭的 Server。这是修掉的真缺陷，不是可以简化的冗余：不要把这些等待重新压回一个乘式。切换中止与"放弃已激活替换"两段是后来补上的：前者原先不计入预算，声明值比实际最坏耗时少一个 `shutdownTimeoutMs`，`ConnectionLayer` 按 `closeBudgetMs + 余量` 计时会先放弃；后者对应 `close()` 在 `activate` 之后中止切换时必须等新进程退出（INV-002）。
-
 ### 结果消息的两个 Session 字段
 
-`result` 上 `sessionChange` 与 `requestSessionId` 语义不同：`sessionChange` 只在成功结果上出现，记录 handler 在本次请求内声明的路由变更，取值为 `{type:'bind',sessionId}` 或 `{type:'unbind'}`，没有变更时缺失；`requestSessionId` 回显请求进入框架时已带的入口 Session，成功与失败结果都带，入口无 Session 时不带。加回显的原因是结果可能晚于 Portal 的结算（超时、取消、重放耗尽）：那时未确认缓冲里的条目已删除，Portal 只能从结果消息恢复 Session，而只带 `sessionChange` 的形状覆盖不到失败结果与"入口已有 Session 但未新绑定"的迟到结果。`requestSessionId` 只属于线格式，不进入 `ExecutorOutcome` 或结算结果。wire 上不再有 `result.sessionId`：入口归属只由 `requestSessionId` 表达，本次变更只由 `sessionChange` 表达。
-
-### 代码版本回显
-
-`ready` 与 `request` 各带一个可选字段 `codeVersion`，值是应用提供的 opaque 非空字符串。`ready` 报告应用声明的、该 Server 正在运行的代码版本（由部署方声明，框架不校验其与实际构建产物是否一致）；`request` 记录 Portal 接受该请求时的版本，重放沿用该值而不是替换 Server 的版本。Portal 在自身配置了版本、且 `ready` 带了一个不同版本时记 warn（`expectedCodeVersion`、`actualCodeVersion`、`pid`）；Server 在处理 `replayCount > 0` 的请求、且请求版本与自身版本都存在且不同时记 warn（请求标识字段、`requestCodeVersion`、`serverCodeVersion`、`replayCount`）。两侧都不因不匹配失败、拒绝、取消请求或改变重放策略。
-
-为什么只回显：框架不解析版本，也不知道两个版本之间是否兼容。把版本用于路由、重放或准入判断，会把"应用如何发布"编码进框架，而发布策略（蓝绿、热修、回滚）属于部署方。回显只做一件事——让跨版本重放可被观察到。跨版本重放仍只承诺 at-least-once 与可观测，行为兼容不在承诺内（SPEC 6.4）。
-
-字段缺失与空值语义不同：缺失表示该部署未声明版本，不构成"不同"；空串或非字符串是非法线格式，解析器拒绝。这样不会把"未声明"误报成"不匹配"。
+`result` 上 `sessionChange` 与 `requestSessionId` 语义不同：`sessionChange` 只在成功结果上出现，记录 handler 在本次请求内声明的路由变更，取值为 `{type:'bind',sessionId}` 或 `{type:'unbind'}`，没有变更时缺失；`requestSessionId` 回显请求进入框架时已带的入口 Session，成功与失败结果都带，入口无 Session 时不带。加回显的原因是结果可能晚于 Portal 的结算（超时、取消、重放耗尽）：那时未确认缓冲里的条目已删除，Portal 只能从结果消息恢复 Session，而只带 `sessionChange` 的形状覆盖不到失败结果与"入口已有 Session 但未新绑定"的迟到结果。`requestSessionId` 只属于线格式，不进入 `ExecutorOutcome` 或结算结果。
 
 ### 确认的边界：框架做不到什么
 

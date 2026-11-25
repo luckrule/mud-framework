@@ -2,7 +2,6 @@ import { createProcessChannel } from '../ipc/bun-child.ts';
 import type { IpcChannel } from '../ipc/channel.ts';
 import type {
   CancelMessage,
-  HelloMessage,
   IpcMessage,
   RequestMessage,
   ShutdownMessage,
@@ -19,11 +18,7 @@ import type { DispatcherOptions } from './dispatcher.ts';
 import type { Extension } from './extension.ts';
 import { RequestRunner, requestIds } from './requests.ts';
 import type { Runtime } from './server-startup.ts';
-import {
-  assertCodeVersion,
-  ServerStartupError,
-  startServer,
-} from './server-startup.ts';
+import { ServerStartupError, startServer } from './server-startup.ts';
 
 export interface ServerProcessOptions {
   /** Builds the storage backend. Called once per process start. */
@@ -41,13 +36,6 @@ export interface ServerProcessOptions {
    * a request with `FORBIDDEN` before its transaction opens.
    */
   authorize?: DispatcherOptions['authorize'];
-  /**
-   * Opaque application code version; must be a non-empty string when set.
-   * Reported in `ready` and compared against a replay's stamped version only to
-   * log a mismatch; the framework never uses it to accept, reject or alter a
-   * Request (SPEC 6.4).
-   */
-  codeVersion?: string;
   logger?: Logger;
   /**
    * The IPC channel; defaults to the real process channel.
@@ -162,13 +150,12 @@ class ServerProcess {
    * possibly happened, and rejects when startup failed.
    */
   private readonly activation = Promise.withResolvers<boolean>();
-  private portalGeneration: number | undefined;
   private phase: Phase = 'awaiting-hello';
   /**
-   * True once input that arrived before `ready` has been reported for this
-   * Portal. A request or a cancel before the barrier means the timing is broken,
-   * and logging every one of them would scale the log volume with the request
-   * rate (SPEC 7.1). One flag for both: they are the same fault.
+   * True once input that arrived before `ready` has been reported. A request or
+   * a cancel before the barrier means the timing is broken, and logging every
+   * one of them would scale the log volume with the request rate (SPEC 7.1).
+   * One flag for both: they are the same fault.
    */
   private preReadyInputLogged = false;
   /** Set while the parent-liveness poll is installed; cleared on completion. */
@@ -243,10 +230,6 @@ class ServerProcess {
    * does not keep the process alive on its own.
    */
   private async begin(): Promise<void> {
-    // Checked before the handshake answers: `prepared` carries the version, and
-    // the wire parser accepts only a non-empty string, so an invalid value
-    // would produce a message no Portal can read.
-    assertCodeVersion(this.options.codeVersion, this.logger);
     this.channel.onMessage((raw) => {
       this.onMessage(raw);
     });
@@ -331,7 +314,7 @@ class ServerProcess {
   private beginPrepare(): void {
     this.phase = 'preparing';
     this.logger.info(
-      { pid: process.pid, codeVersion: this.options.codeVersion },
+      { pid: process.pid },
       'server prepared; waiting for activation',
     );
     this.sendPrepared();
@@ -339,10 +322,7 @@ class ServerProcess {
 
   private sendPrepared(): void {
     try {
-      this.sendBarrier(
-        preparedMessage(process.pid, this.options.codeVersion),
-        'prepared',
-      );
+      this.sendBarrier(preparedMessage(process.pid), 'prepared');
     } catch (error) {
       // No storage exists yet, so there is nothing to close: failing the
       // activation is what makes `run()` return instead of parking on a Portal
@@ -387,7 +367,6 @@ class ServerProcess {
     const runner = new RequestRunner({
       runtime,
       logger: this.logger,
-      codeVersion: this.options.codeVersion,
       send: (message, what) => this.sendQuietly(message, what),
       // The phase stays in this class: `shutdown` owns it, and the runner only
       // asks.
@@ -448,11 +427,7 @@ class ServerProcess {
     this.phase = 'active';
     try {
       this.sendBarrier(
-        readyMessage(
-          process.pid,
-          runtime.capabilities,
-          this.options.codeVersion,
-        ),
+        readyMessage(process.pid, runtime.capabilities),
         'ready',
       );
     } catch (error) {
@@ -499,7 +474,7 @@ class ServerProcess {
     const message = parsed.message;
     switch (message.type) {
       case 'hello':
-        this.onHello(message);
+        this.onHello();
         return;
       case 'activate':
         this.onActivate();
@@ -528,93 +503,21 @@ class ServerProcess {
     }
   }
 
-  private onHello(message: HelloMessage): void {
-    if (this.phase === 'shutting-down') {
-      // Answering a handshake with a barrier while shutting down would promise
-      // readiness this process no longer offers.
+  private onHello(): void {
+    if (this.phase !== 'awaiting-hello') {
+      // Every launch opens a new channel, so the handshake arrives exactly
+      // once per process. A second hello is out of protocol; ignoring it keeps
+      // a duplicate from reopening the prepare state or resending a barrier.
       this.logger.warn(
         {
-          code: 'HELLO_DURING_SHUTDOWN',
-          portalGeneration: message.portalGeneration,
+          code: 'UNEXPECTED_IPC_MESSAGE',
+          reason: `server received "hello" while ${this.phase}`,
         },
-        'hello ignored',
+        'ipc message ignored',
       );
       return;
     }
-    const previous = this.portalGeneration;
-    if (previous !== undefined && message.portalGeneration <= previous) {
-      this.logger.warn(
-        {
-          code: 'STALE_HELLO',
-          portalGeneration: message.portalGeneration,
-          previousPortalGeneration: previous,
-        },
-        'hello ignored',
-      );
-      return;
-    }
-    this.portalGeneration = message.portalGeneration;
-    if (previous === undefined) {
-      this.logger.info(
-        { portalGeneration: message.portalGeneration },
-        'portal generation accepted',
-      );
-      this.beginPrepare();
-      return;
-    }
-    // A later Portal can break the ordering again, and that recurrence should
-    // be visible rather than silenced by the first one.
-    this.preReadyInputLogged = false;
-    if (this.phase === 'preparing') {
-      // The new Portal was not around for the first `prepared`, and the barrier
-      // is per Portal: without a second one it would wait for an answer it
-      // already missed.
-      this.logger.warn(
-        {
-          code: 'PORTAL_GENERATION_CHANGED',
-          portalGeneration: message.portalGeneration,
-          previousPortalGeneration: previous,
-        },
-        'new portal generation; resending prepared',
-      );
-      this.sendPrepared();
-      return;
-    }
-    if (this.phase === 'starting') {
-      // The start has not crossed the barrier yet, and it will send `ready`
-      // when it does. The new Portal is already reading this link, so there is
-      // no barrier to resend.
-      this.logger.warn(
-        {
-          code: 'PORTAL_GENERATION_CHANGED',
-          portalGeneration: message.portalGeneration,
-          previousPortalGeneration: previous,
-        },
-        'new portal generation during startup; ready will follow',
-      );
-      return;
-    }
-    const runtime = this.runtime;
-    const runner = this.runner;
-    if (runtime === undefined || runner === undefined) {
-      return;
-    }
-    // In-flight work is deliberately kept — the handlers are already running,
-    // their results are still the only answer for those ids (duplicates are
-    // the business's problem, INV-011), and results go out on this same link.
-    this.logger.warn(
-      {
-        code: 'PORTAL_GENERATION_CHANGED',
-        portalGeneration: message.portalGeneration,
-        previousPortalGeneration: previous,
-        pendingRequests: runner.pending,
-      },
-      'new portal generation; resending ready',
-    );
-    this.sendQuietly(
-      readyMessage(process.pid, runtime.capabilities, this.options.codeVersion),
-      'ready',
-    );
+    this.beginPrepare();
   }
 
   private onActivate(): void {

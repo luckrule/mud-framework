@@ -6,8 +6,9 @@ import type { IpcMessage } from './protocol.ts';
  * Deliberately free of `Bun.*` types: the real implementation wraps
  * `Bun.spawn({ ipc })` and the in-memory pair below serves tests, and callers
  * must be able to swap one for the other. Inbound payloads are `unknown`
- * because the peer can send anything (older build, corrupt data); consumers
- * narrow them with `parseIpcMessage` (protocol.ts) and must not assume a shape.
+ * because the peer can send anything (corrupt or out-of-protocol data);
+ * consumers narrow them with `parseIpcMessage` (protocol.ts) and must not
+ * assume a shape.
  */
 export interface IpcChannel {
   /**

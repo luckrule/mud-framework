@@ -27,10 +27,8 @@ export class LocalExecutor implements RequestExecutor {
   async execute(request: ExecutorRequest): Promise<ExecutorOutcome> {
     try {
       // Everything except the handler arguments is dispatch metadata, so the
-      // split is expressed once here instead of field by field. `codeVersion`
-      // is IPC envelope metadata with no meaning in process; leaving it in
-      // `meta` would pass an undeclared key to the dispatcher.
-      const { method, payload, codeVersion: _codeVersion, ...meta } = request;
+      // split is expressed once here instead of field by field.
+      const { method, payload, ...meta } = request;
       const { result, sessionChange } = await this.dispatcher.dispatch(
         method,
         payload,

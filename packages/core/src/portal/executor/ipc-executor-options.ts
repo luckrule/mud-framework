@@ -40,17 +40,6 @@ export interface IpcExecutorOptions {
    */
   maxPending?: number;
   /**
-   * Opaque application code version. Stamped on every Request accepted here and
-   * kept across replays; compared only to warn when a `ready` reports another
-   * version. The framework never parses it or makes a decision from it
-   * (SPEC 6.4). Must be a non-empty string when set.
-   *
-   * A caller-supplied `ExecutorRequest.codeVersion` must also be a non-empty
-   * string; an invalid one fails that request with `INTERNAL_ERROR` instead of
-   * being sent.
-   */
-  codeVersion?: string;
-  /**
    * Defaults to a JSON logger writing to stdout with
    * `component: 'ipc-executor'` bindings (SPEC §7.1). Supplying one only
    * redirects where the events go; observability does not depend on it.

@@ -54,7 +54,7 @@ describe('runServerProcess inbound registration', () => {
       logger: createJsonLogger({ sink: () => undefined }),
       channel: channelThatRejectsSecondRegistration(serverChannel),
     });
-    portal.send({ type: 'hello', portalGeneration: 1 });
+    portal.send({ type: 'hello' });
 
     const error = await rejectionOf(done);
 

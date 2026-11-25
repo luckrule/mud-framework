@@ -66,15 +66,12 @@ export async function waitFor(
   return poll();
 }
 
-export function preparedMessage(pid = 4242, codeVersion?: string): IpcMessage {
-  return codeVersion === undefined
-    ? { type: 'prepared', pid }
-    : { type: 'prepared', pid, codeVersion };
+export function preparedMessage(pid = 4242): IpcMessage {
+  return { type: 'prepared', pid };
 }
 
 export function readyMessage(
   maxTransactionDurationMs = 5000,
-  codeVersion?: string,
   pid = 4242,
 ): IpcMessage {
   return {
@@ -87,7 +84,6 @@ export function readyMessage(
       uniqueConstraint: true,
       maxTransactionDurationMs,
     },
-    ...(codeVersion === undefined ? {} : { codeVersion }),
   };
 }
 
@@ -152,7 +148,6 @@ export function expectOnlyHello(server: FakeServerProcess): void {
   if (first?.type !== 'hello') {
     throw new Error(`expected hello, got ${first?.type ?? 'no message'}`);
   }
-  expect(first.portalGeneration).toBeGreaterThan(0);
 }
 
 /**
@@ -199,8 +194,6 @@ export interface FakeServerOptions {
   readyOnActivate?: boolean;
   /** Reported in `prepared`/`ready`; defaults to 4242. */
   pid?: number;
-  /** Echoed in `prepared`/`ready`, like a deployment that declared a version. */
-  codeVersion?: string;
   /** Shared event log for cross-process ordering assertions. */
   timeline?: string[];
   /** Prefix for this process's timeline entries. */
@@ -231,7 +224,6 @@ export class FakeServerProcess {
   private readonly silentOnHello: boolean;
   private readonly readyOnActivate: boolean;
   private readonly pid: number;
-  private readonly codeVersion: string | undefined;
   private readonly timeline: string[] | undefined;
   private readonly label: string;
   private readonly holdRequests: boolean;
@@ -254,7 +246,6 @@ export class FakeServerProcess {
     this.silentOnHello = options.silentOnHello ?? false;
     this.readyOnActivate = options.readyOnActivate ?? false;
     this.pid = options.pid ?? 4242;
-    this.codeVersion = options.codeVersion;
     this.timeline = options.timeline;
     this.label = options.label ?? `server-${String(this.pid)}`;
     this.holdRequests = options.holdRequests ?? false;
@@ -314,16 +305,16 @@ export class FakeServerProcess {
       }
       if (this.autoPrepare && parsed.message.type === 'hello') {
         if (!this.silentOnHello) {
-          this.send(preparedMessage(this.pid, this.codeVersion));
+          this.send(preparedMessage(this.pid));
         }
       }
       if (parsed.message.type === 'activate') {
         this.mark('activate');
         if (this.crashOnActivate) {
-          this.send(readyMessage(5000, this.codeVersion, this.pid));
+          this.send(readyMessage(5000, this.pid));
           this.recordExit({ code: 1, signal: null, observed: true });
         } else if (this.readyOnActivate) {
-          this.send(readyMessage(5000, this.codeVersion, this.pid));
+          this.send(readyMessage(5000, this.pid));
         }
       }
     });
@@ -420,7 +411,6 @@ export interface HarnessOptions {
   startTimeoutMs?: number;
   maxPending?: number;
   closeChannelOnExit?: boolean;
-  codeVersion?: string;
   /** Answer `activate` with `ready` for the initial spawn. */
   readyOnActivate?: boolean;
   /** Hold delivered requests until `shutdown` for the initial spawn. */
@@ -482,7 +472,6 @@ export function harness(options: Partial<HarnessOptions> = {}): Harness {
     stableResetMs: options.stableResetMs,
     startTimeoutMs: options.startTimeoutMs,
     maxPending: options.maxPending,
-    codeVersion: options.codeVersion,
     logger,
   });
   return {

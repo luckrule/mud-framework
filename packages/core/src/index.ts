@@ -1,7 +1,7 @@
 /**
  * Framework core public surface. The in-memory backend and the fake transport
  * are deliberately not exported here: the framework package must not ship
- * backend or transport implementations (SPEC 4.1, 5.1, INV-016, INV-018);
+ * backend or transport implementations (SPEC 4.1, 5.1, INV-016, INV-015);
  * tests import them by path instead.
  *
  * The connection layer and codec are exported: they are framework behaviour
@@ -13,7 +13,7 @@
  * allows no deep paths. That covers the channel implementations too:
  * `spawnBunServer` and `createProcessChannel` are the Portal and Server ends of
  * that link, not a client-side Transport implementation, so exporting them does
- * not make a transport swap change the core (INV-018). Its in-memory channel
+ * not make a transport swap change the core (INV-015). Its in-memory channel
  * pair stays private for the same reason as the fake transport: it is a test
  * double, not a framework implementation.
  *
@@ -78,7 +78,6 @@ export {
   AuthenticationRequiredError,
   BusinessError,
   FORBIDDEN,
-  FRAMEWORK_CAPABILITY_UNSUPPORTED,
   FRAMEWORK_QUEUE_FULL,
   FRAMEWORK_REPLAY_EXHAUSTED,
   FRAMEWORK_SHUTDOWN,
@@ -88,7 +87,6 @@ export {
   INTERNAL_ERROR,
   INVALID_ENVELOPE,
   RequestCancelledError,
-  STORAGE_UNAVAILABLE,
   TRANSPORT_CLOSED,
   TRANSPORT_SEND_FAILED,
   UNKNOWN_METHOD,

@@ -137,7 +137,7 @@ describe('ConnectionLayer request', () => {
       execute: () =>
         Promise.resolve({
           ok: false,
-          error: { code: 'STORAGE_UNAVAILABLE', message: 'backend is gone' },
+          error: { code: 'INTERNAL_ERROR', message: 'backend is gone' },
         }),
       cancel: () => Promise.resolve(),
       close: () => Promise.resolve(),
@@ -152,7 +152,7 @@ describe('ConnectionLayer request', () => {
     expect(lastFrame(transport, 'c1')).toEqual({
       id: 'r1',
       ok: false,
-      error: { code: 'STORAGE_UNAVAILABLE', message: 'backend is gone' },
+      error: { code: 'INTERNAL_ERROR', message: 'backend is gone' },
     });
     const failed = lines
       .map(parseFrame)
@@ -160,7 +160,7 @@ describe('ConnectionLayer request', () => {
     expect(failed).toHaveLength(1);
     expect(failed[0]).toMatchObject({
       method: 'echo',
-      code: 'STORAGE_UNAVAILABLE',
+      code: 'INTERNAL_ERROR',
       reason: 'backend is gone',
       connectionId: 'c1',
       clientRequestId: 'r1',

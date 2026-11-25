@@ -23,7 +23,7 @@ import {
   FRAMEWORK_SHUTDOWN,
   INTERNAL_ERROR,
 } from '../../shared/wire-codes.ts';
-import { failure, nextPortalGeneration } from '../ipc-outbound.ts';
+import { failure } from '../ipc-outbound.ts';
 import { PendingBuffer } from '../ipc-pending.ts';
 import type { DeliveryHost } from './delivery-ledger.ts';
 import { DeliveryLedger, requestFields } from './delivery-ledger.ts';
@@ -70,18 +70,15 @@ export type { IpcExecutorOptions };
 export class IpcExecutor implements RequestExecutor {
   /**
    * The factory the next launch uses. A successful `switchTo` replaces it, so a
-   * crash after the switch restarts the code that was actually running rather
-   * than the version the executor was constructed with (SPEC 6.4).
+   * crash after the switch restarts the process factory that was actually
+   * running rather than the one the executor was constructed with.
    */
   private spawn: () => SpawnedServer;
   private readonly portalTimeoutMs: number;
   private readonly maxReplays: number;
   private readonly shutdownTimeoutMs: number;
   private readonly startTimeoutMs: number;
-  /** Stamped on new requests and compared against `ready`; follows `spawn`. */
-  private codeVersion: string | undefined;
   private readonly logger: Logger;
-  private readonly portalGeneration: number;
   private readonly buffer: PendingBuffer;
   /** Delivery, deadlines and settlement: everything that resolves a pending entry. */
   private readonly ledger: DeliveryLedger;
@@ -147,17 +144,6 @@ export class IpcExecutor implements RequestExecutor {
       );
     }
     this.startTimeoutMs = startTimeoutMs;
-    // Opaque to the framework, but not every value survives the wire: the peer's
-    // parser accepts only a non-empty string, so anything else would leave a
-    // Server that can never reach `ready`.
-    if (
-      options.codeVersion !== undefined &&
-      (typeof options.codeVersion !== 'string' ||
-        options.codeVersion.length === 0)
-    ) {
-      throw new Error('codeVersion must be a non-empty string');
-    }
-    this.codeVersion = options.codeVersion;
     // The buffer owns the cap and validates it, so the refusal and the limit
     // it reports cannot drift from each other.
     this.buffer = new PendingBuffer({
@@ -167,7 +153,6 @@ export class IpcExecutor implements RequestExecutor {
       options.logger ??
         createJsonLogger({ bindings: { component: 'ipc-executor' } }),
     );
-    this.portalGeneration = nextPortalGeneration();
     // Until `ready` declares the backend ceiling, the Portal ceiling applies.
     this.effectiveTimeoutMs = options.timeoutMs;
     // The host is a live view, not a snapshot: the getter and the method read
@@ -200,11 +185,8 @@ export class IpcExecutor implements RequestExecutor {
       slot: this.slot,
       startTimeoutMs: this.startTimeoutMs,
       shutdownTimeoutMs: this.shutdownTimeoutMs,
-      portalGeneration: this.portalGeneration,
-      currentCodeVersion: () => this.codeVersion,
-      adoptVersion: (spawn, codeVersion) => {
+      adoptSpawn: (spawn) => {
         this.spawn = spawn;
-        this.codeVersion = codeVersion;
       },
       attach: (server) => {
         this.slot.track(server);
@@ -244,7 +226,6 @@ export class IpcExecutor implements RequestExecutor {
     return {
       logger: this.logger,
       slot: this.slot,
-      currentCodeVersion: () => this.codeVersion,
       adoptReady: (server, declaredMaxDurationMs) => {
         this.clearGenerationTimer(server);
         this.slot.markReady(server);
@@ -448,21 +429,9 @@ export class IpcExecutor implements RequestExecutor {
         ),
       );
     }
-    const stamped = this.stampCodeVersion(request);
-    if (!stamped.ok) {
-      this.logger.error(
-        {
-          ...requestFields(request),
-          code: INTERNAL_ERROR,
-          reason: stamped.reason,
-        },
-        'request rejected',
-      );
-      return Promise.resolve(failure(INTERNAL_ERROR, stamped.reason));
-    }
     const deferred = Promise.withResolvers<ExecutorOutcome>();
     const pending = this.buffer.add(
-      stamped.request,
+      request,
       deferred,
       // A caller-supplied deadline may only tighten the ceiling this executor
       // already promised; otherwise the buffer would outlive the caller's own
@@ -500,38 +469,6 @@ export class IpcExecutor implements RequestExecutor {
       this.ledger.settle(pending, failure(INTERNAL_ERROR, messageOf(error)));
     }
     return deferred.promise;
-  }
-
-  /**
-   * Stamps this executor's code version on the Request it stores, so a replay
-   * carries the version it was accepted under rather than the replacement
-   * Server's (SPEC 6.4).
-   *
-   * A caller-supplied version wins, because the caller may know which code the
-   * Request belongs to, but it must be a non-empty string for the same reason
-   * the configured value is checked: the peer's parser rejects anything else, so
-   * the Request could never be delivered. An invalid value is refused here
-   * instead of being put on the wire.
-   */
-  private stampCodeVersion(
-    request: ExecutorRequest,
-  ): { ok: true; request: ExecutorRequest } | { ok: false; reason: string } {
-    if (request.codeVersion === undefined) {
-      return this.codeVersion === undefined
-        ? { ok: true, request }
-        : { ok: true, request: { ...request, codeVersion: this.codeVersion } };
-    }
-    if (
-      typeof request.codeVersion !== 'string' ||
-      request.codeVersion.length === 0
-    ) {
-      return {
-        ok: false,
-        reason:
-          'invalid caller-supplied codeVersion: expected a non-empty string',
-      };
-    }
-    return { ok: true, request };
   }
 
   /**
@@ -585,10 +522,7 @@ export class IpcExecutor implements RequestExecutor {
    * the recovery barrier (ADR-0007, INV-002). The sequence itself lives in
    * `VersionSwitch`; this class only hands over the process factory.
    */
-  switchTo(options: {
-    spawn: () => SpawnedServer;
-    codeVersion?: string;
-  }): Promise<void> {
+  switchTo(options: { spawn: () => SpawnedServer }): Promise<void> {
     return this.versionSwitch.switchTo(options);
   }
 
@@ -748,10 +682,7 @@ export class IpcExecutor implements RequestExecutor {
     };
     attachServer(server, this.serverHandlers(server));
     try {
-      server.channel.send({
-        type: 'hello',
-        portalGeneration: this.portalGeneration,
-      });
+      server.channel.send({ type: 'hello' });
     } catch (error) {
       this.onServerLost(
         server,

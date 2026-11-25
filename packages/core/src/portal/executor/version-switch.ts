@@ -28,7 +28,6 @@ export interface SwitchBarrier {
  */
 export interface SwitchOperation {
   readonly spawn: () => SpawnedServer;
-  readonly targetCodeVersion: string | undefined;
   resolve: () => void;
   reject: (error: Error) => void;
   /** Resolves once the switch and its cleanup are done, whatever the outcome. */
@@ -71,7 +70,6 @@ export interface SwitchOperation {
   readonly ready: SwitchBarrier;
   /** Why the switch is failing; read by `runSwitch` to pick the failure path. */
   failure: Error | undefined;
-  versionWarned: boolean;
 }
 
 /**
@@ -92,18 +90,11 @@ export interface SwitchHost {
   readonly slot: ServerSlot<SwitchOperation>;
   readonly startTimeoutMs: number;
   readonly shutdownTimeoutMs: number;
-  /** Stamped on the `hello` the staged process receives. */
-  readonly portalGeneration: number;
-  /** The version new requests carry now; the expected one when a switch names none. */
-  currentCodeVersion(): string | undefined;
   /**
-   * A successful switch changes what a crash restarts and what new requests are
-   * stamped with (SPEC 6.4); a rollback never calls this.
+   * A successful switch changes what a crash restarts; a rollback never calls
+   * this.
    */
-  adoptVersion(
-    spawn: () => SpawnedServer,
-    codeVersion: string | undefined,
-  ): void;
+  adoptSpawn(spawn: () => SpawnedServer): void;
   /** Installs the owner's message and loss handlers on a freshly built process. */
   attach(server: ServerState): void;
   /** Delivers the buffered requests to the current generation. */
@@ -160,10 +151,7 @@ export class VersionSwitch {
    * switch. Failure after that point has no live Server left, so it falls back
    * to the crash-restart path with the previous spawn and rejects as well.
    */
-  switchTo(options: {
-    spawn: () => SpawnedServer;
-    codeVersion?: string;
-  }): Promise<void> {
+  switchTo(options: { spawn: () => SpawnedServer }): Promise<void> {
     const slot = this.host.slot;
     if (slot.switching !== undefined) {
       return Promise.reject(
@@ -173,15 +161,6 @@ export class VersionSwitch {
     if (slot.status !== 'ready') {
       return Promise.reject(
         new Error(`ipc executor cannot switch while ${slot.status}`),
-      );
-    }
-    if (
-      options.codeVersion !== undefined &&
-      (typeof options.codeVersion !== 'string' ||
-        options.codeVersion.length === 0)
-    ) {
-      return Promise.reject(
-        new Error('codeVersion must be a non-empty string'),
       );
     }
     try {
@@ -194,7 +173,6 @@ export class VersionSwitch {
     const abortSignal = Promise.withResolvers<void>();
     const op: SwitchOperation = {
       spawn: options.spawn,
-      targetCodeVersion: options.codeVersion,
       resolve: deferred.resolve,
       reject: deferred.reject,
       completion: completion.promise,
@@ -224,16 +202,9 @@ export class VersionSwitch {
       prepared: newBarrier(),
       ready: newBarrier(),
       failure: undefined,
-      versionWarned: false,
     };
     slot.beginSwitch(op);
-    this.host.logger.info(
-      {
-        fromCodeVersion: this.host.currentCodeVersion(),
-        toCodeVersion: options.codeVersion,
-      },
-      'server switch started',
-    );
+    this.host.logger.info({}, 'server switch started');
     void this.runSwitch(op);
     return deferred.promise;
   }
@@ -379,10 +350,7 @@ export class VersionSwitch {
     op.staged = server;
     this.host.attach(server);
     try {
-      server.channel.send({
-        type: 'hello',
-        portalGeneration: this.host.portalGeneration,
-      });
+      server.channel.send({ type: 'hello' });
     } catch (error) {
       op.stagedLost = new Error(`hello failed: ${messageOf(error)}`);
       op.failure = op.stagedLost;
@@ -533,24 +501,16 @@ export class VersionSwitch {
     staged.staged = false;
     op.promoted = true;
     this.host.slot.adopt(staged);
-    // A crash after this point restarts the code that is now serving, and new
-    // requests carry its version. A switch that declares no target keeps the
-    // version it had, matching the expected version used for the staged
-    // process. A rollback keeps the old values because this only runs after the
-    // promotion succeeded (SPEC 6.4).
-    this.host.adoptVersion(
-      op.spawn,
-      op.targetCodeVersion ?? this.host.currentCodeVersion(),
-    );
+    // A crash after this point restarts the process factory that is now
+    // serving. A rollback keeps the old one because this only runs after the
+    // promotion succeeded.
+    this.host.adoptSpawn(op.spawn);
     this.host.clearRestartTimer();
     this.host.startStableTimer();
     if (staged.declaredMaxDurationMs !== undefined) {
       this.host.adoptCeiling(staged.declaredMaxDurationMs);
     }
-    this.host.logger.info(
-      { pid: staged.pid, codeVersion: staged.reportedCodeVersion },
-      'replacement server ready',
-    );
+    this.host.logger.info({ pid: staged.pid }, 'replacement server ready');
     this.host.pump();
     if (op.promotedLost) {
       // The first flush killed the promoted process; `onServerLost` already
@@ -558,10 +518,7 @@ export class VersionSwitch {
       // switch and `finishSwitch` rejects it.
       return;
     }
-    this.host.logger.info(
-      { pid: staged.pid, codeVersion: staged.reportedCodeVersion },
-      'server switch completed',
-    );
+    this.host.logger.info({ pid: staged.pid }, 'server switch completed');
   }
 
   /**
@@ -718,7 +675,6 @@ export class VersionSwitch {
         {
           reason,
           phase: op.phase,
-          codeVersion: this.host.currentCodeVersion(),
           pendingExits: op.exitsPending.length,
         },
         op.previousLost

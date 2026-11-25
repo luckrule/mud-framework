@@ -26,7 +26,6 @@ import { ServerStartupError } from './server-startup.ts';
 
 interface ActivationHarnessOptions {
   extensions?: readonly Extension[];
-  codeVersion?: string;
   /** Gates backend creation so a test can hold the Server in `starting`. */
   createBackend?: () => Promise<MemoryStorageBackend>;
   /** Enables the parent-liveness poll; off by default (no real parent here). */
@@ -57,7 +56,6 @@ function activationHarness(options: ActivationHarnessOptions = {}) {
     },
     extensions: options.extensions ?? [],
     timeoutMs: 1000,
-    codeVersion: options.codeVersion,
     logger,
     channel: options.wrapChannel?.(channel) ?? channel,
     parentCheckIntervalMs: options.parentCheckIntervalMs ?? 0,
@@ -76,8 +74,8 @@ function activationHarness(options: ActivationHarnessOptions = {}) {
   };
 }
 
-function hello(h: ReturnType<typeof activationHarness>, generation = 1): void {
-  h.portal.send({ type: 'hello', portalGeneration: generation });
+function hello(h: ReturnType<typeof activationHarness>): void {
+  h.portal.send({ type: 'hello' });
 }
 
 function activate(h: ReturnType<typeof activationHarness>): void {
@@ -92,7 +90,6 @@ describe('runServerProcess two-phase activation', () => {
   test('answers hello with prepared without creating the backend', async () => {
     const registered: string[] = [];
     const h = activationHarness({
-      codeVersion: 'build-1',
       extensions: [
         {
           name: 'echo',
@@ -106,7 +103,7 @@ describe('runServerProcess two-phase activation', () => {
     hello(h);
 
     expect(received(h.messages)).toEqual([
-      { type: 'prepared', pid: process.pid, codeVersion: 'build-1' },
+      { type: 'prepared', pid: process.pid },
     ]);
     // INV-002: no storage is opened before the Portal asks for activation.
     expect(h.created()).toBe(0);
@@ -212,7 +209,7 @@ describe('runServerProcess two-phase activation', () => {
     await h.stop();
   });
 
-  test('logs a pre-ready cancel at most once per portal generation', async () => {
+  test('logs a pre-ready cancel at most once', async () => {
     const h = activationHarness();
 
     for (let index = 0; index < 5; index += 1) {
@@ -225,8 +222,7 @@ describe('runServerProcess two-phase activation', () => {
     await tick();
 
     // A cancel before the barrier is the same fault as a request before it, so
-    // it shares the one-per-generation flag instead of adding a line per
-    // message (SPEC 7.1).
+    // it shares the one flag instead of adding a line per message (SPEC 7.1).
     const cancels = h
       .logs()
       .filter((line) => line.code === 'CANCEL_BEFORE_READY');
@@ -304,7 +300,7 @@ describe('runServerProcess two-phase activation', () => {
     expect(types(h)).toEqual(['prepared', 'closed']);
   });
 
-  test('does not resend ready for the initial hello, but does for a newer generation', async () => {
+  test('ignores a second hello after the handshake started', async () => {
     const h = activationHarness();
 
     hello(h);
@@ -313,20 +309,21 @@ describe('runServerProcess two-phase activation', () => {
     await tick();
     expect(types(h)).toEqual(['prepared', 'ready']);
 
-    hello(h, 2);
+    // Every launch opens a new channel, so the handshake arrives exactly once.
+    // A second hello is out of protocol: warn and ignore, never resend a
+    // barrier or reopen the prepare state.
+    hello(h);
     await tick();
-    expect(types(h)).toEqual(['prepared', 'ready', 'ready']);
-
-    // Same generation again: stale, and the resend must not repeat.
-    hello(h, 2);
-    await tick();
-    expect(types(h)).toEqual(['prepared', 'ready', 'ready']);
-    expect(h.logs().filter((line) => line.code === 'STALE_HELLO')).toHaveLength(
-      1,
-    );
-    expect(
-      h.logs().filter((line) => line.code === 'PORTAL_GENERATION_CHANGED'),
-    ).toHaveLength(1);
+    expect(types(h)).toEqual(['prepared', 'ready']);
+    const ignored = h
+      .logs()
+      .filter((line) => line.code === 'UNEXPECTED_IPC_MESSAGE');
+    expect(ignored).toHaveLength(1);
+    expect(ignored[0]).toMatchObject({
+      level: 'warn',
+      msg: 'ipc message ignored',
+      reason: 'server received "hello" while active',
+    });
 
     h.portal.send({ type: 'shutdown', timeoutMs: 1000 });
     await h.done;
@@ -420,9 +417,7 @@ describe('runServerProcess two-phase activation', () => {
       /storage backend is closed/,
     );
     // The process is gone: the link was closed on the failure path.
-    expect(() => h.portal.send({ type: 'hello', portalGeneration: 2 })).toThrow(
-      /closed/,
-    );
+    expect(() => h.portal.send({ type: 'hello' })).toThrow(/closed/);
   });
 
   test('fails the startup when the prepared barrier cannot be sent', async () => {
@@ -453,22 +448,6 @@ describe('runServerProcess two-phase activation', () => {
     expect(types(h)).toEqual([]);
   });
 
-  test('serves a second portal generation that arrives during prepare', async () => {
-    const h = activationHarness();
-
-    hello(h);
-    expect(types(h)).toEqual(['prepared']);
-    hello(h, 2);
-
-    // The second Portal was not around for the first `prepared`; without a
-    // second one it would wait for a barrier it already missed.
-    expect(types(h)).toEqual(['prepared', 'prepared']);
-    activate(h);
-    await tick();
-    expect(types(h)).toEqual(['prepared', 'prepared', 'ready']);
-    await h.stop();
-  });
-
   test('closes storage and fails when the link dies while the start is running', async () => {
     const gate = Promise.withResolvers<void>();
     const backend = new MemoryStorageBackend();
@@ -494,20 +473,6 @@ describe('runServerProcess two-phase activation', () => {
     );
   });
 
-  test('rejects an invalid code version before answering hello', async () => {
-    const h = activationHarness({ codeVersion: '' });
-
-    hello(h);
-
-    const error = await startupFailure(h.done);
-    expect(error.reason).toContain('codeVersion');
-    // Nothing was put on the wire: `prepared` would carry the same value.
-    expect(h.messages).toEqual([]);
-    expect(h.created()).toBe(0);
-  });
-});
-
-describe('activation handshake over a caller-driven channel', () => {
   test('the pre-activation handler ignores server-to-portal message types', async () => {
     const h = activationHarness();
     // Valid shape, wrong direction: the pre-activation handler must not treat

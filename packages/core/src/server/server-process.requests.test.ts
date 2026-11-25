@@ -4,7 +4,6 @@ import { BusinessError } from '../shared/wire-codes.ts';
 import { isRecord, sleep, tick } from '../testing/common.ts';
 import {
   echoRegistration,
-  received,
   requestMessage,
   results,
   startServer,
@@ -24,35 +23,6 @@ describe('runServerProcess requests', () => {
     expect(results(harness.messages)).toEqual([
       { type: 'result', requestId: 'req-1', ok: true, result: 'ping' },
     ]);
-    await harness.stop();
-  });
-
-  test('resends ready with the code version for a new portal generation', async () => {
-    // The generation sequence is the point here, so this test drives the
-    // handshake itself: the automatic generation 1 would make an explicit one
-    // stale.
-    const harness = startServer({
-      autoHandshake: false,
-      codeVersion: 'build-1',
-      extensions: [{ name: 'echo', register: echoRegistration }],
-    });
-    await tick();
-    harness.portal.send({ type: 'hello', portalGeneration: 1 });
-    harness.portal.send({ type: 'activate' });
-    await tick();
-    harness.portal.send({ type: 'hello', portalGeneration: 2 });
-    await tick();
-
-    const ready = received(harness.messages).filter(
-      (message) => message.type === 'ready',
-    );
-    expect(ready).toHaveLength(2);
-    for (const message of ready) {
-      expect(message).toMatchObject({
-        type: 'ready',
-        codeVersion: 'build-1',
-      });
-    }
     await harness.stop();
   });
 
@@ -271,7 +241,7 @@ describe('runServerProcess requests', () => {
 
     harness.portal.send(requestMessage({ requestId: 'req-1' }));
     await tick();
-    harness.portal.send({ type: 'hello', portalGeneration: 1 });
+    harness.portal.send({ type: 'hello' });
     harness.portal.send({ type: 'activate' });
     await tick();
     harness.portal.send(requestMessage({ requestId: 'req-2' }));

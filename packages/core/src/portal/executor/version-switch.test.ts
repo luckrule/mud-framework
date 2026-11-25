@@ -41,7 +41,6 @@ function switchable(
     timeoutMs?: number;
     shutdownTimeoutMs?: number;
     startTimeoutMs?: number;
-    codeVersion?: string;
     restartBackoffMs?: number;
     exitOnShutdown?: boolean;
     holdRequests?: boolean;
@@ -54,7 +53,6 @@ function switchable(
     timeoutMs: options.timeoutMs ?? 5000,
     shutdownTimeoutMs: options.shutdownTimeoutMs ?? 50,
     startTimeoutMs: options.startTimeoutMs ?? 500,
-    codeVersion: options.codeVersion,
     restartBackoffMs: options.restartBackoffMs,
     exitOnShutdown: options.exitOnShutdown,
     holdRequests: options.holdRequests,
@@ -70,7 +68,6 @@ function labelledServer(
   h: Harness & { timeline: string[] },
   label: string,
   overrides: {
-    codeVersion?: string;
     readyOnActivate?: boolean;
     silentOnHello?: boolean;
     exitOnShutdown?: boolean;
@@ -84,7 +81,6 @@ function labelledServer(
     // A distinct pid keeps every assertion that names a process pointing at
     // the replacement rather than accidentally matching the old one.
     pid: overrides.pid ?? NEW_PID,
-    codeVersion: overrides.codeVersion,
     readyOnActivate: overrides.readyOnActivate ?? true,
     silentOnHello: overrides.silentOnHello,
     exitOnShutdown: overrides.exitOnShutdown ?? true,
@@ -148,11 +144,10 @@ describe('IpcExecutor switchTo', () => {
     let spawnedNew: FakeServerProcess | undefined;
     const switching = h.executor.switchTo({
       spawn: () => {
-        const handle = labelledServer(h, 'new', { codeVersion: 'build-2' });
+        const handle = labelledServer(h, 'new');
         spawnedNew = h.servers.at(-1);
         return handle;
       },
-      codeVersion: 'build-2',
     });
 
     // Requests accepted during the switch stay buffered (undelivered) until the
@@ -653,76 +648,10 @@ describe('IpcExecutor switchTo', () => {
     await h.executor.close();
   });
 
-  test('warns when the replacement reports a different code version', async () => {
-    const h = switchable();
-    await started(h);
-
-    await h.executor.switchTo({
-      spawn: () => labelledServer(h, 'new', { codeVersion: 'actual-build' }),
-      codeVersion: 'target-build',
-    });
-
-    const warning = h
-      .logs()
-      .find(
-        (line) =>
-          line.msg === 'server code version differs from the portal version',
-      );
-    expect(warning).toMatchObject({
-      level: 'warn',
-      pid: NEW_PID,
-      expectedCodeVersion: 'target-build',
-      actualCodeVersion: 'actual-build',
-    });
-    await h.executor.close();
-  });
-
-  test('expects the executor version when a switch declares no target', async () => {
-    // A switch without `codeVersion` keeps the executor's version as the
-    // expected one, so a replacement that reports a different version still
-    // produces the SPEC 6.4 warning instead of comparing against `undefined`.
-    const h = switchable({ codeVersion: 'build-1' });
-    await started(h);
-
-    await h.executor.switchTo({
-      spawn: () => labelledServer(h, 'new', { codeVersion: 'build-9' }),
-    });
-
-    const warning = h
-      .logs()
-      .find(
-        (line) =>
-          line.msg === 'server code version differs from the portal version',
-      );
-    expect(warning).toMatchObject({
-      level: 'warn',
-      pid: NEW_PID,
-      expectedCodeVersion: 'build-1',
-      actualCodeVersion: 'build-9',
-    });
-    await h.executor.close();
-  });
-
-  test('rejects an empty target code version without touching the old server', async () => {
-    const h = switchable();
-    const old = await started(h);
-
-    const error = await rejectionOf(
-      h.executor.switchTo({
-        spawn: () => labelledServer(h, 'new'),
-        codeVersion: '',
-      }),
-    );
-    expect(error.message).toContain('codeVersion');
-    expect(h.servers).toHaveLength(1);
-    expect(messagesTo(old)).toEqual(['hello', 'activate']);
-    await h.executor.close();
-  });
-
-  test('restarts the new version after the switched-to server crashes', async () => {
-    // After a successful switch the running code is the target version, so a
-    // crash must restart that version — not the one the executor was built
-    // with — and new requests must carry the new version (SPEC 6.4).
+  test('restarts the switched-to server after it crashes', async () => {
+    // After a successful switch the serving process factory is the target one,
+    // so a crash must restart that process rather than the one the executor was
+    // built with.
     const h = switchable({ restartBackoffMs: 5 });
     await started(h);
 
@@ -730,9 +659,8 @@ describe('IpcExecutor switchTo', () => {
     await h.executor.switchTo({
       spawn: () => {
         replacementSpawns += 1;
-        return labelledServer(h, 'new', { codeVersion: 'build-2' });
+        return labelledServer(h, 'new');
       },
-      codeVersion: 'build-2',
     });
     expect(replacementSpawns).toBe(1);
     const switched = serverAt(h, 1);
@@ -742,60 +670,14 @@ describe('IpcExecutor switchTo', () => {
     await waitFor(() => h.servers.length === 3);
     const restarted = serverAt(h, 2);
     expect(replacementSpawns).toBe(2);
-    restarted.send(readyMessage(5000, 'build-2'));
-    await flushTicks();
-
-    // The restarted process is the current one, and new requests are stamped
-    // with the version the switch promoted.
-    const outcome = h.executor.execute(request({ requestId: 'after' }));
-    await flushTicks();
-    const delivered = requestMessages(restarted).find(
-      (message) => message.requestId === 'after',
-    );
-    expect(delivered?.codeVersion).toBe('build-2');
-    restarted.send(successMessage('after', 'build-2'));
-    expect(await outcome).toEqual({ ok: true, result: 'build-2' });
-
-    // The restarted process reports build-2, so no version mismatch is logged
-    // for the restart: the executor's expected version moved with the switch.
-    expect(
-      h
-        .logs()
-        .filter(
-          (line) =>
-            line.msg === 'server code version differs from the portal version',
-        ),
-    ).toHaveLength(0);
-    await h.executor.close();
-  });
-
-  test('keeps the old version after a switch that rolls back', async () => {
-    // A failed switch must not promote the target version: the restart runs the
-    // old code and new requests keep the old version.
-    const h = switchable({ startTimeoutMs: 40, codeVersion: 'build-1' });
-    await started(h);
-
-    const error = await rejectionOf(
-      h.executor.switchTo({
-        spawn: () => labelledServer(h, 'new', { readyOnActivate: false }),
-        codeVersion: 'build-2',
-      }),
-    );
-    expect(error.message).toMatch(/did not become ready/);
-
-    await waitFor(() => h.servers.length === 3);
-    const restarted = serverAt(h, 2);
-    restarted.send(readyMessage(5000, 'build-1'));
+    restarted.send(readyMessage());
     await flushTicks();
 
     const outcome = h.executor.execute(request({ requestId: 'after' }));
     await flushTicks();
-    const delivered = requestMessages(restarted).find(
-      (message) => message.requestId === 'after',
-    );
-    expect(delivered?.codeVersion).toBe('build-1');
-    restarted.send(successMessage('after', 'build-1'));
-    expect(await outcome).toEqual({ ok: true, result: 'build-1' });
+    expect(requestIds(restarted)).toContain('after');
+    restarted.send(successMessage('after', 'restarted'));
+    expect(await outcome).toEqual({ ok: true, result: 'restarted' });
     await h.executor.close();
   });
 

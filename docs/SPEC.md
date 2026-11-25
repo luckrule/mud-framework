@@ -195,7 +195,7 @@ interface StorageCapabilities {
 }
 ```
 
-所有字段都是必填。能力声明是后端与框架之间的契约，缺任何一个字段都会让框架的降级判断读到 undefined；无法提供的值必须显式声明为最弱的一档（如 `transactions: 'none'`、`maxTransactionDurationMs: Infinity`），而不是省略。能力名只增不删；新增能力字段与删除、改名能力名都属于破坏性变更，MUST 同步升级所有后端，见第 8 节。
+所有字段都是必填。能力声明是后端与框架之间的契约，缺任何一个字段都会让框架的降级判断读到 undefined；无法提供的值必须显式声明为最弱的一档（如 `transactions: 'none'`、`maxTransactionDurationMs: Infinity`），而不是省略。首个对外发布版本前，能力名可删除或改名，按破坏性变更处理；发布后只增不删。新增能力字段同样属于破坏性变更，MUST 同步升级所有后端，见第 8 节。
 
 框架 MUST NOT 假设后端具备未声明的能力。
 
@@ -229,7 +229,7 @@ Extension 对存储能力的依赖 MUST 显式声明。启动时若后端能力�
 
 一个后端至少实现基础读写与事务开启/提交/回滚。能力声明决定这些操作的实际保证强度，不决定它们是否存在；后端 MUST 如实声明，不得为了通过启动校验而虚报。
 
-测试按层分工：框架核心的测试 MUST 使用内存假后端，MUST NOT 依赖真实数据库，因为核心只验证框架行为，不能被具体实现拖慢或引入外部不稳定；后端包的测试 MUST 针对该包的真实后端，可使用内存数据库，验证的是实现自身的正确性；仓库级集成与 smoke 测试 MUST 使用真实后端，验证跨进程装配与恢复链路，smoke 属于发布前验证而非单元测试。真实后端测试只属于后端包与仓库级测试，框架核心 MUST NOT 包含或 import 具体后端实现（见 4.1）。
+测试按层分工：框架核心的测试 MUST 使用内存假后端，MUST NOT 依赖真实数据库，因为核心只验证框架行为，不能被具体实现拖慢或引入外部不稳定；后端包的测试 MUST 针对该包的真实后端，可使用内存数据库，验证的是实现自身的正确性；仓库级集成测试 MUST 使用真实后端，验证跨进程装配与恢复链路。真实后端测试只属于后端包与仓库级测试，框架核心 MUST NOT 包含或 import 具体后端实现（见 4.1）。
 
 ### 4.6 写者
 
@@ -260,7 +260,7 @@ TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：
 ### 5.3 独立维护边界
 
 - 传输实现升级不触发框架核心发版；框架只保证 `Transport` 接口稳定，接口变更属破坏性变更（见 8.2）。
-- 测试按层分工：框架核心的测试 MUST 使用假传输，MUST NOT 依赖真实网络；传输包的测试 MUST 针对该包的真实传输，可使用 loopback 网络，验证的是实现自身的正确性；仓库级集成与 smoke 测试 MUST 使用真实传输与子进程，验证跨进程、恢复与装配链路。真实传输测试只属于传输包与仓库级测试，框架核心 MUST NOT 包含或 import 具体传输实现（见 5.1）。
+- 测试按层分工：框架核心的测试 MUST 使用假传输，MUST NOT 依赖真实网络；传输包的测试 MUST 针对该包的真实传输，可使用 loopback 网络，验证的是实现自身的正确性；仓库级集成测试 MUST 使用真实传输与子进程，验证跨进程、恢复与装配链路。真实传输测试只属于传输包与仓库级测试，框架核心 MUST NOT 包含或 import 具体传输实现（见 5.1）。
 
 ### 5.4 客户端线格式
 
@@ -304,7 +304,7 @@ TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：
 
 版本切换复用同一协议，顺序是契约：连接层先起新进程并等到 `prepared`，再停旧进程、等它 `closed` 且退出被观测到，然后才向新进程发 `activate` 并等 `ready`，最后把缓冲请求投给新进程。`activate` MUST NOT 在旧进程仍可能持有存储时发出（INV-002）；`closed`、kill 返回与退出等待超时都不能代替退出确认。切换期间连接层 MUST 继续按容量与 deadline 接受、缓冲请求，不得向即将退役的旧进程或尚未 `ready` 的新进程投递；新进程 `ready` 后按 6.5 的顺序投递。
 
-切换失败时，旧进程未被 drain 则 MUST 继续服务；已经退役则使用切换前的 spawn 与 `codeVersion` 恢复。回滚重启 MUST 等到旧进程与已 `activate` 的新进程退出均被观测到；无法确认时保持写者屏障并显式失败，不得以恢复可用性为由启动另一写者。切换成功提升后，连接层 MUST 采纳目标 spawn 与 `codeVersion`，供后续崩溃重启与新请求使用；失败回滚不改变当前版本。`close()` 在 `activate` 之后中止切换时，MUST 对放弃的新进程执行有界的退出确认（等退出 → kill → 再等）；确认失败时关闭必须 reject，而不是只记日志后成功返回。
+切换失败时，旧进程未被 drain 则 MUST 继续服务；已经退役则使用切换前的 spawn 恢复。回滚重启 MUST 等到旧进程与已 `activate` 的新进程退出均被观测到；无法确认时保持写者屏障并显式失败，不得以恢复可用性为由启动另一写者。切换成功提升后，连接层 MUST 采纳目标 spawn，供后续崩溃重启使用。`close()` 在 `activate` 之后中止切换时，MUST 对放弃的新进程执行有界的退出确认（等退出 → kill → 再等）；确认失败时关闭必须 reject，而不是只记日志后成功返回。
 
 ### 6.3 关闭顺序
 
@@ -328,8 +328,6 @@ TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：
 幂等由业务负责。需要"只生效一次"的效果（扣钱、发物品、唯一命名），必须由 Extension 用业务幂等键实现，不能依赖框架。
 
 理由：at-least-once 是"连接保活"这一承诺的直接代价——只要允许重放，重复执行就无法在框架层排除。这也是双进程架构存在的理由：单进程崩溃会同时带走连接与状态，无从重放。
-
-代码版本只回显，不判兼容：`prepared`、`ready` 与 `request` 上的 `codeVersion` 是应用提供的 opaque 非空字符串。`prepared` 与 `ready` 报告同一个值——该 Server 正在运行的代码版本；`request` 记录 Portal 接受该请求时的版本，重放沿用该值而不是替换 Server 的版本。Portal 在自身配置了版本、且 `ready` 带了一个不同版本时记 warn（`expectedCodeVersion`、`actualCodeVersion`、`pid`）；Server 在处理 `replayCount > 0` 的请求、且请求版本与自身版本都存在且不同时记 warn（请求标识字段、`requestCodeVersion`、`serverCodeVersion`、`replayCount`）。两侧都不因不匹配失败、拒绝、取消请求或改变重放策略。跨版本重放只保证 at-least-once 与可观测，不保证行为兼容；是否允许带版本热修、如何发布，由部署方决定。切换成功后 Portal 的"自身版本"变为切换目标版本（`switchTo` 的 `codeVersion`），崩溃重启也使用目标 spawn；切换失败回滚则不变。
 
 ### 6.5 重放的顺序约束
 
@@ -363,39 +361,35 @@ TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：
 
 ### 7.2 错误码
 
-错误码 MUST 稳定、可枚举、只增不删。语义变更 MUST 分配新码，不得复用旧码表示新含义。
+错误码 MUST 可枚举。首个对外发布版本前，错误码可删除或改名，按破坏性变更处理；发布后只增不删。语义变更 MUST 分配新码，不得复用旧码表示新含义。
 
 错误码分两类，约束不同：
 
 **wire 码** 随 `error.code` 发给客户端（`ok: false` 时），属于对外契约，MUST 稳定可枚举：
 
-| 码                                 | 含义                                         |
-| ---------------------------------- | -------------------------------------------- |
-| `FRAMEWORK_TIMEOUT`                | 请求超时                                     |
-| `FRAMEWORK_QUEUE_FULL`             | 输入队列拒绝（见 3.5）                       |
-| `FRAMEWORK_SHUTDOWN`               | 因关闭未取得成功确认，不保证未执行或未提交   |
-| `FRAMEWORK_REPLAY_EXHAUSTED`       | 重放次数用尽，请求进入终态（见 6.5）         |
-| `FRAMEWORK_CAPABILITY_UNSUPPORTED` | 存储能力不满足 Extension 声明（见 4.3）      |
-| `TRANSPORT_CLOSED`                 | 传输在请求完成前关闭                         |
-| `TRANSPORT_SEND_FAILED`            | 结果无法写回传输                             |
-| `STORAGE_UNAVAILABLE`              | 存储后端不可达                               |
-| `INVALID_ENVELOPE`                 | 入站帧无法解码                               |
-| `UNKNOWN_METHOD`                   | 没有该方法的 Handler                         |
-| `INTERNAL_ERROR`                   | 框架内部失败，含未声明的业务错误             |
-| `AUTH_REQUIRED`                    | Handler 要求 Session，但请求未携带（见 3.7） |
-| `FORBIDDEN`                        | 注入的访问策略拒绝了请求（见 3.7）           |
+| 码                           | 含义                                         |
+| ---------------------------- | -------------------------------------------- |
+| `FRAMEWORK_TIMEOUT`          | 请求超时                                     |
+| `FRAMEWORK_QUEUE_FULL`       | 输入队列拒绝（见 3.5）                       |
+| `FRAMEWORK_SHUTDOWN`         | 因关闭未取得成功确认，不保证未执行或未提交   |
+| `FRAMEWORK_REPLAY_EXHAUSTED` | 重放次数用尽，请求进入终态（见 6.5）         |
+| `TRANSPORT_CLOSED`           | 传输在请求完成前关闭                         |
+| `TRANSPORT_SEND_FAILED`      | 结果无法写回传输                             |
+| `INVALID_ENVELOPE`           | 入站帧无法解码                               |
+| `UNKNOWN_METHOD`             | 没有该方法的 Handler                         |
+| `INTERNAL_ERROR`             | 框架内部失败，含未声明的业务错误             |
+| `AUTH_REQUIRED`              | Handler 要求 Session，但请求未携带（见 3.7） |
+| `FORBIDDEN`                  | 注入的访问策略拒绝了请求（见 3.7）           |
 
 `AUTH_REQUIRED` 与 `FORBIDDEN` 是预期内的拒绝，不是框架失败：它们发生在存储事务与 Handler 之前，日志级别为 warn（见 7.1），MUST NOT 按错误级记录。它们在业务进程的访问检查点产生，证明本次请求没有打开事务、执行 Handler 或改变 Session 路由。
 
 `FRAMEWORK_SHUTDOWN` 必须区分发生阶段：关闭时拒绝的新输入，以及仍在 Session 屏障前、尚未调用 executor 就被关闭结算的请求，确定没有被调度执行；可能已投递给 Server 却未取得成功确认的请求，则可能已经执行或提交。此码本身不携带阶段信息，MUST NOT 仅凭它判断可无幂等保护地重试；恢复与重试仍须遵守 6.4 的业务幂等边界。
 
-`FRAMEWORK_CAPABILITY_UNSUPPORTED` 与 `STORAGE_UNAVAILABLE` 是预留码：当前没有任何路径产出它们，先占住名字，免得实现时另发明一个码让下游同时面对两套语义。
-
 `TRANSPORT_SEND_FAILED` 的触发条件是"写不出去"，因此它结构上不可能送达客户端，只能作为日志字段被观察到。`TRANSPORT_CLOSED` 在当前实现里同样只出现在日志中：请求因断线结束时连接已不在，没有可回写的通道。两码仍是契约——它们回答"请求为什么结束"，删掉会让终态失去可枚举的说法。
 
 **仅日志诊断字段** 出现在日志的 `code` 字段里，用于定位，不发给客户端，也不构成 wire 契约：`CANCEL_LOST_TO_COMMIT`、`IPC_CHANNEL_CLOSED`、`SERVER_STARTUP_FAILED`、`DUPLICATE_REQUEST`、`INVALID_IPC_MESSAGE` 等。日志里的 `code` 只是一个字段名，取值不受本节约束——把它当成错误码清单会误判哪些码是契约。
 
-`FRAMEWORK_` 前缀是示例惯例，不是强制格式。`INVALID_ENVELOPE`、`UNKNOWN_METHOD`、`INTERNAL_ERROR`、`TRANSPORT_SEND_FAILED` 没有该前缀；错误码只增不删（INV-014），改名等于换码，所以这些名字保持不变。
+`FRAMEWORK_` 前缀是示例惯例，不是强制格式。`INVALID_ENVELOPE`、`UNKNOWN_METHOD`、`INTERNAL_ERROR`、`TRANSPORT_SEND_FAILED` 没有该前缀；发布后错误码只增不删（INV-014），改名等于换码，所以这些名字保持不变。
 
 业务错误码由 Extension 用 `BusinessError` 显式定义，框架原样透传，不改写、不吞掉。只有 `BusinessError` 的 `code` 与框架自身错误码进入 wire：驱动或运行时的偶然 `code`（如 `ENOENT`、`SQLITE_CONSTRAINT_UNIQUE`）不透传，统一降级为 `INTERNAL_ERROR`。否则第三方库升级会静默改变对外契约（INV-014）。
 
@@ -415,7 +409,7 @@ TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：
 
 - 改动承诺（P1–P5）或 INVARIANTS：属于重大变更，MUST 说明改了什么、为什么原承诺不再成立、受影响的代码与迁移方式。
 - 改动边界或术语：MUST 同步修改代码标识符、类型定义与两份文档，不留同义词。
-- 改动存储能力：只增不删；删除或改名能力名按重大变更处理。
+- 改动存储能力：首个对外发布版本前，能力名可删除或改名，按破坏性变更处理；发布后只增不删。
 - 改动 `Transport` 接口签名按重大变更处理，MUST 同步升级所有传输实现。
 - 纯补充说明：可直接改，不构成契约变更。
 

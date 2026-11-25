@@ -1,11 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
 import type { ExecutorRequest } from '../shared/executor.ts';
-import {
-  failure,
-  nextPortalGeneration,
-  requestMessage,
-} from './ipc-outbound.ts';
+import { failure, requestMessage } from './ipc-outbound.ts';
 
 const request: ExecutorRequest = {
   requestId: 'req-1',
@@ -70,24 +66,5 @@ describe('failure', () => {
     const outcome = failure('INTERNAL_ERROR', 'boom');
     expect(outcome).not.toHaveProperty('result');
     expect(outcome).not.toHaveProperty('sessionId');
-  });
-});
-
-describe('nextPortalGeneration', () => {
-  test('strictly increases', () => {
-    const first = nextPortalGeneration();
-    const second = nextPortalGeneration();
-    const third = nextPortalGeneration();
-
-    expect(second).toBeGreaterThan(first);
-    expect(third).toBeGreaterThan(second);
-  });
-
-  test('hands out a fresh value on every call', () => {
-    const seen = new Set<number>();
-    for (let i = 0; i < 50; i += 1) {
-      seen.add(nextPortalGeneration());
-    }
-    expect(seen.size).toBe(50);
   });
 });

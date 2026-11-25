@@ -91,59 +91,24 @@ Handler 默认 `access: 'session'`：请求没有 Session 时以 `AUTH_REQUIRED`
 
 core 只提供同步快照，不提供 HTTP 端点（SPEC 6.6）。应用在自己的 HTTP 服务里把 `layer.health()` 映射为探针：`ready === true` 返回 200，否则返回 503；需要区分原因时把 `state` 与 `executor.state` 写进响应。快照会立即过期，只表达“此刻可以接活”，不能替代请求准入或 deadline。端点属于应用，`examples/minimal/src/portal.ts` 给出了完整实现：独立 `Bun.serve` 监听 8081，响应体包含快照，Portal 停止时一并关闭。
 
-## 版本化入口（应用层）
+## 入口选择（应用层）
 
-版本到入口的映射属于应用与部署配置，不进 core。应用自己维护 `codeVersion -> server entry`：Portal 的 `spawn` 闭包按当前版本选择入口，并把同一个版本传给 `IpcExecutor`；Server 入口把该版本原样交给 `runServerProcess`。框架不解析版本、不判断兼容性、不做版本到入口的映射。
+应用通过 `spawn` 闭包选择入口，框架不感知版本：`IpcExecutor` 与 `runServerProcess` 都不接受、不转发、不记录任何版本标识。发布策略（蓝绿、热修、回滚）由应用决定；`switchTo` 只编排进程替换，不解释入口之间的兼容性。
 
 ```ts
 import { IpcExecutor, spawnBunServer } from 'mud-framework-core';
 
-const SERVER_ENTRY_BY_CODE_VERSION = new Map([
-  ['2026-11-20', './server/main.ts'],
-  ['2026-11-25', './server/main.next.ts'],
-]);
-
-const codeVersion = '2026-11-25';
-
-function serverEntryFor(version: string): string {
-  const entry = SERVER_ENTRY_BY_CODE_VERSION.get(version);
-  if (entry === undefined) {
-    throw new Error(`no server entry for code version ${version}`);
-  }
-  return entry;
-}
-
 const executor = new IpcExecutor({
+  spawn: () => spawnBunServer({ command: ['bun', 'run', './server/main.ts'] }),
+  timeoutMs: 5000,
+});
+
+// 替换进程时传入新的 spawn 闭包；旧进程退出确认之后才会激活新进程。
+await executor.switchTo({
   spawn: () =>
-    spawnBunServer({
-      command: ['bun', 'run', serverEntryFor(codeVersion)],
-    }),
-  codeVersion,
-  timeoutMs: 5000,
+    spawnBunServer({ command: ['bun', 'run', './server/main.next.ts'] }),
 });
 ```
-
-```ts
-// server/main.next.ts：入口随版本发布，声明值必须与映射中选它的键一致。
-import { runServerProcess } from 'mud-framework-core';
-import { SqliteBackend } from 'mud-framework-storage-sqlite';
-
-await runServerProcess({
-  createBackend: () => SqliteBackend.open({ filename: './data/world.sqlite' }),
-  extensions: [/* 同最小装配 */],
-  codeVersion: '2026-11-25',
-  timeoutMs: 5000,
-});
-```
-
-`codeVersion` 必须是应用提供的非空字符串：`IpcExecutor` 构造、`runServerProcess` 启动时都会校验，空串或非字符串直接失败。版本是否与实际构建产物一致、入口声明是否与映射键一致，由构建与部署保证，框架不校验。
-
-回显与告警：
-
-- Server 在 `ready` 中回显自己声明的版本，`prepared` 携带同一个值。Portal 配置了版本、且 `ready` 带了不同的版本时记 warn（`expectedCodeVersion`、`actualCodeVersion`、`pid`）；它仍然接受这个 Server，不据此拒绝启动或重启。
-- Portal 在接受请求时把版本写入 `request.codeVersion`，重放沿用接受时的值，不会替换成当前 Server 的版本。Server 处理 `replayCount > 0` 的请求、且请求版本与自身版本都存在且不同时记 warn（请求标识字段、`requestCodeVersion`、`serverCodeVersion`、`replayCount`）。
-- 任一侧未声明版本时不算"不同"，不记 warn；缺失字段表示该部署未声明版本。
-- 版本不匹配只影响可观测性：框架不据此拒绝、取消、路由请求或改变重放策略。跨版本重放仍按 at-least-once 执行，行为兼容不在承诺内；是否允许带版本热修、如何发布，由部署方决定。
 
 ## 硬约束
 

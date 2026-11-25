@@ -18,8 +18,6 @@ export interface MessageHost {
   readonly logger: Logger;
   /** Sole owner of `status`, `server` and the in-flight switch. */
   readonly slot: ServerSlot<SwitchOperation>;
-  /** The version new requests carry now; the expected one in a mismatch check. */
-  currentCodeVersion(): string | undefined;
   /**
    * Marks `server` live: the slot transition, the stability clock and the
    * backend's declared ceiling. Returns the ceiling now in force, which is what
@@ -68,7 +66,7 @@ export function onServerMessage(
   const message = parsed.message;
   switch (message.type) {
     case 'prepared':
-      onPrepared(host, server, message.pid, message.codeVersion);
+      onPrepared(host, server, message.pid);
       return;
     case 'ready':
       onReady(
@@ -76,7 +74,6 @@ export function onServerMessage(
         server,
         message.pid,
         message.capabilities.maxTransactionDurationMs,
-        message.codeVersion,
       );
       return;
     case 'result':
@@ -142,23 +139,10 @@ function onClosed(
  * its staged process instead and activates it only after the previous one has
  * exited.
  */
-function onPrepared(
-  host: MessageHost,
-  server: ServerState,
-  pid: number,
-  codeVersion: string | undefined,
-): void {
+function onPrepared(host: MessageHost, server: ServerState, pid: number): void {
   const op = host.slot.switching;
   if (op?.staged === server) {
     server.pid = pid;
-    server.reportedCodeVersion = codeVersion;
-    warnOnVersionMismatch(
-      host,
-      pid,
-      op.targetCodeVersion ?? host.currentCodeVersion(),
-      codeVersion,
-      op,
-    );
     op.prepared.seen = true;
     op.prepared.resolve();
     return;
@@ -182,7 +166,6 @@ function onPrepared(
     return;
   }
   server.pid = pid;
-  server.reportedCodeVersion = codeVersion;
   try {
     host.slot.assertNoOtherLiveServer(server);
     server.channel.send({ type: 'activate' });
@@ -203,21 +186,12 @@ function onReady(
   server: ServerState,
   pid: number,
   declaredMaxDurationMs: number,
-  actualCodeVersion: string | undefined,
 ): void {
   const op = host.slot.switching;
   if (op?.staged === server) {
     server.ready = true;
     server.pid = pid;
     server.declaredMaxDurationMs = declaredMaxDurationMs;
-    server.reportedCodeVersion = actualCodeVersion;
-    warnOnVersionMismatch(
-      host,
-      pid,
-      op.targetCodeVersion ?? host.currentCodeVersion(),
-      actualCodeVersion,
-      op,
-    );
     op.ready.seen = true;
     op.ready.resolve();
     return;
@@ -236,17 +210,6 @@ function onReady(
   server.ready = true;
   server.pid = pid;
   server.declaredMaxDurationMs = declaredMaxDurationMs;
-  server.reportedCodeVersion = actualCodeVersion;
-  // Reported, not enforced: a Server built from different code may still be
-  // the only process available, and refusing it would turn a deployment
-  // mismatch into an outage (SPEC 6.4). A deployment that declared no version
-  // says nothing, so silence is not a mismatch.
-  warnOnVersionMismatch(
-    host,
-    pid,
-    host.currentCodeVersion(),
-    actualCodeVersion,
-  );
   if (host.slot.isTerminal) {
     return;
   }
@@ -254,32 +217,4 @@ function onReady(
   host.logger.info({ pid, effectiveTimeoutMs }, 'server ready');
   host.resolveStart();
   host.pump();
-}
-
-/**
- * Warns when a Server reports a code version other than the one expected
- * (SPEC 6.4). A missing value on either side says nothing, so silence is not
- * a mismatch. `op` records the warning so a switch does not log the same
- * mismatch for both `prepared` and `ready`.
- */
-function warnOnVersionMismatch(
-  host: MessageHost,
-  pid: number,
-  expected: string | undefined,
-  actual: string | undefined,
-  op?: SwitchOperation,
-): void {
-  if (expected === undefined || actual === undefined || actual === expected) {
-    return;
-  }
-  if (op !== undefined) {
-    if (op.versionWarned) {
-      return;
-    }
-    op.versionWarned = true;
-  }
-  host.logger.warn(
-    { pid, expectedCodeVersion: expected, actualCodeVersion: actual },
-    'server code version differs from the portal version',
-  );
 }

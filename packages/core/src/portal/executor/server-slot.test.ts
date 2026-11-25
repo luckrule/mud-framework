@@ -32,7 +32,6 @@ function fakeServer(overrides: Partial<ServerState> = {}): ServerState {
     staged: false,
     retiring: false,
     declaredMaxDurationMs: undefined,
-    reportedCodeVersion: undefined,
     shutdownSent: false,
     closedSignal: Promise.withResolvers<void>(),
     ...overrides,

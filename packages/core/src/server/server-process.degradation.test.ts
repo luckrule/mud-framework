@@ -88,7 +88,8 @@ describe('runServerProcess capability degradation warnings', () => {
       extensions: [{ name: 'echo', register: echoRegistration }],
     });
     await tick();
-    // The handshake already ran; a second `hello` would only log STALE_HELLO.
+    // The handshake already ran; a second `hello` would only log an unexpected
+    // message warning.
     const atStartup = degradationWarnings(harness.logs()).length;
 
     for (let index = 0; index < 3; index += 1) {

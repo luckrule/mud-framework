@@ -18,11 +18,6 @@ import type { StorageCapabilities } from '../storage/types.ts';
 /** Portal -> Server: handshake. */
 export interface HelloMessage {
   readonly type: 'hello';
-  /**
-   * Incremented on every Portal start so Server can tell a new Portal instance
-   * from the one it was already talking to.
-   */
-  readonly portalGeneration: number;
 }
 
 /**
@@ -30,13 +25,11 @@ export interface HelloMessage {
  * activation (ADR-0007).
  *
  * Nothing that can write storage exists yet: no backend, no Extension, no
- * handler. `pid` names the process so a Portal can observe the restart, and
- * `codeVersion` is the same opaque echo `ready` carries.
+ * handler. `pid` names the process so a Portal can observe the restart.
  */
 export interface PreparedMessage {
   readonly type: 'prepared';
   readonly pid: number;
-  readonly codeVersion?: string;
 }
 
 /**
@@ -61,13 +54,6 @@ export interface RequestMessage extends RequestIdentity {
   readonly timeoutMs: number;
   /** 0 on first delivery; incremented by Portal on each replay (SPEC 7.3). */
   readonly replayCount: number;
-  /**
-   * The application's opaque code version at the moment this Request was
-   * accepted. A replay keeps the value its pending entry was stamped with, so
-   * it names the code the original delivery ran under, not the replacement
-   * Server's. The framework only reports a difference (SPEC 6.4).
-   */
-  readonly codeVersion?: string;
 }
 
 /**
@@ -105,12 +91,6 @@ export interface ReadyMessage {
   readonly type: 'ready';
   readonly pid: number;
   readonly capabilities: StorageCapabilities;
-  /**
-   * The application's opaque code version this Server is running. Omitted when
-   * the deployment declared none, which is not the same as reporting a
-   * different version (SPEC 6.4).
-   */
-  readonly codeVersion?: string;
 }
 
 /**
@@ -214,15 +194,11 @@ function buildMessage(raw: unknown): IpcMessage {
   }
   switch (type) {
     case 'hello':
-      return {
-        type: 'hello',
-        portalGeneration: readInteger(raw, 'hello', 'portalGeneration', 0),
-      };
+      return { type: 'hello' };
     case 'prepared':
       return {
         type: 'prepared',
         pid: readInteger(raw, 'prepared', 'pid', 1),
-        codeVersion: readOptionalString(raw, 'prepared', 'codeVersion'),
       };
     case 'activate':
       return { type: 'activate' };
@@ -244,7 +220,6 @@ function buildMessage(raw: unknown): IpcMessage {
         type: 'ready',
         pid: readInteger(raw, 'ready', 'pid', 1),
         capabilities: readCapabilities(raw, 'ready', 'capabilities'),
-        codeVersion: readOptionalString(raw, 'ready', 'codeVersion'),
       };
     case 'result':
       return buildResult(raw);
@@ -271,7 +246,6 @@ function buildRequest(raw: Record<string, unknown>): RequestMessage {
     payload: raw.payload,
     timeoutMs: readPositiveNumber(raw, 'request', 'timeoutMs'),
     replayCount: readInteger(raw, 'request', 'replayCount', 0),
-    codeVersion: readOptionalString(raw, 'request', 'codeVersion'),
   };
 }
 

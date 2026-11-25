@@ -38,36 +38,15 @@ export function failure(code: string, message: string): ExecutorOutcome {
 
 /**
  * Builds the handshake answer that starts the two-phase activation (ADR-0007).
- * Same rule as `ready`: an absent version stays absent.
  */
-export function preparedMessage(
-  pid: number,
-  codeVersion: string | undefined,
-): PreparedMessage {
-  const base = { type: 'prepared' as const, pid };
-  return codeVersion === undefined ? base : { ...base, codeVersion };
+export function preparedMessage(pid: number): PreparedMessage {
+  return { type: 'prepared', pid };
 }
 
-/**
- * Builds the readiness barrier. `codeVersion` is omitted when the deployment
- * declared none, rather than sent as `undefined` (SPEC 6.4).
- */
+/** Builds the readiness barrier. */
 export function readyMessage(
   pid: number,
   capabilities: StorageCapabilities,
-  codeVersion: string | undefined,
 ): ReadyMessage {
-  const base = { type: 'ready' as const, pid, capabilities };
-  return codeVersion === undefined ? base : { ...base, codeVersion };
-}
-
-let portalGenerationCounter = 0;
-
-/**
- * A process-wide increasing id, so a Server can tell a new Portal instance from
- * the one it handshook with even within the same pid.
- */
-export function nextPortalGeneration(): number {
-  portalGenerationCounter += 1;
-  return portalGenerationCounter;
+  return { type: 'ready', pid, capabilities };
 }

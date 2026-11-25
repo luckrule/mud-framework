@@ -58,15 +58,6 @@ export function results(messages: readonly unknown[]): ResultMessage[] {
 }
 
 /**
- * The readiness barriers a Server sent, for tests that count them across
- * generations. A startup-failure assertion should use `messageTypes` instead:
- * "no `ready`" alone would accept a stray `closed` or `result`.
- */
-export function readies(messages: readonly unknown[]): IpcMessage[] {
-  return received(messages).filter((message) => message.type === 'ready');
-}
-
-/**
  * The message types Portal received, in order. Used where the exact shape
  * matters, e.g. a failed startup that must have sent `prepared` and nothing
  * else: asserting only "no `ready`" would accept a stray `closed` or `result`.
@@ -84,7 +75,6 @@ export interface HarnessOptions {
   extensions?: readonly Extension[];
   backend?: StorageBackend;
   timeoutMs?: number;
-  codeVersion?: string;
   /** Replaces the collecting logger: `logs()` then stays empty. */
   logger?: Logger;
   /** Observes every message Portal receives, for cross-array ordering checks. */
@@ -142,7 +132,6 @@ export function startServer(options: HarnessOptions = {}): Harness {
     createBackend: () => backend,
     extensions: options.extensions ?? [],
     timeoutMs: options.timeoutMs ?? 1000,
-    codeVersion: options.codeVersion,
     authorize: options.authorize,
     logger,
     channel: serverChannel,
@@ -153,7 +142,7 @@ export function startServer(options: HarnessOptions = {}): Harness {
     readParentPid: options.readParentPid,
   });
   if (autoHandshake) {
-    portal.send({ type: 'hello', portalGeneration: 1 });
+    portal.send({ type: 'hello' });
   }
   return {
     portal,

@@ -7,7 +7,6 @@ import type { StorageBackend } from '../storage/types.ts';
 import { rejectionOf, throwingLogger, tick } from '../testing/common.ts';
 import {
   echoRegistration,
-  readies,
   requestMessage,
   results,
   sendRaw,
@@ -45,42 +44,6 @@ describe('runServerProcess lifecycle', () => {
       throw new Error(`expected ServerChannelClosedError, got ${error.name}`);
     }
     expect(error.reason).toBe('portal gone');
-  });
-
-  test('resends ready when a newer portal generation arrives', async () => {
-    const harness = startServer({
-      autoHandshake: false,
-      extensions: [{ name: 'echo', register: echoRegistration }],
-    });
-    harness.portal.send({ type: 'hello', portalGeneration: 1 });
-    harness.portal.send({ type: 'activate' });
-    await tick();
-
-    harness.portal.send({ type: 'hello', portalGeneration: 2 });
-    await tick();
-
-    // The startup barrier plus one per new generation: a restarted Portal was
-    // not around for the first one and would wait for readiness forever.
-    expect(readies(harness.messages)).toHaveLength(2);
-    await harness.stop();
-  });
-
-  test('ignores a hello that does not advance the generation', async () => {
-    const harness = startServer({
-      autoHandshake: false,
-      extensions: [{ name: 'echo', register: echoRegistration }],
-    });
-    harness.portal.send({ type: 'hello', portalGeneration: 3 });
-    harness.portal.send({ type: 'activate' });
-    await tick();
-
-    harness.portal.send({ type: 'hello', portalGeneration: 3 });
-    await tick();
-
-    expect(readies(harness.messages)).toHaveLength(1);
-    const stale = harness.logs().filter((line) => line.code === 'STALE_HELLO');
-    expect(stale).toHaveLength(1);
-    await harness.stop();
   });
 
   test('logs a warning for an invalid message and keeps running', async () => {

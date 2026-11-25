@@ -51,8 +51,6 @@ export interface ServerState {
   retiring: boolean;
   /** Capabilities the Server declared in `ready`; absent before it. */
   declaredMaxDurationMs: number | undefined;
-  /** `codeVersion` the Server reported in `prepared`/`ready`. */
-  reportedCodeVersion: string | undefined;
   /** True once a `shutdown` was sent, so a switch and `close()` cannot both send one. */
   shutdownSent: boolean;
   /** Resolves once `closed` arrived or the process is known to be gone. */
