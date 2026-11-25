@@ -77,7 +77,7 @@ try {
 }
 ```
 
-示例的前置条件是 `./data` 目录已存在，且数据库已有业务表 `players (name TEXT NOT NULL)`。`SqliteBackend.open` 既不创建父目录，也不创建业务 schema；目录缺失会导致打开失败，表缺失会让 `player.create` 返回 `INTERNAL_ERROR`。schema 初始化与迁移属于应用，必须在接受业务请求前完成；可放在 Server 的 `createBackend` 中，但不得提前到 Portal 或 prepared 阶段。
+上面片段的前置条件是 `./data` 目录已存在，且数据库已有业务表 `players (name TEXT NOT NULL)`。`SqliteBackend.open` 既不创建父目录，也不创建业务 schema；目录缺失会导致打开失败，表缺失会让 `player.create` 返回 `INTERNAL_ERROR`。schema 初始化与迁移属于应用，必须在接受业务请求前完成；可放在 Server 的 `createBackend` 中，但不得提前到 Portal 或 prepared 阶段。`examples/minimal/` 是可直接运行的版本：它在 `createBackend` 中递归创建目录并用 `CREATE TABLE IF NOT EXISTS` 建表，首次运行无需手工准备。
 
 ### 访问声明与登录装配
 
@@ -89,7 +89,7 @@ Handler 默认 `access: 'session'`：请求没有 Session 时以 `AUTH_REQUIRED`
 
 ## 健康探针（应用层）
 
-core 只提供同步快照，不提供 HTTP 端点（SPEC 6.6）。应用在自己的 HTTP 服务里把 `layer.health()` 映射为探针：`ready === true` 返回 200，否则返回 503；需要区分原因时把 `state` 与 `executor.state` 写进响应。快照会立即过期，只表达“此刻可以接活”，不能替代请求准入或 deadline。端点属于应用，Step 3 的示例会给出实现。
+core 只提供同步快照，不提供 HTTP 端点（SPEC 6.6）。应用在自己的 HTTP 服务里把 `layer.health()` 映射为探针：`ready === true` 返回 200，否则返回 503；需要区分原因时把 `state` 与 `executor.state` 写进响应。快照会立即过期，只表达“此刻可以接活”，不能替代请求准入或 deadline。端点属于应用，`examples/minimal/src/portal.ts` 给出了完整实现：独立 `Bun.serve` 监听 8081，响应体包含快照，Portal 停止时一并关闭。
 
 ## 版本化入口（应用层）
 

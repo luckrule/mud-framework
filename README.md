@@ -10,6 +10,8 @@
 
 需要 Bun >= 1.4.5。`bun install` 安装依赖并启用 Git 钩子，之后用 `bun run test` 跑测试，或用 `bash scripts/ci.sh --skip-install` 跑完整门禁。各命令说明与提交规范见 `docs/CONTRIBUTING.md`。
 
+想先看到双进程跑起来：在仓库根执行 `bun run examples/minimal/src/portal.ts`，另开终端执行 `bun run examples/minimal/src/client.ts`；端口、数据目录与健康检查见 `examples/minimal/README.md`。
+
 ## 目录结构
 
 ```
@@ -18,6 +20,7 @@ mud-framework/
 ├── .github/           CI 配置与 PR 模板
 ├── benchmarks/        手动性能基准，不接入 CI
 ├── docs/              规格、不变量与协作规范
+├── examples/          最小双进程示例，从仓库根可直接运行
 ├── packages/          四个包：core、connector-ws、storage-sqlite，以及 private 的 test-support（仅测试辅助）
 ├── scripts/           门禁脚本，本地与 CI 共用
 ├── tests/             跨包集成测试
