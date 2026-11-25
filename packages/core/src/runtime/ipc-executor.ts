@@ -1,6 +1,5 @@
 import { messageOf } from '../internal/guards.ts';
 import type { ResultMessage } from '../ipc/protocol.ts';
-import { parseIpcMessage } from '../ipc/protocol.ts';
 import type { SpawnedServer } from '../ipc/spawn-port.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import { safeLogger } from '../logging/safe-logger.ts';
@@ -32,6 +31,8 @@ import {
   killQuietly,
   waitForExit,
 } from './server-launcher.ts';
+import type { MessageHost } from './server-messages.ts';
+import { onServerMessage } from './server-messages.ts';
 import type { ServerState } from './server-slot.ts';
 import { ServerSlot } from './server-slot.ts';
 import { effectiveTimeoutMs, settleWithin, tightenTimeout } from './timeout.ts';
@@ -146,6 +147,8 @@ export class IpcExecutor implements RequestExecutor {
   private readonly slot = new ServerSlot<SwitchOperation>();
   /** The `switchTo` sequence; it writes state only through `slot`. */
   private readonly versionSwitch: VersionSwitch;
+  /** The Server→Portal handlers' view of this executor. */
+  private readonly messageHost: MessageHost;
   private effectiveTimeoutMs: number;
   /**
    * Crashes since the last stable run; drives the restart backoff. Reset only
@@ -247,6 +250,7 @@ export class IpcExecutor implements RequestExecutor {
     };
     this.ledger = new DeliveryLedger({ buffer: this.buffer, host });
     this.versionSwitch = new VersionSwitch(this.switchHost());
+    this.messageHost = this.messageHostOf();
   }
 
   /**
@@ -298,6 +302,43 @@ export class IpcExecutor implements RequestExecutor {
       nextBackoffMs: () => this.nextBackoffMs(),
       scheduleRestart: (backoffMs) => {
         this.scheduleRestart(backoffMs);
+      },
+    };
+  }
+
+  /**
+   * The message handlers' view of this executor. Every member reads live state
+   * or calls back into the executor, so the handlers never hold a stale status
+   * or Server.
+   */
+  private messageHostOf(): MessageHost {
+    return {
+      logger: this.logger,
+      slot: this.slot,
+      currentCodeVersion: () => this.codeVersion,
+      adoptReady: (server, declaredMaxDurationMs) => {
+        this.slot.markReady(server);
+        // The crash streak ends only after a stable run, not at the handshake:
+        // a Server that reaches `ready` and then dies on its first request
+        // would otherwise reset the backoff and restart immediately, forever.
+        this.startStableTimer();
+        this.adoptCeiling(declaredMaxDurationMs);
+        return this.effectiveTimeoutMs;
+      },
+      pump: () => {
+        this.pump();
+      },
+      resolveStart: () => {
+        this.resolveStart();
+      },
+      onResult: (message) => {
+        this.onResult(message);
+      },
+      onServerLost: (server, code, signal, reason) => {
+        this.onServerLost(server, code, signal, reason);
+      },
+      resolveClosed: () => {
+        this.resolveClosed();
       },
     };
   }
@@ -875,232 +916,12 @@ export class IpcExecutor implements RequestExecutor {
   private serverHandlers(server: ServerState): ServerHandlers {
     return {
       onMessage: (raw) => {
-        this.onServerMessage(server, raw);
+        onServerMessage(this.messageHost, server, raw);
       },
       onLost: (code, signal, reason) => {
         this.onServerLost(server, code, signal, reason);
       },
     };
-  }
-
-  private onServerMessage(server: ServerState, raw: unknown): void {
-    const parsed = parseIpcMessage(raw);
-    if (!parsed.ok) {
-      this.logger.warn(
-        { pid: server.pid, reason: parsed.reason },
-        'ipc message rejected',
-      );
-      return;
-    }
-    const message = parsed.message;
-    switch (message.type) {
-      case 'prepared':
-        this.onPrepared(server, message.pid, message.codeVersion);
-        return;
-      case 'ready':
-        this.onReady(
-          server,
-          message.pid,
-          message.capabilities.maxTransactionDurationMs,
-          message.codeVersion,
-        );
-        return;
-      case 'result':
-        this.onResult(message);
-        return;
-      case 'closed':
-        this.onClosed(server, message.reason);
-        return;
-      case 'hello':
-      case 'request':
-      case 'cancel':
-      case 'shutdown':
-      case 'activate':
-        // Valid shape, wrong direction: a Server must not send these.
-        this.logger.warn(
-          { pid: server.pid, reason: `unexpected "${message.type}" message` },
-          'ipc message rejected',
-        );
-    }
-  }
-
-  private onClosed(server: ServerState, reason: string): void {
-    server.closedSignal.resolve();
-    if (server.retiring) {
-      // The previous process finished its graceful close; the switch waits on
-      // its own signal for this before it may activate the replacement
-      // (INV-002). A `close()` that took over may also be waiting, so wake it.
-      server.shutdownAcknowledged = true;
-      this.resolveClosed();
-      return;
-    }
-    if (this.slot.status === 'closing') {
-      server.shutdownAcknowledged = true;
-      this.resolveClosed();
-      return;
-    }
-    if (this.slot.switching?.staged === server) {
-      // A prepared process has no storage to close, so this is not a shutdown
-      // ack; the exit that follows is what the switch reacts to.
-      this.logger.warn(
-        { pid: server.pid, reason },
-        'replacement server closed before activation',
-      );
-      return;
-    }
-    // Unsolicited: the process exit that follows is what actually matters,
-    // and it arrives through `exited`/`onClose`. Not a shutdown ack, so
-    // close() must still be able to kill a process that stays alive.
-    this.logger.warn(
-      { pid: server.pid, reason },
-      'server closed without being asked',
-    );
-  }
-
-  /**
-   * The Server accepted the handshake and is waiting for activation (ADR-0007):
-   * it holds no storage yet, so the only thing that can happen now is opening
-   * it. Sending `activate` at once is the ordinary-start path; a `switchTo`
-   * owns its staged process instead and activates it only after the previous
-   * one has exited.
-   */
-  private onPrepared(
-    server: ServerState,
-    pid: number,
-    codeVersion: string | undefined,
-  ): void {
-    const op = this.slot.switching;
-    if (op?.staged === server) {
-      server.pid = pid;
-      server.reportedCodeVersion = codeVersion;
-      this.warnOnVersionMismatch(
-        pid,
-        op.targetCodeVersion ?? this.codeVersion,
-        codeVersion,
-        op,
-      );
-      op.prepared.seen = true;
-      op.prepared.resolve();
-      return;
-    }
-    if (this.slot.server !== server || server.closed) {
-      this.logger.debug(
-        { pid },
-        'prepared from a server generation already given up',
-      );
-      return;
-    }
-    if (server.ready) {
-      // Out of order: this generation already opened its storage.
-      this.logger.warn({ pid }, 'prepared received after ready; ignored');
-      return;
-    }
-    if (this.slot.isTerminal) {
-      // Nothing may open storage while the Portal is closing: there would be
-      // nowhere to drain it. The shutdown path kills this process.
-      this.logger.debug({ pid }, 'prepared ignored while closing');
-      return;
-    }
-    server.pid = pid;
-    server.reportedCodeVersion = codeVersion;
-    try {
-      server.channel.send({ type: 'activate' });
-    } catch (error) {
-      this.onServerLost(
-        server,
-        null,
-        null,
-        `activate failed: ${messageOf(error)}`,
-      );
-      return;
-    }
-    this.logger.debug({ pid }, 'server prepared; activating');
-  }
-
-  private onReady(
-    server: ServerState,
-    pid: number,
-    declaredMaxDurationMs: number,
-    actualCodeVersion: string | undefined,
-  ): void {
-    const op = this.slot.switching;
-    if (op?.staged === server) {
-      server.ready = true;
-      server.pid = pid;
-      server.declaredMaxDurationMs = declaredMaxDurationMs;
-      server.reportedCodeVersion = actualCodeVersion;
-      this.warnOnVersionMismatch(
-        pid,
-        op.targetCodeVersion ?? this.codeVersion,
-        actualCodeVersion,
-        op,
-      );
-      op.ready.seen = true;
-      op.ready.resolve();
-      return;
-    }
-    if (this.slot.server !== server || server.closed) {
-      this.logger.debug(
-        { pid },
-        'ready from a server generation already given up',
-      );
-      return;
-    }
-    if (server.ready) {
-      this.logger.debug({ pid }, 'duplicate ready ignored');
-      return;
-    }
-    server.ready = true;
-    server.pid = pid;
-    server.declaredMaxDurationMs = declaredMaxDurationMs;
-    server.reportedCodeVersion = actualCodeVersion;
-    // Reported, not enforced: a Server built from different code may still be
-    // the only process available, and refusing it would turn a deployment
-    // mismatch into an outage (SPEC 6.4). A deployment that declared no version
-    // says nothing, so silence is not a mismatch.
-    this.warnOnVersionMismatch(pid, this.codeVersion, actualCodeVersion);
-    if (this.slot.isTerminal) {
-      return;
-    }
-    this.slot.markReady(server);
-    // The crash streak ends only after a stable run, not at the handshake: a
-    // Server that reaches `ready` and then dies on its first request would
-    // otherwise reset the backoff and restart immediately, forever.
-    this.startStableTimer();
-    this.adoptCeiling(declaredMaxDurationMs);
-    this.logger.info(
-      { pid, effectiveTimeoutMs: this.effectiveTimeoutMs },
-      'server ready',
-    );
-    this.resolveStart();
-    this.pump();
-  }
-
-  /**
-   * Warns when a Server reports a code version other than the one expected
-   * (SPEC 6.4). A missing value on either side says nothing, so silence is not
-   * a mismatch. `op` records the warning so a switch does not log the same
-   * mismatch for both `prepared` and `ready`.
-   */
-  private warnOnVersionMismatch(
-    pid: number,
-    expected: string | undefined,
-    actual: string | undefined,
-    op?: SwitchOperation,
-  ): void {
-    if (expected === undefined || actual === undefined || actual === expected) {
-      return;
-    }
-    if (op !== undefined) {
-      if (op.versionWarned) {
-        return;
-      }
-      op.versionWarned = true;
-    }
-    this.logger.warn(
-      { pid, expectedCodeVersion: expected, actualCodeVersion: actual },
-      'server code version differs from the portal version',
-    );
   }
 
   /**
