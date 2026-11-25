@@ -87,7 +87,7 @@ export {
 } from './runtime/wire-codes.ts';
 export type { ConnectionLayerOptions } from './runtime/connection-layer.ts';
 export { ConnectionLayer } from './runtime/connection-layer.ts';
-export type { IpcExecutorOptions } from './runtime/ipc-executor.ts';
+export type { IpcExecutorOptions } from './runtime/ipc-executor-options.ts';
 export { IpcExecutor } from './runtime/ipc-executor.ts';
 export type { ServerExitInfo, SpawnedServer } from './ipc/spawn-port.ts';
 export type { ServerProcessOptions } from './runtime/server-process.ts';
