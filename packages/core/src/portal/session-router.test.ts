@@ -153,4 +153,63 @@ describe('SessionRouter ownership', () => {
     bind('c2', 's1');
     expect(router.sessionOf('c2')).toBe('s1');
   });
+
+  test('unbind removes the route and logs the session it ended', () => {
+    const { router, bind, logs } = harness();
+    bind('c1', 's1');
+
+    router.unbind('c1');
+
+    expect(router.sessionOf('c1')).toBeUndefined();
+    const unbound = logs().filter((entry) => entry.msg === 'session unbound');
+    expect(unbound).toHaveLength(1);
+    expect(unbound[0]).toMatchObject({
+      level: 'info',
+      sessionId: 's1',
+      connectionId: 'c1',
+    });
+  });
+
+  test('unbind is a no-op for a connection that holds nothing', () => {
+    const { router, logs } = harness();
+
+    // A repeated logout is not a failure.
+    expect(() => router.unbind('never-seen')).not.toThrow();
+    router.unbind('never-seen');
+
+    expect(
+      logs().filter((entry) => entry.msg === 'session unbound'),
+    ).toHaveLength(0);
+  });
+
+  test('unbind releases the route but keeps the unfinished session barrier', async () => {
+    const { router, bind } = harness();
+    bind('c1', 's1');
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let oldWorkDone = false;
+    const oldRun = router.run('c1', new AbortController().signal, async () => {
+      entered.resolve();
+      await release.promise;
+      oldWorkDone = true;
+    });
+    await entered.promise;
+
+    router.unbind('c1');
+    expect(router.sessionOf('c1')).toBeUndefined();
+    // A different connection takes the Session while the first request is
+    // still running: the terminal barrier must outlive the route (INV-004).
+    bind('c2', 's1');
+    let newStarted = false;
+    const newRun = router.run('c2', new AbortController().signal, async () => {
+      newStarted = true;
+    });
+    await Promise.resolve();
+    expect(newStarted).toBe(false);
+
+    release.resolve();
+    await Promise.all([oldRun, newRun]);
+    expect(oldWorkDone).toBe(true);
+    expect(newStarted).toBe(true);
+  });
 });

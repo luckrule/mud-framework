@@ -11,10 +11,14 @@ import { ConnectionLayer } from './connection-layer.ts';
 describe('ConnectionLayer request', () => {
   test('dispatches a request and replies with the handler result', async () => {
     const { transport, backend, dispatcher } = await harness();
-    dispatcher.register('echo', async (ctx, payload) => {
-      await ctx.storage.execute('INSERT 1', [payload]);
-      return payload;
-    });
+    dispatcher.register(
+      'echo',
+      async (ctx, payload) => {
+        await ctx.storage.execute('INSERT 1', [payload]);
+        return payload;
+      },
+      { access: 'public' },
+    );
     transport.connect('c1');
 
     await transport.receive('c1', '{"id":"r1","method":"echo","payload":"hi"}');
@@ -30,13 +34,17 @@ describe('ConnectionLayer request', () => {
   test('processes requests on one connection strictly in order', async () => {
     const { transport, dispatcher } = await harness();
     const log: string[] = [];
-    dispatcher.register('work', async (_ctx, payload) => {
-      const label = String(payload);
-      log.push(`${label}:start`);
-      await sleep(25);
-      log.push(`${label}:end`);
-      return label;
-    });
+    dispatcher.register(
+      'work',
+      async (_ctx, payload) => {
+        const label = String(payload);
+        log.push(`${label}:start`);
+        await sleep(25);
+        log.push(`${label}:end`);
+        return label;
+      },
+      { access: 'public' },
+    );
     transport.connect('c1');
 
     const first = transport.receive(
@@ -62,15 +70,19 @@ describe('ConnectionLayer request', () => {
     const { transport, dispatcher } = await harness({ timeoutMs: 2000 });
     const barrier = Promise.withResolvers<void>();
     let active = 0;
-    dispatcher.register('barrier', async () => {
-      active += 1;
-      if (active === 2) {
-        barrier.resolve();
-      }
-      // Deadlocks (then times out) if the layer serialized across connections.
-      await barrier.promise;
-      return active;
-    });
+    dispatcher.register(
+      'barrier',
+      async () => {
+        active += 1;
+        if (active === 2) {
+          barrier.resolve();
+        }
+        // Deadlocks (then times out) if the layer serialized across connections.
+        await barrier.promise;
+        return active;
+      },
+      { access: 'public' },
+    );
     transport.connect('c1');
     transport.connect('c2');
 
@@ -94,9 +106,13 @@ describe('ConnectionLayer request', () => {
 
   test('maps a handler failure to INTERNAL_ERROR', async () => {
     const { transport, dispatcher } = await harness();
-    dispatcher.register('explode', async () => {
-      throw new Error('business failure');
-    });
+    dispatcher.register(
+      'explode',
+      async () => {
+        throw new Error('business failure');
+      },
+      { access: 'public' },
+    );
     transport.connect('c1');
 
     await transport.receive('c1', '{"id":"r1","method":"explode"}');
@@ -209,6 +225,34 @@ describe('ConnectionLayer request', () => {
       'error message is not a string',
       { ok: false, error: { code: 'INTERNAL_ERROR', message: 7 } },
     ],
+    [
+      'sessionChange is not an object',
+      { ok: true, result: null, sessionChange: 'bind' },
+    ],
+    [
+      'sessionChange type is unknown',
+      { ok: true, result: null, sessionChange: { type: 'rebind' } },
+    ],
+    [
+      'bind change has no session id',
+      { ok: true, result: null, sessionChange: { type: 'bind' } },
+    ],
+    [
+      'bind change has an empty session id',
+      {
+        ok: true,
+        result: null,
+        sessionChange: { type: 'bind', sessionId: '' },
+      },
+    ],
+    [
+      'unbind change carries a session id',
+      {
+        ok: true,
+        result: null,
+        sessionChange: { type: 'unbind', sessionId: 's1' },
+      },
+    ],
   ];
 
   for (const [label, outcome] of malformedOutcomes) {
@@ -292,10 +336,14 @@ describe('ConnectionLayer request', () => {
 
   test('maps a timeout to FRAMEWORK_TIMEOUT', async () => {
     const { transport, dispatcher } = await harness({ timeoutMs: 15 });
-    dispatcher.register('slow', async () => {
-      await sleep(60);
-      return 'late';
-    });
+    dispatcher.register(
+      'slow',
+      async () => {
+        await sleep(60);
+        return 'late';
+      },
+      { access: 'public' },
+    );
     transport.connect('c1');
 
     await transport.receive('c1', '{"id":"r1","method":"slow"}');
@@ -309,18 +357,76 @@ describe('ConnectionLayer request', () => {
     await sleep(60);
   });
 
+  test('logs an access refusal at warn with its code and request id', async () => {
+    const { transport, dispatcher, logs } = await harness({
+      createRequestId: () => 'req-refused',
+    });
+    dispatcher.register('inspect', async () => null);
+    transport.connect('c1');
+
+    await transport.receive('c1', '{"id":"r1","method":"inspect"}');
+
+    expect(lastFrame(transport, 'c1')).toMatchObject({
+      id: 'r1',
+      ok: false,
+      error: { code: 'AUTH_REQUIRED' },
+    });
+    const refused = logs().filter(
+      (entry) =>
+        entry.msg === 'request failed' && entry.code === 'AUTH_REQUIRED',
+    );
+    expect(refused).toHaveLength(1);
+    expect(refused[0]).toMatchObject({
+      level: 'warn',
+      requestId: 'req-refused',
+      method: 'inspect',
+      code: 'AUTH_REQUIRED',
+    });
+  });
+
+  test('logs a policy refusal at warn with its code and request id', async () => {
+    const { transport, dispatcher, logs } = await harness({
+      createRequestId: () => 'req-forbidden',
+      authorize: () => false,
+    });
+    dispatcher.register('inspect', async () => null, { access: 'public' });
+    transport.connect('c1');
+
+    await transport.receive('c1', '{"id":"r1","method":"inspect"}');
+
+    expect(lastFrame(transport, 'c1')).toMatchObject({
+      id: 'r1',
+      ok: false,
+      error: { code: 'FORBIDDEN' },
+    });
+    const refused = logs().filter(
+      (entry) => entry.msg === 'request failed' && entry.code === 'FORBIDDEN',
+    );
+    expect(refused).toHaveLength(1);
+    expect(refused[0]).toMatchObject({
+      level: 'warn',
+      requestId: 'req-forbidden',
+      method: 'inspect',
+      code: 'FORBIDDEN',
+    });
+  });
+
   test('gives the handler the connection and client request ids', async () => {
     const { transport, dispatcher } = await harness();
     let seen: Record<string, unknown> = {};
-    dispatcher.register('inspect', async (ctx) => {
-      seen = {
-        requestId: ctx.requestId,
-        connectionId: ctx.connectionId,
-        clientRequestId: ctx.clientRequestId,
-        sessionId: ctx.sessionId,
-      };
-      return null;
-    });
+    dispatcher.register(
+      'inspect',
+      async (ctx) => {
+        seen = {
+          requestId: ctx.requestId,
+          connectionId: ctx.connectionId,
+          clientRequestId: ctx.clientRequestId,
+          sessionId: ctx.sessionId,
+        };
+        return null;
+      },
+      { access: 'public' },
+    );
     transport.connect('c1');
 
     await transport.receive('c1', '{"id":"client-7","method":"inspect"}');
@@ -346,9 +452,13 @@ describe('ConnectionLayer request', () => {
         return `req-${counter}`;
       },
     });
-    dispatcher.register('explode', async () => {
-      throw new Error('boom');
-    });
+    dispatcher.register(
+      'explode',
+      async () => {
+        throw new Error('boom');
+      },
+      { access: 'public' },
+    );
     transport.connect('c1');
 
     await transport.receive('c1', '{"id":"client-1","method":"explode"}');

@@ -48,11 +48,11 @@ Handler 可以 await，框架的调度建立在 Promise 之上。
 
 **Session（会话）** — 玩家的一次逻辑在线期，由 Session ID 标识，可跨越多个 Connection（断线重连）。Session 是路由与状态归属的单位。
 
-连接层保存 `sessionId → connectionId` 活跃路由，路由表是 Connection 当前绑定身份的唯一来源。绑定由业务通过 `RequestContext.bindSession` 声明，只在请求成功时生效；框架要求非空 id，但不判断其业务合法性。一个 Connection 同时只持有一个 Session；新 Connection 接管同一 Session 后，旧 Connection 保持连接但不再持有该 Session，只有再次显式绑定才会重新获得身份。连接断开时清除其路由，但不得因此丢弃该 Session 尚未结束的请求屏障（见 3.2）。边界：框架不持有 Session 的业务状态，其保留窗口与结束规则归业务进程。
+连接层保存 `sessionId → connectionId` 活跃路由，路由表是 Connection 当前绑定身份的唯一来源。绑定与解绑由业务通过 `RequestContext.bindSession` / `RequestContext.unbindSession` 声明，只在请求成功时生效；框架要求非空 id，但不判断其业务合法性。一个 Connection 同时只持有一个 Session；新 Connection 接管同一 Session 后，旧 Connection 保持连接但不再持有该 Session，只有再次显式绑定才会重新获得身份。连接断开时清除其路由，但不得因此丢弃该 Session 尚未结束的请求屏障（见 3.2）。边界：框架不持有 Session 的业务状态，其保留窗口与结束规则归业务进程。
 
 **Transport（传输）** — 传输实现的接口：接受连接、交付入站数据、写出发站数据、关闭。它只负责字节流与传输帧的编解码（交付入站数据、写出发站数据的一部分），不含 Envelope 编解码、Session 路由与输入缓冲；Envelope 与客户端线格式见 §5.4，其余职责属于连接层进程。框架核心不依赖任何具体 Transport。
 
-**Handler（处理器）** — 处理单个 Request 的业务函数，可以是 async。输入是已解码的请求与请求上下文；正常返回即表示该请求成功。
+**Handler（处理器）** — 处理单个 Request 的业务函数，可以是 async。输入是已解码的请求与请求上下文；正常返回即表示该请求成功。注册时声明 `access`（默认 `'session'`，即要求请求携带 Session；`'public'` 不要求）与 `mayChangeSession`（默认 false，只有声明 true 的 Handler 可以调用 `bindSession` / `unbindSession`）。
 
 **Extension（扩展）** — 业务能力的打包单元，向框架注册 Handler 并声明自己依赖的存储能力。框架核心不含任何游戏规则。
 
@@ -71,6 +71,8 @@ Handler 可以 await，框架的调度建立在 Promise 之上。
 **Input Queue（输入队列）** — 每个 Connection 上的有界请求队列，保证同连接内请求有序。见 3.5。
 
 **Request Context（请求上下文）** — 随 Request 传入 Handler 的框架侧上下文，携带 Session ID、Connection ID、请求标识、事务句柄、中止信号、日志器与 Extension 名。Handler 的存储调用与日志调用 SHOULD 经由它，框架据此统一归属日志、统一判定事务是否仍有效。
+
+`bindSession` 与 `unbindSession` 只在上下文中记录变更，一个请求至多一次；变更仅在请求成功且未超时时交给调用方，由连接层在结果返回后应用。失败、超时或取消的请求不返回变更，因此失败的登录不会留下半建成的路由，失败的登出也不会移除已有路由。
 
 中止信号是标准 `AbortSignal`，超时、取消或断线时 abort，`reason` 说明触发原因；正常成功不会触发异常中止。它是通知而非抢占：handler 可把它传给接受信号的操作以提前停下。事务句柄在请求的任一终态后均失效，不依赖 handler 是否响应信号；这不撤销已经开始的 COMMIT 或框架外副作用（见 3.3、3.4）。
 
@@ -155,6 +157,17 @@ Connection 在 Request 处理中关闭时，该 Request MUST 进入终态，不�
 
 断线不等于 Session 结束。Session 状态在业务进程侧保留一段时间（由配置决定），期间重连可恢复；超时未重连则按业务规则结束。
 
+### 3.7 访问检查
+
+Handler 的访问检查在业务进程内、Dispatcher 上执行，顺序是契约：
+
+1. 未注册的 method 以 `UNKNOWN_METHOD` 结束，不因请求缺少 Session 改成 `AUTH_REQUIRED`。
+2. Handler 默认 `access: 'session'`；请求的入口 Session 缺失或为空时，以 `AUTH_REQUIRED` 拒绝并记录 warn（`code`、`method`）。`'public'` 跳过这一步。
+3. 若消费方注入了 `authorize(ctx, method, payload)`，对所有已注册 Handler（包括 public）调用；返回 false 以 `FORBIDDEN` 拒绝并记录 warn，抛出的异常按框架内部失败处理（`INTERNAL_ERROR`）。策略只读取请求身份、`AbortSignal` 与日志器，不获得存储或 Session 变更能力，且在请求 deadline 内完成。
+4. 打开存储事务并执行 Handler。
+
+拒绝 MUST NOT 打开存储事务、执行 Handler 或改变 Session 路由。Handler 未声明 `mayChangeSession: true` 却调用 `bindSession`/`unbindSession` 时，校验抛出普通错误；handler 未捕获时请求以 `INTERNAL_ERROR` 失败；handler 捕获后请求可以成功，但不会记录任何 Session 变更——吞掉该错误不构成合法用法。检查点与拒绝语义属于框架；认证与授权策略、登录流程属于消费方，由消费方注入或实现为 public Handler。
+
 ## 4. 存储契约
 
 ### 4.1 接口边界
@@ -236,7 +249,9 @@ Extension 对存储能力的依赖 MUST 显式声明。启动时若后端能力�
 
 ### 5.2 传输职责边界
 
-Transport 只负责四件事：接受连接、交付入站数据、写出发站数据、关闭。MUST NOT 承担：Session 路由、输入缓冲、重放、鉴权策略、TLS 终止——这些职责属于连接层进程（见 6.1）。理由：这些职责依赖 Session 与 Request 语义，属于框架契约；下沉到传输会让每个传输实现各自重写一遍，且无法保证跨传输一致。
+Transport 只负责四件事：接受连接、交付入站数据、写出发站数据、关闭。MUST NOT 承担：Session 路由、输入缓冲、重放、访问检查、TLS 终止。理由：这些职责依赖 Session 与 Request 语义，属于框架契约；下沉到传输会让每个传输实现各自重写一遍，且无法保证跨传输一致。
+
+职责拆分：Session 路由、输入缓冲与重放在连接层进程（见 6.1）；访问检查点与拒绝语义（`AUTH_REQUIRED` / `FORBIDDEN`、检查顺序）在 core 的 Dispatcher 内，随 Handler 在业务进程执行（见 3.7）；认证与授权策略、登录流程属于消费方，由消费方注入 `authorize` 或在 Extension 中实现；TLS 终止在部署层或具体传输实现，core 不承担。
 
 ### 5.3 独立维护边界
 
@@ -320,7 +335,7 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 
 ### 7.1 结构化日志
 
-框架日志 MUST 是结构化的（字段而非拼接字符串）。字段名是契约，文案与日志行的产出顺序不是契约。每个 Request 的日志 SHOULD 至少携带：请求标识、Session ID、Connection ID、Extension 名、耗时、结果、错误码。日志级别按语义使用：告警级用于能力降级、重放、队列拒绝这类"能继续运行但需要人知道"的事件；错误级用于请求失败；不得用错误级记录预期内的业务拒绝。
+框架日志 MUST 是结构化的（字段而非拼接字符串）。字段名是契约，文案与日志行的产出顺序不是契约。每个 Request 的日志 SHOULD 至少携带：请求标识、Session ID、Connection ID、Extension 名、耗时、结果、错误码。日志级别按语义使用：告警级用于能力降级、重放、队列拒绝这类"能继续运行但需要人知道"的事件；错误级用于请求失败；不得用错误级记录预期内的业务拒绝，包括 `AUTH_REQUIRED` 与 `FORBIDDEN`（见 3.7、7.2）。
 
 注入的日志实现抛错 MUST NOT 改变框架控制流。日志实现失败时框架不保证 `child()` 的绑定字段（bindings）完整：`safeLogger` 的 `child` 抛错会回退到父包装。
 
@@ -328,7 +343,9 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 
 边界：`extension` 字段只有 Server 侧在 handler 注册元数据可知时填充。Portal 不持有 handler 注册信息，其请求级日志（例如拒绝、队列满、超时、取消、重放）无法获知 Extension，不能按该字段过滤 Portal 日志；这些日志与 Server 侧日志依靠请求标识与 Connection ID 关联。
 
-边界：请求结算之后产生的日志（如 `late result discarded`）依靠结果消息恢复 Session ID。结果消息回显请求进入框架时的入口 Session ID（`requestSessionId`，成功与失败结果都携带；入口无 Session 时不带），迟到结果用它填 `sessionId`；结果消息的 `sessionId` 仍只表示 handler 在本次请求内新绑定的 Session。结果未带 `requestSessionId` 时，已结算的日志退回用稳定的请求标识（§7.3）与同一请求的其它日志行关联。
+边界：请求结算之后产生的日志（如 `late result discarded`）依靠结果消息恢复 Session ID。结果消息回显请求进入框架时的入口 Session ID（`requestSessionId`，成功与失败结果都携带；入口无 Session 时不带），迟到结果用它填 `sessionId`；结果消息的 `sessionChange` 仍只表示 handler 在本次请求内声明的 Session 变更（bind 携带新 Session，unbind 表示解绑）。结果未带 `requestSessionId` 时，已结算的日志退回用稳定的请求标识（§7.3）与同一请求的其它日志行关联。
+
+结果/完成类日志（`request completed`、`result received`、失败日志）的 `sessionId` 表示请求入口 Session（与 `RequestIdentity` 同义），不会因 Handler 绑定而被改写；入口无 Session 时不写。成功请求声明了 Session 变更时写 `sessionChange`，值为 `SessionChange` 对象（`{type:'bind',sessionId}` 或 `{type:'unbind'}`）；没有变更不写。字段名与语义都是契约。路由事件行（`session bound`、`session rebound to a new connection`、`session binding refused: session table is full`）的 `sessionId` 表示本次被建立、接管或拒绝的路由 id，与请求入口 Session 无关。
 
 ### 7.2 错误码
 
@@ -338,19 +355,23 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 
 **wire 码** 随 `error.code` 发给客户端（`ok: false` 时），属于对外契约，MUST 稳定可枚举：
 
-| 码                                 | 含义                                       |
-| ---------------------------------- | ------------------------------------------ |
-| `FRAMEWORK_TIMEOUT`                | 请求超时                                   |
-| `FRAMEWORK_QUEUE_FULL`             | 输入队列拒绝（见 3.5）                     |
-| `FRAMEWORK_SHUTDOWN`               | 因关闭未取得成功确认，不保证未执行或未提交 |
-| `FRAMEWORK_REPLAY_EXHAUSTED`       | 重放次数用尽，请求进入终态（见 6.5）       |
-| `FRAMEWORK_CAPABILITY_UNSUPPORTED` | 存储能力不满足 Extension 声明（见 4.3）    |
-| `TRANSPORT_CLOSED`                 | 传输在请求完成前关闭                       |
-| `TRANSPORT_SEND_FAILED`            | 结果无法写回传输                           |
-| `STORAGE_UNAVAILABLE`              | 存储后端不可达                             |
-| `INVALID_ENVELOPE`                 | 入站帧无法解码                             |
-| `UNKNOWN_METHOD`                   | 没有该方法的 Handler                       |
-| `INTERNAL_ERROR`                   | 框架内部失败，含未声明的业务错误           |
+| 码                                 | 含义                                         |
+| ---------------------------------- | -------------------------------------------- |
+| `FRAMEWORK_TIMEOUT`                | 请求超时                                     |
+| `FRAMEWORK_QUEUE_FULL`             | 输入队列拒绝（见 3.5）                       |
+| `FRAMEWORK_SHUTDOWN`               | 因关闭未取得成功确认，不保证未执行或未提交   |
+| `FRAMEWORK_REPLAY_EXHAUSTED`       | 重放次数用尽，请求进入终态（见 6.5）         |
+| `FRAMEWORK_CAPABILITY_UNSUPPORTED` | 存储能力不满足 Extension 声明（见 4.3）      |
+| `TRANSPORT_CLOSED`                 | 传输在请求完成前关闭                         |
+| `TRANSPORT_SEND_FAILED`            | 结果无法写回传输                             |
+| `STORAGE_UNAVAILABLE`              | 存储后端不可达                               |
+| `INVALID_ENVELOPE`                 | 入站帧无法解码                               |
+| `UNKNOWN_METHOD`                   | 没有该方法的 Handler                         |
+| `INTERNAL_ERROR`                   | 框架内部失败，含未声明的业务错误             |
+| `AUTH_REQUIRED`                    | Handler 要求 Session，但请求未携带（见 3.7） |
+| `FORBIDDEN`                        | 注入的访问策略拒绝了请求（见 3.7）           |
+
+`AUTH_REQUIRED` 与 `FORBIDDEN` 是预期内的拒绝，不是框架失败：它们发生在存储事务与 Handler 之前，日志级别为 warn（见 7.1），MUST NOT 按错误级记录。它们在业务进程的访问检查点产生，证明本次请求没有打开事务、执行 Handler 或改变 Session 路由。
 
 `FRAMEWORK_SHUTDOWN` 必须区分发生阶段：关闭时拒绝的新输入，以及仍在 Session 屏障前、尚未调用 executor 就被关闭结算的请求，确定没有被调度执行；可能已投递给 Server 却未取得成功确认的请求，则可能已经执行或提交。此码本身不携带阶段信息，MUST NOT 仅凭它判断可无幂等保护地重试；恢复与重试仍须遵守 6.4 的业务幂等边界。
 

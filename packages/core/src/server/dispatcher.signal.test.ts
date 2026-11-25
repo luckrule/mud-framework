@@ -11,11 +11,15 @@ describe('Dispatcher.abortSignal', () => {
     const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });
     let seen: unknown;
     let aborted: boolean | undefined;
-    dispatcher.register('inspect', async (ctx) => {
-      seen = ctx.signal;
-      aborted = ctx.signal.aborted;
-      return null;
-    });
+    dispatcher.register(
+      'inspect',
+      async (ctx) => {
+        seen = ctx.signal;
+        aborted = ctx.signal.aborted;
+        return null;
+      },
+      { access: 'public' },
+    );
 
     await dispatcher.dispatch('inspect', null);
 
@@ -30,13 +34,17 @@ describe('Dispatcher.abortSignal', () => {
     let reason: unknown;
     const handlerDone = deferred<void>();
 
-    dispatcher.register('slow', async (ctx) => {
-      await sleep(40);
-      aborted = ctx.signal.aborted;
-      reason = ctx.signal.reason;
-      handlerDone.resolve();
-      return 'late';
-    });
+    dispatcher.register(
+      'slow',
+      async (ctx) => {
+        await sleep(40);
+        aborted = ctx.signal.aborted;
+        reason = ctx.signal.reason;
+        handlerDone.resolve();
+        return 'late';
+      },
+      { access: 'public' },
+    );
 
     const error = await rejectionOf(dispatcher.dispatch('slow', null));
     await handlerDone.promise;
@@ -54,13 +62,17 @@ describe('Dispatcher.abortSignal', () => {
     let aborted = false;
     let reason: unknown;
 
-    dispatcher.register('slow', async (ctx) => {
-      entered.resolve();
-      await release.promise;
-      aborted = ctx.signal.aborted;
-      reason = ctx.signal.reason;
-      return 'late';
-    });
+    dispatcher.register(
+      'slow',
+      async (ctx) => {
+        entered.resolve();
+        await release.promise;
+        aborted = ctx.signal.aborted;
+        reason = ctx.signal.reason;
+        return 'late';
+      },
+      { access: 'public' },
+    );
 
     const pending = dispatcher.dispatch('slow', null, { requestId: 'r1' });
     await entered.promise;
@@ -79,19 +91,23 @@ describe('Dispatcher.abortSignal', () => {
     const woke = deferred<string>();
     const entered = deferred<void>();
 
-    dispatcher.register('wait-for-abort', async (ctx) => {
-      entered.resolve();
-      // The point of the signal: a cooperative handler stops as soon as the
-      // request goes terminal. Without the abort this promise never settles,
-      // because nothing else in the handler would resolve it.
-      const reason = await new Promise<unknown>((resolve) => {
-        ctx.signal.addEventListener('abort', () => {
-          resolve(ctx.signal.reason);
+    dispatcher.register(
+      'wait-for-abort',
+      async (ctx) => {
+        entered.resolve();
+        // The point of the signal: a cooperative handler stops as soon as the
+        // request goes terminal. Without the abort this promise never settles,
+        // because nothing else in the handler would resolve it.
+        const reason = await new Promise<unknown>((resolve) => {
+          ctx.signal.addEventListener('abort', () => {
+            resolve(ctx.signal.reason);
+          });
         });
-      });
-      woke.resolve(String(reason));
-      return 'woke';
-    });
+        woke.resolve(String(reason));
+        return 'woke';
+      },
+      { access: 'public' },
+    );
 
     const error = await rejectionOf(
       dispatcher.dispatch('wait-for-abort', null),
@@ -108,11 +124,15 @@ describe('Dispatcher.abortSignal', () => {
     let signal: AbortSignal | undefined;
     let abortedInside: boolean | undefined;
 
-    dispatcher.register('inspect', async (ctx) => {
-      signal = ctx.signal;
-      abortedInside = ctx.signal.aborted;
-      return null;
-    });
+    dispatcher.register(
+      'inspect',
+      async (ctx) => {
+        signal = ctx.signal;
+        abortedInside = ctx.signal.aborted;
+        return null;
+      },
+      { access: 'public' },
+    );
 
     await dispatcher.dispatch('inspect', null);
 

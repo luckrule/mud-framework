@@ -49,7 +49,7 @@ describe('IpcExecutor timeout', () => {
       requestSessionId: 's1',
       ok: true,
       result: 'too late',
-      sessionId: 's-late',
+      sessionChange: { type: 'bind', sessionId: 's-late' },
     });
     await flushTicks();
     expect(h.logs().some((line) => line.msg === 'late result discarded')).toBe(

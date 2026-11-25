@@ -74,6 +74,21 @@ export class SessionRouter {
   }
 
   /**
+   * Applies an unbind declared by a successful request. Idempotent: a
+   * connection that holds nothing is already unbound, so a repeated unbind is
+   * a no-op rather than a failure. The Session's unfinished work is untouched —
+   * the terminal barrier does not follow the route (INV-004, SPEC 3.2).
+   */
+  unbind(connectionId: string, logger: Logger = this.logger): void {
+    const sessionId = this.heldBy.get(connectionId);
+    if (sessionId === undefined) {
+      return;
+    }
+    this.release(connectionId);
+    logger.info({ sessionId, connectionId }, 'session unbound');
+  }
+
+  /**
    * Recheck ownership after every wait: a displaced waiter must not execute as
    * its former Session. Only framework completion, including the reply, removes
    * work from the barrier; disconnecting a route cannot make it terminal.

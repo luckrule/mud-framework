@@ -24,8 +24,10 @@ describe('runServerProcess extension capabilities', () => {
           name: 'banking',
           requires: { transactions: 'full' },
           register: (dispatcher) => {
-            dispatcher.register('deposit', (_ctx, payload) =>
-              Promise.resolve({ deposited: payload }),
+            dispatcher.register(
+              'deposit',
+              (_ctx, payload) => Promise.resolve({ deposited: payload }),
+              { access: 'public' },
             );
           },
         },
@@ -68,7 +70,9 @@ describe('runServerProcess extension capabilities', () => {
           name: 'banking',
           requires: { transactions: 'full' },
           register: (dispatcher) => {
-            dispatcher.register('deposit', () => Promise.resolve('deposited'));
+            dispatcher.register('deposit', () => Promise.resolve('deposited'), {
+              access: 'public',
+            });
           },
         },
       ],
@@ -112,7 +116,9 @@ describe('runServerProcess extension capabilities', () => {
           name: 'banking',
           requires: { transactions: 'full' },
           register: (dispatcher) => {
-            dispatcher.register('deposit', () => Promise.resolve('deposited'));
+            dispatcher.register('deposit', () => Promise.resolve('deposited'), {
+              access: 'public',
+            });
           },
         },
         {
@@ -144,7 +150,9 @@ describe('runServerProcess extension capabilities', () => {
           requires: { transactions: 'full' },
           required: true,
           register: (dispatcher) => {
-            dispatcher.register('deposit', () => Promise.resolve('deposited'));
+            dispatcher.register('deposit', () => Promise.resolve('deposited'), {
+              access: 'public',
+            });
           },
         },
       ],

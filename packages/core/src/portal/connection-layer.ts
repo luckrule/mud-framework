@@ -5,7 +5,11 @@ import type { Codec, Envelope, ResponseEnvelope } from '../client/codec.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import { safeLogger } from '../logging/safe-logger.ts';
 import type { Logger } from '../logging/types.ts';
-import type { ExecutorOutcome, RequestExecutor } from '../shared/executor.ts';
+import type {
+  ExecutorOutcome,
+  RequestExecutor,
+  SessionChange,
+} from '../shared/executor.ts';
 import { isRecord, messageOf } from '../shared/guards.ts';
 import { settleWithin } from '../shared/timeout.ts';
 import {
@@ -602,7 +606,7 @@ export class ConnectionLayer implements TransportHandlers {
       state.inFlight.delete(requestId);
     }
     if (outcome.ok) {
-      // SPEC 2: the binding a handler declared takes effect only when the
+      // SPEC 2: a Session change a handler declared takes effect only when the
       // request succeeded, so a failed login leaves no route behind. Applied
       // before the reply so a reconnect sees the new holder as soon as the
       // client can, and so the reply itself is part of the chain a later
@@ -611,11 +615,19 @@ export class ConnectionLayer implements TransportHandlers {
       // Skipped once the connection is gone: `onDisconnect` already removed its
       // route, and re-adding one here would route a future reconnect to a
       // connection id that no longer exists.
+      const change = outcome.sessionChange;
       if (
-        outcome.sessionId !== undefined &&
+        change !== undefined &&
         this.connections.get(connection.id) === state
       ) {
-        this.router.bind(connection.id, outcome.sessionId, terminal, logger);
+        if (change.type === 'bind') {
+          this.router.bind(connection.id, change.sessionId, terminal, logger);
+        } else {
+          // Deliberately behind the same success check: a failed unbind keeps
+          // the existing route. `unbind` leaves the Session's unfinished
+          // barrier in place (INV-004).
+          this.router.unbind(connection.id, logger);
+        }
       }
       await this.reply(
         connection,
@@ -748,7 +760,9 @@ function isExecutorOutcome(value: unknown): value is ExecutorOutcome {
     return false;
   }
   if (value.ok === true) {
-    return true;
+    return (
+      value.sessionChange === undefined || isSessionChange(value.sessionChange)
+    );
   }
   if (value.ok !== false) {
     return false;
@@ -760,6 +774,24 @@ function isExecutorOutcome(value: unknown): value is ExecutorOutcome {
     error.code.length > 0 &&
     typeof error.message === 'string'
   );
+}
+
+/**
+ * The same strictness as the IPC parser: a malformed change must not reach the
+ * router, where a bad id or an unknown type would silently misroute a later
+ * request (SPEC 3.7).
+ */
+function isSessionChange(value: unknown): value is SessionChange {
+  if (!isRecord(value)) {
+    return false;
+  }
+  if (value.type === 'bind') {
+    return typeof value.sessionId === 'string' && value.sessionId.length > 0;
+  }
+  if (value.type === 'unbind') {
+    return value.sessionId === undefined;
+  }
+  return false;
 }
 
 function toFailure(error: unknown): ExecutorOutcome {

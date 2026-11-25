@@ -2,7 +2,6 @@ import { describe, expect, test } from 'bun:test';
 
 import {
   FakeServerProcess,
-  boundSuccessMessage,
   failureOf,
   flushTicks,
   harness,
@@ -73,18 +72,23 @@ describe('IpcExecutor result', () => {
     await h.executor.close();
   });
 
-  test('carries the session id a result reports into the outcome', async () => {
+  test('carries the session change a result reports into the outcome', async () => {
     const h = harness();
     const server = await started(h);
 
     const outcomePromise = h.executor.execute(request({ requestId: 'req-1' }));
-    server.send(boundSuccessMessage('req-1', 'welcome', 'session-1'));
+    server.send(
+      successMessage('req-1', 'welcome', {
+        type: 'bind',
+        sessionId: 'session-1',
+      }),
+    );
 
     const outcome = await outcomePromise;
     expect(outcome).toEqual({
       ok: true,
       result: 'welcome',
-      sessionId: 'session-1',
+      sessionChange: { type: 'bind', sessionId: 'session-1' },
     });
     // The outcome is the message minus its envelope: a leaked `type` or
     // `requestId` would mean the split is wrong, and the connection layer would
@@ -92,7 +96,37 @@ describe('IpcExecutor result', () => {
     expect(outcome).not.toHaveProperty('type');
     expect(outcome).not.toHaveProperty('requestId');
     const received = h.logs().find((line) => line.msg === 'result received');
-    expect(received).toMatchObject({ sessionId: 'session-1' });
+    // No entry Session: the log names no `sessionId`, and the binding is
+    // carried by `sessionChange`.
+    expect(received).not.toHaveProperty('sessionId');
+    expect(received).toMatchObject({
+      sessionChange: { type: 'bind', sessionId: 'session-1' },
+    });
+    await h.executor.close();
+  });
+
+  test('carries an unbind change a result reports into the outcome', async () => {
+    const h = harness();
+    const server = await started(h);
+
+    const outcomePromise = h.executor.execute(
+      request({ requestId: 'req-1', sessionId: 'entry-1' }),
+    );
+    server.send(successMessage('req-1', 'bye', { type: 'unbind' }));
+
+    const outcome = await outcomePromise;
+    expect(outcome).toEqual({
+      ok: true,
+      result: 'bye',
+      sessionChange: { type: 'unbind' },
+    });
+    expect(outcome).not.toHaveProperty('type');
+    expect(outcome).not.toHaveProperty('requestId');
+    const received = h.logs().find((line) => line.msg === 'result received');
+    expect(received).toMatchObject({
+      sessionId: 'entry-1',
+      sessionChange: { type: 'unbind' },
+    });
     await h.executor.close();
   });
 
@@ -113,6 +147,7 @@ describe('IpcExecutor result', () => {
     await outcomePromise;
     const received = h.logs().find((line) => line.msg === 'result received');
     expect(received).toMatchObject({ sessionId: 's-existing' });
+    expect(received).not.toHaveProperty('sessionChange');
     await h.executor.close();
   });
 
@@ -126,6 +161,7 @@ describe('IpcExecutor result', () => {
     expect(await outcomePromise).toEqual({ ok: true, result: 'ok' });
     const received = h.logs().find((line) => line.msg === 'result received');
     expect(received).not.toHaveProperty('sessionId');
+    expect(received).not.toHaveProperty('sessionChange');
     await h.executor.close();
   });
 
@@ -165,7 +201,7 @@ describe('IpcExecutor result', () => {
       requestSessionId: 'entry-1',
       ok: true,
       result: 'late',
-      sessionId: 'bound-1',
+      sessionChange: { type: 'bind', sessionId: 'bound-1' },
     });
     await flushTicks();
 
@@ -231,7 +267,7 @@ describe('IpcExecutor result', () => {
     await h.executor.close();
   });
 
-  test('lets a newly bound session override the request echo on result received', async () => {
+  test('keeps the entry session and reports the binding as a session change on result received', async () => {
     const h = harness();
     const server = await started(h);
 
@@ -244,12 +280,17 @@ describe('IpcExecutor result', () => {
       requestSessionId: 'entry-1',
       ok: true,
       result: 'welcome',
-      sessionId: 'bound-1',
+      sessionChange: { type: 'bind', sessionId: 'bound-1' },
     });
 
     await outcomePromise;
     const received = h.logs().find((line) => line.msg === 'result received');
-    expect(received).toMatchObject({ sessionId: 'bound-1' });
+    // The entry Session stays the request's identity; the new binding is the
+    // change, not a replacement for `sessionId`.
+    expect(received).toMatchObject({
+      sessionId: 'entry-1',
+      sessionChange: { type: 'bind', sessionId: 'bound-1' },
+    });
     await h.executor.close();
   });
 
@@ -264,13 +305,13 @@ describe('IpcExecutor result', () => {
       requestSessionId: 'entry-1',
       ok: true,
       result: 'welcome',
-      sessionId: 'bound-1',
+      sessionChange: { type: 'bind', sessionId: 'bound-1' },
     });
     const firstOutcome = await first;
     expect(firstOutcome).toEqual({
       ok: true,
       result: 'welcome',
-      sessionId: 'bound-1',
+      sessionChange: { type: 'bind', sessionId: 'bound-1' },
     });
     expect(firstOutcome).not.toHaveProperty('requestSessionId');
 

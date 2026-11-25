@@ -52,7 +52,7 @@ ADR-0002 决定了拆成两个进程，但没定两件事：两个进程之间�
 
 ### 结果消息的两个 Session 字段
 
-`result` 上 `sessionId` 与 `requestSessionId` 语义不同：前者是 handler 在本次请求内新绑定的 Session，只有成功结果可能有；后者回显请求进入框架时已带的入口 Session，成功与失败结果都带，入口无 Session 时不带。加回显的原因是结果可能晚于 Portal 的结算（超时、取消、重放耗尽）：那时未确认缓冲里的条目已删除，Portal 只能从结果消息恢复 Session，而只带 `sessionId` 的形状覆盖不到失败结果与"入口已有 Session 但未新绑定"的迟到结果。`requestSessionId` 只属于线格式，不进入 `ExecutorOutcome` 或结算结果。`sessionId` 的语义不变。
+`result` 上 `sessionChange` 与 `requestSessionId` 语义不同：`sessionChange` 只在成功结果上出现，记录 handler 在本次请求内声明的路由变更，取值为 `{type:'bind',sessionId}` 或 `{type:'unbind'}`，没有变更时缺失；`requestSessionId` 回显请求进入框架时已带的入口 Session，成功与失败结果都带，入口无 Session 时不带。加回显的原因是结果可能晚于 Portal 的结算（超时、取消、重放耗尽）：那时未确认缓冲里的条目已删除，Portal 只能从结果消息恢复 Session，而只带 `sessionChange` 的形状覆盖不到失败结果与"入口已有 Session 但未新绑定"的迟到结果。`requestSessionId` 只属于线格式，不进入 `ExecutorOutcome` 或结算结果。wire 上不再有 `result.sessionId`：入口归属只由 `requestSessionId` 表达，本次变更只由 `sessionChange` 表达。
 
 ### 代码版本回显
 

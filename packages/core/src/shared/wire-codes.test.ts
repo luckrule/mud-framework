@@ -3,7 +3,11 @@ import { readFileSync } from 'node:fs';
 
 import * as wireCodes from './wire-codes.ts';
 import {
+  AUTH_REQUIRED,
+  AuthenticationRequiredError,
   BusinessError,
+  FORBIDDEN,
+  ForbiddenError,
   FrameworkTimeoutError,
   INTERNAL_ERROR,
   RequestCancelledError,
@@ -77,9 +81,21 @@ describe('isFrameworkCode', () => {
 });
 
 describe('failureLogLevel', () => {
-  test('logs framework codes at error', () => {
+  test('logs framework failures at error', () => {
     for (const code of codeValues) {
+      if (code === AUTH_REQUIRED || code === FORBIDDEN) {
+        continue;
+      }
       expect(failureLogLevel({ code })).toBe('error');
+    }
+  });
+
+  test('logs the expected access refusals at warn', () => {
+    // They are framework codes, but a refusal is an expected outcome and must
+    // not page anyone (SPEC 7.1, 7.2).
+    for (const code of [AUTH_REQUIRED, FORBIDDEN]) {
+      expect(isFrameworkCode(code)).toBe(true);
+      expect(failureLogLevel({ code })).toBe('warn');
     }
   });
 
@@ -91,6 +107,24 @@ describe('failureLogLevel', () => {
 });
 
 describe('describeFailure', () => {
+  test('passes an AuthenticationRequiredError code through', () => {
+    const error = new AuthenticationRequiredError('look');
+
+    expect(describeFailure(error)).toEqual({
+      code: AUTH_REQUIRED,
+      message: error.message,
+    });
+  });
+
+  test('passes a ForbiddenError code through', () => {
+    const error = new ForbiddenError('look');
+
+    expect(describeFailure(error)).toEqual({
+      code: FORBIDDEN,
+      message: error.message,
+    });
+  });
+
   test('passes a FrameworkTimeoutError code through', () => {
     const error = new FrameworkTimeoutError('req-1', 15);
 

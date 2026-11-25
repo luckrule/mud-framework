@@ -111,13 +111,18 @@ describe('runServerProcess lifecycle', () => {
         {
           name: 'failures',
           register: (dispatcher) => {
-            dispatcher.register('denied', () =>
-              Promise.reject(
-                new BusinessError('PLAYER_NOT_FOUND', 'no such player'),
-              ),
+            dispatcher.register(
+              'denied',
+              () =>
+                Promise.reject(
+                  new BusinessError('PLAYER_NOT_FOUND', 'no such player'),
+                ),
+              { access: 'public' },
             );
-            dispatcher.register('explode', () =>
-              Promise.reject(new Error('internal boom')),
+            dispatcher.register(
+              'explode',
+              () => Promise.reject(new Error('internal boom')),
+              { access: 'public' },
             );
           },
         },
@@ -165,10 +170,14 @@ describe('runServerProcess lifecycle', () => {
         {
           name: 'stuck',
           register: (dispatcher) => {
-            dispatcher.register('stuck', async () => {
-              await release.promise;
-              return 'late';
-            });
+            dispatcher.register(
+              'stuck',
+              async () => {
+                await release.promise;
+                return 'late';
+              },
+              { access: 'public' },
+            );
           },
         },
       ],

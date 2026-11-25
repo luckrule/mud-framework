@@ -62,13 +62,18 @@ describe('runServerProcess requests', () => {
         {
           name: 'failures',
           register: (dispatcher) => {
-            dispatcher.register('explode', () =>
-              Promise.reject(new Error('business failure')),
+            dispatcher.register(
+              'explode',
+              () => Promise.reject(new Error('business failure')),
+              { access: 'public' },
             );
-            dispatcher.register('denied', () =>
-              Promise.reject(
-                new BusinessError('BUSINESS_DENIED', 'not allowed'),
-              ),
+            dispatcher.register(
+              'denied',
+              () =>
+                Promise.reject(
+                  new BusinessError('BUSINESS_DENIED', 'not allowed'),
+                ),
+              { access: 'public' },
             );
           },
         },
@@ -116,16 +121,20 @@ describe('runServerProcess requests', () => {
     await harness.stop();
   });
 
-  test('carries the session id a handler bound into the result message', async () => {
+  test('carries the session change a handler bound into the result message', async () => {
     const harness = startServer({
       extensions: [
         {
           name: 'auth',
           register: (dispatcher) => {
-            dispatcher.register('login', async (ctx) => {
-              ctx.bindSession('session-1');
-              return 'welcome';
-            });
+            dispatcher.register(
+              'login',
+              async (ctx) => {
+                ctx.bindSession('session-1');
+                return 'welcome';
+              },
+              { access: 'public', mayChangeSession: true },
+            );
           },
         },
       ],
@@ -141,13 +150,13 @@ describe('runServerProcess requests', () => {
         requestId: 'req-1',
         ok: true,
         result: 'welcome',
-        sessionId: 'session-1',
+        sessionChange: { type: 'bind', sessionId: 'session-1' },
       },
     ]);
     await harness.stop();
   });
 
-  test('omits the session id from the result when the handler binds nothing', async () => {
+  test('omits the session change from the result when the handler changes nothing', async () => {
     const harness = startServer({
       extensions: [{ name: 'echo', register: echoRegistration }],
     });
@@ -186,10 +195,14 @@ describe('runServerProcess requests', () => {
         {
           name: 'slow',
           register: (dispatcher) => {
-            dispatcher.register('slow', async () => {
-              await sleep(40);
-              return 'late';
-            });
+            dispatcher.register(
+              'slow',
+              async () => {
+                await sleep(40);
+                return 'late';
+              },
+              { access: 'public' },
+            );
           },
         },
       ],
@@ -282,11 +295,15 @@ describe('runServerProcess requests', () => {
         {
           name: 'slow',
           register: (dispatcher) => {
-            dispatcher.register('slow', async () => {
-              calls += 1;
-              await gate.promise;
-              return 'done';
-            });
+            dispatcher.register(
+              'slow',
+              async () => {
+                calls += 1;
+                await gate.promise;
+                return 'done';
+              },
+              { access: 'public' },
+            );
           },
         },
       ],
@@ -315,10 +332,14 @@ describe('runServerProcess requests', () => {
         {
           name: 'slow',
           register: (dispatcher) => {
-            dispatcher.register('slow', async () => {
-              await gate.promise;
-              return 'done';
-            });
+            dispatcher.register(
+              'slow',
+              async () => {
+                await gate.promise;
+                return 'done';
+              },
+              { access: 'public' },
+            );
           },
         },
       ],
@@ -350,10 +371,14 @@ describe('runServerProcess requests', () => {
         {
           name: 'slow',
           register: (dispatcher) => {
-            dispatcher.register('slow', async () => {
-              await gate.promise;
-              return 'done';
-            });
+            dispatcher.register(
+              'slow',
+              async () => {
+                await gate.promise;
+                return 'done';
+              },
+              { access: 'public' },
+            );
           },
         },
       ],

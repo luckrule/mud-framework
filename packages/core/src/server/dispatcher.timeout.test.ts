@@ -17,17 +17,22 @@ describe('Dispatcher.timeout', () => {
     const handlerDone = deferred<void>();
     let lateWriteError = '';
 
-    dispatcher.register('slow', async (ctx) => {
-      await sleep(40);
-      try {
-        await ctx.storage.execute('INSERT 1');
-        lateWriteError = 'write was accepted';
-      } catch (error) {
-        lateWriteError = error instanceof Error ? error.message : String(error);
-      }
-      handlerDone.resolve();
-      return 'late result';
-    });
+    dispatcher.register(
+      'slow',
+      async (ctx) => {
+        await sleep(40);
+        try {
+          await ctx.storage.execute('INSERT 1');
+          lateWriteError = 'write was accepted';
+        } catch (error) {
+          lateWriteError =
+            error instanceof Error ? error.message : String(error);
+        }
+        handlerDone.resolve();
+        return 'late result';
+      },
+      { access: 'public' },
+    );
 
     const error = await rejectionOf(dispatcher.dispatch('slow', null));
     await handlerDone.promise;
@@ -44,10 +49,14 @@ describe('Dispatcher.timeout', () => {
       capabilities: { maxTransactionDurationMs: 5 },
     });
     const dispatcher = new Dispatcher({ backend, timeoutMs: 10_000 });
-    dispatcher.register('slow', async () => {
-      await sleep(50);
-      return 'late';
-    });
+    dispatcher.register(
+      'slow',
+      async () => {
+        await sleep(50);
+        return 'late';
+      },
+      { access: 'public' },
+    );
 
     const error = await rejectionOf(dispatcher.dispatch('slow', null));
 
@@ -78,10 +87,14 @@ describe('Dispatcher.timeout', () => {
       { backend, timeoutMs: 10_000 },
       lines,
     );
-    dispatcher.register('slow', async () => {
-      await sleep(40);
-      return 'late';
-    });
+    dispatcher.register(
+      'slow',
+      async () => {
+        await sleep(40);
+        return 'late';
+      },
+      { access: 'public' },
+    );
 
     await rejectionOf(dispatcher.dispatch('slow', null, { requestId: 'r1' }));
 
@@ -100,10 +113,14 @@ describe('Dispatcher.timeout', () => {
   test('FrameworkTimeoutError carries the id that was actually used', async () => {
     const backend = new MemoryStorageBackend();
     const { dispatcher } = quietDispatcher({ backend, timeoutMs: 10 });
-    dispatcher.register('slow', async () => {
-      await sleep(40);
-      return 'late';
-    });
+    dispatcher.register(
+      'slow',
+      async () => {
+        await sleep(40);
+        return 'late';
+      },
+      { access: 'public' },
+    );
 
     const error = await rejectionOf(
       dispatcher.dispatch('slow', null, { requestId: 'given-id' }),
@@ -118,10 +135,14 @@ describe('Dispatcher.timeout', () => {
   test('meta.timeoutMs tightens the effective timeout', async () => {
     const backend = new MemoryStorageBackend();
     const { dispatcher } = quietDispatcher({ backend, timeoutMs: 10_000 });
-    dispatcher.register('slow', async () => {
-      await sleep(60);
-      return 'late';
-    });
+    dispatcher.register(
+      'slow',
+      async () => {
+        await sleep(60);
+        return 'late';
+      },
+      { access: 'public' },
+    );
 
     const error = await rejectionOf(
       dispatcher.dispatch('slow', null, { timeoutMs: 10 }),
@@ -139,10 +160,14 @@ describe('Dispatcher.timeout', () => {
       capabilities: { maxTransactionDurationMs: 10_000 },
     });
     const { dispatcher } = quietDispatcher({ backend, timeoutMs: 15 });
-    dispatcher.register('slow', async () => {
-      await sleep(60);
-      return 'late';
-    });
+    dispatcher.register(
+      'slow',
+      async () => {
+        await sleep(60);
+        return 'late';
+      },
+      { access: 'public' },
+    );
 
     // The override is far above the configured ceiling; the smaller value wins.
     const error = await rejectionOf(
@@ -161,10 +186,14 @@ describe('Dispatcher.timeout', () => {
       capabilities: { maxTransactionDurationMs: 5 },
     });
     const { dispatcher } = quietDispatcher({ backend, timeoutMs: 10_000 });
-    dispatcher.register('slow', async () => {
-      await sleep(40);
-      return 'late';
-    });
+    dispatcher.register(
+      'slow',
+      async () => {
+        await sleep(40);
+        return 'late';
+      },
+      { access: 'public' },
+    );
 
     const error = await rejectionOf(
       dispatcher.dispatch('slow', null, { timeoutMs: 500 }),

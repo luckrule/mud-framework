@@ -47,25 +47,35 @@ describe('vertical slice', () => {
       executor: new LocalExecutor({ dispatcher }),
     });
 
-    dispatcher.register('player.create', async (ctx, payload) => {
-      const name = isRecord(payload) ? payload.name : undefined;
-      if (typeof name !== 'string') {
-        throw new Error('player.create expects { name: string }');
-      }
-      await ctx.storage.execute(
-        'CREATE TABLE IF NOT EXISTS players (name TEXT PRIMARY KEY)',
-      );
-      await ctx.storage.execute('INSERT INTO players (name) VALUES (?)', [
-        name,
-      ]);
-      return { created: name, requestId: ctx.requestId };
-    });
-    dispatcher.register('player.list', async (ctx) => {
-      const rows = await ctx.storage.query<PlayerRow>(
-        'SELECT name FROM players ORDER BY name',
-      );
-      return rows.map((row) => row.name);
-    });
+    // This slice has no login step, so its handlers declare themselves public;
+    // they neither read nor change a Session (SPEC 3.7).
+    dispatcher.register(
+      'player.create',
+      async (ctx, payload) => {
+        const name = isRecord(payload) ? payload.name : undefined;
+        if (typeof name !== 'string') {
+          throw new Error('player.create expects { name: string }');
+        }
+        await ctx.storage.execute(
+          'CREATE TABLE IF NOT EXISTS players (name TEXT PRIMARY KEY)',
+        );
+        await ctx.storage.execute('INSERT INTO players (name) VALUES (?)', [
+          name,
+        ]);
+        return { created: name, requestId: ctx.requestId };
+      },
+      { access: 'public' },
+    );
+    dispatcher.register(
+      'player.list',
+      async (ctx) => {
+        const rows = await ctx.storage.query<PlayerRow>(
+          'SELECT name FROM players ORDER BY name',
+        );
+        return rows.map((row) => row.name);
+      },
+      { access: 'public' },
+    );
 
     try {
       await layer.start();
@@ -111,9 +121,15 @@ describe('vertical slice', () => {
       executor: new LocalExecutor({ dispatcher }),
     });
 
-    dispatcher.register('broken', async () => {
-      throw new Error('handler exploded');
-    });
+    // Public so the test observes the handler failure it is about, not the
+    // Session gate that would otherwise answer first.
+    dispatcher.register(
+      'broken',
+      async () => {
+        throw new Error('handler exploded');
+      },
+      { access: 'public' },
+    );
 
     try {
       await layer.start();

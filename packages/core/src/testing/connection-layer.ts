@@ -8,7 +8,11 @@ import type { Logger, LogLevel } from '../logging/types.ts';
 import { ConnectionLayer } from '../portal/connection-layer.ts';
 import { Dispatcher } from '../server/dispatcher.ts';
 import { LocalExecutor } from '../server/local-executor.ts';
-import type { ExecutorRequest, RequestExecutor } from '../shared/executor.ts';
+import type {
+  ExecutorRequest,
+  RequestExecutor,
+  SessionChange,
+} from '../shared/executor.ts';
 import { MemoryStorageBackend } from '../storage/memory.ts';
 import { FakeTransport } from '../transport/fake.ts';
 import type { Transport, TransportConnection } from '../transport/types.ts';
@@ -48,6 +52,8 @@ export async function harness(
     maxQueuedPerConnection?: number;
     shutdownTimeoutMs?: number;
     maxSessions?: number;
+    /** Access policy handed to the dispatcher (SPEC 3.7). */
+    authorize?: ConstructorParameters<typeof Dispatcher>[0]['authorize'];
   } = {},
 ): Promise<Harness> {
   const transport = new FakeTransport();
@@ -66,6 +72,7 @@ export async function harness(
     timeoutMs: options.timeoutMs ?? 1000,
     logger,
     createRequestId: options.createRequestId,
+    authorize: options.authorize,
   });
   const layer = new ConnectionLayer({
     transport,
@@ -201,14 +208,18 @@ export interface ControlledExecutor {
 }
 
 /**
- * An executor that reports a Session binding for `bind` (the id is chosen by
- * `sessionOf`), hangs on `hang` until released, and succeeds immediately
- * otherwise. `cancel` is deliberately a no-op: the reconnect tests need a
- * request that outlives its connection, so the layer's own bounded waits are
- * what get measured rather than the executor's.
+ * An executor that reports a Session change for the methods the options name
+ * (`sessionOf` binds, `changeOf` can return either change or none), hangs on
+ * `hang` until released, and succeeds immediately otherwise. `cancel` is
+ * deliberately a no-op: the reconnect tests need a request that outlives its
+ * connection, so the layer's own bounded waits are what get measured rather
+ * than the executor's.
  */
 export function controlledExecutor(
-  options: { sessionOf?: (method: string) => string | undefined } = {},
+  options: {
+    sessionOf?: (method: string) => string | undefined;
+    changeOf?: (method: string) => SessionChange | undefined;
+  } = {},
 ): ControlledExecutor {
   const started: string[] = [];
   const finished: string[] = [];
@@ -231,9 +242,15 @@ export function controlledExecutor(
         }
         finished.push(request.method);
         const sessionId = options.sessionOf?.(request.method);
-        return sessionId === undefined
+        const sessionChange =
+          options.changeOf !== undefined
+            ? options.changeOf(request.method)
+            : sessionId === undefined
+              ? undefined
+              : { type: 'bind' as const, sessionId };
+        return sessionChange === undefined
           ? { ok: true, result: request.method }
-          : { ok: true, result: request.method, sessionId };
+          : { ok: true, result: request.method, sessionChange };
       },
       cancel: () => Promise.resolve(),
       close: () => Promise.resolve(),
@@ -248,11 +265,12 @@ export interface SessionHarness {
   logs: () => Record<string, unknown>[];
 }
 
-/** A layer whose executor binds `bind` to a Session; see `controlledExecutor`. */
+/** A layer whose executor changes the Session for the methods the options name. */
 export function sessionHarness(
   options: {
     maxSessions?: number;
     sessionOf?: (method: string) => string | undefined;
+    changeOf?: (method: string) => SessionChange | undefined;
   } = {},
 ): SessionHarness {
   const transport = new FakeTransport();
@@ -265,6 +283,7 @@ export function sessionHarness(
   const controlled = controlledExecutor({
     sessionOf:
       options.sessionOf ?? ((method) => (method === 'bind' ? 's1' : undefined)),
+    changeOf: options.changeOf,
   });
   const layer = new ConnectionLayer({
     transport,

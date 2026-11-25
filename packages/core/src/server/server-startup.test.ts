@@ -64,7 +64,9 @@ function echoExtension(name = 'echo'): Extension {
   return {
     name,
     register: (registrar) => {
-      registrar.register('echo', (_ctx, payload) => Promise.resolve(payload));
+      registrar.register('echo', (_ctx, payload) => Promise.resolve(payload), {
+        access: 'public',
+      });
     },
   };
 }
@@ -164,10 +166,14 @@ describe('startServer', () => {
       {
         name: 'banking',
         register: (registrar) => {
-          registrar.register('deposit', async (ctx) => {
-            ctx.logger.info({ detail: 'seen' }, 'handler ran');
-            return ctx.extension;
-          });
+          registrar.register(
+            'deposit',
+            async (ctx) => {
+              ctx.logger.info({ detail: 'seen' }, 'handler ran');
+              return ctx.extension;
+            },
+            { access: 'public' },
+          );
         },
       },
     ]);

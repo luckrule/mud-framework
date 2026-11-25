@@ -46,15 +46,23 @@ const extension: Extension = {
   name: 'bench',
   requires: { transactions: 'full' },
   register: (registrar) => {
-    registrar.register('echo', (_ctx, payload) => Promise.resolve(payload));
-    registrar.register('store', async (ctx, payload) => {
-      const seq = seqOf(payload);
-      await ctx.storage.execute(
-        'INSERT INTO bench_rows (seq, body) VALUES (?, ?)',
-        [seq, `row-${seq}`],
-      );
-      return { stored: seq };
+    // The benchmark client has no login step and neither handler touches a
+    // Session, so both opt out of the Session gate explicitly (SPEC 3.7).
+    registrar.register('echo', (_ctx, payload) => Promise.resolve(payload), {
+      access: 'public',
     });
+    registrar.register(
+      'store',
+      async (ctx, payload) => {
+        const seq = seqOf(payload);
+        await ctx.storage.execute(
+          'INSERT INTO bench_rows (seq, body) VALUES (?, ?)',
+          [seq, `row-${seq}`],
+        );
+        return { stored: seq };
+      },
+      { access: 'public' },
+    );
   },
 };
 

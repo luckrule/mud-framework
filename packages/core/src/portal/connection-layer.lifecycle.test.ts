@@ -163,7 +163,9 @@ describe('ConnectionLayer lifecycle', () => {
 
   test('stop closes the transport and the dispatcher', async () => {
     const { transport, dispatcher, layer } = await harness();
-    dispatcher.register('echo', async (_ctx, payload) => payload);
+    dispatcher.register('echo', async (_ctx, payload) => payload, {
+      access: 'public',
+    });
     transport.connect('c1');
 
     await layer.stop();

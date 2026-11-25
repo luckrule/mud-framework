@@ -15,6 +15,7 @@ import { preparedMessage, readyMessage } from '../portal/ipc-outbound.ts';
 import { messageOf } from '../shared/guards.ts';
 import { settleWithin } from '../shared/timeout.ts';
 import type { StorageBackend } from '../storage/types.ts';
+import type { DispatcherOptions } from './dispatcher.ts';
 import type { Extension } from './extension.ts';
 import { RequestRunner, requestIds } from './requests.ts';
 import type { Runtime } from './server-startup.ts';
@@ -34,6 +35,12 @@ export interface ServerProcessOptions {
   extensions: readonly Extension[];
   /** Framework-side request ceiling; effective = min(this, backend max). */
   timeoutMs: number;
+  /**
+   * Optional access policy for every registered handler (SPEC 3.7). Forwarded
+   * unchanged to the dispatcher this process creates; returning false refuses
+   * a request with `FORBIDDEN` before its transaction opens.
+   */
+  authorize?: DispatcherOptions['authorize'];
   /**
    * Opaque application code version; must be a non-empty string when set.
    * Reported in `ready` and compared against a replay's stamped version only to

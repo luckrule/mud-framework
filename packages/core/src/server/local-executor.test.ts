@@ -35,7 +35,9 @@ describe('LocalExecutor', () => {
       backend: new MemoryStorageBackend(),
       timeoutMs: 1000,
     });
-    dispatcher.register('echo', async (_ctx, payload) => payload);
+    dispatcher.register('echo', async (_ctx, payload) => payload, {
+      access: 'public',
+    });
     const executor = new LocalExecutor({ dispatcher });
 
     // In process there is no backend to wait for; the interface still requires
@@ -52,7 +54,9 @@ describe('LocalExecutor', () => {
       backend: new MemoryStorageBackend(),
       timeoutMs: 1000,
     });
-    dispatcher.register('echo', async (_ctx, payload) => payload);
+    dispatcher.register('echo', async (_ctx, payload) => payload, {
+      access: 'public',
+    });
     const executor = new LocalExecutor({ dispatcher });
 
     const outcome = await executor.execute(request({ payload: 'hi' }));
@@ -66,10 +70,14 @@ describe('LocalExecutor', () => {
       backend: new MemoryStorageBackend(),
       timeoutMs: 15,
     });
-    dispatcher.register('slow', async () => {
-      await sleep(60);
-      return 'late';
-    });
+    dispatcher.register(
+      'slow',
+      async () => {
+        await sleep(60);
+        return 'late';
+      },
+      { access: 'public' },
+    );
     const executor = new LocalExecutor({ dispatcher });
 
     const outcome = await executor.execute(request({ method: 'slow' }));
@@ -109,9 +117,13 @@ describe('LocalExecutor', () => {
       backend: new MemoryStorageBackend(),
       timeoutMs: 1000,
     });
-    dispatcher.register('explode', async () => {
-      throw new Error('business failure');
-    });
+    dispatcher.register(
+      'explode',
+      async () => {
+        throw new Error('business failure');
+      },
+      { access: 'public' },
+    );
     const executor = new LocalExecutor({ dispatcher });
 
     const outcome = await executor.execute(request({ method: 'explode' }));
@@ -128,14 +140,18 @@ describe('LocalExecutor', () => {
       backend: new MemoryStorageBackend(),
       timeoutMs: 1000,
     });
-    dispatcher.register('explode', async () => {
-      // Shaped like a SQLite driver error: a duck-typed `code` must not become
-      // the wire code, or downstream alerts would key on a driver detail
-      // (INV-014, SPEC 7.2).
-      throw Object.assign(new Error('UNIQUE constraint failed'), {
-        code: 'SQLITE_CONSTRAINT_UNIQUE',
-      });
-    });
+    dispatcher.register(
+      'explode',
+      async () => {
+        // Shaped like a SQLite driver error: a duck-typed `code` must not become
+        // the wire code, or downstream alerts would key on a driver detail
+        // (INV-014, SPEC 7.2).
+        throw Object.assign(new Error('UNIQUE constraint failed'), {
+          code: 'SQLITE_CONSTRAINT_UNIQUE',
+        });
+      },
+      { access: 'public' },
+    );
     const executor = new LocalExecutor({ dispatcher });
 
     const outcome = await executor.execute(request({ method: 'explode' }));
@@ -155,9 +171,13 @@ describe('LocalExecutor', () => {
       backend: new MemoryStorageBackend(),
       timeoutMs: 1000,
     });
-    dispatcher.register('explode', async () => {
-      throw new BusinessError('PLAYER_NOT_FOUND', 'no such player');
-    });
+    dispatcher.register(
+      'explode',
+      async () => {
+        throw new BusinessError('PLAYER_NOT_FOUND', 'no such player');
+      },
+      { access: 'public' },
+    );
     const executor = new LocalExecutor({ dispatcher });
 
     const outcome = await executor.execute(request({ method: 'explode' }));
@@ -174,9 +194,13 @@ describe('LocalExecutor', () => {
       backend: new MemoryStorageBackend(),
       timeoutMs: 1000,
     });
-    dispatcher.register('explode', async () => {
-      throw new BusinessError('', 'unclassifiable failure');
-    });
+    dispatcher.register(
+      'explode',
+      async () => {
+        throw new BusinessError('', 'unclassifiable failure');
+      },
+      { access: 'public' },
+    );
     const executor = new LocalExecutor({ dispatcher });
 
     const outcome = await executor.execute(request({ method: 'explode' }));
@@ -199,10 +223,14 @@ describe('LocalExecutor', () => {
       },
     });
     let contextRequestId = '';
-    dispatcher.register('inspect', async (ctx) => {
-      contextRequestId = ctx.requestId;
-      return null;
-    });
+    dispatcher.register(
+      'inspect',
+      async (ctx) => {
+        contextRequestId = ctx.requestId;
+        return null;
+      },
+      { access: 'public' },
+    );
     const executor = new LocalExecutor({ dispatcher });
 
     await executor.execute(request({ method: 'inspect', requestId: 'req-42' }));
@@ -218,14 +246,18 @@ describe('LocalExecutor', () => {
       timeoutMs: 1000,
     });
     let seen: Record<string, unknown> = {};
-    dispatcher.register('inspect', async (ctx) => {
-      seen = {
-        connectionId: ctx.connectionId,
-        clientRequestId: ctx.clientRequestId,
-        sessionId: ctx.sessionId,
-      };
-      return null;
-    });
+    dispatcher.register(
+      'inspect',
+      async (ctx) => {
+        seen = {
+          connectionId: ctx.connectionId,
+          clientRequestId: ctx.clientRequestId,
+          sessionId: ctx.sessionId,
+        };
+        return null;
+      },
+      { access: 'public' },
+    );
     const executor = new LocalExecutor({ dispatcher });
 
     await executor.execute(request({ method: 'inspect', sessionId: 's1' }));
@@ -238,15 +270,19 @@ describe('LocalExecutor', () => {
     await executor.close();
   });
 
-  test('carries the session id a handler bound into the success outcome', async () => {
+  test('carries the session change a handler bound into the success outcome', async () => {
     const dispatcher = quietDispatcher({
       backend: new MemoryStorageBackend(),
       timeoutMs: 1000,
     });
-    dispatcher.register('login', async (ctx) => {
-      ctx.bindSession('session-1');
-      return 'welcome';
-    });
+    dispatcher.register(
+      'login',
+      async (ctx) => {
+        ctx.bindSession('session-1');
+        return 'welcome';
+      },
+      { access: 'public', mayChangeSession: true },
+    );
     const executor = new LocalExecutor({ dispatcher });
 
     const outcome = await executor.execute(request({ method: 'login' }));
@@ -254,17 +290,19 @@ describe('LocalExecutor', () => {
     expect(outcome).toEqual({
       ok: true,
       result: 'welcome',
-      sessionId: 'session-1',
+      sessionChange: { type: 'bind', sessionId: 'session-1' },
     });
     await executor.close();
   });
 
-  test('omits the session id when the handler binds nothing', async () => {
+  test('omits the session change when the handler changes nothing', async () => {
     const dispatcher = quietDispatcher({
       backend: new MemoryStorageBackend(),
       timeoutMs: 1000,
     });
-    dispatcher.register('echo', async (_ctx, payload) => payload);
+    dispatcher.register('echo', async (_ctx, payload) => payload, {
+      access: 'public',
+    });
     const executor = new LocalExecutor({ dispatcher });
 
     const outcome = await executor.execute(request({ payload: 'hi' }));
@@ -280,10 +318,14 @@ describe('LocalExecutor', () => {
       backend: new MemoryStorageBackend(),
       timeoutMs: 1000,
     });
-    dispatcher.register('login', async (ctx) => {
-      ctx.bindSession('half-made');
-      throw new BusinessError('LOGIN_REFUSED', 'nope');
-    });
+    dispatcher.register(
+      'login',
+      async (ctx) => {
+        ctx.bindSession('half-made');
+        throw new BusinessError('LOGIN_REFUSED', 'nope');
+      },
+      { access: 'public', mayChangeSession: true },
+    );
     const executor = new LocalExecutor({ dispatcher });
 
     const outcome = await executor.execute(request({ method: 'login' }));
@@ -312,10 +354,14 @@ describe('LocalExecutor', () => {
       backend: new MemoryStorageBackend(),
       timeoutMs: 10_000,
     });
-    dispatcher.register('slow', async () => {
-      await sleep(60);
-      return 'late';
-    });
+    dispatcher.register(
+      'slow',
+      async () => {
+        await sleep(60);
+        return 'late';
+      },
+      { access: 'public' },
+    );
     const executor = new LocalExecutor({ dispatcher });
 
     const startedAt = performance.now();
@@ -347,7 +393,9 @@ describe('LocalExecutor', () => {
       metas.push(observed);
       return dispatch(method, payload, observed);
     };
-    dispatcher.register('echo', async (_ctx, payload) => payload);
+    dispatcher.register('echo', async (_ctx, payload) => payload, {
+      access: 'public',
+    });
     const executor = new LocalExecutor({ dispatcher });
 
     const outcome = await executor.execute(request({ codeVersion: 'build-1' }));
@@ -365,12 +413,16 @@ describe('LocalExecutor', () => {
     const dispatcher = quietDispatcher({ backend, timeoutMs: 1000 });
     const entered = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
-    dispatcher.register('slow', async (ctx) => {
-      await ctx.storage.execute('INSERT 1');
-      entered.resolve();
-      await release.promise;
-      return 'late';
-    });
+    dispatcher.register(
+      'slow',
+      async (ctx) => {
+        await ctx.storage.execute('INSERT 1');
+        entered.resolve();
+        await release.promise;
+        return 'late';
+      },
+      { access: 'public' },
+    );
     const executor = new LocalExecutor({ dispatcher });
 
     const outcomePromise = executor.execute(request({ method: 'slow' }));

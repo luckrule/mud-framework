@@ -16,10 +16,14 @@ describe('runServerProcess cancel', () => {
         {
           name: 'echo',
           register: (dispatcher) => {
-            dispatcher.register('echo', (_ctx, payload) => {
-              calls += 1;
-              return Promise.resolve(payload);
-            });
+            dispatcher.register(
+              'echo',
+              (_ctx, payload) => {
+                calls += 1;
+                return Promise.resolve(payload);
+              },
+              { access: 'public' },
+            );
           },
         },
       ],
@@ -47,11 +51,15 @@ describe('runServerProcess cancel', () => {
         {
           name: 'slow',
           register: (dispatcher) => {
-            dispatcher.register('slow', async () => {
-              calls += 1;
-              await gate.promise;
-              return 'done';
-            });
+            dispatcher.register(
+              'slow',
+              async () => {
+                calls += 1;
+                await gate.promise;
+                return 'done';
+              },
+              { access: 'public' },
+            );
           },
         },
       ],
@@ -88,19 +96,23 @@ describe('runServerProcess cancel', () => {
         {
           name: 'slow',
           register: (dispatcher) => {
-            dispatcher.register('slow', async (ctx) => {
-              await ctx.storage.execute('INSERT 1');
-              entered.resolve();
-              await gate.promise;
-              try {
-                await ctx.storage.execute('INSERT 2');
-                lateWriteError = 'write was accepted';
-              } catch (error) {
-                lateWriteError =
-                  error instanceof Error ? error.message : String(error);
-              }
-              return 'done';
-            });
+            dispatcher.register(
+              'slow',
+              async (ctx) => {
+                await ctx.storage.execute('INSERT 1');
+                entered.resolve();
+                await gate.promise;
+                try {
+                  await ctx.storage.execute('INSERT 2');
+                  lateWriteError = 'write was accepted';
+                } catch (error) {
+                  lateWriteError =
+                    error instanceof Error ? error.message : String(error);
+                }
+                return 'done';
+              },
+              { access: 'public' },
+            );
           },
         },
       ],
@@ -146,11 +158,15 @@ describe('runServerProcess cancel', () => {
         {
           name: 'slow',
           register: (dispatcher) => {
-            dispatcher.register('slow', async (ctx) => {
-              await ctx.storage.execute('INSERT 1');
-              await sleep(60);
-              return 'late';
-            });
+            dispatcher.register(
+              'slow',
+              async (ctx) => {
+                await ctx.storage.execute('INSERT 1');
+                await sleep(60);
+                return 'late';
+              },
+              { access: 'public' },
+            );
           },
         },
       ],
@@ -180,10 +196,14 @@ describe('runServerProcess cancel', () => {
         {
           name: 'slow',
           register: (dispatcher) => {
-            dispatcher.register('slow', async () => {
-              await sleep(60);
-              return 'late';
-            });
+            dispatcher.register(
+              'slow',
+              async () => {
+                await sleep(60);
+                return 'late';
+              },
+              { access: 'public' },
+            );
           },
         },
       ],

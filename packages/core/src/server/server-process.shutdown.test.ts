@@ -108,10 +108,14 @@ describe('runServerProcess shutdown', () => {
         {
           name: 'slow',
           register: (dispatcher) => {
-            dispatcher.register('slow', async () => {
-              await gate.promise;
-              return 'done';
-            });
+            dispatcher.register(
+              'slow',
+              async () => {
+                await gate.promise;
+                return 'done';
+              },
+              { access: 'public' },
+            );
           },
         },
       ],
@@ -147,10 +151,14 @@ describe('runServerProcess shutdown', () => {
         {
           name: 'slow',
           register: (dispatcher) => {
-            dispatcher.register('slow', async () => {
-              await gate.promise;
-              return 'done';
-            });
+            dispatcher.register(
+              'slow',
+              async () => {
+                await gate.promise;
+                return 'done';
+              },
+              { access: 'public' },
+            );
           },
         },
       ],
@@ -203,10 +211,14 @@ describe('runServerProcess shutdown', () => {
         {
           name: 'stuck',
           register: (dispatcher) => {
-            dispatcher.register('stuck', async () => {
-              await release.promise;
-              return 'late';
-            });
+            dispatcher.register(
+              'stuck',
+              async () => {
+                await release.promise;
+                return 'late';
+              },
+              { access: 'public' },
+            );
           },
         },
       ],
@@ -266,10 +278,14 @@ describe('runServerProcess shutdown', () => {
         {
           name: 'stuck',
           register: (dispatcher) => {
-            dispatcher.register('stuck', async () => {
-              await release.promise;
-              return 'late';
-            });
+            dispatcher.register(
+              'stuck',
+              async () => {
+                await release.promise;
+                return 'late';
+              },
+              { access: 'public' },
+            );
           },
         },
       ],

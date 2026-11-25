@@ -1,12 +1,23 @@
 import type { StorageRequirements } from '../storage/requirements.ts';
-import type { Handler } from './dispatcher.ts';
+import type { Handler, HandlerOptions } from './dispatcher.ts';
+
+/**
+ * What an Extension may declare for one handler. The owning Extension is
+ * tagged automatically, so `extension` is removed: a consumer must not be able
+ * to overwrite the name its request logs are attributed to (SPEC 7.1).
+ */
+export type HandlerRegistrationOptions = Omit<HandlerOptions, 'extension'>;
 
 /**
  * What an Extension registers through: the owning Extension is tagged
  * automatically so request logs can name it (SPEC 7.1).
  */
 export interface ExtensionRegistrar {
-  register(method: string, handler: Handler): void;
+  register(
+    method: string,
+    handler: Handler,
+    options?: HandlerRegistrationOptions,
+  ): void;
 }
 
 /**

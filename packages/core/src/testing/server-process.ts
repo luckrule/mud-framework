@@ -14,6 +14,7 @@ import type {
 import { parseIpcMessage } from '../ipc/protocol.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import type { Logger } from '../logging/types.ts';
+import type { DispatcherOptions } from '../server/dispatcher.ts';
 import type { Extension, ExtensionRegistrar } from '../server/extension.ts';
 import { runServerProcess } from '../server/server-process.ts';
 import { ServerStartupError } from '../server/server-startup.ts';
@@ -94,6 +95,8 @@ export interface HarnessOptions {
   parentCheckIntervalMs?: number;
   /** Lets a test pretend the process was reparented. */
   readParentPid?: () => number;
+  /** Access policy forwarded to the Server's dispatcher (SPEC 3.7). */
+  authorize?: DispatcherOptions['authorize'];
   /**
    * Drives `hello` and, once `prepared` arrives, `activate`. On by default so a
    * test that only cares about the started Server does not repeat the two-phase
@@ -140,6 +143,7 @@ export function startServer(options: HarnessOptions = {}): Harness {
     extensions: options.extensions ?? [],
     timeoutMs: options.timeoutMs ?? 1000,
     codeVersion: options.codeVersion,
+    authorize: options.authorize,
     logger,
     channel: serverChannel,
     abortTimeoutMs: options.abortTimeoutMs,
@@ -181,7 +185,9 @@ export function numberField(
 }
 
 export function echoRegistration(registrar: ExtensionRegistrar): void {
-  registrar.register('echo', (_ctx, payload) => Promise.resolve(payload));
+  registrar.register('echo', (_ctx, payload) => Promise.resolve(payload), {
+    access: 'public',
+  });
 }
 
 /** Narrows the rejection without an unchecked cast, so a wrong type fails loudly. */

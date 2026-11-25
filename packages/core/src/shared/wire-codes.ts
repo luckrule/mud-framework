@@ -34,6 +34,10 @@ const CODES = {
   UNKNOWN_METHOD: 'UNKNOWN_METHOD',
   /** SPEC 7.2: a framework-internal failure, including an undeclared business error. */
   INTERNAL_ERROR: 'INTERNAL_ERROR',
+  /** SPEC 7.2/3.7: the handler requires a Session the request did not carry. */
+  AUTH_REQUIRED: 'AUTH_REQUIRED',
+  /** SPEC 7.2/3.7: the injected access policy refused the request. */
+  FORBIDDEN: 'FORBIDDEN',
 } as const;
 
 export const FRAMEWORK_TIMEOUT = CODES.FRAMEWORK_TIMEOUT;
@@ -48,6 +52,8 @@ export const STORAGE_UNAVAILABLE = CODES.STORAGE_UNAVAILABLE;
 export const INVALID_ENVELOPE = CODES.INVALID_ENVELOPE;
 export const UNKNOWN_METHOD = CODES.UNKNOWN_METHOD;
 export const INTERNAL_ERROR = CODES.INTERNAL_ERROR;
+export const AUTH_REQUIRED = CODES.AUTH_REQUIRED;
+export const FORBIDDEN = CODES.FORBIDDEN;
 
 /**
  * Every wire code, in SPEC 7.2 order (`CODES` key order). What tests and the
@@ -119,6 +125,38 @@ export class UnknownHandlerError extends Error {
 }
 
 /**
+ * The handler's declared access requires a Session, but the request entered
+ * without one (SPEC 3.7). A distinct type so the wire code does not depend on
+ * matching message text (INV-014).
+ */
+export class AuthenticationRequiredError extends Error {
+  readonly code = AUTH_REQUIRED;
+  readonly method: string;
+
+  constructor(method: string) {
+    super(`handler "${method}" requires a session`);
+    this.name = 'AuthenticationRequiredError';
+    this.method = method;
+  }
+}
+
+/**
+ * The injected access policy refused this request (SPEC 3.7). A framework code
+ * rather than a business one: the policy belongs to the consumer, but the
+ * refusal semantics and the wire code are the framework's.
+ */
+export class ForbiddenError extends Error {
+  readonly code = FORBIDDEN;
+  readonly method: string;
+
+  constructor(method: string) {
+    super(`access to "${method}" was denied`);
+    this.name = 'ForbiddenError';
+    this.method = method;
+  }
+}
+
+/**
  * The framework's own wire codes, listed one by one rather than matched by
  * prefix: a business code may legitimately be called anything, including
  * something starting with `FRAMEWORK_`, and a prefix rule would silently
@@ -128,6 +166,16 @@ export class UnknownHandlerError extends Error {
  * processes cannot disagree.
  */
 const FRAMEWORK_CODES: ReadonlySet<string> = new Set(WIRE_CODES);
+
+/**
+ * Framework codes that are expected refusals rather than failures (SPEC 7.1,
+ * 7.2). They stay framework codes for classification, but a logged request
+ * ending in one of them must not be recorded at error level.
+ */
+const EXPECTED_REFUSALS: ReadonlySet<string> = new Set([
+  AUTH_REQUIRED,
+  FORBIDDEN,
+]);
 
 /** Whether `code` is a framework terminal state rather than a business refusal. */
 export function isFrameworkCode(code: string): boolean {
@@ -141,8 +189,13 @@ export function isFrameworkCode(code: string): boolean {
  * Used by both processes so they cannot disagree. The list is the judgement:
  * an unrecognised code came from `BusinessError` (the only path that puts a
  * non-framework code on the wire, SPEC 7.2), so it is a business refusal.
+ * `AUTH_REQUIRED` and `FORBIDDEN` are framework codes but expected refusals, so
+ * they need the explicit set above rather than the framework/business split.
  */
 export function failureLogLevel(error: { code: string }): 'error' | 'warn' {
+  if (EXPECTED_REFUSALS.has(error.code)) {
+    return 'warn';
+  }
   return isFrameworkCode(error.code) ? 'error' : 'warn';
 }
 
@@ -159,7 +212,9 @@ export function describeFailure(error: unknown): {
   if (
     error instanceof FrameworkTimeoutError ||
     error instanceof RequestCancelledError ||
-    error instanceof UnknownHandlerError
+    error instanceof UnknownHandlerError ||
+    error instanceof AuthenticationRequiredError ||
+    error instanceof ForbiddenError
   ) {
     return { code: error.code, message };
   }

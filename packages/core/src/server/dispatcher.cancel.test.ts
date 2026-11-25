@@ -21,17 +21,21 @@ describe('Dispatcher.cancel', () => {
     const release = deferred<void>();
     let writeError = '';
 
-    dispatcher.register('slow', async (ctx) => {
-      entered.resolve();
-      await release.promise;
-      try {
-        await ctx.storage.execute('INSERT 1');
-        writeError = 'write was accepted';
-      } catch (error) {
-        writeError = error instanceof Error ? error.message : String(error);
-      }
-      return 'late result';
-    });
+    dispatcher.register(
+      'slow',
+      async (ctx) => {
+        entered.resolve();
+        await release.promise;
+        try {
+          await ctx.storage.execute('INSERT 1');
+          writeError = 'write was accepted';
+        } catch (error) {
+          writeError = error instanceof Error ? error.message : String(error);
+        }
+        return 'late result';
+      },
+      { access: 'public' },
+    );
 
     const pending = dispatcher.dispatch('slow', null, { requestId: 'r1' });
     await entered.promise;
@@ -57,11 +61,15 @@ describe('Dispatcher.cancel', () => {
     const entered = deferred<void>();
     const release = deferred<void>();
 
-    dispatcher.register('slow', async () => {
-      entered.resolve();
-      await release.promise;
-      return 'late';
-    });
+    dispatcher.register(
+      'slow',
+      async () => {
+        entered.resolve();
+        await release.promise;
+        return 'late';
+      },
+      { access: 'public' },
+    );
 
     const pending = dispatcher.dispatch('slow', null, { requestId: 'r2' });
     await entered.promise;
@@ -87,7 +95,9 @@ describe('Dispatcher.cancel', () => {
   test('cancel returns false for a request that already finished', async () => {
     const backend = new MemoryStorageBackend();
     const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });
-    dispatcher.register('echo', async (_ctx, payload) => payload);
+    dispatcher.register('echo', async (_ctx, payload) => payload, {
+      access: 'public',
+    });
 
     await dispatcher.dispatch('echo', 'hi', { requestId: 'done' });
 
@@ -103,12 +113,16 @@ describe('Dispatcher.cancel', () => {
     const entered = deferred<void>();
     const release = deferred<void>();
 
-    dispatcher.register('write-then-return', async (ctx) => {
-      await ctx.storage.execute('INSERT 1');
-      entered.resolve();
-      await release.promise;
-      return 'looks successful';
-    });
+    dispatcher.register(
+      'write-then-return',
+      async (ctx) => {
+        await ctx.storage.execute('INSERT 1');
+        entered.resolve();
+        await release.promise;
+        return 'looks successful';
+      },
+      { access: 'public' },
+    );
 
     const pending = dispatcher.dispatch('write-then-return', null, {
       requestId: 'r3',
@@ -131,14 +145,18 @@ describe('Dispatcher.cancel', () => {
     const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 }, lines);
     let accepted: boolean | undefined;
 
-    dispatcher.register('quick', async () => {
-      // Runs before the backend's COMMIT timer, so the cancel lands in the
-      // window where the handler is done but the transaction is not.
-      setTimeout(() => {
-        accepted = dispatcher.cancel('r-commit', 'FRAMEWORK_TIMEOUT');
-      }, 0);
-      return 'ok';
-    });
+    dispatcher.register(
+      'quick',
+      async () => {
+        // Runs before the backend's COMMIT timer, so the cancel lands in the
+        // window where the handler is done but the transaction is not.
+        setTimeout(() => {
+          accepted = dispatcher.cancel('r-commit', 'FRAMEWORK_TIMEOUT');
+        }, 0);
+        return 'ok';
+      },
+      { access: 'public' },
+    );
 
     const error = await rejectionOf(
       dispatcher.dispatch('quick', null, { requestId: 'r-commit' }),
@@ -167,7 +185,9 @@ describe('Dispatcher.cancel', () => {
     const lines: string[] = [];
     const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 }, lines);
 
-    dispatcher.register('quick', () => Promise.resolve('ok'));
+    dispatcher.register('quick', () => Promise.resolve('ok'), {
+      access: 'public',
+    });
 
     await dispatcher.dispatch('quick', null, { requestId: 'r-plain' });
     await sleep(10);
@@ -188,12 +208,16 @@ describe('Dispatcher.cancel', () => {
     const release = deferred<void>();
     let calls = 0;
 
-    dispatcher.register('slow', async () => {
-      calls += 1;
-      (calls === 1 ? firstEntered : secondEntered).resolve();
-      await release.promise;
-      return calls;
-    });
+    dispatcher.register(
+      'slow',
+      async () => {
+        calls += 1;
+        (calls === 1 ? firstEntered : secondEntered).resolve();
+        await release.promise;
+        return calls;
+      },
+      { access: 'public' },
+    );
 
     // Same id twice: the second `set` overwrites the first's map entry.
     const first = dispatcher.dispatch('slow', null, {
@@ -222,11 +246,15 @@ describe('Dispatcher.cancel', () => {
     const entered = deferred<void>();
     const release = deferred<void>();
 
-    dispatcher.register('slow', async () => {
-      entered.resolve();
-      await release.promise;
-      return 'late';
-    });
+    dispatcher.register(
+      'slow',
+      async () => {
+        entered.resolve();
+        await release.promise;
+        return 'late';
+      },
+      { access: 'public' },
+    );
 
     const pending = dispatcher.dispatch('slow', null, { requestId: 'r2' });
     await entered.promise;

@@ -21,6 +21,16 @@ export interface ExecutorRequest extends RequestIdentity {
 }
 
 /**
+ * A Session change a handler declared and the framework applied only after the
+ * request succeeded (SPEC 2). Unbind is a separate member rather than a null
+ * id: "this request ended the binding" and "this request bound nothing" are
+ * different outcomes, and a failed request must produce neither.
+ */
+export type SessionChange =
+  | { readonly type: 'bind'; readonly sessionId: string }
+  | { readonly type: 'unbind' };
+
+/**
  * A discriminated union rather than a thrown error: across a process boundary
  * the failure is a deserialised `{code, message}`, so `instanceof` cannot work
  * and both sides would need different handling. As a return value, in-process
@@ -31,7 +41,7 @@ export interface ExecutorRequest extends RequestIdentity {
  * `isFrameworkCode` instead, which is one list rather than two prefix rules.
  */
 export type ExecutorOutcome =
-  | { ok: true; result: unknown; sessionId?: string }
+  | { ok: true; result: unknown; sessionChange?: SessionChange }
   | { ok: false; error: { code: string; message: string } };
 
 /**

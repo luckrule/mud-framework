@@ -33,6 +33,20 @@ const validMessages: IpcMessage[] = [
   {
     type: 'result',
     requestId: 'req-1',
+    ok: true,
+    result: 'welcome',
+    sessionChange: { type: 'bind', sessionId: 'session-1' },
+  },
+  {
+    type: 'result',
+    requestId: 'req-1',
+    ok: true,
+    result: 'bye',
+    sessionChange: { type: 'unbind' },
+  },
+  {
+    type: 'result',
+    requestId: 'req-1',
     ok: false,
     error: { code: 'FRAMEWORK_TIMEOUT', message: 'timed out' },
   },
@@ -305,18 +319,18 @@ describe('parseIpcMessage', () => {
         requestId: 'req-1',
         ok: true,
         result: undefined,
-        sessionId: undefined,
+        sessionChange: undefined,
       });
     }
   });
 
-  test('accepts a success result carrying a session id', () => {
+  test('accepts a success result carrying a bind change', () => {
     const parsed = parseIpcMessage({
       type: 'result',
       requestId: 'req-1',
       ok: true,
       result: null,
-      sessionId: 'session-1',
+      sessionChange: { type: 'bind', sessionId: 'session-1' },
     });
 
     expect(parsed).toEqual({
@@ -326,9 +340,92 @@ describe('parseIpcMessage', () => {
         requestId: 'req-1',
         ok: true,
         result: null,
-        sessionId: 'session-1',
+        sessionChange: { type: 'bind', sessionId: 'session-1' },
       },
     });
+  });
+
+  test('accepts a success result carrying an unbind change', () => {
+    const parsed = parseIpcMessage({
+      type: 'result',
+      requestId: 'req-1',
+      ok: true,
+      result: null,
+      sessionChange: { type: 'unbind' },
+    });
+
+    expect(parsed).toEqual({
+      ok: true,
+      message: {
+        type: 'result',
+        requestId: 'req-1',
+        ok: true,
+        result: null,
+        sessionChange: { type: 'unbind' },
+      },
+    });
+  });
+
+  test('rejects an unknown session change type', () => {
+    expectRejected(
+      {
+        type: 'result',
+        requestId: 'req-1',
+        ok: true,
+        result: null,
+        sessionChange: { type: 'rebind' },
+      },
+      'bind',
+    );
+  });
+
+  test('rejects a session change that is not an object', () => {
+    expectRejected(
+      {
+        type: 'result',
+        requestId: 'req-1',
+        ok: true,
+        result: null,
+        sessionChange: 'bind',
+      },
+      'sessionChange',
+    );
+  });
+
+  test('rejects a bind change without a usable session id', () => {
+    expectRejected(
+      {
+        type: 'result',
+        requestId: 'req-1',
+        ok: true,
+        result: null,
+        sessionChange: { type: 'bind' },
+      },
+      'sessionId',
+    );
+    expectRejected(
+      {
+        type: 'result',
+        requestId: 'req-1',
+        ok: true,
+        result: null,
+        sessionChange: { type: 'bind', sessionId: '' },
+      },
+      'non-empty string',
+    );
+  });
+
+  test('rejects an unbind change that carries a session id', () => {
+    expectRejected(
+      {
+        type: 'result',
+        requestId: 'req-1',
+        ok: true,
+        result: null,
+        sessionChange: { type: 'unbind', sessionId: 'session-1' },
+      },
+      'absent for an unbind',
+    );
   });
 
   test('accepts a success result carrying the request session id', () => {
@@ -338,7 +435,7 @@ describe('parseIpcMessage', () => {
       requestSessionId: 'entry-1',
       ok: true,
       result: null,
-      sessionId: 'bound-1',
+      sessionChange: { type: 'bind', sessionId: 'bound-1' },
     });
 
     expect(parsed).toEqual({
@@ -349,7 +446,7 @@ describe('parseIpcMessage', () => {
         requestSessionId: 'entry-1',
         ok: true,
         result: null,
-        sessionId: 'bound-1',
+        sessionChange: { type: 'bind', sessionId: 'bound-1' },
       },
     });
   });
@@ -427,7 +524,7 @@ describe('parseIpcMessage', () => {
         requestSessionId: undefined,
         ok: true,
         result: undefined,
-        sessionId: undefined,
+        sessionChange: undefined,
       },
     });
     expect(success.ok).toBe(true);
@@ -457,27 +554,27 @@ describe('parseIpcMessage', () => {
     }
   });
 
-  test('rejects an empty session id on a success result', () => {
+  test('rejects an empty session id on a success bind change', () => {
     expectRejected(
       {
         type: 'result',
         requestId: 'req-1',
         ok: true,
         result: null,
-        sessionId: '',
+        sessionChange: { type: 'bind', sessionId: '' },
       },
       'non-empty string',
     );
   });
 
-  test('rejects a non-string session id on a success result', () => {
+  test('rejects a non-string session id on a success bind change', () => {
     expectRejected(
       {
         type: 'result',
         requestId: 'req-1',
         ok: true,
         result: null,
-        sessionId: 7,
+        sessionChange: { type: 'bind', sessionId: 7 },
       },
       'sessionId',
     );
@@ -504,7 +601,7 @@ describe('parseIpcMessage', () => {
       requestId: 'req-1',
       ok: true,
       result: { hp: 3 },
-      sessionId: 'bound-1',
+      sessionChange: { type: 'bind', sessionId: 'bound-1' },
       futureField: 'ignored',
     });
 
@@ -516,7 +613,7 @@ describe('parseIpcMessage', () => {
         requestSessionId: undefined,
         ok: true,
         result: { hp: 3 },
-        sessionId: 'bound-1',
+        sessionChange: { type: 'bind', sessionId: 'bound-1' },
       },
     });
     expect(parsed.ok).toBe(true);

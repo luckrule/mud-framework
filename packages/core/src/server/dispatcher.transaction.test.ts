@@ -15,10 +15,14 @@ describe('Dispatcher.transaction', () => {
   test('runs a handler inside a transaction and returns its result', async () => {
     const backend = new MemoryStorageBackend();
     const dispatcher = new Dispatcher({ backend, timeoutMs: 1000 });
-    dispatcher.register('echo', async (ctx, payload) => {
-      await ctx.storage.execute('INSERT 1', [payload]);
-      return payload;
-    });
+    dispatcher.register(
+      'echo',
+      async (ctx, payload) => {
+        await ctx.storage.execute('INSERT 1', [payload]);
+        return payload;
+      },
+      { access: 'public' },
+    );
 
     const { result } = await dispatcher.dispatch('echo', 'hello');
 
@@ -29,9 +33,13 @@ describe('Dispatcher.transaction', () => {
   test('rejects and rolls back when the handler throws', async () => {
     const backend = new MemoryStorageBackend();
     const dispatcher = new Dispatcher({ backend, timeoutMs: 1000 });
-    dispatcher.register('fail', async () => {
-      throw new Error('business failure');
-    });
+    dispatcher.register(
+      'fail',
+      async () => {
+        throw new Error('business failure');
+      },
+      { access: 'public' },
+    );
 
     const error = await rejectionOf(dispatcher.dispatch('fail', null));
 
@@ -61,14 +69,18 @@ describe('Dispatcher.transaction', () => {
       });
       const saved = deferred<RequestContext>();
       const attempts = deferred<PromiseSettledResult<unknown>[]>();
-      dispatcher.register('first', async (ctx) => {
-        saved.resolve(ctx);
-        await ctx.storage.execute('first write');
-        if (first === 'failure') {
-          throw new Error('first failed');
-        }
-        return 'first result';
-      });
+      dispatcher.register(
+        'first',
+        async (ctx) => {
+          saved.resolve(ctx);
+          await ctx.storage.execute('first write');
+          if (first === 'failure') {
+            throw new Error('first failed');
+          }
+          return 'first result';
+        },
+        { access: 'public', mayChangeSession: true },
+      );
       const firstDispatch = dispatcher.dispatch('first', null);
       if (first === 'failure') {
         expect((await rejectionOf(firstDispatch)).message).toBe('first failed');
@@ -76,20 +88,24 @@ describe('Dispatcher.transaction', () => {
         expect(await firstDispatch).toEqual({ result: 'first result' });
       }
       const stale = await saved.promise;
-      dispatcher.register('second', async (ctx) => {
-        await ctx.storage.execute('second write');
-        expect(() => stale.bindSession('stale-session')).toThrow(/expired/);
-        attempts.resolve(
-          await Promise.allSettled([
-            stale.storage.execute('stale write'),
-            stale.storage.query('stale query'),
-          ]),
-        );
-        if (second === 'failure') {
-          throw new Error('second failed');
-        }
-        return 'second result';
-      });
+      dispatcher.register(
+        'second',
+        async (ctx) => {
+          await ctx.storage.execute('second write');
+          expect(() => stale.bindSession('stale-session')).toThrow(/expired/);
+          attempts.resolve(
+            await Promise.allSettled([
+              stale.storage.execute('stale write'),
+              stale.storage.query('stale query'),
+            ]),
+          );
+          if (second === 'failure') {
+            throw new Error('second failed');
+          }
+          return 'second result';
+        },
+        { access: 'public' },
+      );
 
       const secondDispatch = dispatcher.dispatch('second', null);
       if (second === 'failure') {
@@ -121,21 +137,25 @@ describe('Dispatcher.transaction', () => {
     const saved = deferred<RequestContext>();
     const attempts = deferred<PromiseSettledResult<unknown>[]>();
     let bindingError: unknown;
-    dispatcher.register('quick', async (ctx) => {
-      saved.resolve(ctx);
-      setTimeout(() => {
-        void Promise.allSettled([
-          ctx.storage.execute('late write'),
-          ctx.storage.query('late query'),
-        ]).then(attempts.resolve);
-        try {
-          ctx.bindSession('late-session');
-        } catch (error) {
-          bindingError = error;
-        }
-      }, 0);
-      return 'done';
-    });
+    dispatcher.register(
+      'quick',
+      async (ctx) => {
+        saved.resolve(ctx);
+        setTimeout(() => {
+          void Promise.allSettled([
+            ctx.storage.execute('late write'),
+            ctx.storage.query('late query'),
+          ]).then(attempts.resolve);
+          try {
+            ctx.bindSession('late-session');
+          } catch (error) {
+            bindingError = error;
+          }
+        }, 0);
+        return 'done';
+      },
+      { access: 'public', mayChangeSession: true },
+    );
 
     const result = await dispatcher.dispatch('quick', null);
 

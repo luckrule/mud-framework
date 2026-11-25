@@ -122,8 +122,10 @@ describe('runServerProcess two-phase activation', () => {
           name: 'echo',
           register: (registrar) => {
             registered.push('echo');
-            registrar.register('echo', (_ctx, payload) =>
-              Promise.resolve(payload),
+            registrar.register(
+              'echo',
+              (_ctx, payload) => Promise.resolve(payload),
+              { access: 'public' },
             );
           },
         },
@@ -163,10 +165,14 @@ describe('runServerProcess two-phase activation', () => {
         {
           name: 'echo',
           register: (registrar) => {
-            registrar.register('echo', (_ctx, payload) => {
-              calls += 1;
-              return Promise.resolve(payload);
-            });
+            registrar.register(
+              'echo',
+              (_ctx, payload) => {
+                calls += 1;
+                return Promise.resolve(payload);
+              },
+              { access: 'public' },
+            );
           },
         },
       ],
@@ -607,8 +613,10 @@ describe('readiness barrier ordering', () => {
         {
           name: 'echo',
           register: (registrar) => {
-            registrar.register('echo', (_ctx, payload) =>
-              Promise.resolve(payload),
+            registrar.register(
+              'echo',
+              (_ctx, payload) => Promise.resolve(payload),
+              { access: 'public' },
             );
           },
         },

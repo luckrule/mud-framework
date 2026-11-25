@@ -3,9 +3,15 @@ import { randomUUID } from 'node:crypto';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import { safeLogger } from '../logging/safe-logger.ts';
 import type { Logger } from '../logging/types.ts';
+import type { SessionChange } from '../shared/executor.ts';
+import { describeValue, messageOf } from '../shared/guards.ts';
 import type { RequestIdentity } from '../shared/identity.ts';
 import { tightenTimeout } from '../shared/timeout.ts';
 import {
+  AUTH_REQUIRED,
+  AuthenticationRequiredError,
+  FORBIDDEN,
+  ForbiddenError,
   FrameworkTimeoutError,
   RequestCancelledError,
   UnknownHandlerError,
@@ -18,8 +24,8 @@ import type { StorageBackend, StorageTransaction } from '../storage/types.ts';
  * original `requestId` so the id survives the replay (SPEC 7.3).
  *
  * `sessionId` here means "this request already belongs to a Session", which is
- * not the same thing as `DispatchResult.boundSessionId` ("the handler bound
- * this request to one").
+ * not the same thing as the `SessionChange` a successful dispatch may report
+ * ("the handler bound or unbound one").
  */
 export type DispatchMeta = Partial<RequestIdentity> & {
   /**
@@ -50,8 +56,16 @@ export interface RequestContext extends RequestIdentity {
    * Only a successful request commits the binding: a handler that throws or
    * times out leaves the connection unbound, so a failed login cannot leave a
    * half-created session behind. Calls after the handler settles are rejected.
+   * Requires `mayChangeSession: true` on the handler's registration.
    */
   bindSession(sessionId: string): void;
+  /**
+   * Ends the current connection's Session binding. Like `bindSession`, it is
+   * recorded for the request and applied only if the request succeeds, so a
+   * failed unbind leaves the route in place. Requires `mayChangeSession: true`
+   * and shares the one-change-per-request budget with `bindSession`.
+   */
+  unbindSession(): void;
   /** The Extension that registered this handler, when one did (SPEC 7.1). */
   readonly extension?: string;
   /** Already bound to the request's ids; handlers never build one. */
@@ -61,20 +75,19 @@ export interface RequestContext extends RequestIdentity {
 }
 
 /**
- * What a successful dispatch yields: the handler's value plus the Session it
- * bound, if any. Failures are still thrown — `instanceof` only works in
- * process, and `LocalExecutor` is the one place that turns them into the
- * cross-process `ExecutorOutcome` union.
+ * What a successful dispatch yields: the handler's value plus the Session
+ * change it declared, if any. Failures are still thrown — `instanceof` only
+ * works in process, and `LocalExecutor` is the one place that turns them into
+ * the cross-process `ExecutorOutcome` union.
  *
- * `boundSessionId` rather than `sessionId`: the input `DispatchMeta.sessionId`
- * says "this request already belongs to a Session", and reusing the name for
- * the output would suggest the result merely echoes the input.
+ * The change was recorded, not applied: the caller owns the routing table and
+ * commits it only after this result arrives (SPEC 2).
  */
 export interface DispatchResult {
   /** The handler's return value. */
   result: unknown;
-  /** Set when the handler bound the connection to a Session (SPEC 2). */
-  boundSessionId?: string;
+  /** Set when the handler bound or unbound a Session (SPEC 2). */
+  sessionChange?: SessionChange;
 }
 
 export type Handler = (
@@ -82,14 +95,52 @@ export type Handler = (
   payload: unknown,
 ) => Promise<unknown>;
 
+/** Whether a handler needs a Session on entry (SPEC 3.7). */
+export type HandlerAccess = 'public' | 'session';
+
 export interface HandlerOptions {
   /** The Extension that owns this handler, for request logs (SPEC 7.1). */
   readonly extension?: string;
+  /**
+   * Defaults to `'session'`: a handler is assumed to need an authenticated
+   * Session unless it explicitly opts out with `'public'` (SPEC 3.7).
+   */
+  readonly access?: HandlerAccess;
+  /**
+   * Defaults to false. Only a handler that declares true may call
+   * `bindSession`/`unbindSession`; the declaration makes the mutation an
+   * explicit part of the handler's contract rather than an accident.
+   */
+  readonly mayChangeSession?: boolean;
+}
+
+/**
+ * What an access policy sees. Deliberately narrower than `RequestContext`: the
+ * policy runs before the transaction exists, so it has no storage to write and
+ * no Session change to declare (SPEC 3.7).
+ */
+export interface AccessContext extends RequestIdentity {
+  /** The Extension that registered the handler, when one did (SPEC 7.1). */
+  readonly extension?: string;
+  /** Aborts at the request deadline, so a slow policy can stop early. */
+  readonly signal: AbortSignal;
+  readonly logger: Logger;
 }
 
 export interface DispatcherOptions {
   backend: StorageBackend;
   timeoutMs: number;
+  /**
+   * Optional access policy, called for every registered handler after the
+   * Session check and before the transaction (SPEC 3.7). Returning false
+   * refuses the request with `FORBIDDEN`; throwing is an internal failure.
+   * Runs under the request deadline, so it cannot outlive the request.
+   */
+  authorize?: (
+    ctx: AccessContext,
+    method: string,
+    payload: unknown,
+  ) => boolean | Promise<boolean>;
   /** Defaults to `randomUUID`; injectable so tests get deterministic ids. */
   createRequestId?: () => string;
   /** Defaults to the JSON logger; tests inject a sink-backed one. */
@@ -106,11 +157,13 @@ interface StorageScope {
   active: boolean;
 }
 
-/** What `register` remembers about a handler: the function and its Extension. */
+/** What `register` remembers about a handler: the function and its contract. */
 interface HandlerEntry {
   readonly handler: Handler;
   /** The owning Extension, if any, for request logs (SPEC 7.1). */
   readonly extension?: string;
+  readonly access: HandlerAccess;
+  readonly mayChangeSession: boolean;
 }
 
 /** A pending request: cancellation ends its scope and rejects dispatch. */
@@ -132,6 +185,7 @@ export class Dispatcher {
   private readonly timeoutMs: number;
   private readonly createRequestId: () => string;
   private readonly logger: Logger;
+  private readonly authorize: DispatcherOptions['authorize'];
   private readonly handlers = new Map<string, HandlerEntry>();
   /** Requests that have not reached a terminal state, by framework request id. */
   private readonly inFlight = new Map<string, InFlight>();
@@ -148,6 +202,7 @@ export class Dispatcher {
     this.backend = options.backend;
     this.timeoutMs = options.timeoutMs;
     this.createRequestId = options.createRequestId ?? randomUUID;
+    this.authorize = options.authorize;
     // A child rather than a default-only binding: an injected logger must still
     // carry `component: 'dispatcher'`, so every dispatcher line is identifiable
     // whatever the caller bound.
@@ -160,6 +215,8 @@ export class Dispatcher {
     this.assertOpen();
     this.handlers.set(name, {
       handler,
+      access: options?.access ?? 'session',
+      mayChangeSession: options?.mayChangeSession ?? false,
       ...(options?.extension === undefined
         ? {}
         : { extension: options.extension }),
@@ -205,6 +262,21 @@ export class Dispatcher {
     if (registered === undefined) {
       logger.warn({ method: name }, 'dispatch rejected: unknown method');
       throw new UnknownHandlerError(name);
+    }
+
+    // SPEC 3.7: the Session gate runs before any request state is created, so
+    // a refusal cannot open a transaction, execute the handler or affect the
+    // routing table. Unknown methods were already answered above: adding a
+    // Session must not turn "no such method" into AUTH_REQUIRED.
+    if (
+      registered.access !== 'public' &&
+      (meta.sessionId === undefined || meta.sessionId.length === 0)
+    ) {
+      logger.warn(
+        { code: AUTH_REQUIRED, method: name },
+        'dispatch rejected: session required',
+      );
+      throw new AuthenticationRequiredError(name);
     }
 
     const effectiveTimeoutMs = tightenTimeout(
@@ -257,13 +329,30 @@ export class Dispatcher {
       terminal.reject(new FrameworkTimeoutError(requestId, effectiveTimeoutMs));
     }, effectiveTimeoutMs);
 
-    // Recorded, not applied: the binding is committed only when the handler
-    // succeeds, so a failed login leaves the connection unbound (SPEC 2). A
+    // Recorded, not applied: the change is committed only when the handler
+    // succeeds, so a failed request leaves the route untouched (SPEC 2). A
     // holder object rather than a `let`, because the handler closure assigns it
     // and control-flow narrowing would otherwise treat it as still undefined.
-    const binding: { sessionId?: string } = {};
+    const change: { value?: SessionChange } = {};
 
     try {
+      if (this.authorize !== undefined) {
+        await this.decideAccess(
+          this.authorize,
+          {
+            requestId,
+            connectionId,
+            clientRequestId,
+            sessionId: meta.sessionId,
+            extension: registered.extension,
+            signal: expiry.controller.signal,
+            logger,
+          },
+          name,
+          payload,
+          terminal.promise,
+        );
+      }
       const work = this.backend.transaction(async (tx) => {
         const context: RequestContext = {
           requestId,
@@ -273,22 +362,19 @@ export class Dispatcher {
           signal: expiry.controller.signal,
           extension: registered.extension,
           bindSession: (sessionId) => {
+            assertSessionChangeAllowed(registered.mayChangeSession);
             assertActive(storageScope);
             if (sessionId.length === 0) {
               // An empty id cannot be routed, and the framework does not
               // invent one: the business owns what a session is (SPEC 2).
               throw new Error('bindSession requires a non-empty session id');
             }
-            if (binding.sessionId !== undefined) {
-              // Two ids in one request have no defined meaning, and letting the
-              // last call win would make the binding depend on call order while
-              // looking successful. Failing the request keeps it diagnosable and
-              // leaves the connection unbound.
-              throw new Error(
-                `bindSession called twice in one request: "${binding.sessionId}" then "${sessionId}"`,
-              );
-            }
-            binding.sessionId = sessionId;
+            recordSessionChange(change, { type: 'bind', sessionId });
+          },
+          unbindSession: () => {
+            assertSessionChangeAllowed(registered.mayChangeSession);
+            assertActive(storageScope);
+            recordSessionChange(change, { type: 'unbind' });
           },
           logger,
           storage: guard(tx, storageScope),
@@ -317,18 +403,78 @@ export class Dispatcher {
         () => undefined,
       );
       const result = await Promise.race([work, terminal.promise]);
-      const boundSessionId = binding.sessionId;
-      if (boundSessionId === undefined) {
+      const sessionChange = change.value;
+      if (sessionChange === undefined) {
         return { result };
       }
-      logger.debug({ sessionId: boundSessionId }, 'session bound');
-      return { result, boundSessionId };
+      // The request's `sessionId` binding (if any) is the entry Session; the
+      // change is always the object, never a replacement id.
+      logger.debug({ sessionChange }, 'session change recorded');
+      return { result, sessionChange };
     } finally {
       storageScope.active = false;
       clearTimeout(timer);
       if (this.inFlight.get(requestId) === entry) {
         this.inFlight.delete(requestId);
       }
+    }
+  }
+
+  /**
+   * Runs the injected access policy under the request deadline (SPEC 3.7). The
+   * decision is raced against the terminal promise rather than given its own
+   * timer: the request timer already started, so timeout and cancellation end
+   * the request through the same path as any other terminal transition. The
+   * `.then(onFulfilled, onRejected)` below consumes a policy rejection even
+   * when the terminal promise wins the race, so a late rejection cannot surface
+   * as an unhandled one and look like a crash.
+   */
+  private async decideAccess(
+    authorize: NonNullable<DispatcherOptions['authorize']>,
+    context: AccessContext,
+    method: string,
+    payload: unknown,
+    terminal: Promise<never>,
+  ): Promise<void> {
+    const decision = Promise.resolve().then(() =>
+      authorize(context, method, payload),
+    );
+    const raced = await Promise.race([
+      decision.then(
+        (allowed) => ({ type: 'decision' as const, allowed }),
+        (error: unknown) => ({ type: 'policy-error' as const, error }),
+      ),
+      terminal.catch((error: unknown) => ({
+        type: 'terminal' as const,
+        error,
+      })),
+    ]);
+    if (raced.type === 'terminal') {
+      throw raced.error;
+    }
+    if (raced.type === 'policy-error') {
+      // A policy failure is an internal failure, not a business refusal: its
+      // code must not reach the wire even when it looks like a `BusinessError`
+      // (SPEC 3.7, 7.2).
+      throw new Error(
+        `access policy failed for "${method}": ${messageOf(raced.error)}`,
+        { cause: raced.error },
+      );
+    }
+    const allowed: unknown = raced.allowed;
+    if (allowed !== true) {
+      if (allowed === false) {
+        context.logger.warn(
+          { code: FORBIDDEN, method },
+          'dispatch rejected: access denied',
+        );
+        throw new ForbiddenError(method);
+      }
+      // A consumer policy is outside code: a truthy non-boolean is not an
+      // allow, and treating it as one would turn a policy defect into access.
+      throw new Error(
+        `access policy for "${method}" returned ${describeValue(allowed)}; expected a boolean`,
+      );
     }
   }
 
@@ -423,4 +569,35 @@ function assertActive(scope: StorageScope): void {
   if (!scope.active) {
     throw new Error(EXPIRED_MESSAGE);
   }
+}
+
+function assertSessionChangeAllowed(mayChangeSession: boolean): void {
+  if (!mayChangeSession) {
+    throw new Error(
+      'handler must be registered with mayChangeSession: true to change the session',
+    );
+  }
+}
+
+/**
+ * At most one change per request. Two changes have no defined meaning, and
+ * letting the last call win would make the outcome depend on call order while
+ * looking successful. A rejected request commits neither change.
+ */
+function recordSessionChange(
+  holder: { value?: SessionChange },
+  next: SessionChange,
+): void {
+  if (holder.value !== undefined) {
+    throw new Error(
+      `a request may change its session at most once: ${describeSessionChange(holder.value)} then ${describeSessionChange(next)}`,
+    );
+  }
+  holder.value = next;
+}
+
+function describeSessionChange(change: SessionChange): string {
+  return change.type === 'bind'
+    ? `bindSession("${change.sessionId}")`
+    : 'unbindSession()';
 }

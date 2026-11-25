@@ -30,18 +30,18 @@ export class LocalExecutor implements RequestExecutor {
       // is IPC envelope metadata with no meaning in process; leaving it in
       // `meta` would pass an undeclared key to the dispatcher.
       const { method, payload, codeVersion: _codeVersion, ...meta } = request;
-      const { result, boundSessionId } = await this.dispatcher.dispatch(
+      const { result, sessionChange } = await this.dispatcher.dispatch(
         method,
         payload,
         meta,
       );
-      // `boundSessionId` is present only when the handler bound this request to
-      // a Session; an unbound success must not carry an `undefined` field, or
-      // the "absent means unbound" convention would be indistinguishable from
-      // "bound to nothing" further down the IPC path (SPEC 2).
-      return boundSessionId === undefined
+      // `sessionChange` is present only when the handler changed this request's
+      // Session; an unchanged success must not carry an `undefined` field, or
+      // the "absent means no change" convention would be indistinguishable from
+      // "changed to nothing" further down the IPC path (SPEC 2).
+      return sessionChange === undefined
         ? { ok: true, result }
-        : { ok: true, result, sessionId: boundSessionId };
+        : { ok: true, result, sessionChange };
     } catch (error) {
       return { ok: false, error: describeFailure(error) };
     }

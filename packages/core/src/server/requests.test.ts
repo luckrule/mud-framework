@@ -66,7 +66,9 @@ function startRunner(
 describe('RequestRunner', () => {
   test('accept runs the handler and answers with its result', async () => {
     const harness = startRunner();
-    harness.register('echo', (_ctx, payload) => Promise.resolve(payload));
+    harness.register('echo', (_ctx, payload) => Promise.resolve(payload), {
+      access: 'public',
+    });
 
     harness.runner.accept(requestMessage({ payload: 'ping' }));
     await tick();
@@ -83,7 +85,9 @@ describe('RequestRunner', () => {
 
   test('echoes the entry session id on a success result', async () => {
     const harness = startRunner();
-    harness.register('echo', (_ctx, payload) => Promise.resolve(payload));
+    harness.register('echo', (_ctx, payload) => Promise.resolve(payload), {
+      access: 'public',
+    });
 
     harness.runner.accept(requestMessage({ sessionId: 'entry-1' }));
     await tick();
@@ -101,7 +105,9 @@ describe('RequestRunner', () => {
 
   test('echoes the entry session id on a failure result', async () => {
     const harness = startRunner();
-    harness.register('fail', () => Promise.reject(new Error('boom')));
+    harness.register('fail', () => Promise.reject(new Error('boom')), {
+      access: 'public',
+    });
 
     harness.runner.accept(
       requestMessage({ method: 'fail', sessionId: 'entry-1' }),
@@ -118,12 +124,53 @@ describe('RequestRunner', () => {
     });
   });
 
+  test('logs and relays an unbind change without inventing a session id', async () => {
+    const harness = startRunner();
+    harness.register(
+      'logout',
+      async (ctx) => {
+        ctx.unbindSession();
+        return 'bye';
+      },
+      { access: 'public', mayChangeSession: true },
+    );
+
+    harness.runner.accept(
+      requestMessage({ method: 'logout', sessionId: 'entry-1' }),
+    );
+    await tick();
+
+    expect(harness.sent).toEqual([
+      {
+        type: 'result',
+        requestId: 'req-1',
+        requestSessionId: 'entry-1',
+        ok: true,
+        result: 'bye',
+        sessionChange: { type: 'unbind' },
+      },
+    ]);
+    const completed = harness
+      .logs()
+      .filter((line) => line.msg === 'request completed');
+    expect(completed).toHaveLength(1);
+    expect(completed[0]).toMatchObject({
+      requestId: 'req-1',
+      sessionId: 'entry-1',
+      sessionChange: { type: 'unbind' },
+    });
+  });
+
   test('keeps a newly bound session distinct from the entry session', async () => {
     const harness = startRunner();
-    harness.register('login', async (ctx) => {
-      ctx.bindSession('bound-1');
-      return 'welcome';
-    });
+    harness.register(
+      'login',
+      async (ctx) => {
+        ctx.bindSession('bound-1');
+        return 'welcome';
+      },
+      { access: 'public', mayChangeSession: true },
+    );
 
     harness.runner.accept(
       requestMessage({ method: 'login', sessionId: 'entry-1' }),
@@ -137,15 +184,74 @@ describe('RequestRunner', () => {
         requestSessionId: 'entry-1',
         ok: true,
         result: 'welcome',
-        sessionId: 'bound-1',
+        sessionChange: { type: 'bind', sessionId: 'bound-1' },
       },
     ]);
+    const completed = harness
+      .logs()
+      .filter((line) => line.msg === 'request completed');
+    expect(completed).toHaveLength(1);
+    // `sessionId` stays the entry Session; the new binding is the change.
+    expect(completed[0]).toMatchObject({
+      requestId: 'req-1',
+      sessionId: 'entry-1',
+      sessionChange: { type: 'bind', sessionId: 'bound-1' },
+    });
+  });
+
+  test('logs no sessionId for a bind when the request entered without one', async () => {
+    const harness = startRunner();
+    harness.register(
+      'login',
+      async (ctx) => {
+        ctx.bindSession('bound-1');
+        return 'welcome';
+      },
+      { access: 'public', mayChangeSession: true },
+    );
+
+    harness.runner.accept(requestMessage({ method: 'login' }));
+    await tick();
+
+    const completed = harness
+      .logs()
+      .filter((line) => line.msg === 'request completed');
+    expect(completed).toHaveLength(1);
+    expect(completed[0]).not.toHaveProperty('sessionId');
+    expect(completed[0]).toMatchObject({
+      requestId: 'req-1',
+      sessionChange: { type: 'bind', sessionId: 'bound-1' },
+    });
+  });
+
+  test('logs the entry session without a sessionChange when nothing changed', async () => {
+    const harness = startRunner();
+    harness.register('echo', (_ctx, payload) => Promise.resolve(payload), {
+      access: 'public',
+    });
+
+    harness.runner.accept(requestMessage({ sessionId: 'entry-1' }));
+    await tick();
+
+    const completed = harness
+      .logs()
+      .filter((line) => line.msg === 'request completed');
+    expect(completed).toHaveLength(1);
+    expect(completed[0]).toMatchObject({
+      requestId: 'req-1',
+      sessionId: 'entry-1',
+    });
+    expect(completed[0]).not.toHaveProperty('sessionChange');
   });
 
   test('omits requestSessionId when the request entered without a session', async () => {
     const harness = startRunner();
-    harness.register('echo', (_ctx, payload) => Promise.resolve(payload));
-    harness.register('fail', () => Promise.reject(new Error('boom')));
+    harness.register('echo', (_ctx, payload) => Promise.resolve(payload), {
+      access: 'public',
+    });
+    harness.register('fail', () => Promise.reject(new Error('boom')), {
+      access: 'public',
+    });
 
     harness.runner.accept(requestMessage());
     harness.runner.accept(
@@ -195,6 +301,7 @@ describe('RequestRunner', () => {
     const harness = startRunner();
     harness.register('deposit', (_ctx, payload) => Promise.resolve(payload), {
       extension: 'banking',
+      access: 'public',
     });
 
     harness.runner.accept(requestMessage({ method: 'deposit', payload: 'ok' }));
@@ -215,7 +322,7 @@ describe('RequestRunner', () => {
     harness.register(
       'withdraw',
       () => Promise.reject(new Error('insufficient funds')),
-      { extension: 'banking' },
+      { extension: 'banking', access: 'public' },
     );
 
     harness.runner.accept(requestMessage({ method: 'withdraw' }));
@@ -233,7 +340,9 @@ describe('RequestRunner', () => {
 
   test('a handler no Extension registered logs no extension key', async () => {
     const harness = startRunner();
-    harness.register('echo', (_ctx, payload) => Promise.resolve(payload));
+    harness.register('echo', (_ctx, payload) => Promise.resolve(payload), {
+      access: 'public',
+    });
 
     harness.runner.accept(requestMessage({ payload: 'ping' }));
     await tick();
@@ -250,11 +359,15 @@ describe('RequestRunner', () => {
     const harness = startRunner();
     let calls = 0;
     const gate = Promise.withResolvers<void>();
-    harness.register('slow', async () => {
-      calls += 1;
-      await gate.promise;
-      return 'done';
-    });
+    harness.register(
+      'slow',
+      async () => {
+        calls += 1;
+        await gate.promise;
+        return 'done';
+      },
+      { access: 'public' },
+    );
 
     harness.runner.accept(requestMessage({ method: 'slow', replayCount: 0 }));
     harness.runner.accept(requestMessage({ method: 'slow', replayCount: 1 }));
@@ -281,18 +394,23 @@ describe('RequestRunner', () => {
     const entered = Promise.withResolvers<void>();
     const gate = Promise.withResolvers<void>();
     let lateWriteError = '';
-    harness.register('slow', async (ctx) => {
-      await ctx.storage.execute('INSERT 1');
-      entered.resolve();
-      await gate.promise;
-      try {
-        await ctx.storage.execute('INSERT 2');
-        lateWriteError = 'write was accepted';
-      } catch (error) {
-        lateWriteError = error instanceof Error ? error.message : String(error);
-      }
-      return 'done';
-    });
+    harness.register(
+      'slow',
+      async (ctx) => {
+        await ctx.storage.execute('INSERT 1');
+        entered.resolve();
+        await gate.promise;
+        try {
+          await ctx.storage.execute('INSERT 2');
+          lateWriteError = 'write was accepted';
+        } catch (error) {
+          lateWriteError =
+            error instanceof Error ? error.message : String(error);
+        }
+        return 'done';
+      },
+      { access: 'public' },
+    );
 
     harness.runner.accept(requestMessage({ method: 'slow' }));
     await entered.promise;
@@ -331,7 +449,7 @@ describe('RequestRunner', () => {
         await gate.promise;
         return 'done';
       },
-      { extension: 'banking' },
+      { extension: 'banking', access: 'public' },
     );
 
     harness.runner.accept(requestMessage({ method: 'slow' }));
@@ -358,6 +476,7 @@ describe('RequestRunner', () => {
     const harness = startRunner();
     harness.register('slow', () => Promise.resolve('done'), {
       extension: 'banking',
+      access: 'public',
     });
 
     harness.runner.accept(requestMessage({ method: 'slow' }));
@@ -413,7 +532,9 @@ describe('RequestRunner', () => {
 
   test('warns when a replay was accepted under a different code version', async () => {
     const harness = startRunner(1000, () => true, 'build-2');
-    harness.register('echo', (_ctx, payload) => Promise.resolve(payload));
+    harness.register('echo', (_ctx, payload) => Promise.resolve(payload), {
+      access: 'public',
+    });
 
     harness.runner.accept(
       requestMessage({
@@ -456,7 +577,9 @@ describe('RequestRunner', () => {
 
   test('does not warn when the replay version matches the server version', async () => {
     const harness = startRunner(1000, () => true, 'build-1');
-    harness.register('echo', (_ctx, payload) => Promise.resolve(payload));
+    harness.register('echo', (_ctx, payload) => Promise.resolve(payload), {
+      access: 'public',
+    });
 
     harness.runner.accept(
       requestMessage({ replayCount: 1, codeVersion: 'build-1' }),
@@ -475,7 +598,9 @@ describe('RequestRunner', () => {
 
   test('does not warn about versions on a first delivery', async () => {
     const harness = startRunner(1000, () => true, 'build-2');
-    harness.register('echo', (_ctx, payload) => Promise.resolve(payload));
+    harness.register('echo', (_ctx, payload) => Promise.resolve(payload), {
+      access: 'public',
+    });
 
     // Only a replay crossed a restart; a fresh request runs entirely under the
     // version that accepted it.
@@ -524,10 +649,14 @@ describe('RequestRunner', () => {
   test('drain waits for a running handler', async () => {
     const harness = startRunner();
     const gate = Promise.withResolvers<void>();
-    harness.register('slow', async () => {
-      await gate.promise;
-      return 'done';
-    });
+    harness.register(
+      'slow',
+      async () => {
+        await gate.promise;
+        return 'done';
+      },
+      { access: 'public' },
+    );
 
     harness.runner.accept(requestMessage({ method: 'slow' }));
     await tick();
@@ -550,10 +679,14 @@ describe('RequestRunner', () => {
   test('drain returns when the budget runs out and names what is left', async () => {
     const harness = startRunner();
     const gate = Promise.withResolvers<void>();
-    harness.register('stuck', async () => {
-      await gate.promise;
-      return 'late';
-    });
+    harness.register(
+      'stuck',
+      async () => {
+        await gate.promise;
+        return 'late';
+      },
+      { access: 'public' },
+    );
 
     harness.runner.accept(requestMessage({ method: 'stuck' }));
     await tick();
@@ -576,10 +709,14 @@ describe('RequestRunner', () => {
   test('counts pending and running requests over a request lifecycle', async () => {
     const harness = startRunner();
     const gate = Promise.withResolvers<void>();
-    harness.register('slow', async () => {
-      await gate.promise;
-      return 'done';
-    });
+    harness.register(
+      'slow',
+      async () => {
+        await gate.promise;
+        return 'done';
+      },
+      { access: 'public' },
+    );
 
     expect(harness.runner.pending).toBe(0);
     expect(harness.runner.running).toBe(0);

@@ -52,11 +52,15 @@ describe('ConnectionLayer disconnect', () => {
     const { transport, dispatcher, logs } = await harness({ level: 'debug' });
     const entered = Promise.withResolvers<void>();
     const gate = Promise.withResolvers<void>();
-    dispatcher.register('pending', async () => {
-      entered.resolve();
-      await gate.promise;
-      return 'done';
-    });
+    dispatcher.register(
+      'pending',
+      async () => {
+        entered.resolve();
+        await gate.promise;
+        return 'done';
+      },
+      { access: 'public' },
+    );
     transport.connect('c1');
 
     const inFlight = transport.receive('c1', '{"id":"r1","method":"pending"}');
@@ -128,10 +132,14 @@ describe('ConnectionLayer disconnect', () => {
   test('drops a request whose connection closed before it started', async () => {
     const { transport, dispatcher, logs } = await harness();
     let calls = 0;
-    dispatcher.register('echo', (_ctx, payload) => {
-      calls += 1;
-      return Promise.resolve(payload);
-    });
+    dispatcher.register(
+      'echo',
+      (_ctx, payload) => {
+        calls += 1;
+        return Promise.resolve(payload);
+      },
+      { access: 'public' },
+    );
     transport.connect('c1');
 
     // Queued behind the chain, so the disconnect wins the race to start it.
@@ -158,17 +166,21 @@ describe('ConnectionLayer disconnect', () => {
     const entered = Promise.withResolvers<void>();
     const gate = Promise.withResolvers<void>();
     let writeError = '';
-    dispatcher.register('pending', async (ctx) => {
-      entered.resolve();
-      await gate.promise;
-      try {
-        await ctx.storage.execute('INSERT 1');
-        writeError = 'write was accepted';
-      } catch (error) {
-        writeError = error instanceof Error ? error.message : String(error);
-      }
-      return 'done';
-    });
+    dispatcher.register(
+      'pending',
+      async (ctx) => {
+        entered.resolve();
+        await gate.promise;
+        try {
+          await ctx.storage.execute('INSERT 1');
+          writeError = 'write was accepted';
+        } catch (error) {
+          writeError = error instanceof Error ? error.message : String(error);
+        }
+        return 'done';
+      },
+      { access: 'public' },
+    );
     transport.connect('c1');
 
     const inFlight = transport.receive('c1', '{"id":"r1","method":"pending"}');
@@ -191,16 +203,20 @@ describe('ConnectionLayer disconnect', () => {
     const { transport, dispatcher } = await harness();
     const entered = Promise.withResolvers<void>();
     const woke = Promise.withResolvers<string>();
-    dispatcher.register('waiting', async (ctx) => {
-      entered.resolve();
-      const reason = await new Promise<unknown>((resolve) => {
-        ctx.signal.addEventListener('abort', () => {
-          resolve(ctx.signal.reason);
+    dispatcher.register(
+      'waiting',
+      async (ctx) => {
+        entered.resolve();
+        const reason = await new Promise<unknown>((resolve) => {
+          ctx.signal.addEventListener('abort', () => {
+            resolve(ctx.signal.reason);
+          });
         });
-      });
-      woke.resolve(String(reason));
-      return 'done';
-    });
+        woke.resolve(String(reason));
+        return 'done';
+      },
+      { access: 'public' },
+    );
     transport.connect('c1');
 
     const inFlight = transport.receive('c1', '{"id":"r1","method":"waiting"}');
@@ -246,10 +262,14 @@ describe('ConnectionLayer disconnect', () => {
   test('a late result after the disconnect does not throw', async () => {
     const { transport, dispatcher } = await harness();
     const gate = Promise.withResolvers<void>();
-    dispatcher.register('pending', async () => {
-      await gate.promise;
-      return 'done';
-    });
+    dispatcher.register(
+      'pending',
+      async () => {
+        await gate.promise;
+        return 'done';
+      },
+      { access: 'public' },
+    );
     transport.connect('c1');
 
     const inFlight = transport.receive('c1', '{"id":"r1","method":"pending"}');
@@ -263,7 +283,9 @@ describe('ConnectionLayer disconnect', () => {
 
   test('ignores messages for a connection it does not track', async () => {
     const { transport, dispatcher, layer } = await harness();
-    dispatcher.register('echo', async (_ctx, payload) => payload);
+    dispatcher.register('echo', async (_ctx, payload) => payload, {
+      access: 'public',
+    });
     const connection = transport.connect('c1');
     await transport.disconnect('c1');
 

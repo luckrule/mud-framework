@@ -26,16 +26,22 @@ const extension: Extension = {
   name: 'package-smoke',
   requires: { transactions: 'full', uniqueConstraint: true },
   register: (registrar) => {
-    registrar.register('smoke.store', async (ctx, payload) => {
-      const value = valueOf(payload);
-      await ctx.storage.execute(
-        'CREATE TABLE IF NOT EXISTS smoke_rows (value TEXT NOT NULL)',
-      );
-      await ctx.storage.execute('INSERT INTO smoke_rows (value) VALUES (?)', [
-        value,
-      ]);
-      return { stored: value };
-    });
+    // The smoke has no login step: it proves the package-level assembly, not
+    // access control, so the only handler is public.
+    registrar.register(
+      'smoke.store',
+      async (ctx, payload) => {
+        const value = valueOf(payload);
+        await ctx.storage.execute(
+          'CREATE TABLE IF NOT EXISTS smoke_rows (value TEXT NOT NULL)',
+        );
+        await ctx.storage.execute('INSERT INTO smoke_rows (value) VALUES (?)', [
+          value,
+        ]);
+        return { stored: value };
+      },
+      { access: 'public' },
+    );
   },
 };
 

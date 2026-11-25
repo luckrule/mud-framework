@@ -95,6 +95,7 @@ export async function startServer(deps: StartupDeps): Promise<StartupResult> {
     dispatcher = new Dispatcher({
       backend,
       timeoutMs: options.timeoutMs,
+      authorize: options.authorize,
       logger,
     });
     const runtime: Runtime = {
@@ -195,8 +196,9 @@ async function registerExtensions(
       // The Extension never sees the dispatcher, so it cannot forget (or
       // override) the name its handlers are logged under (SPEC 7.1).
       const registrar: ExtensionRegistrar = {
-        register: (method, handler) => {
+        register: (method, handler, options) => {
           dispatcher.register(method, handler, {
+            ...options,
             extension: extension.name,
           });
         },

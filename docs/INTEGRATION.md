@@ -48,13 +48,20 @@ try {
         name: 'players',
         requires: { transactions: 'full', uniqueConstraint: true },
         register: (registrar) => {
-          registrar.register('player.create', async (ctx, payload) => {
-            const name = (payload as { name: string }).name;
-            await ctx.storage.execute('INSERT INTO players (name) VALUES (?)', [
-              name,
-            ]);
-            return { created: name };
-          });
+          registrar.register(
+            'player.create',
+            async (ctx, payload) => {
+              const name = (payload as { name: string }).name;
+              await ctx.storage.execute(
+                'INSERT INTO players (name) VALUES (?)',
+                [name],
+              );
+              return { created: name };
+            },
+            // 示例没有登录步骤，所以这个入口显式公开；真实业务通常只把
+            // 登录/注册声明为 public，其余方法保持默认。
+            { access: 'public' },
+          );
         },
       },
     ],
@@ -71,6 +78,12 @@ try {
 ```
 
 示例的前置条件是 `./data` 目录已存在，且数据库已有业务表 `players (name TEXT NOT NULL)`。`SqliteBackend.open` 既不创建父目录，也不创建业务 schema；目录缺失会导致打开失败，表缺失会让 `player.create` 返回 `INTERNAL_ERROR`。schema 初始化与迁移属于应用，必须在接受业务请求前完成；可放在 Server 的 `createBackend` 中，但不得提前到 Portal 或 prepared 阶段。
+
+### 访问声明与登录装配
+
+Handler 默认 `access: 'session'`：请求没有 Session 时以 `AUTH_REQUIRED` 拒绝，且不会打开事务或执行 Handler。登录/注册这类入口声明 `access: 'public'` 并加 `mayChangeSession: true`，在 handler 内校验凭据后调用 `ctx.bindSession(id)`；该绑定只在请求成功后生效。登录之后的方法保持默认，连接层会把已绑定的 Session 带到后续请求。退出登录同理：public + `mayChangeSession: true` 的 handler 调 `ctx.unbindSession()`，成功后路由被移除，失败时保留。
+
+凭据校验、用户数据、Session ID 的生成与保留策略都属于消费方，框架不提供用户库或登录协议。需要更细的授权判断时，单进程装配给 `Dispatcher` 注入可选的 `authorize(ctx, method, payload)`，双进程装配把它传给 `runServerProcess`（Server 创建 Dispatcher 时透传）：它在 Session 检查之后、事务之前执行，只看到请求身份、`AbortSignal` 与日志器；返回 false 得到 `FORBIDDEN`，抛错按 `INTERNAL_ERROR` 处理，且整个决策受请求 deadline 约束。
 
 `runServerProcess` 返回的 Promise 就是退出信号：收到 `shutdown` 并正常收尾时 resolve，启动失败或链路断开时 reject。入口脚本应把失败映射为非零退出码，供进程管理与诊断识别；Portal 也通过 IPC 断开与退出事件发现 Server 丢失，不只依赖退出码。
 

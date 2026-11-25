@@ -11,13 +11,19 @@ describe('ConnectionLayer bounded input queue (SPEC 3.5)', () => {
     });
     const entered = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
-    dispatcher.register('bind', async (ctx) => {
-      ctx.bindSession('s1');
-      entered.resolve();
-      await release.promise;
-      return 'bound';
+    dispatcher.register(
+      'bind',
+      async (ctx) => {
+        ctx.bindSession('s1');
+        entered.resolve();
+        await release.promise;
+        return 'bound';
+      },
+      { access: 'public', mayChangeSession: true },
+    );
+    dispatcher.register('identity', async (ctx) => ctx.sessionId, {
+      access: 'public',
     });
-    dispatcher.register('identity', async (ctx) => ctx.sessionId);
     transport.connect('c1');
     const slow = transport.receive('c1', '{"id":"slow","method":"bind"}');
     await entered.promise;
@@ -62,11 +68,15 @@ describe('ConnectionLayer bounded input queue (SPEC 3.5)', () => {
     });
     const gate = Promise.withResolvers<void>();
     const calls: string[] = [];
-    dispatcher.register('work', async (_ctx, payload) => {
-      calls.push(String(payload));
-      await gate.promise;
-      return payload;
-    });
+    dispatcher.register(
+      'work',
+      async (_ctx, payload) => {
+        calls.push(String(payload));
+        await gate.promise;
+        return payload;
+      },
+      { access: 'public' },
+    );
     transport.connect('c1');
 
     const pending = [
@@ -92,10 +102,14 @@ describe('ConnectionLayer bounded input queue (SPEC 3.5)', () => {
       timeoutMs: 5000,
     });
     const gate = Promise.withResolvers<void>();
-    dispatcher.register('work', async (_ctx, payload) => {
-      await gate.promise;
-      return payload;
-    });
+    dispatcher.register(
+      'work',
+      async (_ctx, payload) => {
+        await gate.promise;
+        return payload;
+      },
+      { access: 'public' },
+    );
     transport.connect('c1');
 
     const pending = [
@@ -125,10 +139,14 @@ describe('ConnectionLayer bounded input queue (SPEC 3.5)', () => {
       timeoutMs: 5000,
     });
     const gate = Promise.withResolvers<void>();
-    dispatcher.register('work', async (_ctx, payload) => {
-      await gate.promise;
-      return payload;
-    });
+    dispatcher.register(
+      'work',
+      async (_ctx, payload) => {
+        await gate.promise;
+        return payload;
+      },
+      { access: 'public' },
+    );
     transport.connect('c1');
 
     const first = transport.receive(
@@ -163,10 +181,14 @@ describe('ConnectionLayer bounded input queue (SPEC 3.5)', () => {
       timeoutMs: 5000,
     });
     const gate = Promise.withResolvers<void>();
-    dispatcher.register('work', async () => {
-      await gate.promise;
-      return null;
-    });
+    dispatcher.register(
+      'work',
+      async () => {
+        await gate.promise;
+        return null;
+      },
+      { access: 'public' },
+    );
     transport.connect('c1');
 
     const pending = [
@@ -195,10 +217,14 @@ describe('ConnectionLayer bounded input queue (SPEC 3.5)', () => {
       timeoutMs: 5000,
     });
     const gate = Promise.withResolvers<void>();
-    dispatcher.register('work', async (_ctx, payload) => {
-      await gate.promise;
-      return payload;
-    });
+    dispatcher.register(
+      'work',
+      async (_ctx, payload) => {
+        await gate.promise;
+        return payload;
+      },
+      { access: 'public' },
+    );
     transport.connect('c1');
 
     // One executing plus a thousand waiting fills the documented default;

@@ -1,4 +1,4 @@
-import type { ExecutorOutcome } from '../shared/executor.ts';
+import type { ExecutorOutcome, SessionChange } from '../shared/executor.ts';
 /**
  * Portal <-> Server IPC protocol (ADR-0002).
  *
@@ -130,10 +130,10 @@ export type ResultMessage = {
    * The Session the request carried on entry, echoed back by the Server so a
    * result that arrives after the Portal settled the request still names it.
    *
-   * Deliberately separate from the `sessionId` that `ExecutorOutcome` carries:
-   * that one is a Session the handler bound during this request and only a
-   * success can have it. A failure carries this echo and no `sessionId`.
-   * Omitted when the request entered with no Session.
+   * Deliberately separate from the `sessionChange` that `ExecutorOutcome`
+   * carries: that one is a change the handler declared during this request and
+   * only a success can have it. A failure carries this echo and no
+   * `sessionChange`. Omitted when the request entered with no Session.
    */
   readonly requestSessionId?: string;
 } & ExecutorOutcome;
@@ -277,8 +277,8 @@ function buildRequest(raw: Record<string, unknown>): RequestMessage {
 
 function buildResult(raw: Record<string, unknown>): ResultMessage {
   const requestId = readString(raw, 'result', 'requestId', true);
-  // Read for both outcomes: a failed result has no `sessionId` of its own, so
-  // the echo is the only Session it can name.
+  // Read for both outcomes: a failed result has no `sessionChange` of its own,
+  // so the echo is the only Session it can name.
   const requestSessionId = readOptionalString(
     raw,
     'result',
@@ -299,10 +299,48 @@ function buildResult(raw: Record<string, unknown>): ResultMessage {
     requestSessionId,
     ok: true,
     result: raw.result,
-    // Absent means "no Session bound" (SPEC 2), so it is passed through as
-    // `undefined` rather than defaulted to an empty string.
-    sessionId: readOptionalString(raw, 'result', 'sessionId'),
+    // Absent means "no Session change" (SPEC 2), so it is passed through as
+    // `undefined` rather than defaulted to an empty object.
+    sessionChange: readSessionChange(raw, 'result', 'sessionChange'),
   };
+}
+
+/**
+ * Strict by construction: a malformed change must be refused here, because a
+ * permissive parse would let a bad `sessionId` or an unknown change type reach
+ * the Portal's routing table (SPEC 3.7).
+ */
+function readSessionChange(
+  raw: Record<string, unknown>,
+  messageType: string,
+  field: string,
+): SessionChange | undefined {
+  if (raw[field] === undefined) {
+    return undefined;
+  }
+  const record = readRecord(raw, messageType, field);
+  const prefix = `${messageType}.${field}`;
+  const type = record.type;
+  if (type === 'bind') {
+    return {
+      type: 'bind',
+      sessionId: readString(record, prefix, 'sessionId', true),
+    };
+  }
+  if (type === 'unbind') {
+    if (record.sessionId !== undefined) {
+      throw new ShapeError(
+        fieldReason(
+          prefix,
+          'sessionId',
+          'absent for an unbind',
+          record.sessionId,
+        ),
+      );
+    }
+    return { type: 'unbind' };
+  }
+  throw new ShapeError(fieldReason(prefix, 'type', '"bind" or "unbind"', type));
 }
 
 function readResultError(

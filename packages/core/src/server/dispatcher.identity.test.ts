@@ -9,10 +9,14 @@ describe('Dispatcher.identity', () => {
     const backend = new MemoryStorageBackend();
     const dispatcher = new Dispatcher({ backend, timeoutMs: 1000 });
     let seen = '';
-    dispatcher.register('inspect', async (ctx) => {
-      seen = ctx.requestId;
-      return null;
-    });
+    dispatcher.register(
+      'inspect',
+      async (ctx) => {
+        seen = ctx.requestId;
+        return null;
+      },
+      { access: 'public' },
+    );
 
     await dispatcher.dispatch('inspect', null);
 
@@ -27,10 +31,14 @@ describe('Dispatcher.identity', () => {
       createRequestId: () => 'fixed-id',
     });
     let seen = '';
-    dispatcher.register('inspect', async (ctx) => {
-      seen = ctx.requestId;
-      return null;
-    });
+    dispatcher.register(
+      'inspect',
+      async (ctx) => {
+        seen = ctx.requestId;
+        return null;
+      },
+      { access: 'public' },
+    );
 
     await dispatcher.dispatch('inspect', null);
 
@@ -45,10 +53,14 @@ describe('Dispatcher.identity', () => {
       createRequestId: () => 'fresh-id',
     });
     const seen: string[] = [];
-    dispatcher.register('inspect', async (ctx) => {
-      seen.push(ctx.requestId);
-      return null;
-    });
+    dispatcher.register(
+      'inspect',
+      async (ctx) => {
+        seen.push(ctx.requestId);
+        return null;
+      },
+      { access: 'public' },
+    );
 
     await dispatcher.dispatch('inspect', null, { requestId: 'original-id' });
     await dispatcher.dispatch('inspect', null);
@@ -60,14 +72,18 @@ describe('Dispatcher.identity', () => {
     const backend = new MemoryStorageBackend();
     const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });
     let seen: Record<string, unknown> = {};
-    dispatcher.register('inspect', async (ctx) => {
-      seen = {
-        connectionId: ctx.connectionId,
-        clientRequestId: ctx.clientRequestId,
-        sessionId: ctx.sessionId,
-      };
-      return null;
-    });
+    dispatcher.register(
+      'inspect',
+      async (ctx) => {
+        seen = {
+          connectionId: ctx.connectionId,
+          clientRequestId: ctx.clientRequestId,
+          sessionId: ctx.sessionId,
+        };
+        return null;
+      },
+      { access: 'public' },
+    );
 
     await dispatcher.dispatch('inspect', null, {
       connectionId: 'c1',
@@ -86,14 +102,18 @@ describe('Dispatcher.identity', () => {
     const backend = new MemoryStorageBackend();
     const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });
     let seen: Record<string, unknown> = {};
-    dispatcher.register('inspect', async (ctx) => {
-      seen = {
-        connectionId: ctx.connectionId,
-        clientRequestId: ctx.clientRequestId,
-        sessionId: ctx.sessionId,
-      };
-      return null;
-    });
+    dispatcher.register(
+      'inspect',
+      async (ctx) => {
+        seen = {
+          connectionId: ctx.connectionId,
+          clientRequestId: ctx.clientRequestId,
+          sessionId: ctx.sessionId,
+        };
+        return null;
+      },
+      { access: 'public' },
+    );
 
     await dispatcher.dispatch('inspect', null);
 
@@ -108,10 +128,14 @@ describe('Dispatcher.identity', () => {
     const backend = new MemoryStorageBackend();
     const lines: string[] = [];
     const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 }, lines);
-    dispatcher.register('inspect', async (ctx) => {
-      ctx.logger.info({ detail: 'inside handler' }, 'handler ran');
-      return null;
-    });
+    dispatcher.register(
+      'inspect',
+      async (ctx) => {
+        ctx.logger.info({ detail: 'inside handler' }, 'handler ran');
+        return null;
+      },
+      { access: 'public' },
+    );
 
     await dispatcher.dispatch('inspect', null, {
       requestId: 'req-9',

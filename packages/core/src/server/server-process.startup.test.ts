@@ -49,8 +49,10 @@ describe('runServerProcess startup', () => {
         {
           name: 'echo',
           register: (dispatcher) => {
-            dispatcher.register('echo', (_ctx, payload) =>
-              Promise.resolve(payload),
+            dispatcher.register(
+              'echo',
+              (_ctx, payload) => Promise.resolve(payload),
+              { access: 'public' },
             );
             readiesDuringRegister = received(harness.messages).filter(
               (message) => message.type === 'ready',

@@ -15,14 +15,21 @@ describe('Dispatcher logger safety', () => {
       timeoutMs: 1000,
       logger: throwingLogger(),
     });
-    dispatcher.register('login', (ctx) => {
-      ctx.bindSession('s1');
-      return Promise.resolve('ok');
-    });
+    dispatcher.register(
+      'login',
+      (ctx) => {
+        ctx.bindSession('s1');
+        return Promise.resolve('ok');
+      },
+      { access: 'public', mayChangeSession: true },
+    );
 
     const result = await dispatcher.dispatch('login', {});
 
-    expect(result).toEqual({ result: 'ok', boundSessionId: 's1' });
+    expect(result).toEqual({
+      result: 'ok',
+      sessionChange: { type: 'bind', sessionId: 's1' },
+    });
     await dispatcher.close();
   }, 2000);
 
@@ -45,7 +52,9 @@ describe('Dispatcher logger safety', () => {
       timeoutMs: 10,
       logger: throwingLogger(),
     });
-    dispatcher.register('hang', () => new Promise<never>(() => undefined));
+    dispatcher.register('hang', () => new Promise<never>(() => undefined), {
+      access: 'public',
+    });
 
     const error = await rejectionOf(dispatcher.dispatch('hang', {}));
 

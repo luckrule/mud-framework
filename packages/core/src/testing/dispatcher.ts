@@ -35,6 +35,38 @@ export function quietDispatcher(
 }
 
 /**
+ * A backend that counts transaction openings. `MemoryStorageBackend.stats()`
+ * cannot distinguish "never opened" from "opened and still running", which is
+ * exactly the distinction an access refusal has to prove.
+ */
+export class CountingBackend implements StorageBackend {
+  transactions = 0;
+
+  capabilities(): StorageCapabilities {
+    return {
+      transactions: 'full',
+      concurrency: 'pooled',
+      snapshotRead: true,
+      uniqueConstraint: false,
+      maxTransactionDurationMs: Number.POSITIVE_INFINITY,
+    };
+  }
+
+  async transaction<T>(fn: (tx: StorageTransaction) => Promise<T>): Promise<T> {
+    this.transactions += 1;
+    const tx: StorageTransaction = {
+      query: <R>(): Promise<R[]> => Promise.resolve([]),
+      execute: (): Promise<void> => Promise.resolve(),
+    };
+    return fn(tx);
+  }
+
+  close(): Promise<void> {
+    return Promise.resolve();
+  }
+}
+
+/**
  * A backend whose COMMIT lands a macrotask after the handler returns, like a
  * real database flushing its log. `MemoryStorageBackend` commits in the same
  * turn, which hides the window where a cancel arrives too late to roll back.

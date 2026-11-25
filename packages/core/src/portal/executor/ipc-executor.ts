@@ -807,10 +807,10 @@ export class IpcExecutor implements RequestExecutor {
       ...requestFields(pending.request),
       durationMs: Date.now() - pending.startedAt,
     };
-    // A fresh binding wins over the entry Session the connection layer already
-    // knew.
-    if (message.ok && message.sessionId !== undefined) {
-      fields.sessionId = message.sessionId;
+    // `sessionId` stays the entry Session from `requestFields`; a routing
+    // change is reported separately, never as a replacement id.
+    if (message.ok && message.sessionChange !== undefined) {
+      fields.sessionChange = message.sessionChange;
     }
     this.logger.debug(fields, 'result received');
     this.ledger.settle(pending, outcome);

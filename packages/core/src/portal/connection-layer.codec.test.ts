@@ -14,7 +14,9 @@ describe('ConnectionLayer codec', () => {
     const { transport, dispatcher } = await harness({
       codec: new Base64Codec(),
     });
-    dispatcher.register('echo', async (_ctx, payload) => payload);
+    dispatcher.register('echo', async (_ctx, payload) => payload, {
+      access: 'public',
+    });
     transport.connect('c1');
 
     const request = Buffer.from(

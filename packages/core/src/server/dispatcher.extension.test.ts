@@ -17,7 +17,7 @@ describe('Dispatcher handler metadata', () => {
         ctx.logger.info({ detail: 'seen' }, 'handler ran');
         return null;
       },
-      { extension: 'banking' },
+      { extension: 'banking', access: 'public' },
     );
 
     await dispatcher.dispatch('deposit', null, {
@@ -60,11 +60,15 @@ describe('Dispatcher handler metadata', () => {
     const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 }, lines);
     let seen: string | undefined = 'unset';
 
-    dispatcher.register('plain', async (ctx) => {
-      seen = ctx.extension;
-      ctx.logger.info({ detail: 'seen' }, 'handler ran');
-      return null;
-    });
+    dispatcher.register(
+      'plain',
+      async (ctx) => {
+        seen = ctx.extension;
+        ctx.logger.info({ detail: 'seen' }, 'handler ran');
+        return null;
+      },
+      { access: 'public' },
+    );
 
     await dispatcher.dispatch('plain', null, { requestId: 'r-plain' });
 

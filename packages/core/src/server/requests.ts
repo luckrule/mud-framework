@@ -408,16 +408,19 @@ export class RequestRunner {
     durationMs: number,
   ): void {
     if (outcome.ok) {
-      const sessionId = outcome.sessionId;
       const fields: LogFields = { ...this.requestFields(message), durationMs };
-      if (sessionId !== undefined) {
-        fields.sessionId = sessionId;
+      const change = outcome.sessionChange;
+      if (change !== undefined) {
+        // `sessionId` already names the entry Session; the routing change is a
+        // separate field so the two cannot be confused.
+        fields.sessionChange = change;
       }
       this.deps.logger.debug(fields, 'request completed');
       // The outcome already has the shape of the message's payload half, so it
-      // is spread rather than copied field by field. An unbound success carries
-      // `sessionId: undefined` as an own property, which every channel either
-      // drops (JSON) or keeps with the same meaning as absence (SPEC 2).
+      // is spread rather than copied field by field. An unchanged success
+      // carries `sessionChange: undefined` as an own property, which every
+      // channel either drops (JSON) or keeps with the same meaning as absence
+      // (SPEC 2).
       this.deps.send({ ...resultEnvelope(message), ...outcome }, 'result');
       return;
     }
@@ -438,7 +441,8 @@ export class RequestRunner {
  * The correlation half of every result sent for `message`: its request id plus
  * the Session it entered with, echoed so the Portal can name the Session of a
  * result that arrives after its pending entry is gone. The echo is not an
- * outcome field; a Session bound by the handler stays in `outcome.sessionId`.
+ * outcome field; a Session change declared by the handler stays in
+ * `outcome.sessionChange`.
  */
 function resultEnvelope(message: RequestMessage): {
   type: 'result';

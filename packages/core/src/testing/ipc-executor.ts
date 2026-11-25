@@ -10,7 +10,11 @@ import type { ServerExitInfo, SpawnedServer } from '../ipc/spawn-port.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import type { Logger } from '../logging/types.ts';
 import { IpcExecutor } from '../portal/executor/ipc-executor.ts';
-import type { ExecutorOutcome, ExecutorRequest } from '../shared/executor.ts';
+import type {
+  ExecutorOutcome,
+  ExecutorRequest,
+  SessionChange,
+} from '../shared/executor.ts';
 
 /**
  * The in-memory channel delivers synchronously, but crash detection, the exit
@@ -87,16 +91,14 @@ export function readyMessage(
   };
 }
 
-export function successMessage(requestId: string, result: unknown): IpcMessage {
-  return { type: 'result', requestId, ok: true, result };
-}
-
-export function boundSuccessMessage(
+export function successMessage(
   requestId: string,
   result: unknown,
-  sessionId: string,
+  sessionChange?: SessionChange,
 ): IpcMessage {
-  return { type: 'result', requestId, ok: true, result, sessionId };
+  return sessionChange === undefined
+    ? { type: 'result', requestId, ok: true, result }
+    : { type: 'result', requestId, ok: true, result, sessionChange };
 }
 
 export function request(

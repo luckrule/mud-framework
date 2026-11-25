@@ -1,7 +1,10 @@
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 
 import { runServerProcess } from '../../../packages/core/src/index.ts';
-import type { Extension } from '../../../packages/core/src/index.ts';
+import type {
+  Extension,
+  ServerProcessOptions,
+} from '../../../packages/core/src/index.ts';
 import { SqliteBackend } from '../../../packages/storage-sqlite/src/index.ts';
 
 /**
@@ -92,22 +95,71 @@ function playersExtension(): Extension {
       uniqueConstraint: true,
     },
     register: (registrar) => {
-      registrar.register('player.create', async (ctx, payload) => {
-        const { name, sessionId } = payload as {
-          name: string;
-          sessionId: string;
-        };
-        ctx.bindSession(sessionId);
-        await ctx.storage.execute(
-          'CREATE TABLE IF NOT EXISTS players (name TEXT NOT NULL)',
-        );
-        await ctx.storage.execute('INSERT INTO players (name) VALUES (?)', [
-          name,
-        ]);
-        return { created: name, sessionId };
-      });
+      // The login entry is the one handler that may create a Session: it runs
+      // without one and declares the bind. `fail` is a test hook that binds and
+      // then throws, so a test can prove a failed login leaves no route behind
+      // (SPEC 2).
+      registrar.register(
+        'player.create',
+        async (ctx, payload) => {
+          const { name, sessionId, fail } = payload as {
+            name: string;
+            sessionId: string;
+            fail?: boolean;
+          };
+          ctx.bindSession(sessionId);
+          if (fail === true) {
+            throw new Error('player.create failed after bindSession');
+          }
+          await ctx.storage.execute(
+            'CREATE TABLE IF NOT EXISTS players (name TEXT NOT NULL)',
+          );
+          await ctx.storage.execute('INSERT INTO players (name) VALUES (?)', [
+            name,
+          ]);
+          return { created: name, sessionId };
+        },
+        { access: 'public', mayChangeSession: true },
+      );
+      // Session-gated by default (SPEC 3.7): reaching it without a Session must
+      // fail before the handler runs.
       registrar.register('player.whoami', (ctx) =>
         Promise.resolve({ sessionId: ctx.sessionId ?? null }),
+      );
+      // Also session-gated by default, and deliberately writes: the table is
+      // evidence the access gate did or did not let the handler execute.
+      registrar.register('player.probe', async (ctx) => {
+        await ctx.storage.execute(
+          'CREATE TABLE IF NOT EXISTS probes (request_id TEXT NOT NULL)',
+        );
+        await ctx.storage.execute(
+          'INSERT INTO probes (request_id) VALUES (?)',
+          [ctx.requestId],
+        );
+        return { sessionId: ctx.sessionId ?? null };
+      });
+      // Also session-gated by default. The authorize hook in `runServerProcess`
+      // rejects this method, so the probe row is evidence the policy stopped it
+      // before the handler ran (SPEC 3.7).
+      registrar.register('player.forbidden', async (ctx) => {
+        await ctx.storage.execute(
+          'CREATE TABLE IF NOT EXISTS probes (request_id TEXT NOT NULL)',
+        );
+        await ctx.storage.execute(
+          'INSERT INTO probes (request_id) VALUES (?)',
+          [ctx.requestId],
+        );
+        return { executed: true };
+      });
+      // Ending a Session needs one to end, and removing the route is a Session
+      // change, so this is the session counterpart of the login entry.
+      registrar.register(
+        'player.logout',
+        (ctx) => {
+          ctx.unbindSession();
+          return Promise.resolve({ loggedOut: true });
+        },
+        { access: 'session', mayChangeSession: true },
       );
     },
   };
@@ -123,7 +175,9 @@ function pooledOnlyExtension(required: boolean): Extension {
     requires: { concurrency: 'pooled' },
     ...(required ? { required: true } : {}),
     register: (registrar) => {
-      registrar.register('pooled.ping', () => Promise.resolve({ pong: true }));
+      registrar.register('pooled.ping', () => Promise.resolve({ pong: true }), {
+        access: 'public',
+      });
     },
   };
 }
@@ -162,65 +216,84 @@ const extensions: Extension[] = [
   {
     name: 'notes',
     register: (dispatcher) => {
-      dispatcher.register('echo', (_ctx, payload) => Promise.resolve(payload));
+      // The notes handlers are transport/replay probes, not business methods:
+      // none of them reads or changes a Session, so they opt out explicitly
+      // (SPEC 3.7).
+      dispatcher.register('echo', (_ctx, payload) => Promise.resolve(payload), {
+        access: 'public',
+      });
       // Answers with the build this process was started from, so a client on one
       // socket can tell which process served a request across a switch.
-      dispatcher.register('version', () =>
-        Promise.resolve({ codeVersion: codeVersion ?? null }),
+      dispatcher.register(
+        'version',
+        () => Promise.resolve({ codeVersion: codeVersion ?? null }),
+        { access: 'public' },
       );
-      dispatcher.register('store', async (ctx, payload) => {
-        await ctx.storage.execute(
-          'CREATE TABLE IF NOT EXISTS notes (body TEXT NOT NULL)',
-        );
-        await ctx.storage.execute('INSERT INTO notes (body) VALUES (?)', [
-          String(payload),
-        ]);
-        return { stored: payload };
-      });
+      dispatcher.register(
+        'store',
+        async (ctx, payload) => {
+          await ctx.storage.execute(
+            'CREATE TABLE IF NOT EXISTS notes (body TEXT NOT NULL)',
+          );
+          await ctx.storage.execute('INSERT INTO notes (body) VALUES (?)', [
+            String(payload),
+          ]);
+          return { stored: payload };
+        },
+        { access: 'public' },
+      );
       if (behavior === 'crash') {
-        dispatcher.register('crash', () => {
-          // oxlint-disable-next-line unicorn/no-process-exit -- the crash must land mid-handler; a graceful stop would let the result out and stop exercising replay
-          process.exit(1);
-        });
+        dispatcher.register(
+          'crash',
+          () => {
+            // oxlint-disable-next-line unicorn/no-process-exit -- the crash must land mid-handler; a graceful stop would let the result out and stop exercising replay
+            process.exit(1);
+          },
+          { access: 'public' },
+        );
       }
       if (behavior === 'crash-once') {
-        dispatcher.register('store-once', async (ctx, payload) => {
-          await ctx.storage.execute(
-            'CREATE TABLE IF NOT EXISTS once_notes (client_request_id TEXT PRIMARY KEY, body TEXT NOT NULL)',
-          );
-          // Deliberately not idempotent: its row count shows whether the
-          // interrupted attempt's transaction ever committed.
-          await ctx.storage.execute(
-            'CREATE TABLE IF NOT EXISTS once_executions (id INTEGER PRIMARY KEY AUTOINCREMENT, client_request_id TEXT NOT NULL)',
-          );
-          await ctx.storage.execute(
-            'INSERT INTO once_executions (client_request_id) VALUES (?)',
-            [ctx.clientRequestId],
-          );
-          // `clientRequestId`, not `requestId`, is the business idempotency
-          // key: `requestId` is minted per Request and only stable across
-          // that Request's own replays, so a client retry would carry a new
-          // one, while `clientRequestId` stays the same (SPEC 6.4).
-          //
-          // This test never reaches the conflict branch: the interrupted
-          // attempt's transaction rolled back, so the replay inserts a
-          // clean row. `once_executions` having exactly one row is what
-          // shows only one execution was ever committed; the guard here
-          // only covers the case a real client retry creates.
-          await ctx.storage.execute(
-            'INSERT INTO once_notes (client_request_id, body) VALUES (?, ?) ON CONFLICT(client_request_id) DO NOTHING',
-            [ctx.clientRequestId, String(payload)],
-          );
-          const attempt = recordAttempt(
-            `${databasePath}.attempts`,
-            ctx.requestId,
-          );
-          if (attempt === 1) {
-            // oxlint-disable-next-line unicorn/no-process-exit -- the crash must land before COMMIT; returning would commit the row and end the crash path being tested
-            process.exit(1);
-          }
-          return { stored: payload };
-        });
+        dispatcher.register(
+          'store-once',
+          async (ctx, payload) => {
+            await ctx.storage.execute(
+              'CREATE TABLE IF NOT EXISTS once_notes (client_request_id TEXT PRIMARY KEY, body TEXT NOT NULL)',
+            );
+            // Deliberately not idempotent: its row count shows whether the
+            // interrupted attempt's transaction ever committed.
+            await ctx.storage.execute(
+              'CREATE TABLE IF NOT EXISTS once_executions (id INTEGER PRIMARY KEY AUTOINCREMENT, client_request_id TEXT NOT NULL)',
+            );
+            await ctx.storage.execute(
+              'INSERT INTO once_executions (client_request_id) VALUES (?)',
+              [ctx.clientRequestId],
+            );
+            // `clientRequestId`, not `requestId`, is the business idempotency
+            // key: `requestId` is minted per Request and only stable across
+            // that Request's own replays, so a client retry would carry a new
+            // one, while `clientRequestId` stays the same (SPEC 6.4).
+            //
+            // This test never reaches the conflict branch: the interrupted
+            // attempt's transaction rolled back, so the replay inserts a
+            // clean row. `once_executions` having exactly one row is what
+            // shows only one execution was ever committed; the guard here
+            // only covers the case a real client retry creates.
+            await ctx.storage.execute(
+              'INSERT INTO once_notes (client_request_id, body) VALUES (?, ?) ON CONFLICT(client_request_id) DO NOTHING',
+              [ctx.clientRequestId, String(payload)],
+            );
+            const attempt = recordAttempt(
+              `${databasePath}.attempts`,
+              ctx.requestId,
+            );
+            if (attempt === 1) {
+              // oxlint-disable-next-line unicorn/no-process-exit -- the crash must land before COMMIT; returning would commit the row and end the crash path being tested
+              process.exit(1);
+            }
+            return { stored: payload };
+          },
+          { access: 'public' },
+        );
       }
     },
   },
@@ -266,11 +339,21 @@ async function openBackend(): Promise<SqliteBackend> {
   return backend;
 }
 
+/**
+ * The E2E policy probe belongs to `extension-trial` only: every other behaviour
+ * leaves authorization unset, so those scenarios are unaffected by it.
+ */
+const authorize: ServerProcessOptions['authorize'] =
+  behavior === 'extension-trial'
+    ? (_ctx, method) => method !== 'player.forbidden'
+    : undefined;
+
 try {
   await runServerProcess({
     createBackend: openBackend,
     extensions,
     timeoutMs: 2000,
+    ...(authorize === undefined ? {} : { authorize }),
     ...(codeVersion === undefined ? {} : { codeVersion }),
   });
 } catch (error) {

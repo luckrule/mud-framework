@@ -33,17 +33,23 @@ export type {
 } from './storage/types.ts';
 export type { StorageRequirements } from './storage/requirements.ts';
 export { unmetRequirements } from './storage/requirements.ts';
-export type { Extension, ExtensionRegistrar } from './server/extension.ts';
+export type {
+  Extension,
+  ExtensionRegistrar,
+  HandlerRegistrationOptions,
+} from './server/extension.ts';
 export type {
   Transport,
   TransportConnection,
   TransportHandlers,
 } from './transport/types.ts';
 export type {
+  AccessContext,
   DispatchMeta,
   DispatchResult,
   DispatcherOptions,
   Handler,
+  HandlerAccess,
   HandlerOptions,
   RequestContext,
 } from './server/dispatcher.ts';
@@ -62,15 +68,20 @@ export type {
   ExecutorOutcome,
   ExecutorRequest,
   RequestExecutor,
+  SessionChange,
 } from './shared/executor.ts';
 export { LocalExecutor } from './server/local-executor.ts';
 export {
+  AUTH_REQUIRED,
+  AuthenticationRequiredError,
   BusinessError,
+  FORBIDDEN,
   FRAMEWORK_CAPABILITY_UNSUPPORTED,
   FRAMEWORK_QUEUE_FULL,
   FRAMEWORK_REPLAY_EXHAUSTED,
   FRAMEWORK_SHUTDOWN,
   FRAMEWORK_TIMEOUT,
+  ForbiddenError,
   FrameworkTimeoutError,
   INTERNAL_ERROR,
   INVALID_ENVELOPE,
