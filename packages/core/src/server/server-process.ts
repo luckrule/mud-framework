@@ -278,6 +278,7 @@ class ServerProcess {
       case 'prepared':
       case 'ready':
       case 'result':
+      case 'event':
       case 'closed':
         // Server-to-Portal types: a Portal that sends one is out of protocol.
         this.logger.warn(
@@ -487,9 +488,7 @@ class ServerProcess {
       sendBarrier: (message, what) => {
         this.sendBarrier(message, what);
       },
-      sendQuietly: (message, what) => {
-        this.sendQuietly(message, what);
-      },
+      sendQuietly: (message, what) => this.sendQuietly(message, what),
       onMessage: (raw) => {
         this.onMessage(raw);
       },
@@ -500,9 +499,10 @@ class ServerProcess {
     };
   }
 
-  private sendQuietly(message: IpcMessage, what: string): void {
+  private sendQuietly(message: IpcMessage, what: string): boolean {
     try {
       this.channel.send(message);
+      return true;
     } catch (error) {
       // The link is gone. Portal's replay buffer still holds whatever it never
       // acknowledged, so there is nothing to retry from here.
@@ -510,6 +510,7 @@ class ServerProcess {
         { code: 'IPC_SEND_FAILED', reason: messageOf(error) },
         `${what} could not be sent`,
       );
+      return false;
     }
   }
 

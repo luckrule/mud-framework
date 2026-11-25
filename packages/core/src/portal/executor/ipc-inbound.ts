@@ -1,4 +1,4 @@
-import type { ResultMessage } from '../../ipc/protocol.ts';
+import type { EventMessage, ResultMessage } from '../../ipc/protocol.ts';
 import { parseIpcMessage } from '../../ipc/protocol.ts';
 import type { Logger } from '../../logging/types.ts';
 import { messageOf } from '../../shared/guards.ts';
@@ -26,6 +26,8 @@ export interface ServerMessageContext {
   resolveStart(): void;
   /** A `result` message: it settles through the buffer and the ledger. */
   onResult(message: ResultMessage): void;
+  /** An `event` message: a committed request's out-of-band notification. */
+  dispatchEvent(message: EventMessage): void;
   /** A send failed: the owner decides whether that is a crash or a retirement. */
   onServerLost(
     server: ServerState,
@@ -73,6 +75,9 @@ export function onServerMessage(
       return;
     case 'result':
       context.onResult(message);
+      return;
+    case 'event':
+      context.dispatchEvent(message);
       return;
     case 'closed':
       onClosed(context, server, message.reason);

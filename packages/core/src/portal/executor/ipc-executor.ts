@@ -1,4 +1,5 @@
 import { failure } from '../../ipc/outbound.ts';
+import type { EventMessage } from '../../ipc/protocol.ts';
 import type { SpawnedServer } from '../../ipc/spawn-port.ts';
 import { createJsonLogger } from '../../logging/json-logger.ts';
 import { safeLogger } from '../../logging/safe-logger.ts';
@@ -10,6 +11,7 @@ import {
   DEFAULT_SHUTDOWN_TIMEOUT_MS,
   closeBudget,
 } from '../../shared/budget.ts';
+import type { ServerEvent } from '../../shared/events.ts';
 import type {
   ExecutorHealth,
   ExecutorOutcome,
@@ -73,6 +75,10 @@ export class IpcExecutor implements RequestExecutor, SwitchDeps {
   private readonly versionSwitch: VersionSwitch;
   /** Launch, crash recovery, restart backoff and Server→Portal messages. */
   private readonly supervisor: ServerSupervisor;
+  /** Event sinks the connection layer registered (ADR-0008). */
+  private readonly eventListeners = new Set<(event: ServerEvent) => void>();
+  /** Set once `close()` starts: no event is dispatched after that. */
+  private eventsClosed = false;
   private closePromise: Promise<void> | undefined;
 
   constructor(options: IpcExecutorOptions) {
@@ -143,6 +149,9 @@ export class IpcExecutor implements RequestExecutor, SwitchDeps {
       startTimeoutMs,
       portalTimeoutMs: options.timeoutMs,
       spawn: options.spawn,
+      onEvent: (message) => {
+        this.dispatchEvent(message);
+      },
     });
   }
 
@@ -344,8 +353,74 @@ export class IpcExecutor implements RequestExecutor, SwitchDeps {
   close(): Promise<void> {
     // Memoised here so the sequence runs once: a second `close()` joins the
     // first rather than shutting the same process down twice.
-    this.closePromise ??= doClose(this.shutdownHost());
+    if (this.closePromise === undefined) {
+      // Events are best-effort (ADR-0008): after shutdown starts there may be
+      // no connection layer left to deliver them to, so the sinks are released
+      // and later messages are dropped with a warn rather than held.
+      this.eventsClosed = true;
+      this.eventListeners.clear();
+      this.closePromise = doClose(this.shutdownHost());
+    }
     return this.closePromise;
+  }
+
+  /**
+   * Registers one sink for Server-initiated events and returns the
+   * unsubscribe function. A subscription after `close()` is a no-op: the
+   * executor can no longer receive events worth delivering.
+   */
+  onEvent(listener: (event: ServerEvent) => void): () => void {
+    if (this.eventsClosed) {
+      return () => undefined;
+    }
+    this.eventListeners.add(listener);
+    return () => {
+      this.eventListeners.delete(listener);
+    };
+  }
+
+  /**
+   * Hands one parsed event to the registered sinks in registration order.
+   * Nothing here may throw at the caller: IPC dispatch has no failure channel,
+   * and one broken sink must not take the process or the other sinks down.
+   */
+  private dispatchEvent(message: EventMessage): void {
+    const event: ServerEvent = {
+      eventId: message.eventId,
+      target: message.target,
+      event: message.event,
+      payload: message.payload,
+    };
+    if (this.eventsClosed || this.eventListeners.size === 0) {
+      this.logger.warn(
+        {
+          eventId: event.eventId,
+          event: event.event,
+          code: 'EVENT_DROPPED',
+          reason: 'no event listener',
+        },
+        'server event dropped',
+      );
+      return;
+    }
+    // Snapshot: a sink that unsubscribes (or subscribes) during dispatch must
+    // not change who receives this event.
+    const listeners = new Set(this.eventListeners);
+    for (const listener of listeners) {
+      try {
+        listener(event);
+      } catch (error) {
+        this.logger.warn(
+          {
+            eventId: event.eventId,
+            event: event.event,
+            code: 'EVENT_LISTENER_FAILED',
+            reason: messageOf(error),
+          },
+          'server event listener failed',
+        );
+      }
+    }
   }
 
   /**

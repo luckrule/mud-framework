@@ -206,6 +206,7 @@ describe('ConnectionLayer session routing (SPEC 3.2, INV-004)', () => {
         transport: scriptedTransport([]).transport,
         executor: {
           start: () => local.start(),
+          onEvent: () => () => undefined,
           execute: (request) => {
             events.push(`execute ${request.method}`);
             return local.execute(request);

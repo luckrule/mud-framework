@@ -1,4 +1,4 @@
-import type { ResultMessage } from '../../ipc/protocol.ts';
+import type { EventMessage, ResultMessage } from '../../ipc/protocol.ts';
 import type { SpawnedServer } from '../../ipc/spawn-port.ts';
 import type { Logger } from '../../logging/types.ts';
 import { messageOf } from '../../shared/guards.ts';
@@ -28,6 +28,8 @@ export interface ServerSupervisorOptions {
   readonly startTimeoutMs: number;
   readonly portalTimeoutMs: number;
   readonly spawn: () => SpawnedServer;
+  /** Forwards one Server-initiated event to the executor's listeners. */
+  readonly onEvent: (message: EventMessage) => void;
 }
 
 /**
@@ -49,6 +51,7 @@ export class ServerSupervisor {
   private readonly restart: RestartPolicy;
   private readonly startTimeoutMs: number;
   private readonly portalTimeoutMs: number;
+  private readonly eventSink: (message: EventMessage) => void;
   private readonly closedWaiter = new ClosedWaiter();
   /** The Portal-promised request ceiling; only ever tightened. */
   private ceilingMs: number;
@@ -78,6 +81,7 @@ export class ServerSupervisor {
     this.restart = options.restart;
     this.startTimeoutMs = options.startTimeoutMs;
     this.portalTimeoutMs = options.portalTimeoutMs;
+    this.eventSink = options.onEvent;
     // Until `ready` declares the backend ceiling, the Portal ceiling applies.
     this.ceilingMs = options.portalTimeoutMs;
   }
@@ -493,5 +497,10 @@ export class ServerSupervisor {
 
   onResult(message: ResultMessage): void {
     this.ledger.acceptResult(message);
+  }
+
+  /** One parsed `event` message; delivery policy belongs to the executor. */
+  dispatchEvent(message: EventMessage): void {
+    this.eventSink(message);
   }
 }

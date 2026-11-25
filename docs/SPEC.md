@@ -156,6 +156,27 @@ Handler 的访问检查在业务进程内、Dispatcher 上执行，顺序是契�
 
 拒绝 MUST NOT 打开存储事务、执行 Handler 或改变 Session 路由。Handler 未声明 `mayChangeSession: true` 却调用 `bindSession`/`unbindSession` 时，校验抛出普通错误；handler 未捕获时请求以 `INTERNAL_ERROR` 失败；handler 捕获后请求可以成功，但不会记录任何 Session 变更——吞掉该错误不构成合法用法。检查点与拒绝语义属于框架；认证与授权策略、登录流程属于消费方，由消费方注入或实现为 public Handler。
 
+### 3.8 Server 主动事件
+
+Handler 可以为一个请求声明要发送的事件（ADR-0008）。`ctx.emit(event, payload)` 发给当前请求的 Connection；`ctx.emitToSession(sessionId, event, payload)` 发给该 Session 在投递时的当前 holder。事件名与 payload 对框架不透明；事件名 MUST 非空，`emitToSession` 的 Session id MUST 非空。
+
+事务边界：
+
+- 事件在 Handler 内只进入本请求的缓冲，MUST 在请求成功提交后才发送；同一请求 MUST 先发结果、再发事件。
+- Handler 抛错、请求超时、被取消或事务回滚时，缓冲的事件 MUST 丢弃，MUST NOT 发送。
+- 请求到达终态后再声明事件 MUST 被拒绝，与事务句柄的失效边界一致。
+- 事件发出后不回滚；投递语义是 at-least-once，重放可能以相同 `eventId` 重发。框架不提供去重，业务用 `eventId` 自行判断。
+- 每个请求可缓冲的事件数量 MUST 有界；超出时声明事件的调用抛出普通错误，Handler 可以捕获。该错误未逃逸时请求仍可成功，逃逸时按 Handler 失败处理。
+
+投递语义（best-effort）：
+
+- 目标 Connection 不存在或已关闭、目标 Session 当前没有 holder、编码失败或传输写失败时，事件 MUST 被丢弃并记录 warn；MUST NOT 缓冲、重试或让请求失败。
+- 结果发送失败时，该请求的全部事件 MUST 跳过并记录；请求的成功状态不变。
+- 同一 Connection 上，结果帧与事件帧、事件帧之间的写顺序由连接层的有序链与传输发送队列保证；不同 Connection 之间不承诺全局顺序。
+- 事件是附加通道：MUST NOT 改变请求的终态、超时、取消、重放、Session 屏障或关闭语义。
+
+安全边界：框架不对事件做授权。Handler 可以向任意 Session 声明事件；房间成员资格、可见性与内容过滤属于业务。
+
 ## 4. 存储契约
 
 ### 4.1 接口边界
@@ -246,6 +267,8 @@ TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：
 
 `result` 无法被当前 `Codec` 编码时，框架用同一 `Codec` 编码一条 `INTERNAL_ERROR` 失败响应作为兜底；若该兜底仍无法编码，框架只能记录 `TRANSPORT_SEND_FAILED`，不承诺发出响应。
 
+下行帧有两类，响应帧的线格式保持不变：响应是 `{id, ok, ...}`，不带 `kind`；事件帧是 `{kind:'event', eventId, event, payload}`，`kind` 是事件帧的判别字段。事件帧的 `eventId` 为 `${requestId}:${index}`，同一请求、同一发射顺序的重放得到相同值，客户端可用它去重；框架不保证事件不重复。客户端 MUST 忽略不认识的帧，MUST NOT 因一个事件帧终止连接。事件投递失败不影响任何响应帧。
+
 ## 6. 生命周期
 
 ### 6.1 进程关系
@@ -321,6 +344,8 @@ TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：
 
 结果/完成类日志（`request completed`、`result received`、失败日志）的 `sessionId` 表示请求入口 Session（与 `RequestIdentity` 同义），不会因 Handler 绑定而被改写；入口无 Session 时不写。成功请求声明了 Session 变更时写 `sessionChange`，值为 `SessionChange` 对象（`{type:'bind',sessionId}` 或 `{type:'unbind'}`）；没有变更不写。字段名与语义都是契约。路由事件行（`session bound`、`session rebound to a new connection`）的 `sessionId` 表示本次被建立或接管的路由 id，与请求入口 Session 无关。
 
+Server 事件的诊断日志（ADR-0008）带 `eventId`、`event`，以及目标字段（`connectionId` 或 `sessionId`）与 `reason`。`code` 取值：`EVENT_DROPPED`（目标缺失、连接已关闭，或没有事件监听者）、`EVENT_SEND_FAILED`（Server 侧单条事件 IPC 发送失败）、`EVENTS_DROPPED`（结果未发出，该请求的全部事件被跳过）、`EVENT_LISTENER_FAILED`（事件监听者抛错）；Portal 侧编码或传输写失败记录 `TRANSPORT_SEND_FAILED`，并以 `stage` 区分 `encode` 与 `send`。这些是仅在日志中出现的诊断字段，不发往客户端；事件投递失败 MUST NOT 改变请求的日志结论或终态。
+
 ### 7.2 错误码
 
 错误码 MUST 可枚举。发布前错误码可删除或改名，按破坏性变更处理；发布后只增不删。语义变更 MUST 分配新码，不得复用旧码表示新含义。
@@ -347,7 +372,7 @@ TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：
 
 `TRANSPORT_SEND_FAILED` 的触发条件是“写不出去”，因此它结构上不可能送达客户端，只能作为日志字段被观察到。`TRANSPORT_CLOSED` 只作为请求终态的原因出现：请求因断线结束时连接已不在，没有可回写的通道，因此不承诺送达。两码仍是契约——它们回答“请求为什么结束”，删掉会让终态失去可枚举的说法。
 
-**仅日志诊断字段** 出现在日志的 `code` 字段里，用于定位，不发给客户端，也不构成 wire 契约：`CANCEL_LOST_TO_COMMIT`、`IPC_CHANNEL_CLOSED`、`SERVER_STARTUP_FAILED`、`DUPLICATE_REQUEST`、`INVALID_IPC_MESSAGE` 等。日志里的 `code` 只是一个字段名，取值不受本节约束。
+**仅日志诊断字段** 出现在日志的 `code` 字段里，用于定位，不发给客户端，也不构成 wire 契约：`CANCEL_LOST_TO_COMMIT`、`IPC_CHANNEL_CLOSED`、`SERVER_STARTUP_FAILED`、`DUPLICATE_REQUEST`、`INVALID_IPC_MESSAGE`、`EVENT_DROPPED`、`EVENT_SEND_FAILED`、`EVENTS_DROPPED`、`EVENT_LISTENER_FAILED` 等。日志里的 `code` 只是一个字段名，取值不受本节约束。
 
 `FRAMEWORK_` 前缀是示例惯例，不是强制格式。`INVALID_ENVELOPE`、`UNKNOWN_METHOD`、`INTERNAL_ERROR`、`TRANSPORT_SEND_FAILED` 没有该前缀；发布后错误码只增不删；改名等于换码，所以这些名字保持不变。
 

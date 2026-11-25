@@ -27,15 +27,44 @@ export type ResponseEnvelope = { id: string } & (
   | { ok: false; error: { code: string; message: string } }
 );
 
+/**
+ * A Server-initiated event on the wire (ADR-0008). Discriminated by `kind`,
+ * which responses deliberately do not carry: their shape is unchanged, so a
+ * client that only understands responses keeps working and a frame without
+ * `kind` is still one.
+ */
+export interface EventEnvelope {
+  kind: 'event';
+  /** `${requestId}:${index}`; stable across a replay with the same order. */
+  eventId: string;
+  event: string;
+  payload: unknown;
+}
+
+/** Everything the connection layer may write down a client connection. */
+export type ServerFrame = ResponseEnvelope | EventEnvelope;
+
 export interface Codec {
-  encode(value: ResponseEnvelope): string | Uint8Array;
+  encode(value: ServerFrame): string | Uint8Array;
   decode(raw: string | Uint8Array): Envelope;
+}
+
+function isEventEnvelope(value: ServerFrame): value is EventEnvelope {
+  return 'kind' in value && value.kind === 'event';
 }
 
 const decoder = new TextDecoder();
 
 export class JsonCodec implements Codec {
-  encode(value: ResponseEnvelope): string {
+  encode(value: ServerFrame): string {
+    if (isEventEnvelope(value)) {
+      return JSON.stringify({
+        kind: 'event',
+        eventId: value.eventId,
+        event: value.event,
+        payload: value.payload,
+      });
+    }
     // Spelled out per branch rather than spreading the rest of the object: the
     // wire shape must be readable here, and `ok` must never be joined by the
     // other branch's field.

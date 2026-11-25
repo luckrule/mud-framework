@@ -20,9 +20,19 @@ export interface RunnerHarness {
   ) => void;
 }
 
+export interface RunnerOptions {
+  /**
+   * What `send` reports. The default records the message and reports success;
+   * returning false models a dead IPC channel without changing what the runner
+   * attempted.
+   */
+  readonly send?: (message: IpcMessage, what: string) => boolean;
+}
+
 export function startRunner(
   timeoutMs = 1000,
   accepting: () => boolean = () => true,
+  options: RunnerOptions = {},
 ): RunnerHarness {
   const backend = new MemoryStorageBackend();
   const lines: string[] = [];
@@ -43,8 +53,9 @@ export function startRunner(
       capabilities: backend.capabilities(),
     },
     logger,
-    send: (message) => {
+    send: (message, what) => {
       sent.push(message);
+      return options.send === undefined ? true : options.send(message, what);
     },
     accepting,
   });
@@ -52,8 +63,8 @@ export function startRunner(
     runner,
     sent,
     logs: () => lines.map(parseLine),
-    register: (method, handler, options) => {
-      dispatcher.register(method, handler, options);
+    register: (method, handler, handlerOptions) => {
+      dispatcher.register(method, handler, handlerOptions);
     },
   };
 }

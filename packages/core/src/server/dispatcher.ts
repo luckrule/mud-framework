@@ -30,9 +30,11 @@ import {
   EXPIRED_MESSAGE,
   guard,
   logLostCommit,
+  recordEvent,
   recordSessionChange,
 } from './dispatcher-scope.ts';
 import type {
+  EventBuffer,
   Expiry,
   InFlight,
   SessionChangeHolder,
@@ -246,6 +248,9 @@ export class Dispatcher {
     // holder object rather than a `let`, because the handler closure assigns it
     // and control-flow narrowing would otherwise treat it as still undefined.
     const change: SessionChangeHolder = {};
+    // Same rule for events (ADR-0008): buffered here, handed back only with a
+    // committed result. A rejected dispatch drops the array with its frame.
+    const eventBuffer: EventBuffer = { events: [] };
 
     try {
       if (this.authorize !== undefined) {
@@ -288,6 +293,24 @@ export class Dispatcher {
             assertActive(storageScope);
             recordSessionChange(change, { type: 'unbind' });
           },
+          emit: (eventName, eventPayload) => {
+            recordEvent(
+              eventBuffer,
+              storageScope,
+              { kind: 'connection', connectionId },
+              eventName,
+              eventPayload,
+            );
+          },
+          emitToSession: (targetSessionId, eventName, eventPayload) => {
+            recordEvent(
+              eventBuffer,
+              storageScope,
+              { kind: 'session', sessionId: targetSessionId },
+              eventName,
+              eventPayload,
+            );
+          },
           logger,
           storage: guard(
             tx,
@@ -320,13 +343,23 @@ export class Dispatcher {
       );
       const result = await Promise.race([work, terminal.promise]);
       const sessionChange = change.value;
-      if (sessionChange === undefined) {
+      const events =
+        eventBuffer.events.length === 0 ? undefined : eventBuffer.events;
+      if (sessionChange === undefined && events === undefined) {
         return { result };
       }
-      // The request's `sessionId` binding (if any) is the entry Session; the
-      // change is always the object, never a replacement id.
-      logger.debug({ sessionChange }, 'session change recorded');
-      return { result, sessionChange };
+      if (sessionChange !== undefined) {
+        // The request's `sessionId` binding (if any) is the entry Session; the
+        // change is always the object, never a replacement id.
+        logger.debug({ sessionChange }, 'session change recorded');
+      }
+      return events === undefined
+        ? { result, sessionChange }
+        : {
+            result,
+            events,
+            ...(sessionChange === undefined ? {} : { sessionChange }),
+          };
     } finally {
       storageScope.active = false;
       clearTimeout(timer);

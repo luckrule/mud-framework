@@ -84,6 +84,7 @@ describe('ConnectionLayer lifecycle', () => {
           ready = true;
         },
         execute: (request) => local.execute(request),
+        onEvent: () => () => undefined,
         cancel: (requestId, code) => local.cancel(requestId, code),
         close: async () => {
           closes += 1;
@@ -201,6 +202,7 @@ describe('ConnectionLayer lifecycle', () => {
         return Promise.resolve();
       },
       execute: () => Promise.resolve({ ok: true, result: null }),
+      onEvent: () => () => undefined,
       cancel: () => Promise.resolve(),
       close: () => Promise.resolve(),
       health: () => ({ state: 'ready', ready: true }),
@@ -227,6 +229,7 @@ describe('ConnectionLayer lifecycle', () => {
     const executor: RequestExecutor = {
       start: () => Promise.reject(new Error('server never became ready')),
       execute: () => Promise.resolve({ ok: true, result: null }),
+      onEvent: () => () => undefined,
       cancel: () => Promise.resolve(),
       close: () => Promise.resolve(),
       health: () => ({ state: 'ready', ready: true }),

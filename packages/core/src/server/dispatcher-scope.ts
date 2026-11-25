@@ -1,4 +1,8 @@
 import type { Logger } from '../logging/types.ts';
+import type {
+  BufferedServerEvent,
+  ServerEventTarget,
+} from '../shared/events.ts';
 import type { SessionChange } from '../shared/executor.ts';
 import { elapsedMs } from '../shared/timeout.ts';
 import type { StorageTransaction } from '../storage/types.ts';
@@ -33,6 +37,45 @@ export interface InFlight {
 /** At most one change per request; `recordSessionChange` enforces it. */
 export interface SessionChangeHolder {
   value?: SessionChange;
+}
+
+/**
+ * How many events one request may buffer (ADR-0008). Bounded like every other
+ * per-request accumulation: an unbounded buffer would let one handler pin
+ * memory until the request ends, and a flood of events is far easier to
+ * produce than a flood of requests. Exceeding it is a plain handler error
+ * (catchable), not a framework terminal state, because the handler that emits
+ * in a loop is the one that has to decide what to drop.
+ */
+export const MAX_EVENTS_PER_REQUEST = 1024;
+
+/** Events recorded by one request, in emission order. */
+export interface EventBuffer {
+  readonly events: BufferedServerEvent[];
+}
+
+export function recordEvent(
+  buffer: EventBuffer,
+  scope: StorageScope,
+  target: ServerEventTarget,
+  event: string,
+  payload: unknown,
+): void {
+  // The same gate as bindSession/storage: a request past its terminal state
+  // must not enqueue anything, because no result will carry it (ADR-0008).
+  assertActive(scope);
+  if (event.length === 0) {
+    throw new Error('emit requires a non-empty event name');
+  }
+  if (target.kind === 'session' && target.sessionId.length === 0) {
+    throw new Error('emitToSession requires a non-empty session id');
+  }
+  if (buffer.events.length >= MAX_EVENTS_PER_REQUEST) {
+    throw new Error(
+      `a request may emit at most ${MAX_EVENTS_PER_REQUEST} events`,
+    );
+  }
+  buffer.events.push({ target, event, payload });
 }
 
 export const EXPIRED_MESSAGE =

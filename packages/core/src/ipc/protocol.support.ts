@@ -50,6 +50,13 @@ export const validMessages: IpcMessage[] = [
     ok: false,
     error: { code: 'FRAMEWORK_TIMEOUT', message: 'timed out' },
   },
+  {
+    type: 'event',
+    eventId: 'req-1:0',
+    target: { kind: 'connection', connectionId: 'conn-1' },
+    event: 'room.description',
+    payload: { text: 'a cave' },
+  },
   { type: 'closed', reason: 'shutdown complete' },
 ];
 

@@ -225,6 +225,38 @@ const extensions: Extension[] = [
         },
         { access: 'public' },
       );
+      // The Server-event slice (ADR-0008): `event.emit` addresses the current
+      // connection, `event.to-session` the current holder of a Session, and
+      // `event.fail` emits before throwing so a test can prove the throw drops
+      // the buffered event with the rollback.
+      dispatcher.register(
+        'event.emit',
+        (ctx, payload) => {
+          ctx.emit('note', payload);
+          return Promise.resolve({ emitted: true });
+        },
+        { access: 'public' },
+      );
+      dispatcher.register(
+        'event.to-session',
+        (ctx, payload) => {
+          const { sessionId, text } = payload as {
+            sessionId: string;
+            text: string;
+          };
+          ctx.emitToSession(sessionId, 'chat.message', text);
+          return Promise.resolve({ emitted: true });
+        },
+        { access: 'public' },
+      );
+      dispatcher.register(
+        'event.fail',
+        (ctx) => {
+          ctx.emit('never.sent', null);
+          throw new Error('event.fail failed after emit');
+        },
+        { access: 'public' },
+      );
       if (behavior === 'crash') {
         dispatcher.register(
           'crash',

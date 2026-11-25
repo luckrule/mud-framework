@@ -134,6 +134,7 @@ describe('ConnectionLayer request', () => {
     });
     const executor: RequestExecutor = {
       start: () => Promise.resolve(),
+      onEvent: () => () => undefined,
       execute: () =>
         Promise.resolve({
           ok: false,
@@ -176,6 +177,7 @@ describe('ConnectionLayer request', () => {
     // happen; an executor is outside code, so it is checked anyway.
     const executor: RequestExecutor = {
       start: () => Promise.resolve(),
+      onEvent: () => () => undefined,
       execute: () => {
         return Promise.resolve({ ok: false } as ExecutorOutcome);
       },
@@ -262,6 +264,7 @@ describe('ConnectionLayer request', () => {
       const transport = new FakeTransport();
       const executor: RequestExecutor = {
         start: () => Promise.resolve(),
+        onEvent: () => () => undefined,
         execute: () => Promise.resolve(outcome as ExecutorOutcome),
         cancel: () => Promise.resolve(),
         close: () => Promise.resolve(),
@@ -297,6 +300,7 @@ describe('ConnectionLayer request', () => {
     });
     const executor: RequestExecutor = {
       start: () => Promise.resolve(),
+      onEvent: () => () => undefined,
       execute: () => Promise.reject(new Error('boom')),
       cancel: () => Promise.resolve(),
       close: () => Promise.resolve(),
@@ -418,6 +422,7 @@ describe('ConnectionLayer request', () => {
     ];
     const executor: RequestExecutor = {
       start: () => Promise.resolve(),
+      onEvent: () => () => undefined,
       execute: () => {
         const next = outcomes.shift();
         if (next === undefined) {

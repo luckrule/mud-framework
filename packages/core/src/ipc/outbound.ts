@@ -1,6 +1,8 @@
+import type { BufferedServerEvent } from '../shared/events.ts';
 import type { ExecutorOutcome, ExecutorRequest } from '../shared/executor.ts';
 import type { StorageCapabilities } from '../storage/types.ts';
 import type {
+  EventMessage,
   PreparedMessage,
   ReadyMessage,
   RequestMessage,
@@ -34,6 +36,24 @@ export function requestMessage(
 
 export function failure(code: string, message: string): ExecutorOutcome {
   return { ok: false, error: { code, message } };
+}
+
+/**
+ * Builds one Server->Portal event message (ADR-0008). `eventId` is assigned by
+ * the caller and stays `${requestId}:${index}`; this function only adds the
+ * message discriminator, so the id format has one owner.
+ */
+export function eventMessage(
+  eventId: string,
+  buffered: BufferedServerEvent,
+): EventMessage {
+  return {
+    type: 'event',
+    eventId,
+    target: buffered.target,
+    event: buffered.event,
+    payload: buffered.payload,
+  };
 }
 
 /**

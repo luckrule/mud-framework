@@ -11,6 +11,7 @@ function immediateExecutor(
 ): RequestExecutor {
   return {
     start: () => Promise.resolve(),
+    onEvent: () => () => undefined,
     execute,
     cancel: () => Promise.resolve(),
     close: () => Promise.resolve(),

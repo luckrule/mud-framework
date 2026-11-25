@@ -1,3 +1,4 @@
+import type { BufferedServerEvent, ServerEvent } from './events.ts';
 import type { RequestIdentity } from './identity.ts';
 
 /** Everything an executor needs about a request; all ids are already assigned. */
@@ -33,7 +34,18 @@ export type SessionChange =
  * `isFrameworkCode` instead, which is one list rather than two prefix rules.
  */
 export type ExecutorOutcome =
-  | { ok: true; result: unknown; sessionChange?: SessionChange }
+  | {
+      ok: true;
+      result: unknown;
+      sessionChange?: SessionChange;
+      /**
+       * Events the handler buffered, in emission order. Present only on a
+       * success and only within the Server process: they are not part of the
+       * IPC result (they travel as separate `event` messages after it), so a
+       * Portal-side outcome never carries them (ADR-0008).
+       */
+      events?: readonly BufferedServerEvent[];
+    }
   | { ok: false; error: { code: string; message: string } };
 
 /**
@@ -91,6 +103,14 @@ export interface RequestExecutor {
    * how to stop the work, but MUST NOT throw.
    */
   cancel(requestId: string, code: string): Promise<void>;
+  /**
+   * Registers a sink for Server-initiated events (ADR-0008) and returns the
+   * unsubscribe function. Events are best-effort: a sink that throws or a
+   * delivery that fails must not affect any request's outcome. The Connection
+   * layer registers one sink per executor; an executor with no sink drops
+   * events and says so in the log rather than buffering them.
+   */
+  onEvent(listener: (event: ServerEvent) => void): () => void;
   /**
    * Releases what this executor owns. In process that closes the dispatcher and
    * through it the storage backend; a remote executor can only ask the other

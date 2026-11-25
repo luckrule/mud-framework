@@ -88,6 +88,43 @@ Handler 默认 `access: 'session'`：请求没有 Session 时以 `AUTH_REQUIRED`
 
 `runServerProcess` 返回的 Promise 就是退出信号：收到 `shutdown` 并正常收尾时 resolve，启动失败或链路断开时 reject。入口脚本应把失败映射为非零退出码；Portal 也通过 IPC 断开与退出事件发现 Server 丢失。
 
+## Server 主动事件
+
+Handler 可以在请求内声明事件，框架在请求成功提交后发送（ADR-0008）。`ctx.emit` 发给当前请求的连接，`ctx.emitToSession` 发给该 Session 当前的持有连接：
+
+```ts
+registrar.register('room.enter', async (ctx, payload) => {
+  const { roomId, sessionIds } = payload as {
+    roomId: string;
+    sessionIds: readonly string[];
+  };
+  // 成员与可见性由业务校验：框架不做事件授权。
+  for (const sessionId of sessionIds) {
+    ctx.emitToSession(sessionId, 'room.entered', { roomId });
+  }
+  ctx.emit('room.joined', { roomId });
+  return { roomId };
+});
+```
+
+事件在 handler 内只进入缓冲：请求失败、超时、取消或回滚时全部丢弃，成功提交后才在响应之后发送。目标 Session 在投递时解析当前持有者，所以重连后事件会跟随 Session；当时没有持有者则丢弃。投递是 best-effort，不排队、不重试、不保证不重复；事件失败不会改变请求结果。
+
+客户端收到两类下行帧。响应帧保持 `{id, ok, ...}`，事件帧是 `{kind:'event', eventId, event, payload}`：
+
+```ts
+socket.addEventListener('message', (event) => {
+  const frame = JSON.parse(event.data) as Record<string, unknown>;
+  if (frame.kind === 'event') {
+    // eventId 为 `${requestId}:${index}`；重放可能重复，可据此去重。
+    handleServerEvent(frame);
+    return;
+  }
+  handleResponse(frame);
+});
+```
+
+事件帧不携带请求的 `id`，也不替代响应：同一个请求先到响应、再到事件。客户端不得因为不认识的事件名或事件帧而断开连接。
+
 ## 健康探针（应用层）
 
 core 只提供同步快照，不提供 HTTP 端点（SPEC 6.6）。应用在自己的 HTTP 服务里把 `layer.health()` 映射为探针：`ready === true` 返回 200，否则 503；需要区分原因时把 `state` 与 `executor.state` 写进响应。快照会立即过期，只表达“此刻可以接活”，不能替代请求准入或 deadline。端点属于应用，`examples/minimal/src/portal.ts` 给出了完整实现。

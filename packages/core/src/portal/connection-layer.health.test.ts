@@ -10,6 +10,7 @@ import { ConnectionLayer } from './connection-layer.ts';
 function stubExecutor(health: () => ExecutorHealth): RequestExecutor {
   return {
     start: () => Promise.resolve(),
+    onEvent: () => () => undefined,
     execute: () => Promise.resolve({ ok: true, result: null }),
     cancel: () => Promise.resolve(),
     close: () => Promise.resolve(),

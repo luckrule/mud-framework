@@ -1,4 +1,5 @@
 import type { Logger } from '../logging/types.ts';
+import type { BufferedServerEvent } from '../shared/events.ts';
 import type { SessionChange } from '../shared/executor.ts';
 import type { RequestIdentity } from '../shared/identity.ts';
 import type { StorageTransaction } from '../storage/types.ts';
@@ -51,6 +52,29 @@ export interface RequestContext extends RequestIdentity {
    * and shares the one-change-per-request budget with `bindSession`.
    */
   unbindSession(): void;
+  /**
+   * Buffers one Server-initiated event for this request's Connection
+   * (ADR-0008). The event is sent only after this request commits; a failed,
+   * timed-out, cancelled or rolled-back request discards it. Delivery is
+   * best-effort and at-least-once: a replay may send it again with the same
+   * `eventId`, and a client that cares can dedupe on that id.
+   *
+   * Events are not what the request returns: the client gets its result first,
+   * then the events. `event` must be non-empty; the buffer is bounded and
+   * exceeding it throws a plain error the handler may catch.
+   */
+  emit(event: string, payload: unknown): void;
+  /**
+   * Buffers one event for the current holder of `sessionId` (ADR-0008). The
+   * Portal resolves the holder when it delivers, so an event sent during a
+   * reconnect follows the Session rather than a stale connection. No holder
+   * at delivery time means the event is dropped and logged, never buffered for
+   * later. `sessionId` must be non-empty.
+   *
+   * The framework does not authorize this: a handler may address any Session,
+   * and membership/visibility rules belong to the business (ADR-0008).
+   */
+  emitToSession(sessionId: string, event: string, payload: unknown): void;
   /** The Extension that registered this handler, when one did (SPEC 7.1). */
   readonly extension?: string;
   /** Already bound to the request's ids; handlers never build one. */
@@ -73,6 +97,13 @@ export interface DispatchResult {
   result: unknown;
   /** Set when the handler bound or unbound a Session (SPEC 2). */
   sessionChange?: SessionChange;
+  /**
+   * Events the handler emitted, in order, present only on a success and only
+   * when at least one was emitted (ADR-0008). The caller sends them after the
+   * result; a failed request has none because there is no committed state to
+   * announce.
+   */
+  events?: readonly BufferedServerEvent[];
 }
 
 export type Handler = (

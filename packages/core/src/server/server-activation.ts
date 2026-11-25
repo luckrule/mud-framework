@@ -27,7 +27,8 @@ export interface ActivationDeps {
   readonly channelClosedReason: () => string | undefined;
   readonly parentGoneReason: () => string | undefined;
   readonly sendBarrier: (message: IpcMessage, what: string) => void;
-  readonly sendQuietly: (message: IpcMessage, what: string) => void;
+  /** Whether the message was written; a false result also drops request events. */
+  readonly sendQuietly: (message: IpcMessage, what: string) => boolean;
   readonly onMessage: (raw: unknown) => void;
   readonly onChannelClose: (reason: string) => void;
   /** The process-level error a dead link is reported as. */

@@ -61,6 +61,7 @@ describe('ConnectionLayer shutdown (SPEC 6.3)', () => {
     const state: { executor: RequestExecutor } = {
       executor: {
         start: () => Promise.resolve(),
+        onEvent: () => () => undefined,
         execute: async () => {
           order.push('execute.start');
           await gate.promise;
@@ -145,6 +146,7 @@ describe('ConnectionLayer shutdown (SPEC 6.3)', () => {
     const lines: string[] = [];
     const executor: RequestExecutor = {
       start: () => Promise.resolve(),
+      onEvent: () => () => undefined,
       execute: () => gate.promise.then(() => ({ ok: true, result: null })),
       cancel: () => Promise.resolve(),
       close: () => {
@@ -195,6 +197,7 @@ describe('ConnectionLayer shutdown (SPEC 6.3)', () => {
     const serverStopped: string[] = [];
     const executor: RequestExecutor = {
       start: () => Promise.resolve(),
+      onEvent: () => () => undefined,
       execute: () => Promise.resolve({ ok: true, result: null }),
       cancel: () => Promise.resolve(),
       closeBudgetMs: 200,
@@ -248,6 +251,7 @@ describe('ConnectionLayer shutdown (SPEC 6.3)', () => {
     let closes = 0;
     const executor: RequestExecutor = {
       start: () => Promise.resolve(),
+      onEvent: () => () => undefined,
       execute: () => Promise.resolve({ ok: true, result: null }),
       cancel: () => Promise.resolve(),
       close: () => {
@@ -296,6 +300,7 @@ describe('ConnectionLayer shutdown (SPEC 6.3)', () => {
     const failure = new Error('server refused to die');
     const executor: RequestExecutor = {
       start: () => Promise.resolve(),
+      onEvent: () => () => undefined,
       execute: () => Promise.resolve({ ok: true, result: null }),
       cancel: () => Promise.resolve(),
       closeBudgetMs: 30,
@@ -333,6 +338,7 @@ describe('ConnectionLayer shutdown (SPEC 6.3)', () => {
     let closes = 0;
     const executor: RequestExecutor = {
       start: () => Promise.resolve(),
+      onEvent: () => () => undefined,
       execute: () => Promise.resolve({ ok: true, result: null }),
       cancel: () => Promise.resolve(),
       close: () => {

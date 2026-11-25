@@ -7,7 +7,8 @@ import type { Logger, LogLevel } from '../logging/types.ts';
 import { ConnectionLayer } from '../portal/connection-layer.ts';
 import { DispatcherExecutor } from '../server/dispatcher-executor.ts';
 import { Dispatcher } from '../server/dispatcher.ts';
-import type { Codec, Envelope, ResponseEnvelope } from '../shared/codec.ts';
+import type { Codec, Envelope, ServerFrame } from '../shared/codec.ts';
+import type { ServerEvent } from '../shared/events.ts';
 import type {
   ExecutorRequest,
   RequestExecutor,
@@ -96,7 +97,7 @@ export async function harness(
 
 /** Base64 frames: proves the codec is the only wire-format decision point. */
 export class Base64Codec implements Codec {
-  encode(value: ResponseEnvelope): string {
+  encode(value: ServerFrame): string {
     return Buffer.from(JSON.stringify(value), 'utf8').toString('base64');
   }
 
@@ -135,6 +136,7 @@ export function scriptedExecutor(order: string[]): ScriptedExecutor {
         return Promise.resolve();
       },
       execute: () => Promise.resolve({ ok: true, result: null }),
+      onEvent: () => () => undefined,
       cancel: () => Promise.resolve(),
       close: () => {
         closeCalls += 1;
@@ -206,6 +208,10 @@ export interface ControlledExecutor {
   requests: ExecutorRequest[];
   /** Settles every `hang` call that is waiting. */
   release: () => void;
+  /** Pushes one Server event to the registered sink (ADR-0008). */
+  emit: (event: ServerEvent) => void;
+  /** How many sinks the layer currently has registered. */
+  listenerCount: () => number;
 }
 
 /**
@@ -225,6 +231,7 @@ export function controlledExecutor(
   const started: string[] = [];
   const finished: string[] = [];
   const requests: ExecutorRequest[] = [];
+  const eventListeners = new Set<(event: ServerEvent) => void>();
   const hang = Promise.withResolvers<void>();
   return {
     started,
@@ -233,6 +240,12 @@ export function controlledExecutor(
     release: () => {
       hang.resolve();
     },
+    emit: (event) => {
+      for (const listener of new Set(eventListeners)) {
+        listener(event);
+      }
+    },
+    listenerCount: () => eventListeners.size,
     executor: {
       start: () => Promise.resolve(),
       execute: async (request) => {
@@ -252,6 +265,12 @@ export function controlledExecutor(
         return sessionChange === undefined
           ? { ok: true, result: request.method }
           : { ok: true, result: request.method, sessionChange };
+      },
+      onEvent: (listener) => {
+        eventListeners.add(listener);
+        return () => {
+          eventListeners.delete(listener);
+        };
       },
       cancel: () => Promise.resolve(),
       close: () => Promise.resolve(),

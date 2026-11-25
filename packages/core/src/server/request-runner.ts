@@ -1,9 +1,11 @@
+import { eventMessage } from '../ipc/outbound.ts';
 import type {
   CancelMessage,
   IpcMessage,
   RequestMessage,
 } from '../ipc/protocol.ts';
 import type { LogFields, Logger } from '../logging/types.ts';
+import type { BufferedServerEvent } from '../shared/events.ts';
 import type { ExecutorOutcome } from '../shared/executor.ts';
 import { messageOf } from '../shared/guards.ts';
 import { requestLogFields } from '../shared/identity.ts';
@@ -42,9 +44,11 @@ export interface RequestRunnerDeps {
    * Sends one message to Portal; `what` names it in the failure line. An
    * implementation must log a send failure (`IPC_SEND_FAILED`) rather than
    * propagate it: the link is gone, and Portal's replay buffer still holds
-   * whatever it never acknowledged.
+   * whatever it never acknowledged. The return value says whether the write
+   * happened: a failed result means the request's events must be dropped too
+   * (ADR-0008), so "sent" cannot be inferred from the call alone.
    */
-  readonly send: (message: IpcMessage, what: string) => void;
+  readonly send: (message: IpcMessage, what: string) => boolean;
   /**
    * Whether the process still takes new work. A refused request is answered
    * with `FRAMEWORK_SHUTDOWN` rather than dropped (SPEC 3.5).
@@ -338,7 +342,10 @@ export class RequestRunner {
         );
         return;
       }
-      this.report(message, outcome, elapsedMs(startedAt));
+      const sent = this.report(message, outcome, elapsedMs(startedAt));
+      if (outcome.ok) {
+        this.sendEvents(message, outcome.events, sent);
+      }
     } finally {
       this.inFlight.delete(message.requestId);
       // The id is terminal, so a later delivery of it is a fresh request rather
@@ -368,11 +375,12 @@ export class RequestRunner {
     }
   }
 
+  /** Returns whether the result message was actually written. */
   private report(
     message: RequestMessage,
     outcome: ExecutorOutcome,
     durationMs: number,
-  ): void {
+  ): boolean {
     if (outcome.ok) {
       const fields: LogFields = { ...this.requestFields(message), durationMs };
       const change = outcome.sessionChange;
@@ -386,9 +394,13 @@ export class RequestRunner {
       // is spread rather than copied field by field. An unchanged success
       // carries `sessionChange: undefined` as an own property, which every
       // channel either drops (JSON) or keeps with the same meaning as absence
-      // (SPEC 2).
-      this.deps.send({ ...resultEnvelope(message), ...outcome }, 'result');
-      return;
+      // (SPEC 2). Events are not part of the result message (ADR-0008): they
+      // follow it as separate messages, so the field is removed here.
+      const { events: _events, ...wireOutcome } = outcome;
+      return this.deps.send(
+        { ...resultEnvelope(message), ...wireOutcome },
+        'result',
+      );
     }
     this.deps.logger[failureLogLevel(outcome.error)](
       {
@@ -399,7 +411,47 @@ export class RequestRunner {
       },
       'request failed',
     );
-    this.deps.send({ ...resultEnvelope(message), ...outcome }, 'result');
+    return this.deps.send({ ...resultEnvelope(message), ...outcome }, 'result');
+  }
+
+  /**
+   * Sends one request's events, in order, after its result (ADR-0008).
+   *
+   * Best effort: a failed result drops every event because the caller that
+   * would interpret them never saw the request succeed; a single failed event
+   * is logged and the rest are still attempted. Neither failure changes the
+   * request's success, and nothing here waits.
+   */
+  private sendEvents(
+    message: RequestMessage,
+    events: readonly BufferedServerEvent[] | undefined,
+    resultSent: boolean,
+  ): void {
+    if (events === undefined || events.length === 0) {
+      return;
+    }
+    const fields = this.requestFields(message);
+    if (!resultSent) {
+      this.deps.logger.warn(
+        {
+          ...fields,
+          code: 'EVENTS_DROPPED',
+          count: events.length,
+          reason: 'result could not be sent',
+        },
+        'events dropped with the unsent result',
+      );
+      return;
+    }
+    for (const [index, event] of events.entries()) {
+      const eventId = `${message.requestId}:${index}`;
+      if (!this.deps.send(eventMessage(eventId, event), 'event')) {
+        this.deps.logger.warn(
+          { ...fields, code: 'EVENT_SEND_FAILED', eventId, event: event.event },
+          'event could not be sent',
+        );
+      }
+    }
   }
 }
 

@@ -1,3 +1,4 @@
+import type { ServerEventTarget } from '../shared/events.ts';
 import type { ExecutorOutcome, SessionChange } from '../shared/executor.ts';
 /**
  * Portal <-> Server IPC protocol (ADR-0002).
@@ -121,6 +122,23 @@ export interface ClosedMessage {
   readonly reason: string;
 }
 
+/**
+ * Server -> Portal: one event a committed request emitted (ADR-0008).
+ *
+ * A separate message rather than a field on `result` because the two have
+ * different delivery rules: a result is owed to a waiting caller, an event is
+ * best-effort and may be dropped at either process without affecting the
+ * request. `eventId` is `${requestId}:${index}`; a replay that emits in the
+ * same order produces the same ids, so clients can dedupe.
+ */
+export interface EventMessage {
+  readonly type: 'event';
+  readonly eventId: string;
+  readonly target: ServerEventTarget;
+  readonly event: string;
+  readonly payload: unknown;
+}
+
 export type IpcMessage =
   | HelloMessage
   | PreparedMessage
@@ -130,6 +148,7 @@ export type IpcMessage =
   | ShutdownMessage
   | ReadyMessage
   | ResultMessage
+  | EventMessage
   | ClosedMessage;
 
 export type IpcParseResult =
@@ -145,6 +164,7 @@ const KNOWN_TYPES = [
   'shutdown',
   'ready',
   'result',
+  'event',
   'closed',
 ] as const;
 
@@ -220,6 +240,8 @@ function buildMessage(raw: unknown): IpcMessage {
       };
     case 'result':
       return buildResult(raw);
+    case 'event':
+      return buildEvent(raw);
     case 'closed':
       return {
         type: 'closed',
@@ -244,6 +266,48 @@ function buildRequest(raw: Record<string, unknown>): RequestMessage {
     timeoutMs: readPositiveNumber(raw, 'request', 'timeoutMs'),
     replayCount: readInteger(raw, 'request', 'replayCount', 0),
   };
+}
+
+function buildEvent(raw: Record<string, unknown>): EventMessage {
+  return {
+    type: 'event',
+    eventId: readString(raw, 'event', 'eventId', true),
+    target: readEventTarget(raw, 'event', 'target'),
+    event: readString(raw, 'event', 'event', true),
+    // Opaque to the framework: any value the business put there is passed on
+    // unchanged, so the Portal never has to know an event's schema.
+    payload: raw.payload,
+  };
+}
+
+/**
+ * Strict like `readSessionChange`: a bad kind or an empty id must be refused
+ * here, because a permissive target would make the Portal log a delivery
+ * failure for an event that was malformed on the wire (ADR-0008).
+ */
+function readEventTarget(
+  raw: Record<string, unknown>,
+  messageType: string,
+  field: string,
+): ServerEventTarget {
+  const record = readRecord(raw, messageType, field);
+  const prefix = `${messageType}.${field}`;
+  const kind = record.kind;
+  if (kind === 'connection') {
+    return {
+      kind: 'connection',
+      connectionId: readString(record, prefix, 'connectionId', true),
+    };
+  }
+  if (kind === 'session') {
+    return {
+      kind: 'session',
+      sessionId: readString(record, prefix, 'sessionId', true),
+    };
+  }
+  throw new ShapeError(
+    fieldReason(prefix, 'kind', '"connection" or "session"', kind),
+  );
 }
 
 function buildResult(raw: Record<string, unknown>): ResultMessage {

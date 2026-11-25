@@ -21,6 +21,8 @@ import {
   onConnect as admitConnection,
   onDisconnect as disconnectConnection,
 } from './connection-admission.ts';
+import type { EventDeliveryHost } from './connection-events.ts';
+import { deliverServerEvent } from './connection-events.ts';
 import type { RequestHost } from './connection-request.ts';
 import {
   cancelQuietly,
@@ -115,6 +117,10 @@ export class ConnectionLayer implements TransportHandlers {
   private readonly router: SessionRouter;
   /** The narrow view the admission, request and reply modules work through. */
   private readonly requestHost: RequestHost;
+  /** The narrow view Server-event delivery works through (ADR-0008). */
+  private readonly eventHost: EventDeliveryHost;
+  /** Set while the layer is subscribed to the executor's event stream. */
+  private unsubscribeEvents: (() => void) | undefined;
   private status: ConnectionLayerStatus = 'idle';
   private executorStart: Promise<void> | undefined;
   private transportStart: Promise<void> | undefined;
@@ -157,6 +163,13 @@ export class ConnectionLayer implements TransportHandlers {
       executor: this.executor,
       enqueue: (state, work) => this.enqueue(state, work),
     };
+    this.eventHost = {
+      codec: this.codec,
+      logger: this.logger,
+      connections: this.connections,
+      router: this.router,
+      enqueue: (state, work) => this.enqueue(state, work),
+    };
   }
 
   async start(): Promise<void> {
@@ -167,6 +180,14 @@ export class ConnectionLayer implements TransportHandlers {
     this.executorStart = Promise.resolve().then(() => this.executor.start());
     // SPEC 6.2: readiness must precede listener startup.
     try {
+      // Subscribed before the transport accepts input, so no request can
+      // commit an event that arrives before the sink exists. Best-effort:
+      // delivery failures are the delivery module's to log (ADR-0008).
+      this.unsubscribeEvents = this.executor.onEvent((event) => {
+        // The chain already swallows its own failures; this keeps an
+        // unexpected rejection out of the process's unhandled-rejection path.
+        void deliverServerEvent(this.eventHost, event).catch(() => undefined);
+      });
       await this.executorStart;
       if (this.status !== 'starting') {
         throw new Error('connection layer startup interrupted by shutdown');
@@ -176,6 +197,8 @@ export class ConnectionLayer implements TransportHandlers {
       );
       await this.transportStart;
     } catch (error) {
+      this.unsubscribeEvents?.();
+      this.unsubscribeEvents = undefined;
       if (this.status === 'starting') {
         this.status = 'stopped';
       }
@@ -242,6 +265,11 @@ export class ConnectionLayer implements TransportHandlers {
     // SPEC 6.3 step 1: stop accepting input. Synchronous so a message that
     // arrives while the drain is running is refused rather than queued.
     this.status = 'stopping';
+    // Events are additional, not owed (ADR-0008): once the layer stops, an
+    // event that would be delivered mid-shutdown is dropped by the executor
+    // instead of racing the transport close.
+    this.unsubscribeEvents?.();
+    this.unsubscribeEvents = undefined;
     const timeoutMs = this.shutdownTimeoutMs;
     // Waiting requests may fail during shutdown, never bypass their barrier.
     for (const state of this.connections.values()) {

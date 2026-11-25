@@ -20,6 +20,7 @@ describe('ConnectionLayer disconnect', () => {
     const gate = Promise.withResolvers<void>();
     const executor: RequestExecutor = {
       start: () => Promise.resolve(),
+      onEvent: () => () => undefined,
       // An executor that ignores the cancel and still reports success: the
       // layer must not throw, and the failed write must still be recorded.
       execute: async () => {
@@ -101,6 +102,7 @@ describe('ConnectionLayer disconnect', () => {
     });
     const executor: RequestExecutor = {
       start: () => Promise.resolve(),
+      onEvent: () => () => undefined,
       execute: () =>
         Promise.resolve({
           ok: false,
@@ -144,6 +146,7 @@ describe('ConnectionLayer disconnect', () => {
     const requests: ExecutorRequest[] = [];
     const executor: RequestExecutor = {
       start: () => Promise.resolve(),
+      onEvent: () => () => undefined,
       // Deliberately ignores cancel and still reports a binding success after
       // the connection is gone: the late result must not create a route.
       execute: async (request) => {
@@ -303,6 +306,7 @@ describe('ConnectionLayer disconnect', () => {
     const gate = Promise.withResolvers<void>();
     const executor: RequestExecutor = {
       start: () => Promise.resolve(),
+      onEvent: () => () => undefined,
       execute: async () => {
         await gate.promise;
         return { ok: true, result: null };
