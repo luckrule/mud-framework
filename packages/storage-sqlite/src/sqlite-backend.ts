@@ -36,6 +36,10 @@ interface ForeignKeysRow {
   foreign_keys: number;
 }
 
+interface TransactionScope {
+  active: boolean;
+}
+
 const DEFAULT_BUSY_TIMEOUT_MS = 5000;
 
 /**
@@ -143,23 +147,26 @@ export class SqliteBackend implements StorageBackend {
     // close() drains the queue before touching the connection.
     this.assertNotUnusable();
     this.db.run('BEGIN IMMEDIATE');
+    const scope: TransactionScope = { active: true };
     try {
-      const result = await fn(this.facade());
+      const result = await fn(this.facade(scope));
       this.db.run('COMMIT');
       return result;
     } catch (error) {
       this.rollbackOrInvalidate();
       throw error;
+    } finally {
+      scope.active = false;
     }
   }
 
-  private facade(): StorageTransaction {
+  private facade(scope: TransactionScope): StorageTransaction {
     return {
       query: <T>(
         sql: string,
         params: readonly unknown[] = [],
       ): Promise<T[]> => {
-        this.assertInTransaction();
+        this.assertInTransaction(scope);
         // `prepare` rather than `query`: the cached statement shares one
         // cursor across callers. Finalize explicitly so long-lived backends
         // do not accumulate native handles.
@@ -174,7 +181,7 @@ export class SqliteBackend implements StorageBackend {
         sql: string,
         params: readonly unknown[] = [],
       ): Promise<void> => {
-        this.assertInTransaction();
+        this.assertInTransaction(scope);
         this.db.run(sql, toBindings(params));
         return Promise.resolve();
       },
@@ -274,9 +281,9 @@ export class SqliteBackend implements StorageBackend {
    * keeps writing past COMMIT/ROLLBACK would otherwise hit the next
    * transaction's connection.
    */
-  private assertInTransaction(): void {
+  private assertInTransaction(scope: TransactionScope): void {
     this.assertNotUnusable();
-    if (!this.db.inTransaction) {
+    if (!scope.active || !this.db.inTransaction) {
       throw new Error('storage transaction is no longer active');
     }
   }

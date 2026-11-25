@@ -49,13 +49,14 @@ export interface RequestContext extends RequestIdentity {
    *
    * Only a successful request commits the binding: a handler that throws or
    * times out leaves the connection unbound, so a failed login cannot leave a
-   * half-created session behind.
+   * half-created session behind. Calls after the handler settles are rejected.
    */
   bindSession(sessionId: string): void;
   /** The Extension that registered this handler, when one did (SPEC 7.1). */
   readonly extension?: string;
   /** Already bound to the request's ids; handlers never build one. */
   logger: Logger;
+  /** Ends with the handler's scope, or earlier on timeout or cancellation. */
   storage: StorageTransaction;
 }
 
@@ -95,15 +96,14 @@ export interface DispatcherOptions {
   logger?: Logger;
 }
 
-/**
- * A request's terminal-state flag plus the signal that announces it. Both live
- * here because every set point must do both: `expired` is what `guard` enforces
- * (a write after the deadline MUST fail), while the abort is only a
- * notification that lets a cooperative handler stop early (SPEC 3.6).
- */
+/** Abnormal termination, separate from the storage handle's lifetime. */
 interface Expiry {
   expired: boolean;
   readonly controller: AbortController;
+}
+
+interface StorageScope {
+  active: boolean;
 }
 
 /** What `register` remembers about a handler: the function and its Extension. */
@@ -113,13 +113,10 @@ interface HandlerEntry {
   readonly extension?: string;
 }
 
-/**
- * One request that has not reached a terminal state yet. `cancel` needs the
- * expiry (to invalidate later writes) and the resolver (to settle the dispatch
- * promise), neither of which is reachable from outside `dispatch` otherwise.
- */
+/** A pending request: cancellation ends its scope and rejects dispatch. */
 interface InFlight {
   readonly expiry: Expiry;
+  readonly storageScope: StorageScope;
   /** Request-bound, so the cancellation line carries the same ids as the rest. */
   readonly logger: Logger;
   readonly startedAt: number;
@@ -221,11 +218,13 @@ export class Dispatcher {
       expired: false,
       controller: new AbortController(),
     };
+    const storageScope: StorageScope = { active: true };
     // Both the timer and `cancel` settle this, and only the first settles it:
     // a request has exactly one terminal state (SPEC 2).
     const terminal = Promise.withResolvers<never>();
     const entry: InFlight = {
       expiry,
+      storageScope,
       logger,
       startedAt: performance.now(),
       fail: (error) => terminal.reject(error),
@@ -244,6 +243,7 @@ export class Dispatcher {
         this.inFlight.delete(requestId);
       }
       expiry.expired = true;
+      storageScope.active = false;
       // A reason, not just the fact: a handler that reacts to the abort may
       // want to tell a timeout from a disconnect, and a string keeps the two
       // cases distinguishable without the handler matching on error types.
@@ -273,7 +273,7 @@ export class Dispatcher {
           signal: expiry.controller.signal,
           extension: registered.extension,
           bindSession: (sessionId) => {
-            assertActive(expiry);
+            assertActive(storageScope);
             if (sessionId.length === 0) {
               // An empty id cannot be routed, and the framework does not
               // invent one: the business owns what a session is (SPEC 2).
@@ -291,16 +291,20 @@ export class Dispatcher {
             binding.sessionId = sessionId;
           },
           logger,
-          storage: guard(tx, expiry),
+          storage: guard(tx, storageScope),
         };
-        const result = await registered.handler(context, payload);
-        // The handler outlived its terminal state: force the backend to roll
-        // back instead of committing effects nobody is waiting for
-        // (SPEC 3.3, 3.4).
-        if (expiry.expired) {
-          throw new Error(EXPIRED_MESSAGE);
+        try {
+          const result = await registered.handler(context, payload);
+          // The handler outlived its terminal state: force the backend to roll
+          // back instead of committing effects nobody is waiting for
+          // (SPEC 3.3, 3.4).
+          if (expiry.expired) {
+            throw new Error(EXPIRED_MESSAGE);
+          }
+          return result;
+        } finally {
+          storageScope.active = false;
         }
-        return result;
       });
       // After a timeout or cancel the abandoned transaction settles later, and
       // its rejection must not surface as an unhandled rejection. The commit
@@ -320,6 +324,7 @@ export class Dispatcher {
       logger.debug({ sessionId: boundSessionId }, 'session bound');
       return { result, boundSessionId };
     } finally {
+      storageScope.active = false;
       clearTimeout(timer);
       if (this.inFlight.get(requestId) === entry) {
         this.inFlight.delete(requestId);
@@ -351,6 +356,7 @@ export class Dispatcher {
     // same id already sees a terminal request.
     this.inFlight.delete(requestId);
     entry.expiry.expired = true;
+    entry.storageScope.active = false;
     // The caller's code is the reason: the handler sees the same value the
     // cancel carried (`TRANSPORT_CLOSED`, `FRAMEWORK_TIMEOUT`, ...), so a
     // disconnect and a Portal-side timeout stay distinguishable (SPEC 3.6).
@@ -397,21 +403,24 @@ function logLostCommit(logger: Logger, startedAt: number): void {
   );
 }
 
-function guard(tx: StorageTransaction, expiry: Expiry): StorageTransaction {
+function guard(
+  tx: StorageTransaction,
+  scope: StorageScope,
+): StorageTransaction {
   return {
     async query<T>(sql: string, params?: readonly unknown[]): Promise<T[]> {
-      assertActive(expiry);
+      assertActive(scope);
       return tx.query<T>(sql, params);
     },
     async execute(sql: string, params?: readonly unknown[]): Promise<void> {
-      assertActive(expiry);
+      assertActive(scope);
       return tx.execute(sql, params);
     },
   };
 }
 
-function assertActive(expiry: Expiry): void {
-  if (expiry.expired) {
+function assertActive(scope: StorageScope): void {
+  if (!scope.active) {
     throw new Error(EXPIRED_MESSAGE);
   }
 }

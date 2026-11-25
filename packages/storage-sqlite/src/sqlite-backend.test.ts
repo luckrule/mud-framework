@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
 import { createJsonLogger } from 'mud-framework-core';
+import type { StorageTransaction } from 'mud-framework-core';
 import {
   deferred,
   parseJsonLine,
@@ -110,6 +111,54 @@ describe('SqliteBackend', () => {
     expect(error.message).toBe('boom');
     expect(rows).toEqual([]);
   });
+
+  test.each(['commit', 'rollback'])(
+    'a facade from a %s cannot access a later transaction',
+    async (outcome) => {
+      const backend = SqliteBackend.open();
+      const saved = deferred<StorageTransaction>();
+      try {
+        await backend.transaction((tx) =>
+          tx.execute('CREATE TABLE t (v TEXT)'),
+        );
+        const first = backend.transaction(async (tx) => {
+          saved.resolve(tx);
+          if (outcome === 'rollback') {
+            throw new Error('first transaction failed');
+          }
+        });
+        if (outcome === 'rollback') {
+          expect((await rejectionOf(first)).message).toBe(
+            'first transaction failed',
+          );
+        } else {
+          await first;
+        }
+        const stale = await saved.promise;
+
+        const { accesses: attempts, rows: actualRows } =
+          await backend.transaction(async (tx) => {
+            await tx.execute("INSERT INTO t (v) VALUES ('second')");
+            const accesses = await Promise.allSettled([
+              Promise.resolve().then(() =>
+                stale.execute("INSERT INTO t (v) VALUES ('stale')"),
+              ),
+              Promise.resolve().then(() => stale.query('SELECT v FROM t')),
+            ]);
+            const rows = await tx.query<{ v: string }>('SELECT v FROM t');
+            return { accesses, rows };
+          });
+
+        expect(attempts.map((access) => access.status)).toEqual([
+          'rejected',
+          'rejected',
+        ]);
+        expect(actualRows).toEqual([{ v: 'second' }]);
+      } finally {
+        await backend.close();
+      }
+    },
+  );
 
   test('serializes transactions instead of interleaving them', async () => {
     const backend = SqliteBackend.open();

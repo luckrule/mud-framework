@@ -7,6 +7,10 @@ export interface StorageCapabilities {
   maxTransactionDurationMs: number;
 }
 
+/**
+ * A handle for one transaction scope, never for a later transaction. Callers
+ * must not retain it for work after the transaction callback has settled.
+ */
 export interface StorageTransaction {
   query<T>(sql: string, params?: readonly unknown[]): Promise<T[]>;
   execute(sql: string, params?: readonly unknown[]): Promise<void>;
