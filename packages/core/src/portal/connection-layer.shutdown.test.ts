@@ -72,6 +72,7 @@ describe('ConnectionLayer shutdown (SPEC 6.3)', () => {
           order.push('executor.close');
           return Promise.resolve();
         },
+        health: () => ({ state: 'ready', ready: true }),
       },
     };
     const scripted = scriptedTransport(order);
@@ -150,6 +151,7 @@ describe('ConnectionLayer shutdown (SPEC 6.3)', () => {
         order.push('executor.close');
         return Promise.resolve();
       },
+      health: () => ({ state: 'ready', ready: true }),
     };
     const scripted = scriptedTransport(order);
     const layer = new ConnectionLayer({
@@ -204,6 +206,7 @@ describe('ConnectionLayer shutdown (SPEC 6.3)', () => {
         serverStopped.push('terminated');
         order.push('executor.close.end');
       },
+      health: () => ({ state: 'ready', ready: true }),
     };
     const scripted = scriptedTransport(order);
     const lines: string[] = [];
@@ -251,6 +254,7 @@ describe('ConnectionLayer shutdown (SPEC 6.3)', () => {
         closes += 1;
         return closing.promise;
       },
+      health: () => ({ state: 'ready', ready: true }),
     };
     const scripted = scriptedTransport([]);
     const lines: string[] = [];
@@ -296,6 +300,7 @@ describe('ConnectionLayer shutdown (SPEC 6.3)', () => {
       cancel: () => Promise.resolve(),
       closeBudgetMs: 30,
       close: () => Promise.reject(failure),
+      health: () => ({ state: 'ready', ready: true }),
     };
     const scripted = scriptedTransport([]);
     const lines: string[] = [];
@@ -334,6 +339,7 @@ describe('ConnectionLayer shutdown (SPEC 6.3)', () => {
         closes += 1;
         return Promise.reject(executorFailure);
       },
+      health: () => ({ state: 'ready', ready: true }),
     };
     const scripted = scriptedTransport([]);
     scripted.failStop(transportFailure);

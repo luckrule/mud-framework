@@ -87,6 +87,10 @@ Handler 默认 `access: 'session'`：请求没有 Session 时以 `AUTH_REQUIRED`
 
 `runServerProcess` 返回的 Promise 就是退出信号：收到 `shutdown` 并正常收尾时 resolve，启动失败或链路断开时 reject。入口脚本应把失败映射为非零退出码，供进程管理与诊断识别；Portal 也通过 IPC 断开与退出事件发现 Server 丢失，不只依赖退出码。
 
+## 健康探针（应用层）
+
+core 只提供同步快照，不提供 HTTP 端点（SPEC 6.6）。应用在自己的 HTTP 服务里把 `layer.health()` 映射为探针：`ready === true` 返回 200，否则返回 503；需要区分原因时把 `state` 与 `executor.state` 写进响应。快照会立即过期，只表达“此刻可以接活”，不能替代请求准入或 deadline。端点属于应用，Step 3 的示例会给出实现。
+
 ## 版本化入口（应用层）
 
 版本到入口的映射属于应用与部署配置，不进 core。应用自己维护 `codeVersion -> server entry`：Portal 的 `spawn` 闭包按当前版本选择入口，并把同一个版本传给 `IpcExecutor`；Server 入口把该版本原样交给 `runServerProcess`。框架不解析版本、不判断兼容性、不做版本到入口的映射。

@@ -14,6 +14,7 @@ function immediateExecutor(
     execute,
     cancel: () => Promise.resolve(),
     close: () => Promise.resolve(),
+    health: () => ({ state: 'ready', ready: true }),
   };
 }
 

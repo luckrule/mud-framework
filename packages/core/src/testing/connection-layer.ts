@@ -141,6 +141,7 @@ export function scriptedExecutor(order: string[]): ScriptedExecutor {
         order.push('executor.close');
         return Promise.resolve();
       },
+      health: () => ({ state: 'ready', ready: true }),
     },
   };
 }
@@ -254,6 +255,7 @@ export function controlledExecutor(
       },
       cancel: () => Promise.resolve(),
       close: () => Promise.resolve(),
+      health: () => ({ state: 'ready', ready: true }),
     },
   };
 }

@@ -45,6 +45,27 @@ export type ExecutorOutcome =
   | { ok: false; error: { code: string; message: string } };
 
 /**
+ * What an executor reports about its own ability to execute now. `recovering`
+ * covers a restart or a pending replacement; `blocked` means recovery is
+ * stopped by an unconfirmed writer exit (INV-002); `unknown` is the fallback a
+ * caller uses when the executor cannot answer.
+ */
+export type ExecutorHealthState =
+  | 'idle'
+  | 'starting'
+  | 'ready'
+  | 'recovering'
+  | 'blocked'
+  | 'closed'
+  | 'unknown';
+
+export interface ExecutorHealth {
+  readonly state: ExecutorHealthState;
+  /** True only when the executor can execute now, without waiting for recovery. */
+  readonly ready: boolean;
+}
+
+/**
  * The seam between the connection layer and whoever executes handlers. In
  * process that is `LocalExecutor` over a `Dispatcher`; the two-process design
  * puts an IPC-backed executor behind the same interface.
@@ -83,6 +104,15 @@ export interface RequestExecutor {
    * side to shut down, so the interface must not assume it owns storage.
    */
   close(): Promise<void>;
+  /**
+   * A synchronous, side-effect-free snapshot of whether `execute` can run now
+   * (SPEC 6.6). Callers use it for deployment probes; it is advisory and may be
+   * stale immediately, so it MUST NOT gate an individual request. It must be
+   * safe before `start()`, during `stop()` and while recovering, and must not
+   * throw or log on every poll: a failing implementation is reported as
+   * `{state:'unknown', ready:false}` by the caller.
+   */
+  health(): ExecutorHealth;
   /**
    * Worst-case duration of `close()` in milliseconds, when the executor can
    * bound it. A remote executor has to drain requests and then wait for the

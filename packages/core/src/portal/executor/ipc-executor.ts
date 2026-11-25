@@ -11,6 +11,7 @@ import {
   closeBudget,
 } from '../../shared/budget.ts';
 import type {
+  ExecutorHealth,
   ExecutorOutcome,
   ExecutorRequest,
   RequestExecutor,
@@ -26,6 +27,7 @@ import { failure, nextPortalGeneration } from '../ipc-outbound.ts';
 import { PendingBuffer } from '../ipc-pending.ts';
 import type { DeliveryHost } from './delivery-ledger.ts';
 import { DeliveryLedger, requestFields } from './delivery-ledger.ts';
+import { ipcExecutorHealth } from './executor-health.ts';
 import type { ShutdownHost } from './executor-shutdown.ts';
 import { doClose } from './executor-shutdown.ts';
 import type { IpcExecutorOptions } from './ipc-executor-options.ts';
@@ -102,6 +104,8 @@ export class IpcExecutor implements RequestExecutor {
   private readonly closedWaiter = new ClosedWaiter();
   private closePromise: Promise<void> | undefined;
   private pendingRecovery: { backoffMs: number; blocked: boolean } | undefined;
+  /** Separates the first start from a restart when deriving health. */
+  private handshakeCompleted = false;
 
   constructor(options: IpcExecutorOptions) {
     if (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) {
@@ -562,6 +566,21 @@ export class IpcExecutor implements RequestExecutor {
   }
 
   /**
+   * Reads the slot, the current Server and the recovery barrier, and lets
+   * `ipcExecutorHealth` classify them (SPEC 6.6). No state is written and no
+   * log is emitted, so a probe can poll it.
+   */
+  health(): ExecutorHealth {
+    const server = this.slot.server;
+    return ipcExecutorHealth({
+      status: this.slot.status,
+      handshakeCompleted: this.handshakeCompleted,
+      serverReady: server !== undefined && server.ready && !server.closed,
+      recoveryBlocked: this.pendingRecovery?.blocked === true,
+    });
+  }
+
+  /**
    * Replaces the Server process with one built from `spawn` without dropping
    * the recovery barrier (ADR-0007, INV-002). The sequence itself lives in
    * `VersionSwitch`; this class only hands over the process factory.
@@ -665,6 +684,7 @@ export class IpcExecutor implements RequestExecutor {
   }
 
   private resolveStart(): void {
+    this.handshakeCompleted = true;
     const waiter = this.startWaiter;
     this.startWaiter = undefined;
     this.clearStartTimer();

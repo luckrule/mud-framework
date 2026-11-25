@@ -1,4 +1,5 @@
 import type {
+  ExecutorHealth,
   ExecutorOutcome,
   ExecutorRequest,
   RequestExecutor,
@@ -56,5 +57,11 @@ export class LocalExecutor implements RequestExecutor {
 
   close(): Promise<void> {
     return this.dispatcher.close();
+  }
+
+  health(): ExecutorHealth {
+    return this.dispatcher.isClosed()
+      ? { state: 'closed', ready: false }
+      : { state: 'ready', ready: true };
   }
 }

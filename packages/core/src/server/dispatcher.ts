@@ -526,6 +526,11 @@ export class Dispatcher {
     await this.backend.close();
   }
 
+  /** Read-only view for an owner that reports health without owning the flag. */
+  isClosed(): boolean {
+    return this.closed;
+  }
+
   private assertOpen(): void {
     if (this.closed) {
       throw new Error('dispatcher is closed');

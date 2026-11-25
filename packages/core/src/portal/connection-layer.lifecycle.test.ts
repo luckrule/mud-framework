@@ -90,6 +90,7 @@ describe('ConnectionLayer lifecycle', () => {
           closedBeforeReady = !ready;
           await local.close();
         },
+        health: () => local.health(),
       },
       transport: {
         start: (handlers) => {
@@ -202,6 +203,7 @@ describe('ConnectionLayer lifecycle', () => {
       execute: () => Promise.resolve({ ok: true, result: null }),
       cancel: () => Promise.resolve(),
       close: () => Promise.resolve(),
+      health: () => ({ state: 'ready', ready: true }),
     };
     const layer = new ConnectionLayer({ transport, executor });
 
@@ -227,6 +229,7 @@ describe('ConnectionLayer lifecycle', () => {
       execute: () => Promise.resolve({ ok: true, result: null }),
       cancel: () => Promise.resolve(),
       close: () => Promise.resolve(),
+      health: () => ({ state: 'ready', ready: true }),
     };
     const layer = new ConnectionLayer({ transport, executor });
 
@@ -252,6 +255,7 @@ describe('ConnectionLayer lifecycle', () => {
         executorClosed = true;
         return Promise.resolve();
       },
+      health: () => ({ state: 'ready', ready: true }),
     };
     const layer = new ConnectionLayer({ transport, executor });
 

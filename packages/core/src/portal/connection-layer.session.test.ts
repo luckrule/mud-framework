@@ -543,6 +543,7 @@ describe('ConnectionLayer session routing (SPEC 3.2, INV-004)', () => {
           },
           cancel: (requestId, code) => local.cancel(requestId, code),
           close: () => local.close(),
+          health: () => local.health(),
         },
         logger,
       });

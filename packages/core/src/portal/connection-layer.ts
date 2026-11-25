@@ -26,6 +26,8 @@ import type {
   TransportConnection,
   TransportHandlers,
 } from '../transport/types.ts';
+import type { ConnectionHealth } from './health.ts';
+import { connectionHealthSnapshot, readExecutorHealth } from './health.ts';
 import { SessionRouter } from './session-router.ts';
 
 /**
@@ -478,6 +480,20 @@ export class ConnectionLayer implements TransportHandlers {
     if (executorFailure !== undefined) {
       throw executorFailure;
     }
+  }
+
+  /**
+   * Synchronous snapshot for deployment probes (SPEC 6.6). It has no side
+   * effects: it reads the layer's status and admission count and asks the
+   * executor once, turning a failing self-report into `unknown` rather than
+   * letting it escape the probe.
+   */
+  health(): ConnectionHealth {
+    return connectionHealthSnapshot(
+      this.status,
+      this.connections.size,
+      readExecutorHealth(this.executor),
+    );
   }
 
   /**

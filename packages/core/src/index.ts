@@ -65,6 +65,8 @@ export { safeLogger } from './logging/safe-logger.ts';
 export type { Codec, Envelope, ResponseEnvelope } from './client/codec.ts';
 export { JsonCodec } from './client/codec.ts';
 export type {
+  ExecutorHealth,
+  ExecutorHealthState,
   ExecutorOutcome,
   ExecutorRequest,
   RequestExecutor,
@@ -97,6 +99,10 @@ export {
   isFrameworkCode,
 } from './shared/wire-codes.ts';
 export type { ConnectionLayerOptions } from './portal/connection-layer.ts';
+export type {
+  ConnectionHealth,
+  ConnectionHealthState,
+} from './portal/health.ts';
 export { ConnectionLayer } from './portal/connection-layer.ts';
 export type { IpcExecutorOptions } from './portal/executor/ipc-executor-options.ts';
 export { IpcExecutor } from './portal/executor/ipc-executor.ts';

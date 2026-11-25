@@ -141,6 +141,7 @@ describe('ConnectionLayer request', () => {
         }),
       cancel: () => Promise.resolve(),
       close: () => Promise.resolve(),
+      health: () => ({ state: 'ready', ready: true }),
     };
     const layer = new ConnectionLayer({ transport, executor, logger });
     await layer.start();
@@ -180,6 +181,7 @@ describe('ConnectionLayer request', () => {
       },
       cancel: () => Promise.resolve(),
       close: () => Promise.resolve(),
+      health: () => ({ state: 'ready', ready: true }),
     };
     const layer = new ConnectionLayer({ transport, executor });
     await layer.start();
@@ -263,6 +265,7 @@ describe('ConnectionLayer request', () => {
         execute: () => Promise.resolve(outcome as ExecutorOutcome),
         cancel: () => Promise.resolve(),
         close: () => Promise.resolve(),
+        health: () => ({ state: 'ready', ready: true }),
       };
       const layer = new ConnectionLayer({ transport, executor });
       await layer.start();
@@ -297,6 +300,7 @@ describe('ConnectionLayer request', () => {
       execute: () => Promise.reject(new Error('boom')),
       cancel: () => Promise.resolve(),
       close: () => Promise.resolve(),
+      health: () => ({ state: 'ready', ready: true }),
     };
     const layer = new ConnectionLayer({ transport, executor, logger });
     await layer.start();
@@ -513,6 +517,7 @@ describe('ConnectionLayer request', () => {
       },
       cancel: () => Promise.resolve(),
       close: () => Promise.resolve(),
+      health: () => ({ state: 'ready', ready: true }),
     };
     const layer = new ConnectionLayer({ transport, executor, logger });
     await layer.start();

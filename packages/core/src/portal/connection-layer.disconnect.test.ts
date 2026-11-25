@@ -28,6 +28,7 @@ describe('ConnectionLayer disconnect', () => {
       },
       cancel: () => Promise.resolve(),
       close: () => Promise.resolve(),
+      health: () => ({ state: 'ready', ready: true }),
     };
     const layer = new ConnectionLayer({ transport, executor, logger });
     await layer.start();
@@ -107,6 +108,7 @@ describe('ConnectionLayer disconnect', () => {
         }),
       cancel: () => Promise.resolve(),
       close: () => Promise.resolve(),
+      health: () => ({ state: 'ready', ready: true }),
     };
     const layer = new ConnectionLayer({ transport, executor, logger });
     await layer.start();
@@ -242,6 +244,7 @@ describe('ConnectionLayer disconnect', () => {
         return Promise.resolve();
       },
       close: () => Promise.resolve(),
+      health: () => ({ state: 'ready', ready: true }),
     };
     const layer = new ConnectionLayer({ transport, executor });
     await layer.start();
