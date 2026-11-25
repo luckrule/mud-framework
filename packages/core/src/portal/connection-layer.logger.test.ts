@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
 import type { RequestExecutor } from '../shared/executor.ts';
-import { throwingLogger } from '../testing/common.ts';
+import { parseFrame, throwingLogger } from '../testing/common.ts';
 import { lastFrame } from '../testing/connection-layer.ts';
 import { FakeTransport } from '../transport/fake.ts';
 import { ConnectionLayer } from './connection-layer.ts';
@@ -52,19 +52,23 @@ describe('ConnectionLayer logger safety', () => {
         Promise.resolve({ ok: true, result: 'never runs' }),
       ),
       logger: throwingLogger(),
-      maxQueuedPerConnection: 0,
+      maxQueuedPerConnection: 1,
     });
     await layer.start();
     transport.connect('c1');
 
-    await transport.receive('c1', '{"id":"r1","method":"echo"}');
+    // The first request still occupies the executor's turn when the second
+    // arrives, so the second is the one refused.
+    const first = transport.receive('c1', '{"id":"r1","method":"echo"}');
+    const second = transport.receive('c1', '{"id":"r2","method":"echo"}');
+    await Promise.all([first, second]);
 
-    expect(lastFrame(transport, 'c1')).toEqual({
-      id: 'r1',
+    expect(transport.sentTo('c1').map(parseFrame)).toContainEqual({
+      id: 'r2',
       ok: false,
       error: {
         code: 'FRAMEWORK_QUEUE_FULL',
-        message: 'input queue is full (0 waiting)',
+        message: 'input queue is full (1 waiting)',
       },
     });
     await layer.stop();

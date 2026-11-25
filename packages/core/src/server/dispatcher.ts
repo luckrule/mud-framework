@@ -103,13 +103,15 @@ export interface HandlerOptions {
   readonly extension?: string;
   /**
    * Defaults to `'session'`: a handler is assumed to need an authenticated
-   * Session unless it explicitly opts out with `'public'` (SPEC 3.7).
+   * Session unless it explicitly opts out with `'public'` (SPEC 3.7). Must be
+   * exactly one of those two values.
    */
   readonly access?: HandlerAccess;
   /**
    * Defaults to false. Only a handler that declares true may call
    * `bindSession`/`unbindSession`; the declaration makes the mutation an
-   * explicit part of the handler's contract rather than an accident.
+   * explicit part of the handler's contract rather than an accident. Must be a
+   * boolean when provided.
    */
   readonly mayChangeSession?: boolean;
 }
@@ -213,10 +215,25 @@ export class Dispatcher {
 
   register(name: string, handler: Handler, options?: HandlerOptions): void {
     this.assertOpen();
+    const access = options?.access;
+    if (access !== undefined && access !== 'public' && access !== 'session') {
+      throw new TypeError(
+        `access must be 'public' or 'session', got ${describeValue(access)}`,
+      );
+    }
+    const mayChangeSession = options?.mayChangeSession;
+    if (
+      mayChangeSession !== undefined &&
+      typeof mayChangeSession !== 'boolean'
+    ) {
+      throw new TypeError(
+        `mayChangeSession must be a boolean, got ${describeValue(mayChangeSession)}`,
+      );
+    }
     this.handlers.set(name, {
       handler,
-      access: options?.access ?? 'session',
-      mayChangeSession: options?.mayChangeSession ?? false,
+      access: access ?? 'session',
+      mayChangeSession: mayChangeSession ?? false,
       ...(options?.extension === undefined
         ? {}
         : { extension: options.extension }),

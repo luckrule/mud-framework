@@ -12,18 +12,29 @@ import type {
 import { SendQueue } from './send-queue.ts';
 
 export interface WsTransportOptions {
-  /** Listening port; `0` (the default) lets the OS pick one. */
+  /**
+   * Listening port; `0` (the default) lets the OS pick one. Must be an
+   * integer between 0 and 65535.
+   */
   port?: number;
+  /** Must be a non-empty string. */
   hostname?: string;
-  /** Only upgrade requests for this path are accepted. */
+  /**
+   * Only upgrade requests for this path are accepted. Must be a non-empty
+   * string starting with `/`.
+   */
   path?: string;
-  /** Per-message ceiling for both directions. */
+  /** Per-message ceiling for both directions. Must be a positive integer. */
   maxMessageBytes?: number;
-  /** Forwarded to Bun's WebSocket `idleTimeout`, in seconds. */
+  /**
+   * Forwarded to Bun's WebSocket `idleTimeout`, in seconds. Must be a
+   * non-negative integer; `0` disables the timeout.
+   */
   idleTimeoutSeconds?: number;
   /**
    * How long a payload may wait behind a full socket buffer before its
    * `send` rejects and the connection is dropped. `Infinity` disables it.
+   * Must be a positive finite number or `Infinity`.
    */
   sendTimeoutMs?: number;
   /**
@@ -78,16 +89,27 @@ export class WsTransport implements Transport {
   private server: Bun.Server<WsData> | undefined;
 
   constructor(options: WsTransportOptions = {}) {
+    const port = options.port ?? 0;
+    assertIntegerBetween(port, 'port', 0, 65_535);
     const maxMessageBytes =
       options.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES;
+    assertPositiveInteger(maxMessageBytes, 'maxMessageBytes');
+    const idleTimeoutSeconds =
+      options.idleTimeoutSeconds ?? DEFAULT_IDLE_TIMEOUT_SECONDS;
+    assertNonNegativeInteger(idleTimeoutSeconds, 'idleTimeoutSeconds');
+    const sendTimeoutMs = options.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS;
+    assertSendTimeout(sendTimeoutMs, 'sendTimeoutMs');
+    const hostname = options.hostname ?? '127.0.0.1';
+    assertNonEmptyString(hostname, 'hostname');
+    const path = options.path ?? '/';
+    assertPath(path);
     this.settings = {
-      port: options.port ?? 0,
-      hostname: options.hostname ?? '127.0.0.1',
-      path: options.path ?? '/',
+      port,
+      hostname,
+      path,
       maxMessageBytes,
-      idleTimeoutSeconds:
-        options.idleTimeoutSeconds ?? DEFAULT_IDLE_TIMEOUT_SECONDS,
-      sendTimeoutMs: options.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS,
+      idleTimeoutSeconds,
+      sendTimeoutMs,
     };
     this.logger =
       options.logger === undefined
@@ -359,6 +381,83 @@ export class WsTransport implements Transport {
       },
     );
     return settled;
+  }
+}
+
+function assertIntegerBetween(
+  value: unknown,
+  name: string,
+  min: number,
+  max: number,
+): void {
+  const expected = `an integer between ${min} and ${max}`;
+  if (typeof value !== 'number') {
+    throw new TypeError(`${name} must be ${expected}, got ${String(value)}`);
+  }
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new RangeError(`${name} must be ${expected}, got ${String(value)}`);
+  }
+}
+
+function assertNonEmptyString(value: unknown, name: string): string {
+  if (typeof value !== 'string') {
+    throw new TypeError(
+      `${name} must be a non-empty string, got ${String(value)}`,
+    );
+  }
+  if (value.length === 0) {
+    throw new RangeError(`${name} must be a non-empty string, got ""`);
+  }
+  return value;
+}
+
+function assertPath(value: unknown): void {
+  const path = assertNonEmptyString(value, 'path');
+  if (!path.startsWith('/')) {
+    throw new RangeError(
+      `path must start with "/", got ${JSON.stringify(path)}`,
+    );
+  }
+}
+
+function assertSendTimeout(value: unknown, name: string): void {
+  if (typeof value !== 'number') {
+    throw new TypeError(
+      `${name} must be a positive number or Infinity, got ${String(value)}`,
+    );
+  }
+  const valid =
+    value === Number.POSITIVE_INFINITY || (Number.isFinite(value) && value > 0);
+  if (!valid) {
+    throw new RangeError(
+      `${name} must be a positive number or Infinity, got ${String(value)}`,
+    );
+  }
+}
+
+function assertNonNegativeInteger(value: unknown, name: string): void {
+  if (typeof value !== 'number') {
+    throw new TypeError(
+      `${name} must be a non-negative integer, got ${String(value)}`,
+    );
+  }
+  if (!Number.isInteger(value) || value < 0) {
+    throw new RangeError(
+      `${name} must be a non-negative integer, got ${String(value)}`,
+    );
+  }
+}
+
+function assertPositiveInteger(value: unknown, name: string): void {
+  if (typeof value !== 'number') {
+    throw new TypeError(
+      `${name} must be a positive integer, got ${String(value)}`,
+    );
+  }
+  if (!Number.isInteger(value) || value < 1) {
+    throw new RangeError(
+      `${name} must be a positive integer, got ${String(value)}`,
+    );
   }
 }
 

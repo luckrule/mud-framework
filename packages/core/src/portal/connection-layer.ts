@@ -10,7 +10,7 @@ import type {
   RequestExecutor,
   SessionChange,
 } from '../shared/executor.ts';
-import { isRecord, messageOf } from '../shared/guards.ts';
+import { describeValue, isRecord, messageOf } from '../shared/guards.ts';
 import { settleWithin } from '../shared/timeout.ts';
 import {
   FRAMEWORK_QUEUE_FULL,
@@ -83,13 +83,15 @@ export interface ConnectionLayerOptions {
   /**
    * Requests allowed to wait on one connection, excluding the one executing
    * (SPEC 3.5). Defaults to `DEFAULT_MAX_QUEUED_PER_CONNECTION`; the request
-   * that would exceed it is refused with `FRAMEWORK_QUEUE_FULL`.
+   * that would exceed it is refused with `FRAMEWORK_QUEUE_FULL`. Must be a
+   * positive integer, so at least one waiting request is allowed; `0` is
+   * invalid.
    */
   maxQueuedPerConnection?: number;
   /**
    * Ceiling on each shutdown wait: draining in-flight requests, closing the
    * executor and stopping the transport (SPEC 6.3). Defaults to
-   * `DEFAULT_SHUTDOWN_TIMEOUT_MS`.
+   * `DEFAULT_SHUTDOWN_TIMEOUT_MS`. Must be a finite number of at least 1.
    *
    * This is a floor, not the executor's ceiling: when the executor can bound
    * its own `close()` (`RequestExecutor.closeBudgetMs`, which `IpcExecutor`
@@ -102,7 +104,7 @@ export interface ConnectionLayerOptions {
    * Connections this layer admits at once (SPEC 6.1). Defaults to
    * `DEFAULT_MAX_CONNECTIONS`. This is an admission cap, not a business
    * Session lifetime limit: a connection beyond it is closed (code `1013`)
-   * before any request on it is read.
+   * before any request on it is read. Must be a positive integer.
    */
   maxConnections?: number;
 }
@@ -161,6 +163,14 @@ export class ConnectionLayer implements TransportHandlers {
   private closePromise: Promise<void> | undefined;
 
   constructor(options: ConnectionLayerOptions) {
+    const maxConnections = options.maxConnections ?? DEFAULT_MAX_CONNECTIONS;
+    assertPositiveInteger(maxConnections, 'maxConnections');
+    const maxQueuedPerConnection =
+      options.maxQueuedPerConnection ?? DEFAULT_MAX_QUEUED_PER_CONNECTION;
+    assertPositiveInteger(maxQueuedPerConnection, 'maxQueuedPerConnection');
+    const shutdownTimeoutMs =
+      options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
+    assertFiniteAtLeastOne(shutdownTimeoutMs, 'shutdownTimeoutMs');
     this.transport = options.transport;
     this.executor = options.executor;
     this.codec = options.codec ?? new JsonCodec();
@@ -169,11 +179,9 @@ export class ConnectionLayer implements TransportHandlers {
         createJsonLogger({ bindings: { component: 'connection-layer' } }),
     );
     this.createRequestId = options.createRequestId ?? randomUUID;
-    this.maxQueuedPerConnection =
-      options.maxQueuedPerConnection ?? DEFAULT_MAX_QUEUED_PER_CONNECTION;
-    this.maxConnections = options.maxConnections ?? DEFAULT_MAX_CONNECTIONS;
-    this.shutdownTimeoutMs =
-      options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
+    this.maxQueuedPerConnection = maxQueuedPerConnection;
+    this.maxConnections = maxConnections;
+    this.shutdownTimeoutMs = shutdownTimeoutMs;
     this.router = new SessionRouter({ logger: this.logger });
   }
 
@@ -786,6 +794,32 @@ export class ConnectionLayer implements TransportHandlers {
 /** Length only: the raw frame may hold client data that must not be logged. */
 function rawLengthOf(payload: string | Uint8Array): number {
   return typeof payload === 'string' ? payload.length : payload.byteLength;
+}
+
+function assertPositiveInteger(value: unknown, name: string): void {
+  if (typeof value !== 'number') {
+    throw new TypeError(
+      `${name} must be a positive integer, got ${describeValue(value)}`,
+    );
+  }
+  if (!Number.isInteger(value) || value < 1) {
+    throw new RangeError(
+      `${name} must be a positive integer, got ${String(value)}`,
+    );
+  }
+}
+
+function assertFiniteAtLeastOne(value: unknown, name: string): void {
+  if (typeof value !== 'number') {
+    throw new TypeError(
+      `${name} must be a finite number of at least 1, got ${describeValue(value)}`,
+    );
+  }
+  if (!Number.isFinite(value) || value < 1) {
+    throw new RangeError(
+      `${name} must be a finite number of at least 1, got ${String(value)}`,
+    );
+  }
 }
 
 function toError(error: unknown): Error {
