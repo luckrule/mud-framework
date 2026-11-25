@@ -116,16 +116,13 @@ export interface SwitchHost {
    * `close()` cannot join.
    */
   recordAbandoned(server: ServerState): void;
-  /** Drops a process from the close list once its exit was confirmed. */
-  forgetAbandoned(server: ServerState): void;
   /** Wakes the `closed` wait a `close()` may be parked on. */
   resolveClosed(): void;
   clearRestartTimer(): void;
   startStableTimer(): void;
   adoptCeiling(declaredMaxDurationMs: number): void;
-  /** The next crash-backoff step, consumed when a rollback schedules a restart. */
-  nextBackoffMs(): number;
-  scheduleRestart(backoffMs: number): void;
+  /** Shares the crash path's bounded exit wait and late-exit recovery gate. */
+  recoverAfterExits(): void;
 }
 
 /**
@@ -186,6 +183,11 @@ export class VersionSwitch {
       return Promise.reject(
         new Error('codeVersion must be a non-empty string'),
       );
+    }
+    try {
+      slot.assertNoOtherLiveServer(slot.server);
+    } catch (error) {
+      return Promise.reject(toError(error));
     }
     const deferred = Promise.withResolvers<void>();
     const completion = Promise.withResolvers<void>();
@@ -488,15 +490,8 @@ export class VersionSwitch {
       op.failure = new Error('the replacement was never spawned');
       return;
     }
-    // INV-002: `activate` is what lets this process open storage, so it may
-    // only go out when no other process can still be writing.
-    //
-    // Defensive, not a behaviour branch: `retirePrevious` returns true only
-    // after the previous process exited (or when there was none), and the
-    // slot's current server is that same process, so no live candidate can
-    // exist at this point. The check stays to catch a future orchestration
-    // change that would put two writers on one storage — failing the switch is
-    // the safe outcome then.
+    // INV-002: retained processes from earlier failures also block activation,
+    // even when this switch confirmed its own previous process's exit.
     try {
       this.host.slot.assertNoOtherLiveServer(staged);
     } catch (error) {
@@ -504,8 +499,9 @@ export class VersionSwitch {
       return;
     }
     try {
-      staged.channel.send({ type: 'activate' });
+      // Delivery may take effect before send throws or invokes a sync handler.
       op.activated = true;
+      staged.channel.send({ type: 'activate' });
     } catch (error) {
       op.stagedLost = new Error(`activate failed: ${messageOf(error)}`);
       op.failure = op.stagedLost;
@@ -787,28 +783,10 @@ export class VersionSwitch {
     if (this.host.slot.isTerminal) {
       return;
     }
-    this.host.slot.markStartingAfterLoss();
-    const backoffMs = this.host.nextBackoffMs();
-    if (pendingExits.length === 0) {
-      this.host.scheduleRestart(backoffMs);
-      return;
-    }
-    // `close()` cannot join the wait below (it is a floating promise), so it
-    // must confirm these exits itself. Without this a close landing in the
-    // window between the rollback starting and the exit being observed would
-    // return while the process could still hold storage (INV-002).
     for (const server of pendingExits) {
       this.host.recordAbandoned(server);
     }
-    void Promise.all(
-      pendingExits.map((server) => waitForExit(server, this.host.logger)),
-    ).then(() => {
-      for (const server of pendingExits) {
-        this.host.forgetAbandoned(server);
-      }
-      this.host.scheduleRestart(backoffMs);
-      return undefined;
-    });
+    this.host.recoverAfterExits();
   }
 }
 

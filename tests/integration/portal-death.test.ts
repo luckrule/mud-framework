@@ -37,12 +37,8 @@ import { SqliteBackend } from '../../packages/storage-sqlite/src/index.ts';
 const PORTAL_FIXTURE = join(import.meta.dir, 'fixtures', 'portal-entry.ts');
 
 const READY_TIMEOUT_MS = 15_000;
-/**
- * Covers the framework's own shutdown budget: `closeBudget(5000)` plus the
- * `ConnectionLayer` slack is 15_250ms, so 15s would flag a legitimate slow
- * close as a hang.
- */
-const PORTAL_EXIT_TIMEOUT_MS = 20_000;
+/** Allows the layer drain, executor close budget and process-scheduling slack. */
+const PORTAL_EXIT_TIMEOUT_MS = 30_000;
 const SERVER_EXIT_TIMEOUT_MS = 10_000;
 const CLEANUP_EXIT_TIMEOUT_MS = 3000;
 const CLEANUP_PID_TIMEOUT_MS = 2000;

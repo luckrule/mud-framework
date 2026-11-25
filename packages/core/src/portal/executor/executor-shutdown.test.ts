@@ -99,12 +99,12 @@ describe('executor shutdown', () => {
       pid: 2002,
       staged: false,
     });
+    slot.track(abandoned);
     void abandonedExit.promise.then(() => {
       order.push('abandoned:exit');
       return undefined;
     });
 
-    let abandonedTaken = false;
     const host: ShutdownHost = {
       logger: createJsonLogger({ level: 'debug', sink: () => {} }),
       slot,
@@ -122,13 +122,7 @@ describe('executor shutdown', () => {
         rejectStart: () => {},
         waitForClosed: async () => {},
       },
-      takeAbandoned: () => {
-        if (abandonedTaken) {
-          return [];
-        }
-        abandonedTaken = true;
-        return [abandoned];
-      },
+      listPendingExits: () => slot.pendingExits,
     };
 
     const closing = doClose(host);
@@ -136,6 +130,9 @@ describe('executor shutdown', () => {
     try {
       await flushMicrotasks();
       observedBeforeExit = [...order];
+      expect(host.listPendingExits()).toEqual([abandoned]);
+      expect(host.listPendingExits()).toEqual([abandoned]);
+      expect(slot.pendingExits).toEqual([abandoned]);
     } finally {
       // Unblock `confirmAbandonedExits` whichever order ran, so the close always
       // settles and the assertion below reports the real ordering.
@@ -149,5 +146,7 @@ describe('executor shutdown', () => {
     expect(currentSent).toContainEqual({ type: 'shutdown', timeoutMs: 50 });
     expect(order).toEqual(['current:shutdown', 'abandoned:exit']);
     expect(slot.status).toBe('closed');
+    expect(host.listPendingExits()).toEqual([]);
+    expect(slot.pendingExits).toEqual([]);
   });
 });

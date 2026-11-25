@@ -45,11 +45,8 @@ export interface ShutdownHost {
     rejectStart(error: Error): void;
     waitForClosed(server: ServerState, waitMs: number): Promise<void>;
   };
-  /**
-   * Takes the processes a `close()`-aborted switch abandoned, clearing the
-   * owner's list. The executor owns the list; this module only confirms exits.
-   */
-  takeAbandoned(): ServerState[];
+  /** Snapshots unconfirmed processes without dropping their retained references. */
+  listPendingExits(): ServerState[];
 }
 
 /**
@@ -104,38 +101,44 @@ export async function doClose(host: ShutdownHost): Promise<void> {
       'shutdown drain timed out',
     );
   }
-  await shutdownServer(host);
-  await confirmAbandonedExits(host);
+  const current = host.slot.server;
+  const currentExited = await shutdownServer(host);
+  const abandonedExited = await confirmAbandonedExits(host, current);
   host.ledger.failAllPending(
     FRAMEWORK_SHUTDOWN,
     'ipc executor closed',
     'executor closed',
   );
-  host.slot.markClosed();
   // A start() still waiting for `ready` must not be told "ready" by a close.
   host.waiters.rejectStart(
     new Error('ipc executor closed before the server became ready'),
   );
+  if (!currentExited || !abandonedExited) {
+    throw new Error('ipc executor close could not confirm all server exits');
+  }
+  host.slot.markClosed();
 }
 
 /**
- * Confirms the exit of every process a `close()`-aborted switch abandoned,
- * with the same bounded wait → kill → wait flow `shutdownServer` uses.
- *
- * A replacement that already received `activate` may hold storage, and the
- * switch's own abort path only issues the kill. `close()` must not return
- * while such a process could still be writing (INV-002); a process that
- * survives the second wait is logged rather than waited on forever.
+ * Confirms every retained non-current process with a bounded wait → kill → wait.
+ * A failed final wait leaves the reference retained and makes close reject;
+ * neither a sent kill nor a closed channel proves storage was released.
  */
-async function confirmAbandonedExits(host: ShutdownHost): Promise<void> {
-  const pending = host.takeAbandoned();
+async function confirmAbandonedExits(
+  host: ShutdownHost,
+  current: ServerState | undefined,
+): Promise<boolean> {
+  const pending = host
+    .listPendingExits()
+    .filter((server) => server !== current);
   // Parallel, not sequential: these are independent processes, and the budget
   // counts one bounded wait→kill→wait, not one per process.
-  await Promise.all(
+  const confirmed = await Promise.all(
     pending.map(async (server) => {
       const exited = await waitForExit(server, host.logger);
       if (exited) {
-        return;
+        host.slot.confirmExit(server);
+        return true;
       }
       host.logger.warn(
         { pid: server.pid, timeoutMs: EXIT_WAIT_TIMEOUT_MS },
@@ -148,15 +151,19 @@ async function confirmAbandonedExits(host: ShutdownHost): Promise<void> {
           { pid: server.pid, timeoutMs: EXIT_WAIT_TIMEOUT_MS },
           'abandoned replacement is still running after a kill; close cannot confirm its exit',
         );
+      } else {
+        host.slot.confirmExit(server);
       }
+      return afterKill;
     }),
   );
+  return confirmed.every(Boolean);
 }
 
-async function shutdownServer(host: ShutdownHost): Promise<void> {
+async function shutdownServer(host: ShutdownHost): Promise<boolean> {
   const server = host.slot.server;
   if (server === undefined) {
-    return;
+    return true;
   }
   if (!server.closed) {
     if (server.ready && !server.shutdownSent) {
@@ -210,7 +217,7 @@ async function shutdownServer(host: ShutdownHost): Promise<void> {
   // process is gone; the storage must not be reopened while it lingers
   // (INV-002). This also covers a process that was already killed from the
   // channel-loss path. Waiting is bounded, and a lingering process is logged.
-  const exited = await waitForExit(server, host.logger);
+  let exited = await waitForExit(server, host.logger);
   if (!exited) {
     // `close()` must not return while the Server may still be writing: a
     // caller that then reopens storage gets two writers, which is exactly the
@@ -228,12 +235,22 @@ async function shutdownServer(host: ShutdownHost): Promise<void> {
         'server could not be killed',
       );
     }
-    await waitForExit(server, host.logger);
+    exited = await waitForExit(server, host.logger);
+    if (!exited) {
+      host.logger.warn(
+        { pid: server.pid, timeoutMs: EXIT_WAIT_TIMEOUT_MS },
+        'server is still running after a kill; close cannot confirm its exit',
+      );
+    }
   }
+  server.closed = true;
+  server.closedSignal.resolve();
   try {
     server.channel.close('portal is shutting down');
   } catch (error) {
     host.logger.debug({ reason: messageOf(error) }, 'ipc channel close failed');
   }
+  host.slot.confirmExit(server);
   host.slot.clearIfCurrent(server);
+  return exited;
 }

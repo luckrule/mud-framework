@@ -184,6 +184,7 @@ function onPrepared(
   server.pid = pid;
   server.reportedCodeVersion = codeVersion;
   try {
+    host.slot.assertNoOtherLiveServer(server);
     server.channel.send({ type: 'activate' });
   } catch (error) {
     host.onServerLost(

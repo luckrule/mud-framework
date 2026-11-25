@@ -1,8 +1,10 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, jest, test } from 'bun:test';
 
+import type { ExecutorOutcome } from '../../shared/executor.ts';
 import { rejectionOf } from '../../testing/common.ts';
 import {
   failureOf,
+  flushMicrotasks,
   flushTicks,
   harness,
   readyMessage,
@@ -83,7 +85,7 @@ describe('IpcExecutor restart', () => {
     await h.executor.close();
   });
 
-  test('still kills a server whose exit could not be observed', async () => {
+  test('does not restart a server whose exit could not be observed', async () => {
     const h = harness({ timeoutMs: 5000 });
     const first = await started(h);
 
@@ -103,11 +105,123 @@ describe('IpcExecutor restart', () => {
             'server channel lost while the process was alive; killing it',
         ),
     ).toBe(true);
-    // And the restart is not blocked forever: the replacement appears.
-    await waitFor(() => h.servers.length === 2);
-    serverAt(h, 1).send(readyMessage());
     await flushTicks();
-    await h.executor.close();
+    expect(h.servers).toHaveLength(1);
+    expect((await rejectionOf(h.executor.close())).message).toMatch(
+      /could not confirm/,
+    );
+  });
+
+  test('a late confirmed exit releases the timed-out recovery gate exactly once', async () => {
+    jest.useFakeTimers();
+    try {
+      const h = harness({ timeoutMs: 5000, killExits: false });
+      const first = await started(h);
+
+      first.closeChannel();
+      await flushMicrotasks();
+      jest.advanceTimersByTime(2001);
+      await flushMicrotasks();
+      jest.advanceTimersByTime(1);
+      await flushMicrotasks();
+      expect(h.servers).toHaveLength(1);
+
+      first.crash();
+      await flushMicrotasks();
+      jest.advanceTimersByTime(1);
+      await flushMicrotasks();
+      expect(h.servers).toHaveLength(2);
+      serverAt(h, 1).send(readyMessage());
+      first.closeChannel();
+      jest.advanceTimersByTime(2500);
+      await flushMicrotasks();
+      expect(h.servers).toHaveLength(2);
+      await h.executor.close();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('an exit wait timeout fails buffered and new requests without spawning', async () => {
+    jest.useFakeTimers();
+    try {
+      const h = harness({ timeoutMs: 5000, killExits: false });
+      const first = await started(h);
+      first.closeChannel();
+      let outcome: ExecutorOutcome | undefined;
+      void h.executor
+        .execute(request({ requestId: 'blocked' }))
+        .then((value) => {
+          outcome = value;
+          return undefined;
+        });
+      await flushMicrotasks();
+      jest.advanceTimersByTime(2001);
+      await flushMicrotasks();
+
+      expect(outcome).toMatchObject({
+        ok: false,
+        error: { code: 'INTERNAL_ERROR' },
+      });
+      expect(h.servers).toHaveLength(1);
+      expect(
+        failureOf(await h.executor.execute(request({ requestId: 'late' })))
+          .code,
+      ).toBe('INTERNAL_ERROR');
+
+      first.crash();
+      await flushMicrotasks();
+      jest.advanceTimersByTime(1);
+      await flushMicrotasks();
+      serverAt(h, 1).send(readyMessage());
+      await h.executor.close();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('close retains a timed-out lost process, rejects boundedly, and never revives it', async () => {
+    jest.useFakeTimers();
+    try {
+      const h = harness({ timeoutMs: 5000, killExits: false });
+      const first = await started(h);
+      first.closeChannel();
+      await flushMicrotasks();
+      jest.advanceTimersByTime(2001);
+      await flushMicrotasks();
+
+      let settled = false;
+      const closing = h.executor.close().then(
+        () => {
+          settled = true;
+          return undefined;
+        },
+        (error: unknown) => {
+          settled = true;
+          return error;
+        },
+      );
+      await flushMicrotasks();
+      expect(settled).toBe(false);
+      jest.advanceTimersByTime(2000);
+      await flushMicrotasks();
+      expect(first.killCount).toBe(2);
+      jest.advanceTimersByTime(2000);
+      await flushMicrotasks();
+      expect(await closing).toBeInstanceOf(Error);
+      expect(settled).toBe(true);
+
+      first.crash();
+      await flushMicrotasks();
+      jest.advanceTimersByTime(5000);
+      await flushMicrotasks();
+      expect(h.servers).toHaveLength(1);
+      expect(failureOf(await h.executor.execute(request())).code).toBe(
+        'FRAMEWORK_SHUTDOWN',
+      );
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   test('a server that dies on every request is not restarted in a tight loop', async () => {
@@ -128,6 +242,49 @@ describe('IpcExecutor restart', () => {
 
     expect(h.servers.length).toBeLessThanOrEqual(3);
     await h.executor.close();
+  });
+
+  test('a recovery generation stuck before ready fails within its own start timeout', async () => {
+    jest.useFakeTimers();
+    try {
+      const h = harness({ timeoutMs: 5000, startTimeoutMs: 50 });
+      const first = await started(h);
+      jest.advanceTimersByTime(40);
+      first.crash();
+      await flushMicrotasks();
+      jest.advanceTimersByTime(1);
+      await flushMicrotasks();
+      const recovering = serverAt(h, 1);
+      let outcome: ExecutorOutcome | undefined;
+      void h.executor
+        .execute(request({ requestId: 'recovering' }))
+        .then((value) => {
+          outcome = value;
+          return undefined;
+        });
+
+      jest.advanceTimersByTime(49);
+      await flushMicrotasks();
+      expect(recovering.killCount).toBe(0);
+      expect(outcome).toBeUndefined();
+      jest.advanceTimersByTime(1);
+      await flushMicrotasks();
+      expect(recovering.killCount).toBe(1);
+      expect(outcome).toMatchObject({
+        ok: false,
+        error: { code: 'INTERNAL_ERROR' },
+      });
+      expect(
+        failureOf(await h.executor.execute(request({ requestId: 'late' })))
+          .code,
+      ).toBe('INTERNAL_ERROR');
+      jest.advanceTimersByTime(1000);
+      await flushMicrotasks();
+      expect(h.servers).toHaveLength(2);
+      await h.executor.close();
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   test('fails start after startTimeoutMs when the server never becomes ready', async () => {

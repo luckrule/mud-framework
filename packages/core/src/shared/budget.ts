@@ -16,9 +16,8 @@ export const MAX_RESTART_BACKOFF_MS = 5000;
 export const DEFAULT_SHUTDOWN_TIMEOUT_MS = 5000;
 
 /**
- * Upper bound on how long a kill is awaited before the Portal moves on.
- * SIGKILL normally lands in milliseconds; a process stuck in uninterruptible
- * sleep would otherwise stall shutdown or restart forever.
+ * Bounds one exit-confirmation wait, not the process lifetime. An expired wait
+ * leaves the process unconfirmed and blocks replacement launch or activation.
  */
 export const EXIT_WAIT_TIMEOUT_MS = 2000;
 
@@ -34,11 +33,8 @@ export const EXIT_WAIT_TIMEOUT_MS = 2000;
 export const SHUTDOWN_ACK_SLACK_MS = 250;
 
 /**
- * Upper bound on requests buffered but not yet acknowledged. Their lifetime is
- * bounded by the request deadline, so this is not a steady-state limit; it is a
- * brake for the case the deadline cannot cover: a Server that stays unavailable
- * while a client keeps writing, which would otherwise grow the buffer until the
- * Portal runs out of memory.
+ * Bounds concurrent unacknowledged requests within their deadlines. Portal-side
+ * deadlines still settle individual requests when the Server is unavailable.
  */
 export const DEFAULT_MAX_PENDING = 10_000;
 

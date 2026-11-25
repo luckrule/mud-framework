@@ -93,18 +93,15 @@ export class IpcExecutor implements RequestExecutor {
   /** The crash streak, its backoff and the stability window that ends it. */
   private readonly restart: RestartPolicy;
   private startTimer: ReturnType<typeof setTimeout> | undefined;
+  private generationTimer:
+    | { server: ServerState; timer: ReturnType<typeof setTimeout> }
+    | undefined;
   private startWaiter:
     | { resolve: () => void; reject: (error: Error) => void }
     | undefined;
   private readonly closedWaiter = new ClosedWaiter();
   private closePromise: Promise<void> | undefined;
-  /**
-   * Processes a `close()`-aborted switch abandoned, kept until their exit is
-   * confirmed. `doClose` drains this list before it returns: an abandoned
-   * replacement may have received `activate`, so its exit is what says the
-   * storage is released (INV-002).
-   */
-  private readonly abandonedForClose: ServerState[] = [];
+  private pendingRecovery: { backoffMs: number; blocked: boolean } | undefined;
 
   constructor(options: IpcExecutorOptions) {
     if (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) {
@@ -206,6 +203,7 @@ export class IpcExecutor implements RequestExecutor {
         this.codeVersion = codeVersion;
       },
       attach: (server) => {
+        this.slot.track(server);
         attachServer(server, this.serverHandlers(server));
       },
       pump: () => {
@@ -213,15 +211,7 @@ export class IpcExecutor implements RequestExecutor {
       },
       currentServer: () => this.slot.server,
       recordAbandoned: (server) => {
-        if (!this.abandonedForClose.includes(server)) {
-          this.abandonedForClose.push(server);
-        }
-      },
-      forgetAbandoned: (server) => {
-        const index = this.abandonedForClose.indexOf(server);
-        if (index !== -1) {
-          this.abandonedForClose.splice(index, 1);
-        }
+        this.slot.track(server);
       },
       resolveClosed: () => {
         this.resolveClosed();
@@ -235,9 +225,8 @@ export class IpcExecutor implements RequestExecutor {
       adoptCeiling: (declaredMaxDurationMs) => {
         this.adoptCeiling(declaredMaxDurationMs);
       },
-      nextBackoffMs: () => this.restart.nextBackoffMs(),
-      scheduleRestart: (backoffMs) => {
-        this.scheduleRestart(backoffMs);
+      recoverAfterExits: () => {
+        this.recoverAfterExits(this.restart.nextBackoffMs());
       },
     };
   }
@@ -253,6 +242,7 @@ export class IpcExecutor implements RequestExecutor {
       slot: this.slot,
       currentCodeVersion: () => this.codeVersion,
       adoptReady: (server, declaredMaxDurationMs) => {
+        this.clearGenerationTimer(server);
         this.slot.markReady(server);
         // The crash streak ends only after a stable run, not at the handshake:
         // a Server that reaches `ready` and then dies on its first request
@@ -303,11 +293,17 @@ export class IpcExecutor implements RequestExecutor {
    * rather than left running: continuing to spawn would keep burning CPU and
    * ports on a configuration error, and the caller already has the failure.
    */
-  private onStartTimeout(): void {
-    this.startTimer = undefined;
-    if (this.startWaiter === undefined) {
+  private onStartTimeout(generation?: ServerState): void {
+    if (
+      this.slot.isTerminal ||
+      (generation === undefined
+        ? this.startWaiter === undefined
+        : this.slot.server !== generation || generation.ready)
+    ) {
       return;
     }
+    this.clearStartTimer();
+    this.clearGenerationTimer(generation);
     const attempts = this.restart.attempts;
     this.restart.clearRestartTimer();
     this.restart.clearStableClock();
@@ -411,6 +407,14 @@ export class IpcExecutor implements RequestExecutor {
       );
       return Promise.resolve(
         failure(FRAMEWORK_SHUTDOWN, 'ipc executor is shutting down'),
+      );
+    }
+    if (this.pendingRecovery?.blocked) {
+      return Promise.resolve(
+        failure(
+          INTERNAL_ERROR,
+          'server recovery blocked: process exit is unconfirmed',
+        ),
       );
     }
     // Capacity before duplicate id, matching the order the admission checks had
@@ -644,6 +648,7 @@ export class IpcExecutor implements RequestExecutor {
       waiters: {
         clearStartTimer: () => {
           this.clearStartTimer();
+          this.clearGenerationTimer();
         },
         rejectStart: (error) => {
           this.rejectStart(error);
@@ -651,7 +656,7 @@ export class IpcExecutor implements RequestExecutor {
         waitForClosed: (server, waitMs) =>
           this.closedWaiter.waitForClosed(server, waitMs),
       },
-      takeAbandoned: () => this.abandonedForClose.splice(0),
+      listPendingExits: () => this.slot.pendingExits,
     };
   }
 
@@ -681,8 +686,19 @@ export class IpcExecutor implements RequestExecutor {
     this.startTimer = undefined;
   }
 
+  private clearGenerationTimer(server?: ServerState): void {
+    if (
+      this.generationTimer === undefined ||
+      (server !== undefined && this.generationTimer.server !== server)
+    ) {
+      return;
+    }
+    clearTimeout(this.generationTimer.timer);
+    this.generationTimer = undefined;
+  }
+
   private launch(): void {
-    if (this.slot.isTerminal) {
+    if (this.slot.isTerminal || this.slot.pendingExits.length > 0) {
       return;
     }
     let spawned: SpawnedServer;
@@ -701,6 +717,15 @@ export class IpcExecutor implements RequestExecutor {
     }
     const server = buildServer(spawned, this.slot.nextGeneration());
     this.slot.trackSpawning(server);
+    this.clearGenerationTimer();
+    this.generationTimer = {
+      server,
+      timer: setTimeout(() => {
+        if (this.generationTimer?.server === server) {
+          this.onStartTimeout(server);
+        }
+      }, this.startTimeoutMs),
+    };
     attachServer(server, this.serverHandlers(server));
     try {
       server.channel.send({
@@ -728,6 +753,10 @@ export class IpcExecutor implements RequestExecutor {
       },
       onLost: (code, signal, reason) => {
         this.onServerLost(server, code, signal, reason);
+      },
+      onExit: () => {
+        this.slot.confirmExit(server);
+        this.resumeRecovery();
       },
     };
   }
@@ -798,6 +827,7 @@ export class IpcExecutor implements RequestExecutor {
     }
     server.closed = true;
     server.closedSignal.resolve();
+    this.clearGenerationTimer(server);
     // The switch owns the loss of a process it staged or is retiring; the
     // branches and their order live there. A promoted process that dies is an
     // ordinary crash, so this returns false and the crash path below runs.
@@ -842,13 +872,60 @@ export class IpcExecutor implements RequestExecutor {
       { pid: server.pid, exitCode: code, signal, backoffMs, reason },
       'server process lost',
     );
+    this.recoverAfterExits(backoffMs);
+  }
+
+  private recoverAfterExits(backoffMs: number): void {
+    if (this.slot.isTerminal) {
+      return;
+    }
     this.slot.markStartingAfterLoss();
-    // Wait for the exit before restarting even when the kill was issued: the
-    // replacement must not open storage while the old process still holds it.
-    void waitForExit(server, this.logger).then(() => {
-      this.scheduleRestart(backoffMs);
+    const recovery = { backoffMs, blocked: false };
+    this.pendingRecovery = recovery;
+    const pending = this.slot.pendingExits;
+    if (pending.length === 0) {
+      this.resumeRecovery();
+      return;
+    }
+    void Promise.all(
+      pending.map(async (server) => {
+        const exited = await waitForExit(server, this.logger);
+        this.slot.confirmExit(server);
+        return exited;
+      }),
+    ).then((exited) => {
+      if (this.pendingRecovery !== recovery || this.slot.isTerminal) {
+        return undefined;
+      }
+      if (exited.every(Boolean)) {
+        this.resumeRecovery();
+      } else {
+        recovery.blocked = true;
+        this.logger.error(
+          { pendingExits: this.slot.pendingExits.length },
+          'server recovery blocked: process exit is unconfirmed',
+        );
+        this.ledger.failAllPending(
+          INTERNAL_ERROR,
+          'server recovery blocked: process exit is unconfirmed',
+          'server exit is unconfirmed',
+        );
+      }
       return undefined;
     });
+  }
+
+  private resumeRecovery(): void {
+    if (
+      this.slot.isTerminal ||
+      this.slot.pendingExits.length > 0 ||
+      this.pendingRecovery === undefined
+    ) {
+      return;
+    }
+    const { backoffMs } = this.pendingRecovery;
+    this.pendingRecovery = undefined;
+    this.scheduleRestart(backoffMs);
   }
 
   /**

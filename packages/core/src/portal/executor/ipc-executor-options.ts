@@ -23,24 +23,20 @@ export interface IpcExecutorOptions {
   /** Grace period for a graceful shutdown before killing. Default 5000ms. */
   shutdownTimeoutMs?: number;
   /**
-   * How long `start()` waits for the readiness barrier before failing.
+   * Overall readiness budget for the first `start()`, including crash retries,
+   * and the handshake budget for each ordinary recovery generation. Each
+   * generation's watchdog starts before `hello` and ends at `ready`; expiry is
+   * terminal, with unconfirmed processes retained for close and late exit.
+   * Manual switches use this bound separately for `prepared` and `ready`.
    * Defaults to `Math.max(10_000, restartBackoffMs * 10)`.
-   *
-   * The value has to cover several restart attempts (a first crash may be a
-   * one-off and must not fail the start) while still making a genuinely broken
-   * Server visible in seconds rather than never: with the default backoff the
-   * restarts inside 10s are immediate, 100, 200, 400, 800, 1600, 3200 and 5000
-   * ms, so the default covers eight attempts.
    */
   startTimeoutMs?: number;
   /**
    * Requests buffered but not yet acknowledged by a Server. Default 10000.
    *
-   * A pending request lives at most one deadline, so this is not a throughput
-   * cap; it is the brake for the one case the deadline cannot bound: a Server
-   * that stays unavailable while clients keep writing. Without it the buffer
-   * grows until the Portal runs out of memory, and the connection layer's own
-   * per-connection cap does not apply once a request left its queue.
+   * Portal-side deadlines settle requests even while the Server is unavailable.
+   * This caps concurrent buffer occupancy within those deadlines; the connection
+   * layer's per-connection cap no longer applies after a request leaves its queue.
    */
   maxPending?: number;
   /**

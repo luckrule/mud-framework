@@ -313,14 +313,17 @@ describe('ServerSlot assertNoOtherLiveServer', () => {
     expect(() => slot.assertNoOtherLiveServer()).toThrow();
   });
 
-  test('passes when every candidate has closed or exited', () => {
+  test('throws when a retained closed process has no confirmed exit', () => {
     const slot = new ServerSlot();
+    const closed = fakeServer({ generation: 7, closed: true });
+    slot.trackSpawning(closed);
+    slot.clearIfCurrent(closed);
     slot.beginSwitch({
-      staged: fakeServer({ generation: 7, closed: true }),
+      staged: undefined,
       previous: fakeServer({ generation: 6, exited: true }),
     });
 
-    expect(() => slot.assertNoOtherLiveServer()).not.toThrow();
+    expect(() => slot.assertNoOtherLiveServer()).toThrow(/generation 7/);
   });
 
   test('passes when the only live candidate is the one being activated', () => {

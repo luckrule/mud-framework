@@ -384,6 +384,86 @@ describe('IpcExecutor switchTo', () => {
     await h.executor.close();
   });
 
+  test('retains a replacement when activate is delivered before send throws', async () => {
+    const h = switchable({ killExits: false });
+    await started(h);
+    const error = await rejectionOf(
+      h.executor.switchTo({
+        spawn: () => {
+          const handle = labelledServer(h, 'new');
+          const channel: IpcChannel = {
+            send(message): void {
+              handle.channel.send(message);
+              if (message.type === 'activate') {
+                throw new IpcChannelClosedError('activate delivery uncertain');
+              }
+            },
+            onMessage: (handler) => {
+              handle.channel.onMessage(handler);
+            },
+            onClose: (handler) => {
+              handle.channel.onClose(handler);
+            },
+            close: (reason) => {
+              handle.channel.close(reason);
+            },
+          };
+          return { ...handle, channel };
+        },
+      }),
+    );
+
+    expect(error.message).toMatch(/activate failed/);
+    expect(h.logs().find((line) => line.msg === SWITCH_ROLLBACK)).toMatchObject(
+      { pendingExits: 1 },
+    );
+    expect(h.servers).toHaveLength(2);
+    serverAt(h, 1).crash();
+    await waitFor(() => h.servers.length === 3);
+    serverAt(h, 2).send(readyMessage());
+    await h.executor.close();
+  });
+
+  test('rollback retains an activated replacement after its exit wait times out', async () => {
+    jest.useFakeTimers();
+    try {
+      const h = switchable({ startTimeoutMs: 40, killExits: false });
+      await started(h);
+      const switching = h.executor.switchTo({
+        spawn: () => labelledServer(h, 'new', { readyOnActivate: false }),
+      });
+      await flushMicrotasks();
+      jest.advanceTimersByTime(41);
+      await flushMicrotasks();
+      expect((await rejectionOf(switching)).message).toMatch(
+        /did not become ready/,
+      );
+      const replacement = serverAt(h, 1);
+
+      jest.advanceTimersByTime(2001);
+      await flushMicrotasks();
+      jest.advanceTimersByTime(1);
+      await flushMicrotasks();
+      expect(h.servers).toHaveLength(2);
+
+      let closed = false;
+      const closing = h.executor.close().then(() => {
+        closed = true;
+        return undefined;
+      });
+      await flushMicrotasks();
+      expect(closed).toBe(false);
+      replacement.crash();
+      await flushMicrotasks();
+      await closing;
+      jest.advanceTimersByTime(5000);
+      await flushMicrotasks();
+      expect(h.servers).toHaveLength(2);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   test('does not restart until the lost previous process has exited', async () => {
     // The old process lost its link but survived the kill (INV-002): it may
     // still hold storage, so the rollback restart must wait for its exit like
@@ -396,7 +476,8 @@ describe('IpcExecutor switchTo', () => {
     const old = await started(h);
 
     const switching = h.executor.switchTo({
-      spawn: () => labelledServer(h, 'new', { silentOnHello: true }),
+      spawn: () =>
+        labelledServer(h, 'new', { silentOnHello: true, killExits: true }),
     });
     // A dead link without an exit event: the old process is unreachable and a
     // kill cannot be confirmed, so it must be treated as possibly alive.
@@ -534,7 +615,6 @@ describe('IpcExecutor switchTo', () => {
       jest.advanceTimersByTime(2000 + 30 + 250);
       await flushMicrotasks();
       replacement.crash(0);
-      jest.advanceTimersByTime(2000);
       await flushMicrotasks();
       await closing;
 

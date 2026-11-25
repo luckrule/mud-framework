@@ -20,6 +20,8 @@ import type { ServerState } from './server-slot.ts';
 export interface ServerHandlers {
   /** One raw message from the Server; parsing and dispatch are the caller's. */
   onMessage: (raw: unknown) => void;
+  /** Actual exit confirmation is independent of loss-notification deduplication. */
+  onExit: () => void;
   /**
    * The process is gone, or its exit could not be observed. Both signals — the
    * channel close and the exit promise — arrive here, because they race and
@@ -83,12 +85,13 @@ export function attachServer(
     if (recorded?.observed === true) {
       server.exited = true;
       handlers.onLost(recorded.code, recorded.signal, reason);
+      handlers.onExit();
       return;
     }
     handlers.onLost(null, null, reason);
   });
-  // Both signals mean "this process is gone" and race each other; the
-  // `closed` flag inside the owner's handler makes the handling run once.
+  // Loss notifications race and are deduplicated by the owner. Real exit
+  // confirmation must still arrive independently after an earlier channel loss.
   void (async () => {
     // `exited` resolves with `observed: false` rather than rejecting, so a
     // failed waitpid still reaches the same handling path. The catch is for a
@@ -112,15 +115,17 @@ export function attachServer(
         ? 'server process exited'
         : 'server exit could not be observed',
     );
+    if (info.observed) {
+      handlers.onExit();
+    }
   })();
 }
 
 /**
  * Waits until the child process is known to be gone, bounded so an
  * uninterruptible process cannot stall shutdown or restart forever. Resolves
- * true when the exit was observed, false when the wait gave up: the caller
- * decides whether that is fatal (the close path kills and retries, the restart
- * path logs and moves on).
+ * true only when the exit was observed. False retains the process reference:
+ * recovery stays blocked, and close rejects if its final retry is unconfirmed.
  *
  * The exit info is read here rather than from `server.exited`, because that
  * flag is set by the launch continuation and the two awaits are not ordered

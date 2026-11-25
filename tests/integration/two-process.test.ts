@@ -23,10 +23,9 @@ import type { Logger } from '../../packages/core/src/index.ts';
 import { SqliteBackend } from '../../packages/storage-sqlite/src/index.ts';
 
 /**
- * The only integration coverage that uses a real child process. Everything else
- * runs against the in-memory channel pair, so a defect that only exists on the
- * deployment path (spawn, handshake, exit, restart) is invisible there. The
- * Server entry is `fixtures/server-entry.ts`; its behaviour is selected by argv.
+ * Exercises spawn, handshake, exit and restart using a real Server child rather
+ * than an in-memory channel pair. The Server entry is `fixtures/server-entry.ts`;
+ * its behaviour is selected by argv.
  */
 const FIXTURE = join(import.meta.dir, 'fixtures', 'server-entry.ts');
 

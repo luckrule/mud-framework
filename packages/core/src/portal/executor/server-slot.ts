@@ -83,6 +83,21 @@ export class ServerSlot<Op extends SwitchOwner = SwitchOwner> {
   private currentServer: ServerState | undefined;
   private currentSwitch: Op | undefined;
   private generations = 0;
+  private readonly processes = new Set<ServerState>();
+
+  get pendingExits(): ServerState[] {
+    return [...this.processes].filter((server) => !server.exited);
+  }
+
+  track(server: ServerState): void {
+    this.processes.add(server);
+  }
+
+  confirmExit(server: ServerState): void {
+    if (server.exited) {
+      this.processes.delete(server);
+    }
+  }
 
   get status(): Status {
     return this.currentStatus;
@@ -122,6 +137,7 @@ export class ServerSlot<Op extends SwitchOwner = SwitchOwner> {
 
   /** A spawned process becomes current while it is still starting. */
   trackSpawning(server: ServerState): void {
+    this.track(server);
     this.currentServer = server;
   }
 
@@ -195,29 +211,20 @@ export class ServerSlot<Op extends SwitchOwner = SwitchOwner> {
   }
 
   /**
-   * The INV-002 gate as a debug assertion: a process may only open storage when
-   * no other one can still be writing. `except` is the process about to be
-   * activated.
-   *
-   * Unreachable under the current switch orchestration — `activate` goes out
-   * only after the previous process was confirmed gone, and `currentServer` is
-   * that same process — so this throws only if a future orchestration change
-   * introduces a second writer. It stays a throw (not a log) because reaching it
-   * means data corruption, and a switch that fails is the safe outcome.
+   * INV-002: no launch or activation may pass an unconfirmed process retained
+   * from a loss or failed switch. `except` permits the current process while
+   * staging a replacement, or the replacement that is about to be activated.
+   * Channel closure and a sent kill never release this gate.
    */
   assertNoOtherLiveServer(except?: ServerState): void {
     const candidates: (ServerState | undefined)[] = [
+      ...this.processes,
       this.currentServer,
       this.currentSwitch?.staged,
       this.currentSwitch?.previous,
     ];
     for (const candidate of candidates) {
-      if (
-        candidate === undefined ||
-        candidate === except ||
-        candidate.closed ||
-        candidate.exited
-      ) {
+      if (candidate === undefined || candidate === except || candidate.exited) {
         continue;
       }
       throw new Error(
