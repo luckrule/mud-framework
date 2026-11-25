@@ -6,6 +6,8 @@ import { safeLogger } from '../logging/safe-logger.ts';
 import type { LogFields, Logger } from '../logging/types.ts';
 import type { DeliveryHost } from './delivery-ledger.ts';
 import { DeliveryLedger, requestFields } from './delivery-ledger.ts';
+import type { ShutdownHost } from './executor-shutdown.ts';
+import { doClose } from './executor-shutdown.ts';
 import type {
   ExecutorOutcome,
   ExecutorRequest,
@@ -16,8 +18,6 @@ import {
   DEFAULT_MAX_REPLAYS,
   DEFAULT_RESTART_BACKOFF_MS,
   DEFAULT_SHUTDOWN_TIMEOUT_MS,
-  EXIT_WAIT_TIMEOUT_MS,
-  SHUTDOWN_ACK_SLACK_MS,
   closeBudget,
 } from './ipc-budget.ts';
 import { failure, nextPortalGeneration } from './ipc-messages.ts';
@@ -35,7 +35,7 @@ import type { MessageHost } from './server-messages.ts';
 import { onServerMessage } from './server-messages.ts';
 import type { ServerState } from './server-slot.ts';
 import { ServerSlot } from './server-slot.ts';
-import { effectiveTimeoutMs, settleWithin, tightenTimeout } from './timeout.ts';
+import { effectiveTimeoutMs, tightenTimeout } from './timeout.ts';
 import type { SwitchHost, SwitchOperation } from './version-switch.ts';
 import { VersionSwitch } from './version-switch.ts';
 import {
@@ -609,7 +609,9 @@ export class IpcExecutor implements RequestExecutor {
   }
 
   close(): Promise<void> {
-    this.closePromise ??= this.doClose();
+    // Memoised here so the sequence runs once: a second `close()` joins the
+    // first rather than shutting the same process down twice.
+    this.closePromise ??= doClose(this.shutdownHost());
     return this.closePromise;
   }
 
@@ -666,179 +668,49 @@ export class IpcExecutor implements RequestExecutor {
     return Promise.resolve();
   }
 
-  private async doClose(): Promise<void> {
-    this.slot.markClosing();
-    this.restart.clearRestartTimer();
-    this.restart.clearStableClock();
-    this.clearStartTimer();
-    // A switch in flight must not keep spawning, activating or restarting: it is
-    // interrupted here and its staged process abandoned, so `close()` ends with
-    // at most one Server to shut down and no orphan writer (INV-002).
-    await this.versionSwitch.abortSwitchForClose();
-    // A Request that never reached a live Server cannot complete, so it fails
-    // now instead of burning its whole deadline. Delivered ones are given
-    // until their deadline to settle (SPEC 6.3 step 3).
-    this.ledger.failUndelivered('executor closing before delivery');
-    // Bounded by the same budget as the rest of the shutdown. An unbounded wait
-    // here used to mean "as long as the longest request deadline", so a
-    // ConnectionLayer with a shorter shutdownTimeout would return while this
-    // executor was still waiting and the Server was still writing (the two
-    // timeouts were unrelated). Past the budget the requests are failed and the
-    // Server is shut down anyway.
-    const drained = await settleWithin(
-      this.ledger.awaitPendingSettled(),
-      this.shutdownTimeoutMs,
-    );
-    // A rejection counts as "no longer pending" here, on purpose: the waiter
-    // only ever resolves, so the one thing this branch must distinguish is a
-    // timeout. Treating a rejection as a timeout would fail every buffered
-    // request with a message about a deadline that was never reached.
-    if (drained.status === 'timeout') {
-      this.logger.warn(
-        { timeoutMs: this.shutdownTimeoutMs, pending: this.buffer.size },
-        'pending requests did not settle before the shutdown timeout',
-      );
-      this.ledger.failAllPending(
-        FRAMEWORK_SHUTDOWN,
-        'ipc executor closed before the request settled',
-        'shutdown drain timed out',
-      );
-    }
-    await this.shutdownServer();
-    await this.confirmAbandonedExits();
-    this.ledger.failAllPending(
-      FRAMEWORK_SHUTDOWN,
-      'ipc executor closed',
-      'executor closed',
-    );
-    this.slot.markClosed();
-    // A start() still waiting for `ready` must not be told "ready" by a close.
-    this.rejectStart(
-      new Error('ipc executor closed before the server became ready'),
-    );
-  }
-
   /**
-   * Confirms the exit of every process a `close()`-aborted switch abandoned,
-   * with the same bounded wait → kill → wait flow `shutdownServer` uses.
-   *
-   * A replacement that already received `activate` may hold storage, and the
-   * switch's own abort path only issues the kill. `close()` must not return
-   * while such a process could still be writing (INV-002); a process that
-   * survives the second wait is logged rather than waited on forever.
+   * The close sequence's view of this executor. Every member reads live state
+   * or calls back into the executor, so a step never holds a stale status,
+   * Server or start waiter.
    */
-  private async confirmAbandonedExits(): Promise<void> {
-    const pending = this.abandonedForClose.splice(0);
-    // Parallel, not sequential: these are independent processes, and the budget
-    // counts one bounded wait→kill→wait, not one per process.
-    await Promise.all(
-      pending.map(async (server) => {
-        const exited = await waitForExit(server, this.logger);
-        if (exited) {
-          return;
-        }
-        this.logger.warn(
-          { pid: server.pid, timeoutMs: EXIT_WAIT_TIMEOUT_MS },
-          'abandoned replacement did not exit; killing it before close returns',
-        );
-        killQuietly(server, this.logger);
-        const afterKill = await waitForExit(server, this.logger);
-        if (!afterKill) {
-          this.logger.warn(
-            { pid: server.pid, timeoutMs: EXIT_WAIT_TIMEOUT_MS },
-            'abandoned replacement is still running after a kill; close cannot confirm its exit',
-          );
-        }
-      }),
-    );
-  }
-
-  private async shutdownServer(): Promise<void> {
-    const server = this.slot.server;
-    if (server === undefined) {
-      return;
-    }
-    if (!server.closed) {
-      if (server.ready && !server.shutdownSent) {
-        try {
-          // The Server gets exactly the grace `waitForClosed` will wait for, so
-          // its drain and backend close share one deadline that ends with the
-          // Portal's patience rather than twice its own request ceiling.
-          server.shutdownSent = true;
-          server.channel.send({
-            type: 'shutdown',
-            timeoutMs: this.shutdownTimeoutMs,
-          });
-        } catch (error) {
-          // The process died between the pending drain and this send; the
-          // channel close handler is about to report the same thing.
-          this.logger.warn(
-            { pid: server.pid, reason: messageOf(error) },
-            'shutdown message could not be sent',
-          );
-        }
-      }
-      if (server.ready) {
-        await this.closedWaiter.waitForClosed(
-          server,
-          this.shutdownTimeoutMs + SHUTDOWN_ACK_SLACK_MS,
-        );
-      }
-      if (!server.closed && !server.shutdownAcknowledged) {
-        // A stalled graceful shutdown, or a Server that never finished
-        // starting, must not hold the Portal open. The logged wait is the one
-        // `waitForClosed` actually performed, not the declared grace.
-        this.logger.warn(
-          {
-            pid: server.pid,
-            timeoutMs: this.shutdownTimeoutMs + SHUTDOWN_ACK_SLACK_MS,
-            ready: server.ready,
-          },
-          'server did not finish shutting down; killing it',
-        );
-        try {
-          server.kill();
-        } catch (error) {
-          this.logger.warn(
-            { pid: server.pid, reason: messageOf(error) },
-            'server could not be killed',
-          );
-        }
-      }
-    }
-    // A `closed` message says the Server finished its work, not that the
-    // process is gone; the storage must not be reopened while it lingers
-    // (INV-002). This also covers a process that was already killed from the
-    // channel-loss path. Waiting is bounded, and a lingering process is logged.
-    const exited = await waitForExit(server, this.logger);
-    if (!exited) {
-      // `close()` must not return while the Server may still be writing: a
-      // caller that then reopens storage gets two writers, which is exactly the
-      // defect this class exists to prevent. The graceful path withheld the kill
-      // on purpose, so it is issued here and the exit is awaited once more.
-      this.logger.warn(
-        { pid: server.pid, timeoutMs: EXIT_WAIT_TIMEOUT_MS },
-        'server process did not exit; killing it before close returns',
-      );
-      try {
-        server.kill();
-      } catch (error) {
-        this.logger.warn(
-          { pid: server.pid, reason: messageOf(error) },
-          'server could not be killed',
-        );
-      }
-      await waitForExit(server, this.logger);
-    }
-    try {
-      server.channel.close('portal is shutting down');
-    } catch (error) {
-      this.logger.debug(
-        { reason: messageOf(error) },
-        'ipc channel close failed',
-      );
-    }
-    this.slot.clearIfCurrent(server);
+  private shutdownHost(): ShutdownHost {
+    return {
+      logger: this.logger,
+      slot: this.slot,
+      shutdownTimeoutMs: this.shutdownTimeoutMs,
+      versionSwitch: {
+        abortSwitchForClose: () => this.versionSwitch.abortSwitchForClose(),
+      },
+      ledger: {
+        failUndelivered: (reason) => {
+          this.ledger.failUndelivered(reason);
+        },
+        awaitPendingSettled: () => this.ledger.awaitPendingSettled(),
+        failAllPending: (code, message, reason) => {
+          this.ledger.failAllPending(code, message, reason);
+        },
+        pendingCount: () => this.buffer.size,
+      },
+      restart: {
+        clearRestartTimer: () => {
+          this.restart.clearRestartTimer();
+        },
+        clearStableClock: () => {
+          this.restart.clearStableClock();
+        },
+      },
+      waiters: {
+        clearStartTimer: () => {
+          this.clearStartTimer();
+        },
+        rejectStart: (error) => {
+          this.rejectStart(error);
+        },
+        waitForClosed: (server, waitMs) =>
+          this.closedWaiter.waitForClosed(server, waitMs),
+      },
+      takeAbandoned: () => this.abandonedForClose.splice(0),
+    };
   }
 
   private resolveClosed(): void {
