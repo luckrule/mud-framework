@@ -11,7 +11,7 @@ import type { ServerExitInfo } from '../ipc/spawn-port.ts';
  * process is being retired. Requests keep arriving and stay buffered; only the
  * promotion to the new generation delivers them.
  */
-export type Status =
+type Status =
   | 'idle'
   | 'starting'
   | 'ready'
@@ -64,7 +64,7 @@ export interface ServerState {
  * it is promoting and the one it is retiring. `SwitchOperation` is the only
  * implementation.
  */
-export interface SwitchOwner {
+interface SwitchOwner {
   readonly staged: ServerState | undefined;
   readonly previous: ServerState | undefined;
 }
@@ -195,8 +195,15 @@ export class ServerSlot<Op extends SwitchOwner = SwitchOwner> {
   }
 
   /**
-   * The INV-002 gate: a process may only open storage when no other one can
-   * still be writing. `except` is the process about to be activated.
+   * The INV-002 gate as a debug assertion: a process may only open storage when
+   * no other one can still be writing. `except` is the process about to be
+   * activated.
+   *
+   * Unreachable under the current switch orchestration — `activate` goes out
+   * only after the previous process was confirmed gone, and `currentServer` is
+   * that same process — so this throws only if a future orchestration change
+   * introduces a second writer. It stays a throw (not a log) because reaching it
+   * means data corruption, and a switch that fails is the safe outcome.
    */
   assertNoOtherLiveServer(except?: ServerState): void {
     const candidates: (ServerState | undefined)[] = [

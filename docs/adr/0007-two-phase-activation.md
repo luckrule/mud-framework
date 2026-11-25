@@ -58,6 +58,10 @@ ADR-0004 的崩溃重启路径不受影响：那个路径上新进程起来时�
 
 `close()` 在切换期间必须能中止：中止信号会打断切换的每个 await，`doClose` 放弃新进程后按正常路径关闭旧进程，最终正常 `closed`。若被放弃的新进程已收到 `activate`（可能已持有存储），`doClose` 在返回前对它执行与 `shutdownServer` 相同的 `waitForExit` → `kill` → `waitForExit` 有界流程，仍未退出则记 warn。切换窗口内到达的请求最终要么在新进程成功，要么以稳定错误码结束（关闭时 `FRAMEWORK_SHUTDOWN`），不会挂到 deadline；回滚期间它们仍受自身 deadline 约束。
 
+### 边界：`activate` 前的双写者断言是防御性的，不是行为分支
+
+`VersionSwitch.activateReplacement` 在发 `activate` 前调用 `ServerSlot.assertNoOtherLiveServer`。原实现没有这一步，所以这是重构时新增的代码，但它不改变任何可观测行为：`retirePrevious` 只有在旧进程已确认退出（或本来就没有旧进程）时才返回 true，而 slot 的 current server 就是那个进程，因此到这一步不可能存在另一个存活的候选者。保留它是为了让 INV-002 有一个显式闸口——未来若调整编排顺序，断言失败会让切换 reject 并按既有失败边界回滚，而不是静默产生两个写者。断言失败时的 `op.failure` 写入与回滚路径因此当前不可达，不应据此推断存在新的失败模式。
+
 ### 观测
 
 切换开始（`fromCodeVersion`/`toCodeVersion`）、旧进程已 drain、新进程 ready、切换完成、切换失败与回滚原因各记一行。`ready` 的 `codeVersion` 与目标版本不一致时记 warn；`prepared` 可提前比对，同一次切换只告警一次。字段名沿用现有契约风格，不逐请求刷屏。

@@ -4,7 +4,11 @@ import type { ExecutorOutcome, ExecutorRequest } from './executor.ts';
 import { failure, requestMessage } from './ipc-messages.ts';
 import type { PendingBuffer, PendingRequest } from './ipc-pending.ts';
 import type { ServerState } from './server-slot.ts';
-import { FRAMEWORK_REPLAY_EXHAUSTED, FRAMEWORK_TIMEOUT } from './wire-codes.ts';
+import {
+  FRAMEWORK_REPLAY_EXHAUSTED,
+  FRAMEWORK_SHUTDOWN,
+  FRAMEWORK_TIMEOUT,
+} from './wire-codes.ts';
 
 /**
  * What the ledger needs from its owner. Everything here is a read or a
@@ -28,7 +32,7 @@ export interface DeliveryHost {
   ): void;
 }
 
-export interface DeliveryLedgerOptions {
+interface DeliveryLedgerOptions {
   buffer: PendingBuffer;
   host: DeliveryHost;
 }
@@ -61,23 +65,19 @@ export class DeliveryLedger {
    * reports them (SPEC 6.5).
    *
    * `server` is the caller's decision: a switch is executor state, and
-   * delivering to the process it is draining would race the retirement. The
-   * terminal check defaults to the host, which reads it live, so a caller that
-   * already resolved the same state may pass its own answer instead.
+   * delivering to the process it is draining would race the retirement. Whether
+   * the executor is shutting down is read live from the host.
    *
    * A request that keeps killing the process starves the later requests on its
    * connection: every flush stops at it (its replay budget runs out, and the
    * flush returns), so those requests wait until it reaches a terminal state.
    * That is the necessary cost of the SPEC 6.5 ordering guarantee, not a drop.
    */
-  flush(
-    server: ServerState | undefined,
-    isTerminal: boolean = this.host.isTerminal,
-  ): void {
+  flush(server: ServerState | undefined): void {
     if (server === undefined || !server.ready) {
       return;
     }
-    if (isTerminal) {
+    if (this.host.isTerminal) {
       return;
     }
     for (const pending of this.buffer.undelivered(server.generation)) {
@@ -238,6 +238,59 @@ export class DeliveryLedger {
       const drained = this.drainedWaiter;
       this.drainedWaiter = undefined;
       drained?.();
+    }
+  }
+
+  /**
+   * Fails the requests that never reached a live Server, so they do not burn
+   * their whole deadline while the executor closes (SPEC 6.3 step 3).
+   * `reason` is log-only and names the call site.
+   *
+   * Removing the current entry during iteration is safe for a Map, and settling
+   * only resolves a promise (the continuation runs as a microtask), so this
+   * cannot mutate the map mid-loop.
+   */
+  failUndelivered(reason: string): void {
+    const server = this.host.currentServer();
+    for (const pending of this.buffer.values()) {
+      if (
+        server === undefined ||
+        server.closed ||
+        pending.sentOn === undefined
+      ) {
+        // Per-request line: this is the only trace of why the request ended,
+        // since no Server result or deadline will ever reach it.
+        this.host.logger.warn(
+          {
+            ...requestFields(pending.request),
+            code: FRAMEWORK_SHUTDOWN,
+            reason,
+            durationMs: Date.now() - pending.startedAt,
+          },
+          'pending request failed',
+        );
+        this.settle(
+          pending,
+          failure(FRAMEWORK_SHUTDOWN, 'ipc executor is closing'),
+        );
+      }
+    }
+  }
+
+  /**
+   * Tightens every buffered deadline to `declared` and re-arms its timer. Only
+   * ever shortens: a later Server declaring a longer ceiling must not extend a
+   * deadline the Portal already promised (SPEC 3.4).
+   */
+  tightenDeadlines(declared: number): void {
+    for (const pending of this.buffer.values()) {
+      const tightened = Math.min(pending.effectiveTimeoutMs, declared);
+      if (tightened === pending.effectiveTimeoutMs) {
+        continue;
+      }
+      pending.effectiveTimeoutMs = tightened;
+      pending.deadlineAt = pending.startedAt + tightened;
+      this.armTimer(pending);
     }
   }
 

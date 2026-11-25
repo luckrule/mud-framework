@@ -72,9 +72,13 @@ export interface SwitchOperation {
 }
 
 /**
- * What the switch needs from its owner, and nothing more: the state it must
- * migrate (through `slot`), the factories and timers the promotion and rollback
- * reuse, and the processes `close()` must wait for.
+ * The switch's view of the executor, projected from the executor's own
+ * capabilities rather than a minimal replaceable dependency: crash backoff,
+ * the stability clock, delivery, the abandoned-process list and the timers all
+ * come from the executor, so another owner would have to reproduce that
+ * behaviour, not just satisfy these signatures. It is split out so the four
+ * steps of the sequence and their two failure boundaries live in one file, not
+ * so the switch can run on a different host.
  *
  * The switch never writes `status` or `server` directly; it only asks the slot
  * for a semantic transition, so a state write cannot skip the meaning attached
@@ -85,8 +89,6 @@ export interface SwitchHost {
   readonly slot: ServerSlot<SwitchOperation>;
   readonly startTimeoutMs: number;
   readonly shutdownTimeoutMs: number;
-  /** The factory of the version serving now; a switch supplies its own. */
-  spawn(): SpawnedServer;
   /** Stamped on the `hello` the staged process receives. */
   readonly portalGeneration: number;
   /** The version new requests carry now; the expected one when a switch names none. */
@@ -325,7 +327,9 @@ export class VersionSwitch {
           this.host.logger,
         );
         if (op.activated) {
-          this.recordAbandonedForClose(staged);
+          // The switch's abort path only kills; `close()` must confirm this
+          // exit itself before it returns (INV-002).
+          this.host.recordAbandoned(staged);
         }
       }
       this.host.logger.warn(
@@ -483,6 +487,13 @@ export class VersionSwitch {
     }
     // INV-002: `activate` is what lets this process open storage, so it may
     // only go out when no other process can still be writing.
+    //
+    // Defensive, not a behaviour branch: `retirePrevious` returns true only
+    // after the previous process exited (or when there was none), and the
+    // slot's current server is that same process, so no live candidate can
+    // exist at this point. The check stays to catch a future orchestration
+    // change that would put two writers on one storage — failing the switch is
+    // the safe outcome then.
     try {
       this.host.slot.assertNoOtherLiveServer(staged);
     } catch (error) {
@@ -697,7 +708,7 @@ export class VersionSwitch {
       // before returning. The previous Server is `shutdownServer`'s job, so it
       // is not listed here even when its exit was not observed.
       if (abandoned !== undefined && op.activated) {
-        this.recordAbandonedForClose(abandoned);
+        this.host.recordAbandoned(abandoned);
       }
       op.markComplete();
       return;
@@ -744,21 +755,6 @@ export class VersionSwitch {
     }
   }
 
-  /**
-   * Hands a process to `doClose`, which confirms its exit before returning.
-   * A `close()`-abandoned replacement that received `activate` may hold storage;
-   * a process a rollback is waiting on has the same problem, because that wait
-   * is a floating promise `close()` cannot join.
-   */
-  private recordAbandonedForClose(server: ServerState): void {
-    this.host.recordAbandoned(server);
-  }
-
-  /** Drops a process from the close list once its exit was confirmed. */
-  private forgetAbandonedForClose(server: ServerState): void {
-    this.host.forgetAbandoned(server);
-  }
-
   /** Closes and kills a staged process the switch no longer needs. */
   private abandonStaged(server: ServerState): void {
     server.staged = false;
@@ -799,13 +795,13 @@ export class VersionSwitch {
     // window between the rollback starting and the exit being observed would
     // return while the process could still hold storage (INV-002).
     for (const server of pendingExits) {
-      this.recordAbandonedForClose(server);
+      this.host.recordAbandoned(server);
     }
     void Promise.all(
       pendingExits.map((server) => waitForExit(server, this.host.logger)),
     ).then(() => {
       for (const server of pendingExits) {
-        this.forgetAbandonedForClose(server);
+        this.host.forgetAbandoned(server);
       }
       this.host.scheduleRestart(backoffMs);
       return undefined;

@@ -259,7 +259,6 @@ export class IpcExecutor implements RequestExecutor {
       slot: this.slot,
       startTimeoutMs: this.startTimeoutMs,
       shutdownTimeoutMs: this.shutdownTimeoutMs,
-      spawn: () => this.spawn(),
       portalGeneration: this.portalGeneration,
       currentCodeVersion: () => this.codeVersion,
       adoptVersion: (spawn, codeVersion) => {
@@ -641,36 +640,10 @@ export class IpcExecutor implements RequestExecutor {
     // interrupted here and its staged process abandoned, so `close()` ends with
     // at most one Server to shut down and no orphan writer (INV-002).
     await this.versionSwitch.abortSwitchForClose();
-    const server = this.slot.server;
     // A Request that never reached a live Server cannot complete, so it fails
     // now instead of burning its whole deadline. Delivered ones are given
     // until their deadline to settle (SPEC 6.3 step 3).
-    // Deleting the current entry during iteration is safe for a Map, and
-    // settling only resolves a promise (the continuation runs as a microtask),
-    // so this cannot mutate the map mid-loop.
-    for (const pending of this.buffer.values()) {
-      if (
-        server === undefined ||
-        server.closed ||
-        pending.sentOn === undefined
-      ) {
-        // Per-request line: this is the only trace of why the request ended,
-        // since no Server result or deadline will ever reach it.
-        this.logger.warn(
-          {
-            ...requestFields(pending.request),
-            code: FRAMEWORK_SHUTDOWN,
-            reason: 'executor closing before delivery',
-            durationMs: Date.now() - pending.startedAt,
-          },
-          'pending request failed',
-        );
-        this.ledger.settle(
-          pending,
-          failure(FRAMEWORK_SHUTDOWN, 'ipc executor is closing'),
-        );
-      }
-    }
+    this.ledger.failUndelivered('executor closing before delivery');
     // Bounded by the same budget as the rest of the shutdown. An unbounded wait
     // here used to mean "as long as the longest request deadline", so a
     // ConnectionLayer with a shorter shutdownTimeout would return while this
@@ -1137,20 +1110,11 @@ export class IpcExecutor implements RequestExecutor {
    * request alive past its original ceiling (SPEC 3.4).
    */
   private adoptCeiling(declaredMaxDurationMs: number): void {
-    const declared = effectiveTimeoutMs(
+    this.effectiveTimeoutMs = effectiveTimeoutMs(
       this.portalTimeoutMs,
       declaredMaxDurationMs,
     );
-    this.effectiveTimeoutMs = declared;
-    for (const pending of this.buffer.values()) {
-      const tightened = Math.min(pending.effectiveTimeoutMs, declared);
-      if (tightened === pending.effectiveTimeoutMs) {
-        continue;
-      }
-      pending.effectiveTimeoutMs = tightened;
-      pending.deadlineAt = pending.startedAt + tightened;
-      this.ledger.armTimer(pending);
-    }
+    this.ledger.tightenDeadlines(this.effectiveTimeoutMs);
   }
 
   private onResult(message: ResultMessage): void {
@@ -1316,7 +1280,10 @@ export class IpcExecutor implements RequestExecutor {
   }
 
   /**
-   * Delivers the buffered requests to the current generation (SPEC 6.5).
+   * Re-delivers the buffered requests when the Server is not ready or a switch
+   * is in progress. The hot path sends a single request directly through
+   * `ledger.deliver`; this is the catch-up path after a barrier or a failed
+   * switch.
    *
    * The switching gate stays here because it is executor state: while a
    * replacement is being staged or the previous process is being retired,

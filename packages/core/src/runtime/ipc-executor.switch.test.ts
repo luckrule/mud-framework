@@ -218,6 +218,29 @@ describe('IpcExecutor switchTo', () => {
     await h.executor.close();
   });
 
+  test('a successful switch never trips the INV-002 activation gate', async () => {
+    // The gate is defensive: by the time `activate` goes out, the retired
+    // process's exit was confirmed, so no other live candidate exists. This
+    // pins that state — if orchestration ever changes so the gate fires, the
+    // switch fails here instead of silently producing a second writer.
+    const h = switchable();
+    await started(h);
+
+    await h.executor.switchTo({ spawn: () => labelledServer(h, 'new') });
+    await flushTicks();
+
+    const gateFailures = h.logs().filter((line) => {
+      const reason = line.reason;
+      return (
+        typeof reason === 'string' && reason.includes('another live server')
+      );
+    });
+    expect(gateFailures).toEqual([]);
+    expect(h.logs().some((line) => line.msg === SWITCH_COMPLETED)).toBe(true);
+
+    await h.executor.close();
+  });
+
   test('rejects a switch that is not started from ready', async () => {
     const h = harness({ timeoutMs: 5000, autoPrepare: false });
     const startPromise = h.executor.start();

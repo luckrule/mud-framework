@@ -350,4 +350,29 @@ describe('ServerSlot assertNoOtherLiveServer', () => {
       /generation 13, pid unknown/,
     );
   });
+
+  test('passes in the state the switch reaches before activate', () => {
+    // What `retirePrevious` leaves behind: the old process is still the current
+    // Server but its exit was confirmed. This is why the assertion is a
+    // defensive gate rather than a reachable failure branch.
+    const slot = new ServerSlot();
+    const previous = fakeServer({ generation: 20, exited: true });
+    const staged = fakeServer({ generation: 21 });
+    slot.markReady(previous);
+    slot.beginSwitch({ staged, previous });
+
+    expect(() => slot.assertNoOtherLiveServer(staged)).not.toThrow();
+  });
+
+  test('throws in the same state when the previous exit was not confirmed', () => {
+    // The future orchestration change the gate exists for: activate while the
+    // retired process might still be writing.
+    const slot = new ServerSlot();
+    const previous = fakeServer({ generation: 22 });
+    const staged = fakeServer({ generation: 23 });
+    slot.markReady(previous);
+    slot.beginSwitch({ staged, previous });
+
+    expect(() => slot.assertNoOtherLiveServer(staged)).toThrow(/generation 22/);
+  });
 });
