@@ -106,8 +106,8 @@ export interface SwitchHost {
    * `close()` cannot join.
    */
   recordAbandoned(server: ServerState): void;
-  /** Wakes the `closed` wait a `close()` may be parked on. */
-  resolveClosed(): void;
+  /** Wakes the `closed` wait a `close()` may be parked on, for that Server only. */
+  resolveClosed(server: ServerState): void;
   clearRestartTimer(): void;
   startStableTimer(): void;
   adoptCeiling(declaredMaxDurationMs: number): void;
@@ -256,7 +256,7 @@ export class VersionSwitch {
       op.previousLost = true;
       op.previousGone = true;
       this.host.slot.clearIfCurrent(server);
-      this.host.resolveClosed();
+      this.host.resolveClosed(server);
       if (!server.exited) {
         killQuietly(server, this.host.logger);
         this.recordPendingExit(op, server);

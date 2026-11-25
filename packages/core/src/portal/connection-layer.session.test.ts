@@ -616,7 +616,9 @@ describe('ConnectionLayer session routing (SPEC 3.2, INV-004)', () => {
   );
 
   test('shutdown refuses a session waiter instead of bypassing unfinished work', async () => {
-    const { transport, dispatcher, layer } = await harness({ timeoutMs: 5000 });
+    const { transport, dispatcher, layer, logs } = await harness({
+      timeoutMs: 5000,
+    });
     const entered = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
     let nextStarted = false;
@@ -663,6 +665,16 @@ describe('ConnectionLayer session routing (SPEC 3.2, INV-004)', () => {
         ok: false,
         error: { code: 'FRAMEWORK_SHUTDOWN' },
       });
+      // The request had taken its queue seat, so its refusal is correlatable
+      // with the entry id minted for it (SPEC 7.3).
+      const refused = logs().filter(
+        (entry) =>
+          entry.msg === 'request refused' &&
+          entry.code === 'FRAMEWORK_SHUTDOWN',
+      );
+      expect(refused).toHaveLength(1);
+      expect(refused[0]?.clientRequestId).toBe('4');
+      expect(refused[0]?.requestId).toBeTruthy();
     } finally {
       release.resolve();
       await Promise.all([holding, stopping]);
@@ -712,6 +724,74 @@ describe('ConnectionLayer session routing (SPEC 3.2, INV-004)', () => {
       id: '4',
       ok: false,
       error: { code: 'AUTH_REQUIRED' },
+    });
+    await layer.stop();
+  });
+
+  test('a late unbind from a displaced holder does not release the new holder', async () => {
+    const { transport, dispatcher, layer, logs } = await harness({
+      timeoutMs: 5000,
+    });
+    const logoutEntered = Promise.withResolvers<void>();
+    const releaseLogout = Promise.withResolvers<void>();
+    dispatcher.register(
+      'login',
+      async (ctx) => {
+        ctx.bindSession('s1');
+        return null;
+      },
+      { access: 'public', mayChangeSession: true },
+    );
+    dispatcher.register(
+      'logout',
+      async (ctx) => {
+        logoutEntered.resolve();
+        await releaseLogout.promise;
+        ctx.unbindSession();
+        return 'bye';
+      },
+      { access: 'public', mayChangeSession: true },
+    );
+    dispatcher.register('protected', async (ctx) => ctx.sessionId ?? null);
+    transport.connect('c1');
+    await transport.receive('c1', '{"id":"1","method":"login"}');
+    const logout = transport.receive('c1', '{"id":"2","method":"logout"}');
+    await logoutEntered.promise;
+
+    // c2 takes the Session over while c1's logout handler is still running, so
+    // c1 no longer holds it when the success is applied (SPEC 3.2).
+    transport.connect('c2');
+    await transport.receive('c2', '{"id":"3","method":"login"}');
+    releaseLogout.resolve();
+    await logout;
+
+    // The client still sees its own success; the drop is routing-only.
+    expect(lastFrame(transport, 'c1')).toEqual({
+      id: '2',
+      ok: true,
+      result: 'bye',
+    });
+    await transport.receive('c2', '{"id":"4","method":"protected"}');
+    expect(lastFrame(transport, 'c2')).toEqual({
+      id: '4',
+      ok: true,
+      result: 's1',
+    });
+    await transport.receive('c1', '{"id":"5","method":"protected"}');
+    expect(lastFrame(transport, 'c1')).toMatchObject({
+      id: '5',
+      ok: false,
+      error: { code: 'AUTH_REQUIRED' },
+    });
+    const dropped = logs().filter(
+      (entry) => entry.code === 'SESSION_CHANGE_DROPPED',
+    );
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]).toMatchObject({
+      level: 'warn',
+      connectionId: 'c1',
+      sessionId: 's1',
+      reason: expect.any(String),
     });
     await layer.stop();
   });

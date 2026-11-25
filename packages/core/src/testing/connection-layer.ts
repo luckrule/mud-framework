@@ -271,6 +271,8 @@ export interface SessionHarness {
 export function sessionHarness(
   options: {
     maxConnections?: number;
+    maxQueuedPerConnection?: number;
+    createRequestId?: () => string;
     sessionOf?: (method: string) => string | undefined;
     changeOf?: (method: string) => SessionChange | undefined;
   } = {},
@@ -292,6 +294,8 @@ export function sessionHarness(
     executor: controlled.executor,
     logger,
     maxConnections: options.maxConnections,
+    maxQueuedPerConnection: options.maxQueuedPerConnection,
+    createRequestId: options.createRequestId,
   });
   return {
     transport,

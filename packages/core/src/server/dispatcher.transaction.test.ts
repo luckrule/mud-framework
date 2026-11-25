@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test';
 import { MemoryStorageBackend } from '../storage/memory.ts';
 import { rejectionOf } from '../testing/common.ts';
 import {
+  CountingBackend,
   SlowCommitBackend,
   deferred,
   parseLines,
@@ -380,5 +381,27 @@ describe('Dispatcher.transaction', () => {
     expect(() => backend.capabilities()).toThrow(/closed/);
     const error = await rejectionOf(dispatcher.dispatch('anything', null));
     expect(error.message).toMatch(/closed/);
+  });
+
+  test('a failed backend close stays observable on every later close', async () => {
+    const backend = new CountingBackend();
+    const failure = new Error('db close failed');
+    let closes = 0;
+    backend.close = () => {
+      closes += 1;
+      return Promise.reject(failure);
+    };
+    const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });
+
+    const first = dispatcher.close();
+    const second = dispatcher.close();
+
+    // A second close joins the first attempt: returning a fresh resolved
+    // promise would report a success that never happened.
+    expect(second).toBe(first);
+    expect(await rejectionOf(first)).toBe(failure);
+    expect(await rejectionOf(second)).toBe(failure);
+    expect(closes).toBe(1);
+    expect(dispatcher.isClosed()).toBe(true);
   });
 });

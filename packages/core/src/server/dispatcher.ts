@@ -201,6 +201,7 @@ export class Dispatcher {
   /** Requests that have not reached a terminal state, by framework request id. */
   private readonly inFlight = new Map<string, InFlight>();
   private closed = false;
+  private closePromise: Promise<void> | undefined;
 
   constructor(options: DispatcherOptions) {
     // SPEC 3.4 makes a per-request timeout mandatory; Infinity would also make
@@ -546,10 +547,17 @@ export class Dispatcher {
     return true;
   }
 
-  async close(): Promise<void> {
-    if (this.closed) {
-      return;
-    }
+  /**
+   * Memoised so every caller observes the same close attempt, including a
+   * failed one. A second call after a failed backend close must not return a
+   * fresh resolved promise: that would report a shutdown that never happened.
+   */
+  close(): Promise<void> {
+    this.closePromise ??= this.doClose();
+    return this.closePromise;
+  }
+
+  private async doClose(): Promise<void> {
     this.closed = true;
     await this.backend.close();
   }

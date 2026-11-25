@@ -103,6 +103,12 @@ export class IpcExecutor implements RequestExecutor {
   private readonly closedWaiter = new ClosedWaiter();
   private closePromise: Promise<void> | undefined;
   private pendingRecovery: { backoffMs: number; blocked: boolean } | undefined;
+  /**
+   * Set when a close could not confirm every exit. Unlike `pendingRecovery` it
+   * is never lifted by a late exit: the close is already terminal, and the
+   * unconfirmed writer is exactly what health must keep reporting (INV-002).
+   */
+  private closeBlocked = false;
   /** Separates the first start from a restart when deriving health. */
   private handshakeCompleted = false;
 
@@ -201,8 +207,8 @@ export class IpcExecutor implements RequestExecutor {
       recordAbandoned: (server) => {
         this.slot.track(server);
       },
-      resolveClosed: () => {
-        this.resolveClosed();
+      resolveClosed: (server) => {
+        this.resolveClosed(server);
       },
       clearRestartTimer: () => {
         this.restart.clearRestartTimer();
@@ -250,8 +256,8 @@ export class IpcExecutor implements RequestExecutor {
       onServerLost: (server, code, signal, reason) => {
         this.onServerLost(server, code, signal, reason);
       },
-      resolveClosed: () => {
-        this.resolveClosed();
+      resolveClosed: (server) => {
+        this.resolveClosed(server);
       },
     };
   }
@@ -508,7 +514,8 @@ export class IpcExecutor implements RequestExecutor {
       status: this.slot.status,
       handshakeCompleted: this.handshakeCompleted,
       serverReady: server !== undefined && server.ready && !server.closed,
-      recoveryBlocked: this.pendingRecovery?.blocked === true,
+      recoveryBlocked:
+        this.pendingRecovery?.blocked === true || this.closeBlocked,
     });
   }
 
@@ -593,6 +600,15 @@ export class IpcExecutor implements RequestExecutor {
           this.restart.clearStableClock();
         },
       },
+      recovery: {
+        clear: () => {
+          this.pendingRecovery = undefined;
+          this.closeBlocked = false;
+        },
+        block: () => {
+          this.closeBlocked = true;
+        },
+      },
       waiters: {
         clearStartTimer: () => {
           this.clearStartTimer();
@@ -608,8 +624,8 @@ export class IpcExecutor implements RequestExecutor {
     };
   }
 
-  private resolveClosed(): void {
-    this.closedWaiter.resolve();
+  private resolveClosed(server: ServerState): void {
+    this.closedWaiter.resolve(server);
   }
 
   private resolveStart(): void {
@@ -786,12 +802,12 @@ export class IpcExecutor implements RequestExecutor {
       // A switch retired this process but had already settled (promoted or
       // rolled back) before its exit landed. Its exit is expected: no crash
       // line and no restart beside the current Server.
-      this.resolveClosed();
+      this.resolveClosed(server);
       return;
     }
     this.slot.clearIfCurrent(server);
     // A close that is waiting for `closed` will never get it now.
-    this.resolveClosed();
+    this.resolveClosed(server);
     if (!server.exited) {
       // The link died but the process may still be running: it can no longer
       // be reached or asked to stop, and restarting beside it would give the

@@ -75,7 +75,16 @@ export class DeliveryLedger {
    * That is the necessary cost of the SPEC 6.5 ordering guarantee, not a drop.
    */
   flush(server: ServerState | undefined): void {
-    if (server === undefined || !server.ready) {
+    // `ready` alone is not enough: during a rollback the slot can still name the
+    // generation the switch just retired. Sending there would race its exit and
+    // drop the request on a closed channel; it stays buffered for the restart
+    // instead (SPEC 6.5, INV-002).
+    if (
+      server === undefined ||
+      !server.ready ||
+      server.closed ||
+      server.exited
+    ) {
       return;
     }
     if (this.host.isTerminal) {

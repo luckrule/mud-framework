@@ -1,7 +1,8 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, jest, test } from 'bun:test';
 
 import { rejectionOf } from '../../testing/common.ts';
 import {
+  flushMicrotasks,
   flushTicks,
   harness,
   readyMessage,
@@ -95,6 +96,64 @@ describe('IpcExecutor health', () => {
 
     await closing;
     expect(h.executor.health()).toEqual({ state: 'closed', ready: false });
+  });
+
+  test('converges to closed after a successful close that follows a blocked recovery', async () => {
+    jest.useFakeTimers();
+    try {
+      const h = harness({ timeoutMs: 5000, killExits: false });
+      const first = await started(h);
+      first.closeChannel();
+      await flushMicrotasks();
+      jest.advanceTimersByTime(2001);
+      await flushMicrotasks();
+      expect(h.executor.health()).toEqual({ state: 'blocked', ready: false });
+
+      const closing = h.executor.close();
+      await flushMicrotasks();
+      // The retained writer finally confirms its exit, so close() succeeds; the
+      // stale blocked flag must not outlive the close that cleared the barrier.
+      first.crash();
+      await flushMicrotasks();
+      await closing;
+      expect(h.executor.health()).toEqual({ state: 'closed', ready: false });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('reports blocked, not closed, when close fails on an unconfirmed exit', async () => {
+    jest.useFakeTimers();
+    try {
+      const h = harness({
+        timeoutMs: 5000,
+        exitOnShutdown: false,
+        killExits: false,
+        shutdownTimeoutMs: 20,
+      });
+      const startPromise = h.executor.start();
+      serverAt(h, 0).send(readyMessage());
+      await startPromise;
+
+      const closing = h.executor.close();
+      // Let the sequence arm its first exit wait, then run each bounded wait in
+      // turn: the next timer is armed only after the previous one settles.
+      await flushMicrotasks();
+      jest.advanceTimersByTime(2001);
+      await flushMicrotasks();
+      jest.advanceTimersByTime(2001);
+      await flushMicrotasks();
+      jest.advanceTimersByTime(2001);
+      await flushMicrotasks();
+      const error = await rejectionOf(closing);
+
+      expect(error.message).toMatch(/could not confirm/);
+      // The only observable signal that a writer may still be alive (INV-002):
+      // reporting `closed` here would erase it.
+      expect(h.executor.health()).toEqual({ state: 'blocked', ready: false });
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   test('reports a terminal failed start as closed', async () => {

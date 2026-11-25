@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
 import { isRecord, parseFrame, sleep } from '../testing/common.ts';
-import { harness } from '../testing/connection-layer.ts';
+import { harness, sessionHarness } from '../testing/connection-layer.ts';
 
 describe('ConnectionLayer bounded input queue (SPEC 3.5)', () => {
   test('malformed frames consume the same bounded backlog without changing reply order or session binding', async () => {
@@ -59,6 +59,68 @@ describe('ConnectionLayer bounded input queue (SPEC 3.5)', () => {
       await Promise.all([slow, accepted, refused]);
       await layer.stop();
     }
+  });
+
+  test('allocates a request id when the input takes its queue seat, not when it starts', async () => {
+    const created: string[] = [];
+    const { transport, layer, controlled } = sessionHarness({
+      maxQueuedPerConnection: 1,
+      createRequestId: () => {
+        const id = `req-${created.length + 1}`;
+        created.push(id);
+        return id;
+      },
+    });
+    await layer.start();
+    transport.connect('c1');
+
+    // A malformed frame occupies a seat but is not a Request, so it gets no id.
+    const bad = transport.receive('c1', 'not json');
+    expect(created).toEqual([]);
+    await bad;
+    expect(created).toEqual([]);
+
+    const first = transport.receive('c1', '{"id":"r0","method":"next"}');
+    // SPEC 7.3: minted on entry, before the request waits for its turn.
+    expect(created).toEqual(['req-1']);
+    await first;
+    expect(controlled.requests[0]?.requestId).toBe('req-1');
+    expect(created).toEqual(['req-1']);
+    await layer.stop();
+  });
+
+  test('a queue-full refusal carries the request id minted on entry', async () => {
+    const created: string[] = [];
+    const { transport, layer, controlled, logs } = sessionHarness({
+      maxQueuedPerConnection: 1,
+      createRequestId: () => {
+        const id = `req-${created.length + 1}`;
+        created.push(id);
+        return id;
+      },
+    });
+    await layer.start();
+    transport.connect('c1');
+
+    const first = transport.receive('c1', '{"id":"r0","method":"hang"}');
+    await sleep(0);
+    const second = transport.receive('c1', '{"id":"r1","method":"next"}');
+    const refused = transport.receive('c1', '{"id":"r2","method":"next"}');
+    await refused;
+
+    const rejected = logs().filter(
+      (entry) => entry.code === 'FRAMEWORK_QUEUE_FULL',
+    );
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]).toMatchObject({
+      connectionId: 'c1',
+      clientRequestId: 'r2',
+      requestId: 'req-3',
+    });
+
+    controlled.release();
+    await Promise.all([first, second]);
+    await layer.stop();
   });
 
   test('refuses a request with FRAMEWORK_QUEUE_FULL instead of executing it', async () => {

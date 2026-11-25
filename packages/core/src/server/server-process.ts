@@ -782,11 +782,30 @@ class ServerProcess {
     // Server both hold the storage (INV-002). It is one deadline shared by both
     // steps, not one per step, so the total is what the constant promises.
     const limitMs = this.options.abortTimeoutMs ?? ABORT_TIMEOUT_MS;
-    await this.drainAndClose(runtime, runner, limitMs);
+    try {
+      await this.drainAndClose(runtime, runner, limitMs);
+    } catch (error) {
+      // Every caller uses `void abort(...)`, so a throw here would be an
+      // unhandled rejection while `completion` never settles.
+      this.logger.error(
+        { code: 'ABORT_DRAIN_FAILED', reason: messageOf(error) },
+        'server abort drain failed',
+      );
+    }
     // On the parent-gone path the link is still open, and an open IPC channel
     // keeps the event loop alive: the whole point is that an orphaned process
-    // goes away rather than lingering as a second writer (INV-002).
-    this.channel.close('aborting');
+    // goes away rather than lingering as a second writer (INV-002). The
+    // injected channel is outside code, so a close that throws must not keep
+    // `completion` from rejecting: the failure is logged for diagnosis and the
+    // process still ends.
+    try {
+      this.channel.close('aborting');
+    } catch (error) {
+      this.logger.error(
+        { code: 'ABORT_CHANNEL_CLOSE_FAILED', reason: messageOf(error) },
+        'ipc channel could not be closed while aborting',
+      );
+    }
     this.completion.reject(new ServerChannelClosedError(reason));
   }
 

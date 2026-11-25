@@ -311,21 +311,30 @@ export class ConnectionLayer implements TransportHandlers {
         await this.rejectEnvelope(connection, rawLength, reason);
       });
     }
+    // Assigned when the decoded request enters the framework, before the queue
+    // cap decides whether it gets a seat: a refusal is still a Request whose
+    // log line must be correlatable, while a malformed frame is not and never
+    // reaches this point (SPEC 7.3).
+    const requestId = this.createRequestId();
     if (state.queued >= this.maxQueuedPerConnection) {
-      return this.refuseQueue(state, envelope.id, envelope.method);
+      return this.refuseQueue(state, envelope.id, envelope.method, requestId);
     }
     state.queued += 1;
-    return this.enqueue(state, () => this.startAfterGate(state, envelope));
+    return this.enqueue(state, () =>
+      this.startAfterGate(state, envelope, requestId),
+    );
   }
 
   private refuseQueue(
     state: ConnectionState,
     id: string,
     method?: string,
+    requestId?: string,
   ): Promise<void> {
     this.logger.warn(
       {
         connectionId: state.connection.id,
+        ...(requestId === undefined ? {} : { requestId }),
         clientRequestId: id,
         method,
         code: FRAMEWORK_QUEUE_FULL,
@@ -347,20 +356,27 @@ export class ConnectionLayer implements TransportHandlers {
   private async startAfterGate(
     state: ConnectionState,
     envelope: Envelope,
+    requestId: string,
   ): Promise<void> {
     const ran = await this.router.run(
       state.connection.id,
       state.closed.signal,
       async (sessionId, terminal) => {
         state.queued -= 1;
-        await this.handle(state.connection, envelope, sessionId, terminal);
+        await this.handle(
+          state.connection,
+          envelope,
+          sessionId,
+          terminal,
+          requestId,
+        );
       },
     );
     if (!ran) {
       state.queued -= 1;
       // Shutdown can stop waiting, but cannot start overlapping Session work.
       if (this.connections.get(state.connection.id) === state) {
-        await this.refuseWithId(state.connection, envelope.id);
+        await this.refuseWithId(state.connection, envelope.id, requestId);
       }
     }
   }
@@ -544,10 +560,13 @@ export class ConnectionLayer implements TransportHandlers {
   private async refuseWithId(
     connection: TransportConnection,
     id: string,
+    requestId?: string,
   ): Promise<void> {
     this.logger.warn(
       {
         connectionId: connection.id,
+        ...(requestId === undefined ? {} : { requestId }),
+        clientRequestId: id,
         code: FRAMEWORK_SHUTDOWN,
         reason: 'request arrived after shutdown started',
       },
@@ -595,19 +614,18 @@ export class ConnectionLayer implements TransportHandlers {
     envelope: Envelope,
     sessionId: string | undefined,
     terminal: Promise<void>,
+    requestId: string,
   ): Promise<void> {
     const method = envelope.method;
     const clientRequestId = envelope.id;
     const requestPayload = envelope.payload;
 
-    // Assigned here, at the framework's entry point, before any client data
-    // influences it (SPEC 7.3). The executor carries it through rather than
-    // minting its own, so both sides log the same id; a replay passes it back in.
-    const requestId = this.createRequestId();
-    // The Session this connection already holds, read before the request runs:
-    // a request that binds a Session still runs as unbound, and the binding it
-    // declares is applied only after it succeeds. Every request line carries it
-    // (SPEC 7.1), which is why the logger is built after this lookup.
+    // The id was minted when the request entered the framework (SPEC 7.3), so
+    // every line about it — including the executor's and the replay's — shares
+    // it. The Session this connection already holds is read before the request
+    // runs: a request that binds a Session still runs as unbound, and the
+    // binding it declares is applied only after it succeeds. Every request line
+    // carries it (SPEC 7.1), which is why the logger is built after this lookup.
     const state = this.connections.get(connection.id);
     const logger = this.logger.child({
       requestId,
@@ -682,8 +700,21 @@ export class ConnectionLayer implements TransportHandlers {
         } else {
           // Deliberately behind the same success check: a failed unbind keeps
           // the existing route. `unbind` leaves the Session's unfinished
-          // barrier in place (INV-004).
-          this.router.unbind(connection.id, logger);
+          // barrier in place (INV-004). A Session this connection no longer
+          // holds belongs to its successor, so the late unbind is dropped
+          // instead of silently detaching the new holder (SPEC 3.2).
+          const unbound = this.router.unbind(connection.id, sessionId, logger);
+          if (unbound === 'held-by-other' && sessionId !== undefined) {
+            logger.warn(
+              {
+                connectionId: connection.id,
+                sessionId,
+                code: 'SESSION_CHANGE_DROPPED',
+                reason: 'session was taken over by another connection',
+              },
+              'session change dropped',
+            );
+          }
         }
       }
       await this.reply(

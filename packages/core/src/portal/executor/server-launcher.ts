@@ -163,19 +163,24 @@ export async function waitForExit(
  * `closed` message and a lost process can end that wait.
  */
 export class ClosedWaiter {
-  private waiter: (() => void) | undefined;
+  private waiter:
+    | { readonly server: ServerState; readonly resolve: () => void }
+    | undefined;
   private timer: ReturnType<typeof setTimeout> | undefined;
 
   /**
    * Waits up to `waitMs` for the Server's `closed` acknowledgement. Returns at
-   * once when the acknowledgement already arrived.
+   * once when the acknowledgement already arrived. The waited Server is
+   * recorded so a `closed` from another generation cannot end this wait: an
+   * old process could acknowledge before the current one and make close() kill
+   * a healthy Server.
    */
   waitForClosed(server: ServerState, waitMs: number): Promise<void> {
     if (server.closed || server.shutdownAcknowledged) {
       return Promise.resolve();
     }
     return new Promise<void>((resolve) => {
-      this.waiter = resolve;
+      this.waiter = { server, resolve };
       this.timer = setTimeout(() => {
         this.resolve();
       }, waitMs);
@@ -183,20 +188,30 @@ export class ClosedWaiter {
       // in which case its `resolve` found no waiter. Re-check so the grace
       // period is not paid for a process that is already gone.
       if (server.closed || server.shutdownAcknowledged) {
-        this.resolve();
+        this.resolve(server);
       }
     });
   }
 
-  /** Ends the pending wait, if any; safe to call when nothing is waiting. */
-  resolve(): void {
+  /**
+   * Ends the pending wait, if any; safe to call when nothing is waiting.
+   * `server` narrows the wake-up to the generation being waited on: an
+   * acknowledgement or loss from any other generation is not this wait's.
+   */
+  resolve(server?: ServerState): void {
+    const waiter = this.waiter;
+    if (waiter === undefined) {
+      return;
+    }
+    if (server !== undefined && waiter.server !== server) {
+      return;
+    }
+    this.waiter = undefined;
     if (this.timer !== undefined) {
       clearTimeout(this.timer);
       this.timer = undefined;
     }
-    const waiter = this.waiter;
-    this.waiter = undefined;
-    waiter?.();
+    waiter.resolve();
   }
 }
 

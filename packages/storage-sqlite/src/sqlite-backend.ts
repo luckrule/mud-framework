@@ -55,6 +55,7 @@ export class SqliteBackend implements StorageBackend {
   private readonly busyTimeoutMs: number;
   private readonly logger: Logger | undefined;
   private closing = false;
+  private closePromise: Promise<void> | undefined;
   private unusableReason: string | undefined;
   private queue: Promise<unknown> = Promise.resolve();
 
@@ -132,8 +133,17 @@ export class SqliteBackend implements StorageBackend {
     return result;
   }
 
-  async close(): Promise<void> {
-    this.assertOpen();
+  /**
+   * Memoised and retryable: a second close joins the first attempt instead of
+   * throwing on `closing`, and a failed `db.close` stays observable rather than
+   * being replaced by a later "already closed" success.
+   */
+  close(): Promise<void> {
+    this.closePromise ??= this.doClose();
+    return this.closePromise;
+  }
+
+  private async doClose(): Promise<void> {
     this.closing = true;
     // Drain first so close never cuts an in-flight COMMIT in half.
     await this.queue;

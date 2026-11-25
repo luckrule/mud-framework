@@ -116,6 +116,7 @@ describe('executor shutdown', () => {
         pendingCount: () => 0,
       },
       restart: { clearRestartTimer: () => {}, clearStableClock: () => {} },
+      recovery: { clear: () => {}, block: () => {} },
       waiters: {
         clearStartTimer: () => {},
         rejectStart: () => {},

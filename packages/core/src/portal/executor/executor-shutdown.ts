@@ -34,6 +34,13 @@ export interface ShutdownHost {
   };
   readonly restart: { clearRestartTimer(): void; clearStableClock(): void };
   /**
+   * The recovery barrier's terminal transition. A confirmed close releases it,
+   * so health converges to `closed`; a close that could not confirm every
+   * exit must keep reporting `blocked`, because it is the only observable
+   * signal that a writer may still be alive (INV-002).
+   */
+  readonly recovery: { clear(): void; block(): void };
+  /**
    * The two promises the executor may be parked on. Both must be ended by the
    * close: a start still waiting for `ready` is rejected rather than left
    * hanging, and a `closed` wait is what the shutdown handshake resolves.
@@ -114,8 +121,14 @@ export async function doClose(host: ShutdownHost): Promise<void> {
     new Error('ipc executor closed before the server became ready'),
   );
   if (!currentExited || !abandonedExited) {
+    // An unconfirmed exit leaves a possible writer behind: the executor must
+    // keep reporting `blocked` rather than converge to `closed` (INV-002).
+    host.recovery.block();
     throw new Error('ipc executor close could not confirm all server exits');
   }
+  // The close confirmed every exit, so the recovery barrier has no meaning any
+  // more; a stale `pendingRecovery` must not make health keep reporting it.
+  host.recovery.clear();
   host.slot.markClosed();
 }
 

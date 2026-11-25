@@ -13,6 +13,7 @@ import {
   requestIds,
   serverAt,
   started,
+  waitFor,
 } from '../../testing/ipc-executor.ts';
 import { IpcExecutor } from './ipc-executor.ts';
 
@@ -358,6 +359,41 @@ describe('IpcExecutor close', () => {
     server.crash(0);
     await closing;
     expect(closed).toBe(true);
+  });
+
+  test('a closed message from another generation does not release the close wait', async () => {
+    const h = harness({
+      timeoutMs: 5000,
+      autoClose: false,
+      restartBackoffMs: 1,
+    });
+    const first = await started(h);
+    first.crash(1);
+    await waitFor(() => h.servers.length === 2);
+    const second = serverAt(h, 1);
+    second.send(readyMessage());
+    await flushTicks();
+    expect(h.executor.health()).toEqual({ state: 'ready', ready: true });
+
+    let settled = false;
+    const closing = h.executor.close().then(() => {
+      settled = true;
+      return undefined;
+    });
+    await flushMicrotasks();
+
+    // The old, already retired generation sends `closed` while close() is
+    // waiting on the current one. Only the awaited Server may end that wait,
+    // or close() would kill a healthy Server on a stale message.
+    first.send({ type: 'closed', reason: 'stale generation' });
+    await flushMicrotasks();
+    expect(settled).toBe(false);
+
+    second.send({ type: 'closed', reason: 'shutdown' });
+    second.crash(0);
+    await flushMicrotasks();
+    await closing;
+    expect(settled).toBe(true);
   });
 
   test('kills a server that acknowledges closed but never exits', async () => {

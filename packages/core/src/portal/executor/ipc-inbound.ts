@@ -37,8 +37,8 @@ export interface MessageHost {
     signal: string | null,
     reason: string,
   ): void;
-  /** Wakes the `closed` wait a `close()` may be parked on. */
-  resolveClosed(): void;
+  /** Wakes the `closed` wait a `close()` may be parked on, for that Server only. */
+  resolveClosed(server: ServerState): void;
 }
 
 /**
@@ -106,12 +106,13 @@ function onClosed(
     // its own signal for this before it may activate the replacement
     // (INV-002). A `close()` that took over may also be waiting, so wake it.
     server.shutdownAcknowledged = true;
-    host.resolveClosed();
+    host.resolveClosed(server);
     return;
   }
   if (host.slot.status === 'closing') {
     server.shutdownAcknowledged = true;
-    host.resolveClosed();
+    // Another generation's `closed` must not end a wait for the current Server.
+    host.resolveClosed(server);
     return;
   }
   if (host.slot.switching?.staged === server) {

@@ -1,7 +1,11 @@
 import { describe, expect, jest, test } from 'bun:test';
 
+import type { IpcChannel } from '../../ipc/channel.ts';
+import type { SpawnedServer } from '../../ipc/spawn-port.ts';
+import { createJsonLogger } from '../../logging/json-logger.ts';
 import type { ExecutorOutcome } from '../../shared/executor.ts';
 import {
+  FakeServerProcess,
   failureOf,
   flushMicrotasks,
   harness,
@@ -12,7 +16,8 @@ import {
   serverAt,
   successMessage,
 } from '../../testing/ipc-executor.ts';
-import type { FakeServerProcess, Harness } from '../../testing/ipc-executor.ts';
+import type { FakeServerOptions, Harness } from '../../testing/ipc-executor.ts';
+import { IpcExecutor } from './ipc-executor.ts';
 
 interface DeliveredRequest {
   requestId: string;
@@ -343,6 +348,93 @@ describe('IpcExecutor multi-generation recovery', () => {
       gen4.send(readyMessage());
       await flushMicrotasks();
       await h.executor.close();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('does not deliver to a retired generation while a rollback is starting its replacement', async () => {
+    jest.useFakeTimers();
+    try {
+      const sent: { generation: number; type: string }[] = [];
+      const servers: FakeServerProcess[] = [];
+      const makeServer = (
+        options: Partial<FakeServerOptions> = {},
+      ): SpawnedServer => {
+        const fake = new FakeServerProcess({
+          autoCloseOnShutdown: true,
+          readyOnActivate: true,
+          ...options,
+        });
+        const generation = servers.length;
+        servers.push(fake);
+        const channel = fake.handle.channel;
+        const counting: IpcChannel = {
+          send: (message) => {
+            sent.push({ generation, type: message.type });
+            channel.send(message);
+          },
+          onMessage: (handler) => channel.onMessage(handler),
+          onClose: (handler) => channel.onClose(handler),
+          close: (reason) => channel.close(reason),
+        };
+        return { ...fake.handle, channel: counting };
+      };
+      const executor = new IpcExecutor({
+        spawn: () => makeServer(),
+        timeoutMs: 5000,
+        startTimeoutMs: 20,
+        restartBackoffMs: 1,
+        logger: createJsonLogger({ level: 'debug', sink: () => undefined }),
+      });
+      const startPromise = executor.start();
+      const gen1 = servers[0];
+      if (gen1 === undefined) {
+        throw new Error('the first server was never spawned');
+      }
+      gen1.send(readyMessage());
+      await startPromise;
+
+      // Retire gen1, then fail the replacement before it becomes ready, so the
+      // rollback starts its restart window with `slot.server` still pointing at
+      // the closed/exited generation.
+      void executor
+        .switchTo({ spawn: () => makeServer({ readyOnActivate: false }) })
+        .catch(() => undefined);
+      await flushMicrotasks();
+      jest.advanceTimersByTime(20);
+      await flushMicrotasks();
+
+      const outcome = executor.execute(
+        request({ requestId: 'during-rollback' }),
+      );
+      let settled = false;
+      void outcome.then(() => {
+        settled = true;
+        return undefined;
+      });
+      await flushMicrotasks();
+
+      // The request stays in the unacknowledged buffer: a closed generation is
+      // not a delivery target even while the slot still names it (SPEC 6.5).
+      expect(sent.filter((entry) => entry.type === 'request')).toEqual([]);
+      expect(settled).toBe(false);
+
+      jest.advanceTimersByTime(1);
+      await flushMicrotasks();
+      const gen3 = servers[2];
+      if (gen3 === undefined) {
+        throw new Error('the rollback generation was never spawned');
+      }
+      expect(
+        sent.filter(
+          (entry) => entry.type === 'request' && entry.generation === 2,
+        ),
+      ).toEqual([{ generation: 2, type: 'request' }]);
+
+      gen3.send(successMessage('during-rollback', 'gen3'));
+      expect(await outcome).toEqual({ ok: true, result: 'gen3' });
+      await executor.close();
     } finally {
       jest.useRealTimers();
     }

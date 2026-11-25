@@ -1,18 +1,30 @@
 import { describe, expect, test } from 'bun:test';
 
 import { createProcessChannel } from '../ipc/bun-child.ts';
+import type { IpcChannel } from '../ipc/channel.ts';
+import { createInMemoryChannelPair } from '../ipc/channel.ts';
+import { createJsonLogger } from '../logging/json-logger.ts';
 import { BusinessError } from '../shared/wire-codes.ts';
 import { MemoryStorageBackend } from '../storage/memory.ts';
 import type { StorageBackend } from '../storage/types.ts';
-import { rejectionOf, throwingLogger, tick } from '../testing/common.ts';
+import {
+  isRecord,
+  rejectionOf,
+  throwingLogger,
+  tick,
+} from '../testing/common.ts';
 import {
   echoRegistration,
+  parseLine,
   requestMessage,
   results,
   sendRaw,
   startServer,
 } from '../testing/server-process.ts';
-import { ServerChannelClosedError } from './server-process.ts';
+import {
+  ServerChannelClosedError,
+  runServerProcess,
+} from './server-process.ts';
 
 describe('createProcessChannel singleton', () => {
   test('refuses a second channel in the same process', () => {
@@ -164,6 +176,55 @@ describe('runServerProcess lifecycle', () => {
     expect(drainTimeouts[0]?.timeoutMs).toBe(20);
     release.resolve();
     await tick();
+  });
+
+  test('a throwing channel close during abort still rejects run() instead of hanging', async () => {
+    const [portal, serverChannel] = createInMemoryChannelPair();
+    portal.onMessage((raw) => {
+      if (isRecord(raw) && raw.type === 'prepared') {
+        portal.send({ type: 'activate' });
+      }
+    });
+    const lines: string[] = [];
+    const closingChannel: IpcChannel = {
+      send: (message) => serverChannel.send(message),
+      onMessage: (handler) => serverChannel.onMessage(handler),
+      onClose: (handler) => serverChannel.onClose(handler),
+      close: (reason) => {
+        serverChannel.close(reason);
+        // The injected channel is outside code: a close that throws must not
+        // leave `completion` unsettled while every caller used `void abort`.
+        throw new Error('the portal link refused to close');
+      },
+    };
+    const done = runServerProcess({
+      createBackend: () => new MemoryStorageBackend(),
+      extensions: [{ name: 'echo', register: echoRegistration }],
+      timeoutMs: 1000,
+      logger: createJsonLogger({ sink: (line) => lines.push(line) }),
+      channel: closingChannel,
+      parentCheckIntervalMs: 0,
+    });
+    portal.send({ type: 'hello' });
+    await tick();
+
+    portal.close('portal died');
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const bounded = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), 500);
+    });
+    const outcome = await Promise.race([rejectionOf(done), bounded]);
+    clearTimeout(timer);
+
+    if (outcome === 'timeout') {
+      throw new Error('run() did not settle after a throwing channel close');
+    }
+    expect(outcome).toBeInstanceOf(ServerChannelClosedError);
+    const logged = lines
+      .map(parseLine)
+      .filter((line) => line.code === 'ABORT_CHANNEL_CLOSE_FAILED');
+    expect(logged).toHaveLength(1);
+    expect(logged[0]?.reason).toContain('refused to close');
   });
 
   test('aborts when the parent process is gone', async () => {

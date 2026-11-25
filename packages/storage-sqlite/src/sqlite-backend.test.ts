@@ -221,6 +221,18 @@ describe('SqliteBackend', () => {
     expect(rows).toEqual([{ v: 'committed' }]);
   });
 
+  test('close is idempotent and every caller observes the same result', async () => {
+    const backend = SqliteBackend.open();
+
+    const first = backend.close();
+    const second = backend.close();
+
+    expect(second).toBe(first);
+    await first;
+    await second;
+    expect(() => backend.capabilities()).toThrow(/closed/);
+  });
+
   test('rejects every call after close', async () => {
     const backend = SqliteBackend.open();
     await backend.close();

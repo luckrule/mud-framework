@@ -4,6 +4,9 @@ interface SessionRouterOptions {
   readonly logger: Logger;
 }
 
+/** Whether a declared unbind took effect, was already a no-op, or lost a takeover. */
+export type UnbindResult = 'unbound' | 'not-held' | 'held-by-other';
+
 /** Routing ownership and unfinished Session work have independent lifetimes. */
 export class SessionRouter {
   private readonly logger: Logger;
@@ -62,14 +65,27 @@ export class SessionRouter {
    * connection that holds nothing is already unbound, so a repeated unbind is
    * a no-op rather than a failure. The Session's unfinished work is untouched —
    * the terminal barrier does not follow the route (INV-004, SPEC 3.2).
+   *
+   * The result separates "already unbound" from "another connection took the
+   * Session over", which a caller must not treat as a successful unbind: the
+   * entry Session in the request is what tells them apart, because the route no
+   * longer names this connection (SPEC 3.2).
    */
-  unbind(connectionId: string, logger: Logger = this.logger): void {
-    const sessionId = this.heldBy.get(connectionId);
-    if (sessionId === undefined) {
-      return;
+  unbind(
+    connectionId: string,
+    sessionId?: string,
+    logger: Logger = this.logger,
+  ): UnbindResult {
+    const held = this.heldBy.get(connectionId);
+    if (held !== undefined) {
+      this.release(connectionId);
+      logger.info({ sessionId: held, connectionId }, 'session unbound');
+      return 'unbound';
     }
-    this.release(connectionId);
-    logger.info({ sessionId, connectionId }, 'session unbound');
+    if (sessionId !== undefined && this.routes.has(sessionId)) {
+      return 'held-by-other';
+    }
+    return 'not-held';
   }
 
   /**

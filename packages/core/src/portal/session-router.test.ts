@@ -128,6 +128,21 @@ describe('SessionRouter ownership', () => {
     });
   });
 
+  test('unbind reports a takeover instead of releasing the successor route', () => {
+    const { router, bind } = harness();
+    bind('c1', 's1');
+
+    // The old connection no longer holds anything, but the Session is routed:
+    // releasing it here would detach the successor (SPEC 3.2).
+    expect(router.unbind('c1', 's1')).toBe('unbound');
+    expect(router.sessionOf('c1')).toBeUndefined();
+    bind('c2', 's1');
+    expect(router.unbind('c1', 's1')).toBe('held-by-other');
+    expect(router.sessionOf('c2')).toBe('s1');
+    expect(router.unbind('c1', 'unrouted')).toBe('not-held');
+    expect(router.unbind('c1')).toBe('not-held');
+  });
+
   test('unbind is a no-op for a connection that holds nothing', () => {
     const { router, logs } = harness();
 

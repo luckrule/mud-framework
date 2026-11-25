@@ -98,6 +98,8 @@ Handler 可以 await，框架的调度建立在 Promise 之上。
 
 Session 的终态屏障独立于活跃路由：连续接管、旧连接断开或路由清除均 MUST NOT 丢弃尚未满足的先决屏障。绑定在成功结果返回后应用，不追溯改变本次请求的入口归属；首次从无 Session 发起的绑定请求不在目标 Session 的串行保证内。业务必须自行保护这种登录或绑定逻辑的共享状态。
 
+Session 变更只作用于发起请求的 Connection：若目标 Session 已被新 Connection 接管，旧 Connection 的成功 unbind 不得解除新 holder 的路由，并记录一条 warn（`SESSION_CHANGE_DROPPED`，字段含 `connectionId`、`sessionId`、`reason`）。
+
 边界：终态不等于 JS handler 已停止。超时或取消后，非合作 handler 可能继续计算，其框架外副作用与已开始 COMMIT 的竞态不在串行保证内（见 3.4）；框架不提供跨 Connection 的事务一致性或 Session 业务状态。
 
 理由：跨连接串行会抹掉异步模型的全部收益；同 Session 并行则让"谁的状态更新生效"变得不可判定。
@@ -142,6 +144,8 @@ JS 无法抢占执行中的 Handler。超时保证结果确定与后续事务调
 每个 Connection 的 Input Queue MUST 有明确上限。队列满时的行为 MUST 是显式策略之一：拒绝新输入并返回稳定错误码，或对传输层施加背压。MUST NOT 静默丢弃——静默丢弃会让玩家指令凭空消失且不可诊断，这是最难排查的一类线上问题。
 
 队列满时采用拒绝策略：拒绝新输入并返回 `FRAMEWORK_QUEUE_FULL`，不做背压。理由是拒绝是队列自己能兑现的唯一策略：它让请求立刻以稳定错误码失败，而不是把整条连接堵在一个满队列后面。
+
+`FRAMEWORK_QUEUE_FULL` 同时表示 Portal 的未确认缓冲达到上限（`IpcExecutor.maxPending`）；两层队列的拒绝语义一致：以同一稳定错误码立即失败，不静默丢弃。
 
 ### 3.6 取消与断线
 
@@ -370,7 +374,7 @@ TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：
 | 码                           | 含义                                         |
 | ---------------------------- | -------------------------------------------- |
 | `FRAMEWORK_TIMEOUT`          | 请求超时                                     |
-| `FRAMEWORK_QUEUE_FULL`       | 输入队列拒绝（见 3.5）                       |
+| `FRAMEWORK_QUEUE_FULL`       | 输入队列或 Portal 未确认缓冲拒绝（见 3.5）   |
 | `FRAMEWORK_SHUTDOWN`         | 因关闭未取得成功确认，不保证未执行或未提交   |
 | `FRAMEWORK_REPLAY_EXHAUSTED` | 重放次数用尽，请求进入终态（见 6.5）         |
 | `TRANSPORT_CLOSED`           | 传输在请求完成前关闭                         |
