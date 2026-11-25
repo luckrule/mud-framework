@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 
 import { createJsonLogger } from '../logging/json-logger.ts';
 import type { Logger } from '../logging/types.ts';
-import type { RequestExecutor } from '../shared/executor.ts';
+import type { ExecutorRequest, RequestExecutor } from '../shared/executor.ts';
 import { parseFrame, sleep } from '../testing/common.ts';
 import { harness } from '../testing/connection-layer.ts';
 import { FakeTransport } from '../testing/fake-transport.ts';
@@ -128,6 +128,74 @@ describe('ConnectionLayer disconnect', () => {
     );
     expect(failedSend).toHaveLength(1);
     expect(failedSend[0]).toMatchObject({ level: 'error', connectionId: 'c1' });
+    await layer.stop();
+  });
+
+  test('a successful late result cannot route a session to the closed connection', async () => {
+    const transport = new FakeTransport();
+    const lines: string[] = [];
+    const logger: Logger = createJsonLogger({
+      sink: (line) => {
+        lines.push(line);
+      },
+    });
+    const started = Promise.withResolvers<void>();
+    const gate = Promise.withResolvers<void>();
+    const requests: ExecutorRequest[] = [];
+    const executor: RequestExecutor = {
+      start: () => Promise.resolve(),
+      // Deliberately ignores cancel and still reports a binding success after
+      // the connection is gone: the late result must not create a route.
+      execute: async (request) => {
+        requests.push(request);
+        if (request.method === 'login') {
+          started.resolve();
+          await gate.promise;
+          return {
+            ok: true,
+            result: 'welcome',
+            sessionChange: { type: 'bind', sessionId: 's1' },
+          };
+        }
+        return { ok: true, result: 'next' };
+      },
+      cancel: () => Promise.resolve(),
+      close: () => Promise.resolve(),
+      health: () => ({ state: 'ready', ready: true }),
+    };
+    const layer = new ConnectionLayer({ transport, executor, logger });
+    await layer.start();
+    transport.connect('c1');
+
+    const inFlight = transport.receive('c1', '{"id":"r1","method":"login"}');
+    await started.promise;
+    await transport.disconnect('c1', 'client left');
+    gate.resolve();
+    await inFlight;
+    await sleep(5);
+
+    // A new transport connection reuses the id. If the late success had been
+    // applied, this request would enter with the Session bound to that id.
+    const sent: string[] = [];
+    const replacement = {
+      id: 'c1',
+      send: (payload: string | Uint8Array) => {
+        sent.push(typeof payload === 'string' ? payload : '<binary>');
+        return Promise.resolve();
+      },
+      close: () => Promise.resolve(),
+    };
+    await layer.onConnect(replacement);
+    await layer.onMessage(replacement, '{"id":"r2","method":"next"}');
+
+    expect(requests).toHaveLength(2);
+    expect(requests[1]?.sessionId).toBeUndefined();
+    expect(sent.map(parseFrame)).toMatchObject([
+      { id: 'r2', ok: true, result: 'next' },
+    ]);
+    expect(
+      lines.map(parseFrame).filter((entry) => entry.msg === 'session bound'),
+    ).toHaveLength(0);
     await layer.stop();
   });
 

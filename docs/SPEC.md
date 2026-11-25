@@ -83,6 +83,15 @@ Session 的终态屏障独立于活跃路由：连续接管、旧连接断开或
 
 Session 变更只作用于发起请求的 Connection：若目标 Session 已被新 Connection 接管，旧 Connection 的成功 unbind MUST NOT 解除新 holder 的路由，并记录一条 warn（`SESSION_CHANGE_DROPPED`，字段含 `connectionId`、`sessionId`、`reason`）。
 
+Session 状态转移的契约：
+
+- 活跃路由只在成功请求的 bind/unbind 或连接断开时改变；失败、超时、取消与关闭结算不改变路由。
+- takeover 只改路由，不清除任何未完成的终态屏障；屏障只由请求开始与终态改变，与路由独立。
+- 旧 holder 的迟到 unbind 不影响新 holder；迟到 bind 是显式登录，可重新接管路由，但仍须等待既有屏障。
+- 已断开的 Connection MUST NOT 获得新路由；其迟到结果按取消处理，不应用 Session 变更。
+- 同一请求至多一次 Session 变更；第二次调用被拒绝，首次变更仍是唯一待应用变更。
+- 入口无 Session 的 public 请求执行 unbind 是成功的 no-op：路由不变，结果仍声明 unbind，因此无法区分“本来没有”与“已解绑”。
+
 边界：终态不等于 JS handler 已停止。超时或取消后，非合作 handler 可能继续计算，其框架外副作用与已开始 COMMIT 的竞态不在串行保证内（§3.4）。框架不提供跨 Connection 的事务；需要跨连接一致性的场景由 Extension 使用存储层的并发原语处理，并自行承担冲突。并发承诺止于存储边界（§4.4）。理由：跨连接串行会抹掉异步模型的全部收益；同 Session 并行则让“谁的状态更新生效”变得不可判定。
 
 ### 3.3 事务边界

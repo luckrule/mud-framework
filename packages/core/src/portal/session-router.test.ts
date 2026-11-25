@@ -155,6 +155,81 @@ describe('SessionRouter ownership', () => {
     ).toHaveLength(0);
   });
 
+  test('rebinding the same session does not duplicate the running barrier', async () => {
+    const { router, bind } = harness();
+    bind('c1', 's1');
+    await Promise.resolve();
+    await Promise.resolve();
+    const gate = Promise.withResolvers<void>();
+    const running = router.run('c1', new AbortController().signal, async () => {
+      await gate.promise;
+    });
+    expect(router.pendingCount('s1')).toBe(1);
+
+    bind('c1', 's1');
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(router.pendingCount('s1')).toBe(1);
+
+    gate.resolve();
+    await running;
+    await Promise.resolve();
+    expect(router.pendingCount('s1')).toBe(0);
+  });
+
+  test('binding a new session moves the route but keeps the old barrier', async () => {
+    const { router, bind } = harness();
+    bind('c1', 's1');
+    await Promise.resolve();
+    await Promise.resolve();
+    const gate = Promise.withResolvers<void>();
+    const running = router.run('c1', new AbortController().signal, async () => {
+      await gate.promise;
+    });
+    expect(router.pendingCount('s1')).toBe(1);
+
+    bind('c1', 's2');
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(router.sessionOf('c1')).toBe('s2');
+    expect(router.connectionOf('s1')).toBeUndefined();
+    expect(router.pendingCount('s1')).toBe(1);
+    expect(router.pendingCount('s2')).toBe(0);
+
+    gate.resolve();
+    await running;
+    await Promise.resolve();
+    expect(router.pendingCount('s1')).toBe(0);
+    expect(router.sessionOf('c1')).toBe('s2');
+  });
+
+  test('successive takeovers keep the original barrier', async () => {
+    const { router, bind } = harness();
+    bind('c1', 's1');
+    await Promise.resolve();
+    await Promise.resolve();
+    const gate = Promise.withResolvers<void>();
+    const running = router.run('c1', new AbortController().signal, async () => {
+      await gate.promise;
+    });
+    expect(router.pendingCount('s1')).toBe(1);
+
+    bind('c2', 's1');
+    bind('c3', 's1');
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(router.sessionOf('c3')).toBe('s1');
+    expect(router.sessionOf('c1')).toBeUndefined();
+    expect(router.sessionOf('c2')).toBeUndefined();
+    expect(router.pendingCount('s1')).toBe(1);
+
+    gate.resolve();
+    await running;
+    await Promise.resolve();
+    expect(router.pendingCount('s1')).toBe(0);
+    expect(router.sessionOf('c3')).toBe('s1');
+  });
+
   test('unbind releases the route but keeps the unfinished session barrier', async () => {
     const { router, bind } = harness();
     bind('c1', 's1');

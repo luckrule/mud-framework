@@ -283,4 +283,69 @@ describe('ConnectionLayer session routing (SPEC 3.2, INV-004)', () => {
       }
     },
   );
+
+  test('shutdown refuses a binding request waiting on the barrier and applies no change', async () => {
+    const { transport, dispatcher, layer, logs } = await harness({
+      timeoutMs: 5000,
+    });
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let otherStarted = false;
+    dispatcher.register(
+      'bind',
+      async (ctx) => {
+        ctx.bindSession('s1');
+        return null;
+      },
+      { access: 'public', mayChangeSession: true },
+    );
+    dispatcher.register(
+      'hold',
+      async () => {
+        entered.resolve();
+        await release.promise;
+        return null;
+      },
+      { access: 'public' },
+    );
+    dispatcher.register(
+      'bind-other',
+      async (ctx) => {
+        otherStarted = true;
+        ctx.bindSession('s2');
+        return null;
+      },
+      { access: 'public', mayChangeSession: true },
+    );
+    transport.connect('c1');
+    await transport.receive('c1', '{"id":"1","method":"bind"}');
+    const holding = transport.receive('c1', '{"id":"2","method":"hold"}');
+    await entered.promise;
+
+    transport.connect('c2');
+    await transport.receive('c2', '{"id":"3","method":"bind"}');
+    const other = transport.receive('c2', '{"id":"4","method":"bind-other"}');
+    await sleep(0);
+    const stopping = layer.stop();
+
+    try {
+      await other;
+      expect(otherStarted).toBe(false);
+      expect(lastFrame(transport, 'c2')).toMatchObject({
+        id: '4',
+        ok: false,
+        error: { code: 'FRAMEWORK_SHUTDOWN' },
+      });
+      // The refused request never reached the executor, so its s2 binding was
+      // never applied or logged.
+      expect(
+        logs().filter(
+          (entry) => entry.msg === 'session bound' && entry.sessionId === 's2',
+        ),
+      ).toHaveLength(0);
+    } finally {
+      release.resolve();
+      await Promise.all([holding, stopping]);
+    }
+  });
 });

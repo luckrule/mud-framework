@@ -49,6 +49,16 @@ export class SessionRouter {
     return this.heldBy.get(connectionId);
   }
 
+  /** Read-only inverse of `sessionOf`; the two maps are always inverse. */
+  connectionOf(sessionId: string): string | undefined {
+    return this.routes.get(sessionId);
+  }
+
+  /** Unfinished requests gating `sessionId`; independent of its route. */
+  pendingCount(sessionId: string): number {
+    return this.unfinished.get(sessionId)?.size ?? 0;
+  }
+
   release(connectionId: string): void {
     const sessionId = this.heldBy.get(connectionId);
     if (sessionId === undefined) {

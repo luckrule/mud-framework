@@ -359,6 +359,107 @@ describe('ConnectionLayer session routing (SPEC 3.2, INV-004)', () => {
     }
   });
 
+  test('a late successful bind from the displaced holder takes the session back and still waits on the existing barrier', async () => {
+    const { transport, dispatcher, layer, logs } = await harness({
+      timeoutMs: 5000,
+    });
+    const loginEntered = Promise.withResolvers<void>();
+    const releaseLogin = Promise.withResolvers<void>();
+    const holdEntered = Promise.withResolvers<void>();
+    const releaseHold = Promise.withResolvers<void>();
+    const started: string[] = [];
+    dispatcher.register(
+      'late-login',
+      async (ctx) => {
+        loginEntered.resolve();
+        await releaseLogin.promise;
+        ctx.bindSession('s1');
+        return 'welcome';
+      },
+      { access: 'public', mayChangeSession: true },
+    );
+    dispatcher.register(
+      'bind',
+      async (ctx) => {
+        ctx.bindSession('s1');
+        return null;
+      },
+      { access: 'public', mayChangeSession: true },
+    );
+    dispatcher.register(
+      'hold',
+      async (ctx) => {
+        holdEntered.resolve();
+        await releaseHold.promise;
+        return ctx.sessionId;
+      },
+      { access: 'public' },
+    );
+    dispatcher.register(
+      'identity',
+      async (ctx) => {
+        started.push(ctx.connectionId);
+        return ctx.sessionId;
+      },
+      { access: 'public' },
+    );
+    dispatcher.register('protected', async (ctx) => ctx.sessionId ?? null);
+
+    transport.connect('c1');
+    const lateLogin = transport.receive(
+      'c1',
+      '{"id":"1","method":"late-login"}',
+    );
+    await loginEntered.promise;
+
+    // c2 takes the Session over while c1's binding request is still running.
+    transport.connect('c2');
+    await transport.receive('c2', '{"id":"2","method":"bind"}');
+    const holding = transport.receive('c2', '{"id":"3","method":"hold"}');
+    await holdEntered.promise;
+
+    releaseLogin.resolve();
+    await lateLogin;
+
+    // c1's success is explicit binding, so it takes the Session back even
+    // though c2 is the current holder (SPEC 3.2).
+    expect(lastFrame(transport, 'c1')).toEqual({
+      id: '1',
+      ok: true,
+      result: 'welcome',
+    });
+    const rebound = logs().filter(
+      (entry) => entry.msg === 'session rebound to a new connection',
+    );
+    expect(rebound).toHaveLength(1);
+    expect(rebound[0]).toMatchObject({
+      previousConnectionId: 'c2',
+      connectionId: 'c1',
+    });
+
+    // The take-over changed only the route: c2's unfinished request still gates
+    // the Session, so c1's next request must wait for it (INV-004).
+    const next = transport.receive('c1', '{"id":"4","method":"identity"}');
+    await sleep(10);
+    expect(started).toEqual([]);
+
+    releaseHold.resolve();
+    await Promise.all([holding, next]);
+    expect(lastFrame(transport, 'c1')).toEqual({
+      id: '4',
+      ok: true,
+      result: 's1',
+    });
+    await transport.receive('c2', '{"id":"5","method":"protected"}');
+    expect(lastFrame(transport, 'c2')).toMatchObject({
+      id: '5',
+      ok: false,
+      error: { code: 'AUTH_REQUIRED' },
+    });
+
+    await layer.stop();
+  });
+
   test('a late unbind from a displaced holder does not release the new holder', async () => {
     const { transport, dispatcher, layer, logs } = await harness({
       timeoutMs: 5000,

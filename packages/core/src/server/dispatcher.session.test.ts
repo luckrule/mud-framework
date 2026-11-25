@@ -207,6 +207,45 @@ describe('Dispatcher.session', () => {
     expect(backend.stats()).toEqual({ committed: 0, rolledBack: 1 });
   });
 
+  test.each(['bind', 'unbind'] as const)(
+    'keeps the first change when the handler swallows a second %s',
+    async (second) => {
+      const backend = new MemoryStorageBackend();
+      const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });
+      let message = '';
+      dispatcher.register(
+        'change',
+        async (ctx) => {
+          ctx.bindSession('first');
+          try {
+            if (second === 'bind') {
+              ctx.bindSession('second');
+            } else {
+              ctx.unbindSession();
+            }
+          } catch (error) {
+            message = error instanceof Error ? error.message : String(error);
+          }
+          return 'ok';
+        },
+        LOGIN,
+      );
+
+      const outcome = await dispatcher.dispatch('change', null, {
+        sessionId: 'entry',
+      });
+
+      // Catching the second-call error does not make the second change valid;
+      // the first change is the one the request reports.
+      expect(outcome).toEqual({
+        result: 'ok',
+        sessionChange: { type: 'bind', sessionId: 'first' },
+      });
+      expect(message).toMatch(/at most once/);
+      expect(backend.stats()).toEqual({ committed: 1, rolledBack: 0 });
+    },
+  );
+
   test('rejects a bind after an unbind in the same request', async () => {
     const backend = new MemoryStorageBackend();
     const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });

@@ -158,4 +158,111 @@ describe('ConnectionLayer session routing (SPEC 3.2, INV-004)', () => {
       await layer.stop();
     },
   );
+
+  test('a handler that swallows the mayChangeSession error succeeds without changing the route', async () => {
+    const { transport, dispatcher, layer, logs } = await harness();
+    const swallowed: string[] = [];
+    const capture = (error: unknown): void => {
+      swallowed.push(error instanceof Error ? error.message : String(error));
+    };
+    dispatcher.register(
+      'login',
+      async (ctx) => {
+        ctx.bindSession('s1');
+        return null;
+      },
+      { access: 'public', mayChangeSession: true },
+    );
+    dispatcher.register(
+      'sneaky-bind',
+      async (ctx) => {
+        try {
+          ctx.bindSession('s2');
+        } catch (error) {
+          capture(error);
+        }
+        return 'swallowed';
+      },
+      { access: 'public' },
+    );
+    dispatcher.register(
+      'sneaky-unbind',
+      async (ctx) => {
+        try {
+          ctx.unbindSession();
+        } catch (error) {
+          capture(error);
+        }
+        return 'swallowed';
+      },
+      { access: 'public' },
+    );
+    dispatcher.register('protected', async (ctx) => ctx.sessionId ?? null);
+    transport.connect('c1');
+
+    await transport.receive('c1', '{"id":"1","method":"login"}');
+    await transport.receive('c1', '{"id":"2","method":"sneaky-bind"}');
+    await transport.receive('c1', '{"id":"3","method":"protected"}');
+    expect(lastFrame(transport, 'c1')).toEqual({
+      id: '3',
+      ok: true,
+      result: 's1',
+    });
+
+    await transport.receive('c1', '{"id":"4","method":"sneaky-unbind"}');
+    await transport.receive('c1', '{"id":"5","method":"protected"}');
+    expect(lastFrame(transport, 'c1')).toEqual({
+      id: '5',
+      ok: true,
+      result: 's1',
+    });
+
+    expect(swallowed).toHaveLength(2);
+    for (const message of swallowed) {
+      expect(message).toMatch(/mayChangeSession/);
+    }
+    expect(
+      logs().filter((entry) => entry.msg === 'session unbound'),
+    ).toHaveLength(0);
+    await layer.stop();
+  });
+
+  test('an unbind from a request without an entry session leaves the routing table untouched', async () => {
+    const { transport, dispatcher, layer, logs } = await harness();
+    dispatcher.register(
+      'logout',
+      async (ctx) => {
+        ctx.unbindSession();
+        return 'bye';
+      },
+      { access: 'public', mayChangeSession: true },
+    );
+    dispatcher.register('protected', async (ctx) => ctx.sessionId ?? null);
+    transport.connect('c1');
+
+    await transport.receive('c1', '{"id":"1","method":"logout"}');
+    expect(lastFrame(transport, 'c1')).toEqual({
+      id: '1',
+      ok: true,
+      result: 'bye',
+    });
+    // A repeat is still a successful no-op: the router cannot tell "never
+    // bound" from "already unbound" (SPEC 3.2).
+    await transport.receive('c1', '{"id":"2","method":"logout"}');
+    expect(lastFrame(transport, 'c1')).toEqual({
+      id: '2',
+      ok: true,
+      result: 'bye',
+    });
+    await transport.receive('c1', '{"id":"3","method":"protected"}');
+    expect(lastFrame(transport, 'c1')).toMatchObject({
+      id: '3',
+      ok: false,
+      error: { code: 'AUTH_REQUIRED' },
+    });
+    expect(
+      logs().filter((entry) => entry.msg === 'session unbound'),
+    ).toHaveLength(0);
+    await layer.stop();
+  });
 });
