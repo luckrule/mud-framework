@@ -1,13 +1,14 @@
 # Benchmarks
 
-两个基准，都不进 CI 门禁，也不做性能断言：`bench:logger` 测 `safeLogger` 包装的每调用开销；`bench:game` 测 `examples/game-slice` 真实双进程装配下的热路径与空闲重启恢复。
+三个基准，都不进 CI 门禁，也不做性能断言：`bench:logger` 测 `safeLogger` 包装的每调用开销；`bench:game` 测 `examples/game-slice` 真实双进程装配下的热路径与空闲重启恢复；`bench:load` 用独立的生成器进程驱动真实玩家级负载。`bench` 只聚合前两个，`bench:load` 单独运行：它需要更多资源，时长也由环境变量决定。
 
 ## 运行
 
 ```bash
 bun run bench:logger
 bun run bench:game
-bun run bench            # 两个都跑
+bun run bench:load     # 玩家级负载，不包含在 bench 里
+bun run bench          # logger + game 微基准
 ```
 
 `bench:game` 默认自己 spawn `examples/game-slice/src/portal.ts`：数据目录建在系统临时目录，`PORTAL_PORT=0` 由操作系统分配端口，从 Portal stdout 的监听行取实际地址。设 `BENCH_URL` 或 `GAME_SLICE_URL` 可复用已启动的 Portal，此时跳过 spawn、Server kill 与重启恢复，只测请求。
@@ -38,8 +39,36 @@ bun run bench            # 两个都跑
 
 方法：每组先 warmup，样本不含 warmup；延迟用客户端单调时钟测量，单位 ms（µs 精度），吞吐为 wall-clock ops/s；只报告观测值，不与阈值比较。退出时关闭所有客户端、SIGTERM Portal 并在有界时间内确认退出，必要时 SIGKILL，确认 Server pid 消失后删除临时数据目录；`BENCH_KEEP=1` 保留目录，`BENCH_DATA_DIR` 指向自备目录时视为用户数据、不删除。只有装配、连接或清理失败才非零退出。
 
-注意：
+## 玩家级负载基准
 
-- `os.tmpdir()` 常是 tmpfs/内存盘，SQLite 的落盘成本被抹掉，写路径与重启恢复的绝对数字会明显好于真实磁盘；比较写路径时用 `BENCH_DATA_DIR` 指到目标文件系统。
-- 所有客户端与基准脚本共享一个 Bun 事件循环，客户端侧序列化/解析也在被测时间内；跨机器、跨 Bun 版本的绝对值没有可比性。
-- 结果不写入仓库文档：数字随机器、电源策略与运行时状态漂移，写死后会变成过时的性能承诺。正确性由测试与 CI 保证，基准不进门禁。
+`bench:load` 与微基准的关键区别是客户端不共享协调器的事件循环：主程序 spawn 真实 Portal + Server，再 spawn 若干独立的 `benchmarks/game/load/client.ts` 生成器进程，每个进程只跑自己那份 WebSocket 客户端。客户端的 JSON 解析、事件分发与命令循环因此分散在多个进程里；单进程微基准里“所有客户端挤在一个 Bun 事件循环”的客户端侧瓶颈不会直接成为全局瓶颈。它仍是一台机器：生成器与框架争用同一批 CPU，时钟也是同机的，所以是同一主机上的近似，不是跨机器容量。
+
+实现按职责拆在 `benchmarks/game/load/`：`index.ts` 是入口与阶段编排，`orchestrator.ts` 管 Portal/生成器生命周期与清理，`report.ts` 管聚合与报告，`resources.ts` 管 RSS/fd 采样，`client.ts` 是生成器进程，`support.ts` 放配置、类型、直方图与结果解析。
+
+负载模型：
+
+- 每个客户端登录唯一名字 `load-<generator>-<index>`，按 `LOAD_ROOM_SIZE` 分组落到 square/market/smithy/tavern；setup 阶段沿现有出口走到目标房间（复用外部 Portal 时也按登录返回的实际房间重新寻路），全部就绪后各生成器打印 `ready`，主程序汇总后通过 stdin 的 `go` 屏障统一释放测量。
+- 每个客户端同一时刻最多一个在途请求。命令混合 `look` 60%、`who` 10%、`move` 20%、`say` 10%（`LOAD_MIX` 可改）。`game-slice` 没有独立的 `who` handler，交互客户端把 `who` 映射为 `game.look` 并只看玩家列表；负载生成器也把 `who` 记为 `game.look` 读路径，不伪造一个不存在的线上方法。`move` 在 square/market 之间往返；分到 smithy/tavern 的客户端在 setup 后先走到 market/square，因此不会撞无效出口。
+- `realistic` 模式在每个命令后等待围绕 `LOAD_THINK_MS` 的随机 think time（抖动比例是脚本常量），模拟玩家节奏；`saturate` 不加 think time，找吞吐上限。`LOAD_DURATION_SEC` 是测量窗口，`LOAD_WARMUP_SEC` 的 warmup 在 `go` 之后、统计之前执行，不计入样本。
+- `say` 的文本带唯一 token：run tag、发送者、房间 epoch、序号、发送时间戳与发送者当前房间。接收端按 token 统计从发送到 `room.say` 到达的延迟；发送方自己的响应延迟单独记在 `say` 命令延迟里。Server 的 `game.say` 只向发送者发送时所在房间的会话广播，所以收到的样本都算同房间投递；如果事件在队列里等待期间接收端已经走开，另记 `receiver-moved`，但样本仍计入延迟（剔除它会把“赶上换房间”的高延迟事件偏掉）。发送者每次成功换房间就把 epoch 加一；接收端只在 token 房间与本地快照一致时做缺口跟踪，在同一 (sender, epoch) 内看到序号跳号才计为事件缺口，因此换房间不会被误报成丢事件。重复投递、`receiver-moved` 与过期 epoch 分开计数。所有进程同机，`Date.now()` 可直接比较；事件延迟的分辨率因此是 1 ms。
+- 延迟用固定桶直方图累计（5% 相对桶宽，覆盖 1 µs 到 60 s，另有溢出桶），p50/p95/p99 取命中桶的上界；精确的 min/max/均值/样本数另记。这样饱和档的几十万样本也不会撑大结果 JSON。ops/s = 成功命令数 / 各生成器测量窗口的并集（warmup 已排除）。错误按线上 `code` 计数，额外标出 `FRAMEWORK_QUEUE_FULL` 与客户端超时。
+- 主程序每秒读 `/proc/<pid>` 采样 Portal 与 Server 的 RSS 与 fd 数，报告峰值与结束值；Server pid 从 Portal 日志的 `server process ready` 行解析，拿不到时跳过并注明。Linux 之外的平台跳过资源采样。
+- 清理：先停采样，关闭生成器（SIGTERM、有界等待、必要时 SIGKILL），SIGTERM Portal 并在有界时间内确认 Portal 与 Server pid 消失，必要时 SIGKILL，最后删除临时目录。`LOAD_KEEP=1` 保留临时目录与结果文件；`LOAD_DATA_DIR` 是用户数据目录，不会删除。只有装配、连接或清理失败才非零退出；负载本身的超时、队列满与事件缺口只报告，不触发失败。
+
+环境变量（默认值见 `benchmarks/game/load/support.ts` 顶部常量）：`LOAD_CLIENTS`、`LOAD_GENERATORS`、`LOAD_ROOM_SIZE`、`LOAD_DURATION_SEC`、`LOAD_WARMUP_SEC`、`LOAD_THINK_MS`、`LOAD_MODE=realistic|saturate`、`LOAD_MIX`、`LOAD_DATA_DIR`、`LOAD_URL`、`LOAD_KEEP=1`、`REQUEST_TIMEOUT_MS`。`LOAD_URL` 复用外部 Portal 时跳过 spawn、Server pid 采样与清理；此时数据目录由外部 Portal 自己决定，两个并发运行不要共用同一个数据库。
+
+### tmpfs 与真实磁盘
+
+默认数据目录建在系统临时目录下，Linux 上通常是 tmpfs；SQLite 的落盘成本被内存抹掉，写路径（`move`、`say` 的事务）会明显好于真实磁盘。比较写路径时把 `LOAD_DATA_DIR` 指到目标文件系统，例如仓库内已被忽略的 `benchmarks/.load-data`：
+
+```bash
+LOAD_DATA_DIR=benchmarks/.load-data bun run bench:load
+```
+
+同一档负载下对比两次的 `move`/`say` 延迟与 ops/s，`look`/`who` 主要反映读路径与队列，不应作为磁盘结论。数据目录放在仓库内时，`.gitignore` 已覆盖 `benchmarks/.load-data/`。
+
+### 注意
+
+- 生成器进程本身也会成为瓶颈：高并发、大房间广播时，单个生成器的事件循环可能先饱和。提高 `LOAD_GENERATORS` 可以把客户端分散到更多进程，但每个进程仍是一个 Bun 事件循环。
+- 所有进程同机，事件延迟用 `Date.now()` 对齐；这只能作同机近似，跨机器绝对值没有可比性。延迟直方图给的是桶上界，不要把它当成精确分位数。
+- 结果不写入仓库文档：数字随机器、电源策略、并发档位与运行时状态漂移，写死后会变成过时的性能承诺。正确性由测试与 CI 保证，基准不进门禁。

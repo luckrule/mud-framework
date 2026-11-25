@@ -6,6 +6,8 @@
 
 ## 决定
 
+**产品约束（2026-11-26）**：部署期间不接受请求缓冲/延迟上升，也不接受玩家重连；因此保留两阶段激活与 `switchTo`。该约束撤销前不简化启动协议。
+
 ### 握手：`hello` → `prepared` → `activate` → `ready` 是唯一启动路径
 
 Portal 发 `hello`；Server 回 `prepared`（带 `pid`），此时不创建后端、不校验能力、不注册 Extension、不安装请求处理器；Portal 发 `activate`；Server 才执行 `startServer`（后端、能力自检、降级告警、Extension 注册），随后安装请求处理器、置为 active，最后发 `ready`。普通启动与崩溃重启在确认没有旧写者后，收到 `prepared` 即发送 `activate`；`switchTo` 则在 `prepared` 与 `activate` 之间退役旧进程并确认退出，协议形状不变。

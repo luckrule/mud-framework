@@ -9,6 +9,7 @@ logs/
 *.sqlite
 examples/minimal/data/
 examples/game-slice/data/
+benchmarks/.load-data/
 
 # environment
 .env

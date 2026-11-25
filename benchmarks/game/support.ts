@@ -42,7 +42,7 @@ export function withDeadline<T>(
 }
 
 /** Calls `onLine` for every newline-terminated chunk plus the trailing line. */
-async function pumpLines(
+export async function pumpLines(
   stream: ReadableStream<Uint8Array<ArrayBuffer>>,
   onLine: (line: string) => void,
 ): Promise<void> {
