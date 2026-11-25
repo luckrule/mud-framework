@@ -10,6 +10,10 @@ const SAFE_LOGGERS = new WeakSet<Logger>();
  *
  * Idempotent: a logger already wrapped here is returned as is, so handing one
  * from a framework entry point to another does not stack wrappers.
+ *
+ * `setLevel` is the one call that is not swallowed: it is configuration, not a
+ * log write, so an invalid level must reach the caller instead of leaving the
+ * logger silently at its previous level.
  */
 export function safeLogger(logger: Logger): Logger {
   if (SAFE_LOGGERS.has(logger)) {
@@ -27,6 +31,10 @@ export function safeLogger(logger: Logger): Logger {
     },
     error(fields, message) {
       callQuietly(() => logger.error(fields, message));
+    },
+    setLevel(level) {
+      // Deliberately not callQuietly: configuration errors must not be silent.
+      logger.setLevel(level);
     },
     child(bindings) {
       try {

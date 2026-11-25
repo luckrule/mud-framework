@@ -3,7 +3,7 @@ import { describe, expect, test } from 'bun:test';
 import { parseJsonLine as parseLine } from 'mud-framework-test-support';
 
 import { JsonLogger, createJsonLogger } from './json-logger.ts';
-import type { LogFields } from './types.ts';
+import type { LogFields, LogLevel } from './types.ts';
 
 interface Captured {
   lines: string[];
@@ -92,6 +92,54 @@ describe('JsonLogger', () => {
     logger.child({ a: 1 }).warn({}, 'dropped');
 
     expect(parsed()).toHaveLength(0);
+  });
+
+  test('root setLevel reaches an existing child and later children', () => {
+    const { logger, parsed } = capture();
+    const child = logger.child({ scope: 'existing' });
+
+    child.debug({}, 'before');
+    logger.setLevel('debug');
+    child.debug({}, 'existing child');
+    logger.child({ scope: 'future' }).debug({}, 'future child');
+
+    expect(parsed().map((entry) => entry.msg)).toEqual([
+      'existing child',
+      'future child',
+    ]);
+  });
+
+  test('child setLevel reaches the root and siblings', () => {
+    const { logger, parsed } = capture({ level: 'warn' });
+    const left = logger.child({ scope: 'left' });
+    const right = logger.child({ scope: 'right' });
+
+    left.setLevel('debug');
+    logger.debug({}, 'root');
+    right.debug({}, 'sibling');
+    left.debug({}, 'child');
+
+    expect(parsed().map((entry) => entry.msg)).toEqual([
+      'root',
+      'sibling',
+      'child',
+    ]);
+  });
+
+  test('rejects an invalid runtime level and keeps the current one', () => {
+    const { logger, parsed } = capture({ level: 'warn' });
+
+    expect(() => {
+      logger.setLevel('trace' as unknown as LogLevel);
+    }).toThrow(TypeError);
+    expect(() => {
+      logger.setLevel('trace' as unknown as LogLevel);
+    }).toThrow(/trace/);
+
+    logger.info({}, 'filtered');
+    logger.warn({}, 'kept');
+
+    expect(parsed().map((entry) => entry.level)).toEqual(['warn']);
   });
 
   test('degrades to a simplified line when fields cannot be serialized', () => {

@@ -66,6 +66,7 @@ function countingNoop(counter: Counter): Logger {
     error() {
       counter.calls += 1;
     },
+    setLevel: () => undefined,
     child() {
       counter.calls += 1;
       // A fresh logger per call, like `JsonLogger.child`, so the wrapper's

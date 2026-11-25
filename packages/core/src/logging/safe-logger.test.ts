@@ -7,6 +7,7 @@ import {
 
 import { createJsonLogger } from './json-logger.ts';
 import { safeLogger } from './safe-logger.ts';
+import type { LogLevel } from './types.ts';
 
 describe('safeLogger', () => {
   test('swallows a throw from every level', () => {
@@ -89,5 +90,56 @@ describe('safeLogger', () => {
     const logger = safeLogger(throwingLogger());
 
     expect(safeLogger(logger)).toBe(logger);
+  });
+
+  test('forwards setLevel to the wrapped logger', () => {
+    const lines: string[] = [];
+    const logger = safeLogger(
+      createJsonLogger({
+        level: 'warn',
+        sink: (line) => {
+          lines.push(line);
+        },
+      }),
+    );
+
+    logger.setLevel('debug');
+    logger.debug({ a: 1 }, 'enabled');
+
+    expect(lines.map((line) => parseLine(line))).toEqual([
+      { level: 'debug', time: expect.any(String), msg: 'enabled', a: 1 },
+    ]);
+  });
+
+  test('propagates an invalid level without changing the wrapped logger', () => {
+    const lines: string[] = [];
+    const logger = safeLogger(
+      createJsonLogger({
+        level: 'warn',
+        sink: (line) => {
+          lines.push(line);
+        },
+      }),
+    );
+
+    expect(() => {
+      logger.setLevel('trace' as unknown as LogLevel);
+    }).toThrow(TypeError);
+    expect(() => {
+      logger.setLevel('trace' as unknown as LogLevel);
+    }).toThrow(/trace/);
+
+    logger.info({}, 'filtered');
+    logger.warn({}, 'kept');
+
+    expect(lines.map((line) => parseLine(line).level)).toEqual(['warn']);
+  });
+
+  test('does not swallow a throwing setLevel', () => {
+    const logger = safeLogger(throwingLogger());
+
+    expect(() => {
+      logger.setLevel('debug');
+    }).toThrow('logger exploded');
   });
 });

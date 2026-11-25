@@ -31,6 +31,7 @@ function throwingLogger(warns: WarnCall[]): Logger {
     debug: () => undefined,
     info: () => undefined,
     error: () => undefined,
+    setLevel: () => undefined,
     warn(fields, message) {
       warns.push({ fields, message });
       throw new Error('logger must not escape');

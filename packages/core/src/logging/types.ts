@@ -16,10 +16,15 @@ export interface Logger {
   error(fields: LogFields, message: string): void;
   /** A new logger with `bindings` merged over the parent's; the parent is untouched. */
   child(bindings: LogFields): Logger;
+  /**
+   * Changes the minimum level emitted, including for loggers already derived
+   * from this one. Throws `TypeError` for a value outside `LogLevel`.
+   */
+  setLevel(level: LogLevel): void;
 }
 
 export interface LoggerOptions {
-  /** Minimum level emitted; defaults to `info`. */
+  /** Initial minimum level; defaults to `info`. Use `Logger.setLevel` to change it at runtime. */
   level?: LogLevel;
   /** Receives one complete line per event; defaults to stdout. */
   sink?: (line: string) => void;

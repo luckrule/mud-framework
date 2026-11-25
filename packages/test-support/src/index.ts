@@ -61,11 +61,13 @@ export interface ThrowingLogger {
   warn(fields: Record<string, unknown>, message: string): never;
   error(fields: Record<string, unknown>, message: string): never;
   child(bindings: Record<string, unknown>): ThrowingLogger;
+  setLevel(level: string): never;
 }
 
 /**
- * A logger whose every method throws, including `child`. Injecting it at a
- * framework boundary proves a logger fault cannot alter control flow.
+ * A logger whose every method throws, including `child` and `setLevel`.
+ * Injecting it at a framework boundary proves a logger fault cannot alter
+ * control flow.
  */
 export function throwingLogger(): ThrowingLogger {
   return {
@@ -74,6 +76,7 @@ export function throwingLogger(): ThrowingLogger {
     warn: failLogging,
     error: failLogging,
     child: failLogging,
+    setLevel: failLogging,
   };
 }
 
