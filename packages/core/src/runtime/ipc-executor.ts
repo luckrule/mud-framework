@@ -1,5 +1,4 @@
 import { messageOf } from '../internal/guards.ts';
-import type { IpcChannel } from '../ipc/channel.ts';
 import type { ResultMessage } from '../ipc/protocol.ts';
 import { parseIpcMessage } from '../ipc/protocol.ts';
 import type { ServerExitInfo, SpawnedServer } from '../ipc/spawn-port.ts';
@@ -28,6 +27,8 @@ import {
 } from './ipc-messages.ts';
 import type { PendingRequest } from './ipc-pending.ts';
 import { PendingBuffer } from './ipc-pending.ts';
+import type { ServerState } from './server-slot.ts';
+import { ServerSlot } from './server-slot.ts';
 import { effectiveTimeoutMs, settleWithin, tightenTimeout } from './timeout.ts';
 import {
   FRAMEWORK_QUEUE_FULL,
@@ -96,64 +97,6 @@ export interface IpcExecutorOptions {
    * redirects where the events go; observability does not depend on it.
    */
   logger?: Logger;
-}
-
-/**
- * `failed` is a terminal state that is not `closed`: the executor gave up
- * because the Server never became ready within `startTimeoutMs`. It is distinct
- * from `closed` so `execute` can report a different message and so a failed
- * start cannot be mistaken for an orderly shutdown.
- *
- * `switching` is not terminal: a replacement is being prepared or the previous
- * process is being retired. Requests keep arriving and stay buffered; only the
- * promotion to the new generation delivers them.
- */
-type Status =
-  | 'idle'
-  | 'starting'
-  | 'ready'
-  | 'switching'
-  | 'closing'
-  | 'closed'
-  | 'failed';
-
-interface ServerState {
-  readonly generation: number;
-  readonly channel: IpcChannel;
-  readonly kill: () => void;
-  /**
-   * Resolves when the child process is known to be gone. Awaited before a
-   * replacement is spawned, because SIGKILL returning does not mean the process
-   * released its storage yet (INV-002).
-   */
-  readonly exitPromise: Promise<ServerExitInfo>;
-  /** Synchronous view of the exit, for the channel-close path. */
-  readonly lastExit: () => ServerExitInfo | undefined;
-  ready: boolean;
-  closed: boolean;
-  /** True once the child process itself is known to be gone. */
-  exited: boolean;
-  /** Set when the Server answered `shutdown` with `closed`. */
-  shutdownAcknowledged: boolean;
-  pid: number | undefined;
-  /**
-   * Owned by a `switchTo` in progress: not the current Server, so losing it
-   * fails the switch instead of triggering the crash-restart path.
-   */
-  staged: boolean;
-  /**
-   * The previous Server a `switchTo` is draining. Its exit is expected, so it
-   * must not be reported as a crash or restarted.
-   */
-  retiring: boolean;
-  /** Capabilities the Server declared in `ready`; absent before it. */
-  declaredMaxDurationMs: number | undefined;
-  /** `codeVersion` the Server reported in `prepared`/`ready`. */
-  reportedCodeVersion: string | undefined;
-  /** True once a `shutdown` was sent, so a switch and `close()` cannot both send one. */
-  shutdownSent: boolean;
-  /** Resolves once `closed` arrived or the process is known to be gone. */
-  readonly closedSignal: PromiseWithResolvers<void>;
 }
 
 /** A bounded wait for `prepared` or `ready` from the staged process. */
@@ -252,10 +195,9 @@ export class IpcExecutor implements RequestExecutor {
   private readonly logger: Logger;
   private readonly portalGeneration: number;
   private readonly buffer: PendingBuffer;
-  private status: Status = 'idle';
-  private server: ServerState | undefined;
+  /** Sole owner of `status`, `server`, the generation counter and `switching`. */
+  private readonly slot = new ServerSlot<SwitchOperation>();
   private effectiveTimeoutMs: number;
-  private generation = 0;
   /**
    * Crashes since the last stable run; drives the restart backoff. Reset only
    * by `stableTimer`, never by `ready`: a Server that reaches the handshake and
@@ -272,8 +214,6 @@ export class IpcExecutor implements RequestExecutor {
   private closedTimer: ReturnType<typeof setTimeout> | undefined;
   private drainedWaiter: (() => void) | undefined;
   private closePromise: Promise<void> | undefined;
-  /** The `switchTo` in flight, if any; only one at a time. */
-  private switching: SwitchOperation | undefined;
   /**
    * Processes a `close()`-aborted switch abandoned, kept until their exit is
    * confirmed. `doClose` drains this list before it returns: an abandoned
@@ -347,10 +287,10 @@ export class IpcExecutor implements RequestExecutor {
 
   /** Spawns the Server, sends `hello` and resolves once the Server is `ready`. */
   async start(): Promise<void> {
-    if (this.status !== 'idle') {
-      throw new Error(`ipc executor cannot start while ${this.status}`);
+    if (this.slot.status !== 'idle') {
+      throw new Error(`ipc executor cannot start while ${this.slot.status}`);
     }
-    this.status = 'starting';
+    this.slot.beginStart();
     const ready = new Promise<void>((resolve, reject) => {
       this.startWaiter = { resolve, reject };
     });
@@ -377,16 +317,15 @@ export class IpcExecutor implements RequestExecutor {
     const attempts = this.restartAttempts;
     this.clearRestartTimer();
     this.clearStableTimer();
-    this.status = 'failed';
+    this.slot.markFailed();
     this.logger.error(
       { timeoutMs: this.startTimeoutMs, attempts },
       'server did not become ready before the start timeout',
     );
     // A Server that is up but never handshook has no owner any more; leaving it
     // running would be an orphan writer (INV-002).
-    const server = this.server;
-    if (server !== undefined) {
-      this.server = undefined;
+    const server = this.slot.server;
+    if (server !== undefined && this.slot.clearIfCurrent(server)) {
       this.abandonServer(server);
     }
     this.failAllPending(
@@ -427,27 +366,8 @@ export class IpcExecutor implements RequestExecutor {
     }
   }
 
-  /**
-   * True once the executor can neither restart a Server nor accept new work.
-   *
-   * Kept in one place because the invariant it guards is INV-002: a restart is
-   * only safe when no other Server process can still hold storage. The decision
-   * "may I restart / deliver" is made at several points, and a new state (say
-   * `draining`) added to all but `onServerLost` would let a `close()` restart
-   * the Server, leaving two writers on the same storage. That failure is data
-   * corruption, not an error, and the log would read as an ordinary crash plus
-   * a backoff, so it cannot be diagnosed from the outside.
-   */
-  private get isTerminal(): boolean {
-    return (
-      this.status === 'closing' ||
-      this.status === 'closed' ||
-      this.status === 'failed'
-    );
-  }
-
   execute(request: ExecutorRequest): Promise<ExecutorOutcome> {
-    if (this.status === 'idle') {
+    if (this.slot.status === 'idle') {
       // Nothing was ever spawned. Without this the request would sit in the
       // buffer until its deadline and report a timeout, which looks like a slow
       // backend instead of a missing `start()` (SPEC 6.2 step 3).
@@ -463,7 +383,7 @@ export class IpcExecutor implements RequestExecutor {
         failure(INTERNAL_ERROR, 'ipc executor was never started'),
       );
     }
-    if (this.status === 'failed') {
+    if (this.slot.status === 'failed') {
       // A failed start is terminal: the restart loop was stopped, so buffering
       // this request would only hold it until its deadline for a Server that is
       // never coming. Failing now is the same answer as the start rejection.
@@ -482,7 +402,7 @@ export class IpcExecutor implements RequestExecutor {
         ),
       );
     }
-    if (this.isTerminal) {
+    if (this.slot.isTerminal) {
       // `failed` is included here but unreachable: the branch above returns for
       // it first, with a message specific to a start that never succeeded.
       // warn, not error: an orderly shutdown refusal is expected, and the
@@ -491,7 +411,7 @@ export class IpcExecutor implements RequestExecutor {
         {
           ...requestFields(request),
           code: FRAMEWORK_SHUTDOWN,
-          reason: `executor ${this.status}`,
+          reason: `executor ${this.slot.status}`,
         },
         'request rejected',
       );
@@ -555,9 +475,9 @@ export class IpcExecutor implements RequestExecutor {
     }
     this.armTimer(pending);
     try {
-      const server = this.server;
+      const server = this.slot.server;
       if (
-        this.status !== 'switching' &&
+        this.slot.status !== 'switching' &&
         server !== undefined &&
         server.ready &&
         !server.closed
@@ -662,14 +582,14 @@ export class IpcExecutor implements RequestExecutor {
     spawn: () => SpawnedServer;
     codeVersion?: string;
   }): Promise<void> {
-    if (this.switching !== undefined) {
+    if (this.slot.switching !== undefined) {
       return Promise.reject(
         new Error('an ipc executor switch is already in progress'),
       );
     }
-    if (this.status !== 'ready') {
+    if (this.slot.status !== 'ready') {
       return Promise.reject(
-        new Error(`ipc executor cannot switch while ${this.status}`),
+        new Error(`ipc executor cannot switch while ${this.slot.status}`),
       );
     }
     if (
@@ -705,7 +625,7 @@ export class IpcExecutor implements RequestExecutor {
       settled: false,
       phase: 'preparing',
       staged: undefined,
-      previous: this.server,
+      previous: this.slot.server,
       previousGone: false,
       previousLost: false,
       exitsPending: [],
@@ -718,8 +638,7 @@ export class IpcExecutor implements RequestExecutor {
       failure: undefined,
       versionWarned: false,
     };
-    this.switching = op;
-    this.status = 'switching';
+    this.slot.beginSwitch(op);
     this.logger.info(
       {
         fromCodeVersion: this.codeVersion,
@@ -731,7 +650,7 @@ export class IpcExecutor implements RequestExecutor {
     return deferred.promise;
   }
 
-  /** The switch sequence; always settles `op` and clears `this.switching`. */
+  /** The switch sequence; always settles `op` and releases the slot's switch. */
   private async runSwitch(op: SwitchOperation): Promise<void> {
     try {
       if (!(await this.stageReplacement(op))) {
@@ -871,6 +790,14 @@ export class IpcExecutor implements RequestExecutor {
       op.failure = new Error('the replacement was never spawned');
       return;
     }
+    // INV-002: `activate` is what lets this process open storage, so it may
+    // only go out when no other process can still be writing.
+    try {
+      this.slot.assertNoOtherLiveServer(staged);
+    } catch (error) {
+      op.failure = toError(error);
+      return;
+    }
     try {
       staged.channel.send({ type: 'activate' });
       op.activated = true;
@@ -904,8 +831,7 @@ export class IpcExecutor implements RequestExecutor {
     // the only thing that releases the buffered requests to it.
     staged.staged = false;
     op.promoted = true;
-    this.server = staged;
-    this.status = 'ready';
+    this.slot.adopt(staged);
     // A crash after this point restarts the code that is now serving, and new
     // requests carry its version. A switch that declares no target keeps the
     // version it had, matching the expected version used for the staged
@@ -1039,9 +965,7 @@ export class IpcExecutor implements RequestExecutor {
         this.recordPendingExit(op, staged);
       }
     }
-    if (this.switching === op) {
-      this.switching = undefined;
-    }
+    this.slot.releaseSwitch(op);
     if (op.promoted) {
       op.settled = true;
       if (op.promotedLost) {
@@ -1104,8 +1028,8 @@ export class IpcExecutor implements RequestExecutor {
         { reason, phase: op.phase, pid: this.currentPid() },
         'server switch failed; the previous server keeps serving',
       );
-      if (!this.isTerminal) {
-        this.status = 'ready';
+      if (!this.slot.isTerminal) {
+        this.slot.resumeServing();
         this.flush();
       }
     }
@@ -1169,10 +1093,10 @@ export class IpcExecutor implements RequestExecutor {
    * write to the same storage (INV-002).
    */
   private rollbackToPrevious(pendingExits: readonly ServerState[]): void {
-    if (this.isTerminal) {
+    if (this.slot.isTerminal) {
       return;
     }
-    this.status = 'starting';
+    this.slot.markStartingAfterLoss();
     const backoffMs = this.nextBackoffMs();
     if (pendingExits.length === 0) {
       this.scheduleRestart(backoffMs);
@@ -1219,7 +1143,7 @@ export class IpcExecutor implements RequestExecutor {
   }
 
   private currentPid(): number | undefined {
-    return this.server?.pid;
+    return this.slot.server?.pid;
   }
 
   /**
@@ -1261,7 +1185,7 @@ export class IpcExecutor implements RequestExecutor {
   }
 
   private async doClose(): Promise<void> {
-    this.status = 'closing';
+    this.slot.markClosing();
     this.clearRestartTimer();
     this.clearStableTimer();
     this.clearStartTimer();
@@ -1269,7 +1193,7 @@ export class IpcExecutor implements RequestExecutor {
     // interrupted here and its staged process abandoned, so `close()` ends with
     // at most one Server to shut down and no orphan writer (INV-002).
     await this.abortSwitchForClose();
-    const server = this.server;
+    const server = this.slot.server;
     // A Request that never reached a live Server cannot complete, so it fails
     // now instead of burning its whole deadline. Delivered ones are given
     // until their deadline to settle (SPEC 6.3 step 3).
@@ -1331,7 +1255,7 @@ export class IpcExecutor implements RequestExecutor {
       'ipc executor closed',
       'executor closed',
     );
-    this.status = 'closed';
+    this.slot.markClosed();
     // A start() still waiting for `ready` must not be told "ready" by a close.
     this.rejectStart(
       new Error('ipc executor closed before the server became ready'),
@@ -1379,7 +1303,7 @@ export class IpcExecutor implements RequestExecutor {
    * abandons what it spawned and never restarts or promotes anything.
    */
   private async abortSwitchForClose(): Promise<void> {
-    const op = this.switching;
+    const op = this.slot.switching;
     if (op === undefined) {
       return;
     }
@@ -1411,7 +1335,7 @@ export class IpcExecutor implements RequestExecutor {
   }
 
   private async shutdownServer(): Promise<void> {
-    const server = this.server;
+    const server = this.slot.server;
     if (server === undefined) {
       return;
     }
@@ -1492,9 +1416,7 @@ export class IpcExecutor implements RequestExecutor {
         'ipc channel close failed',
       );
     }
-    if (this.server === server) {
-      this.server = undefined;
-    }
+    this.slot.clearIfCurrent(server);
   }
 
   private waitForClosed(server: ServerState): Promise<void> {
@@ -1604,7 +1526,7 @@ export class IpcExecutor implements RequestExecutor {
   }
 
   private launch(): void {
-    if (this.isTerminal) {
+    if (this.slot.isTerminal) {
       return;
     }
     let spawned: SpawnedServer;
@@ -1617,12 +1539,12 @@ export class IpcExecutor implements RequestExecutor {
         { reason: messageOf(error), backoffMs },
         'server spawn failed',
       );
-      this.status = 'starting';
+      this.slot.markStartingAfterLoss();
       this.scheduleRestart(backoffMs);
       return;
     }
     const server = this.buildServer(spawned);
-    this.server = server;
+    this.slot.trackSpawning(server);
     this.attachServer(server);
     try {
       server.channel.send({
@@ -1641,9 +1563,8 @@ export class IpcExecutor implements RequestExecutor {
 
   /** Wraps a spawn result in the executor's own per-process bookkeeping. */
   private buildServer(spawned: SpawnedServer): ServerState {
-    this.generation += 1;
     return {
-      generation: this.generation,
+      generation: this.slot.nextGeneration(),
       channel: spawned.channel,
       kill: () => {
         spawned.kill();
@@ -1769,12 +1690,12 @@ export class IpcExecutor implements RequestExecutor {
       this.resolveClosed();
       return;
     }
-    if (this.status === 'closing') {
+    if (this.slot.status === 'closing') {
       server.shutdownAcknowledged = true;
       this.resolveClosed();
       return;
     }
-    if (this.switching?.staged === server) {
+    if (this.slot.switching?.staged === server) {
       // A prepared process has no storage to close, so this is not a shutdown
       // ack; the exit that follows is what the switch reacts to.
       this.logger.warn(
@@ -1804,7 +1725,7 @@ export class IpcExecutor implements RequestExecutor {
     pid: number,
     codeVersion: string | undefined,
   ): void {
-    const op = this.switching;
+    const op = this.slot.switching;
     if (op?.staged === server) {
       server.pid = pid;
       server.reportedCodeVersion = codeVersion;
@@ -1818,7 +1739,7 @@ export class IpcExecutor implements RequestExecutor {
       op.prepared.resolve();
       return;
     }
-    if (this.server !== server || server.closed) {
+    if (this.slot.server !== server || server.closed) {
       this.logger.debug(
         { pid },
         'prepared from a server generation already given up',
@@ -1830,7 +1751,7 @@ export class IpcExecutor implements RequestExecutor {
       this.logger.warn({ pid }, 'prepared received after ready; ignored');
       return;
     }
-    if (this.isTerminal) {
+    if (this.slot.isTerminal) {
       // Nothing may open storage while the Portal is closing: there would be
       // nowhere to drain it. The shutdown path kills this process.
       this.logger.debug({ pid }, 'prepared ignored while closing');
@@ -1858,7 +1779,7 @@ export class IpcExecutor implements RequestExecutor {
     declaredMaxDurationMs: number,
     actualCodeVersion: string | undefined,
   ): void {
-    const op = this.switching;
+    const op = this.slot.switching;
     if (op?.staged === server) {
       server.ready = true;
       server.pid = pid;
@@ -1874,7 +1795,7 @@ export class IpcExecutor implements RequestExecutor {
       op.ready.resolve();
       return;
     }
-    if (this.server !== server || server.closed) {
+    if (this.slot.server !== server || server.closed) {
       this.logger.debug(
         { pid },
         'ready from a server generation already given up',
@@ -1894,10 +1815,10 @@ export class IpcExecutor implements RequestExecutor {
     // mismatch into an outage (SPEC 6.4). A deployment that declared no version
     // says nothing, so silence is not a mismatch.
     this.warnOnVersionMismatch(pid, this.codeVersion, actualCodeVersion);
-    if (this.isTerminal) {
+    if (this.slot.isTerminal) {
       return;
     }
-    this.status = 'ready';
+    this.slot.markReady(server);
     // The crash streak ends only after a stable run, not at the handshake: a
     // Server that reaches `ready` and then dies on its first request would
     // otherwise reset the backoff and restart immediately, forever.
@@ -2013,7 +1934,7 @@ export class IpcExecutor implements RequestExecutor {
     }
     server.closed = true;
     server.closedSignal.resolve();
-    const op = this.switching;
+    const op = this.slot.switching;
     if (op?.staged === server && !op.promoted) {
       // The replacement died while the switch was waiting on it. Record the
       // loss; the switch's own await reacts to `closedSignal` and reports it.
@@ -2025,9 +1946,9 @@ export class IpcExecutor implements RequestExecutor {
     }
     if (op?.staged === server) {
       // Promoted, but the switch has not settled yet: this is an ordinary crash
-      // of the current Server, handled by the crash path below (clear
-      // `this.server`, wait for the exit, schedule the restart). The switch must
-      // not report success for a process that is already gone.
+      // of the current Server, handled by the crash path below (clear the
+      // current Server, wait for the exit, schedule the restart). The switch
+      // must not report success for a process that is already gone.
       op.promotedLost = true;
       op.stagedLost ??= new Error(
         `replacement server lost after promotion: ${reason}`,
@@ -2050,9 +1971,7 @@ export class IpcExecutor implements RequestExecutor {
       // Server to fall back to, so it fails and the crash path restarts.
       op.previousLost = true;
       op.previousGone = true;
-      if (this.server === server) {
-        this.server = undefined;
-      }
+      this.slot.clearIfCurrent(server);
       this.resolveClosed();
       if (!server.exited) {
         this.killQuietly(server);
@@ -2073,9 +1992,7 @@ export class IpcExecutor implements RequestExecutor {
       this.resolveClosed();
       return;
     }
-    if (this.server === server) {
-      this.server = undefined;
-    }
+    this.slot.clearIfCurrent(server);
     // A close that is waiting for `closed` will never get it now.
     this.resolveClosed();
     if (!server.exited) {
@@ -2090,7 +2007,7 @@ export class IpcExecutor implements RequestExecutor {
       );
       this.killQuietly(server);
     }
-    if (this.isTerminal) {
+    if (this.slot.isTerminal) {
       // SPEC 6.3: no restart while shutting down; nothing can complete these.
       this.failAllPending(
         FRAMEWORK_SHUTDOWN,
@@ -2104,7 +2021,7 @@ export class IpcExecutor implements RequestExecutor {
       { pid: server.pid, exitCode: code, signal, backoffMs, reason },
       'server process lost',
     );
-    this.status = 'starting';
+    this.slot.markStartingAfterLoss();
     // Wait for the exit before restarting even when the kill was issued: the
     // replacement must not open storage while the old process still holds it.
     void this.waitForExit(server).then(() => {
@@ -2114,7 +2031,7 @@ export class IpcExecutor implements RequestExecutor {
   }
 
   private scheduleRestart(backoffMs: number): void {
-    if (this.isTerminal) {
+    if (this.slot.isTerminal) {
       return;
     }
     this.restartTimer = setTimeout(() => {
@@ -2180,17 +2097,17 @@ export class IpcExecutor implements RequestExecutor {
    * That is the necessary cost of the SPEC 6.5 ordering guarantee, not a drop.
    */
   private flush(): void {
-    if (this.status === 'switching') {
+    if (this.slot.status === 'switching') {
       // The current Server is about to be retired; delivering now would send a
       // request to a process the switch is draining. It stays buffered until
       // the replacement is promoted and this method runs again.
       return;
     }
-    const server = this.server;
+    const server = this.slot.server;
     if (server === undefined || !server.ready) {
       return;
     }
-    if (this.isTerminal) {
+    if (this.slot.isTerminal) {
       return;
     }
     for (const pending of this.buffer.undelivered(server.generation)) {
@@ -2295,7 +2212,7 @@ export class IpcExecutor implements RequestExecutor {
   }
 
   private cancelOnServer(pending: PendingRequest, code: string): void {
-    const server = this.server;
+    const server = this.slot.server;
     if (
       server === undefined ||
       !server.ready ||
