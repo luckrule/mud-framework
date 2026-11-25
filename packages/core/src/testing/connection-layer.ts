@@ -48,7 +48,6 @@ export async function harness(
     maxQueuedPerConnection?: number;
     shutdownTimeoutMs?: number;
     maxSessions?: number;
-    sessionHandoffTimeoutMs?: number;
   } = {},
 ): Promise<Harness> {
   const transport = new FakeTransport();
@@ -77,7 +76,6 @@ export async function harness(
     maxQueuedPerConnection: options.maxQueuedPerConnection,
     shutdownTimeoutMs: options.shutdownTimeoutMs,
     maxSessions: options.maxSessions,
-    sessionHandoffTimeoutMs: options.sessionHandoffTimeoutMs,
   });
   await layer.start();
   return {
@@ -254,7 +252,6 @@ export interface SessionHarness {
 export function sessionHarness(
   options: {
     maxSessions?: number;
-    sessionHandoffTimeoutMs?: number;
     sessionOf?: (method: string) => string | undefined;
   } = {},
 ): SessionHarness {
@@ -274,7 +271,6 @@ export function sessionHarness(
     executor: controlled.executor,
     logger,
     maxSessions: options.maxSessions,
-    sessionHandoffTimeoutMs: options.sessionHandoffTimeoutMs,
   });
   return {
     transport,

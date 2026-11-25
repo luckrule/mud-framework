@@ -1,12 +1,166 @@
 import { describe, expect, test } from 'bun:test';
 
+import { createJsonLogger } from '../logging/json-logger.ts';
+import { Dispatcher } from '../server/dispatcher.ts';
+import { LocalExecutor } from '../server/local-executor.ts';
 import type { RequestExecutor } from '../shared/executor.ts';
+import { MemoryStorageBackend } from '../storage/memory.ts';
 import { rejectionOf } from '../testing/common.ts';
 import { harness, scriptedExecutor } from '../testing/connection-layer.ts';
+import { FakeTransport } from '../transport/fake.ts';
 import type { Transport } from '../transport/types.ts';
 import { ConnectionLayer } from './connection-layer.ts';
 
 describe('ConnectionLayer lifecycle', () => {
+  test('a transport that finishes starting after stop is released once and never resurrects the layer', async () => {
+    const listener = new FakeTransport();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let stops = 0;
+    const logger = createJsonLogger({ sink: () => undefined });
+    const dispatcher = new Dispatcher({
+      backend: new MemoryStorageBackend(),
+      timeoutMs: 1000,
+      logger,
+    });
+    const layer = new ConnectionLayer({
+      executor: new LocalExecutor({ dispatcher }),
+      transport: {
+        start: async (handlers) => {
+          entered.resolve();
+          await release.promise;
+          await listener.start(handlers);
+        },
+        stop: async () => {
+          stops += 1;
+          await listener.stop();
+        },
+      },
+      shutdownTimeoutMs: 10,
+      logger,
+    });
+    const starting = layer.start().then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    await entered.promise;
+
+    try {
+      await layer.stop();
+      release.resolve();
+      const startError = await starting;
+      expect(() => listener.connect('late')).toThrow(/stopped/);
+      expect(startError).toBeInstanceOf(Error);
+      await layer.stop();
+      expect(stops).toBe(1);
+    } finally {
+      release.resolve();
+      await starting;
+      await listener.stop().catch(() => undefined);
+    }
+  });
+
+  test('stop reports a timeout but still closes late executor readiness without starting a listener afterwards', async () => {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const listener = new FakeTransport();
+    const logger = createJsonLogger({ sink: () => undefined });
+    const dispatcher = new Dispatcher({
+      backend: new MemoryStorageBackend(),
+      timeoutMs: 1000,
+      logger,
+    });
+    const local = new LocalExecutor({ dispatcher });
+    let ready = false;
+    let closedBeforeReady = false;
+    let closes = 0;
+    let listenerStarts = 0;
+    const layer = new ConnectionLayer({
+      executor: {
+        start: async () => {
+          entered.resolve();
+          await release.promise;
+          await local.start();
+          ready = true;
+        },
+        execute: (request) => local.execute(request),
+        cancel: (requestId, code) => local.cancel(requestId, code),
+        close: async () => {
+          closes += 1;
+          closedBeforeReady = !ready;
+          await local.close();
+        },
+      },
+      transport: {
+        start: (handlers) => {
+          listenerStarts += 1;
+          return listener.start(handlers);
+        },
+        stop: () => listener.stop(),
+      },
+      shutdownTimeoutMs: 10,
+      logger,
+    });
+    const starting = layer.start().then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    await entered.promise;
+
+    try {
+      const stopError = await rejectionOf(layer.stop());
+      expect(stopError.message).toMatch(/executor close.*shutdown timeout/);
+      release.resolve();
+      expect(await starting).toBeInstanceOf(Error);
+      expect(await rejectionOf(layer.stop())).toBe(stopError);
+      expect(closedBeforeReady).toBe(false);
+      expect(closes).toBe(1);
+      expect(listenerStarts).toBe(0);
+      expect(() => listener.connect('late')).toThrow(/not started/);
+      const error = await rejectionOf(dispatcher.dispatch('missing', null));
+      expect(error.message).toMatch(/closed/);
+    } finally {
+      release.resolve();
+      await starting;
+      await listener.stop().catch(() => undefined);
+    }
+  });
+
+  test('late transport start rejection remains observable without repeating cleanup or allowing a concurrent start', async () => {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const failure = new Error('late listener startup failed');
+    const { executor, closeCalls } = scriptedExecutor([]);
+    let stops = 0;
+    const layer = new ConnectionLayer({
+      executor,
+      transport: {
+        start: async () => {
+          entered.resolve();
+          await release.promise;
+          throw failure;
+        },
+        stop: async () => {
+          stops += 1;
+        },
+      },
+      shutdownTimeoutMs: 10,
+      logger: createJsonLogger({ sink: () => undefined }),
+    });
+    const starting = layer.start();
+    const rejected = rejectionOf(starting);
+    await entered.promise;
+    const concurrent = await rejectionOf(layer.start());
+    expect(concurrent.message).toMatch(/cannot start while starting/);
+    await layer.stop();
+    release.resolve();
+
+    expect(await rejected).toBe(failure);
+    await layer.stop();
+    expect(closeCalls()).toBe(1);
+    expect(stops).toBe(0);
+  });
+
   test('stop closes the transport and the dispatcher', async () => {
     const { transport, dispatcher, layer } = await harness();
     dispatcher.register('echo', async (_ctx, payload) => payload);

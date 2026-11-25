@@ -16,7 +16,7 @@ const CODES = {
   FRAMEWORK_TIMEOUT: 'FRAMEWORK_TIMEOUT',
   /** SPEC 7.2/3.5: the input queue was full, so the request was refused. */
   FRAMEWORK_QUEUE_FULL: 'FRAMEWORK_QUEUE_FULL',
-  /** SPEC 7.2/6.3: the framework is stopping; the request was not executed. */
+  /** SPEC 7.2/6.3: the framework is stopping; execution outcome is not guaranteed. */
   FRAMEWORK_SHUTDOWN: 'FRAMEWORK_SHUTDOWN',
   /** SPEC 7.2/6.5: the replay budget ran out; the request reached a terminal state. */
   FRAMEWORK_REPLAY_EXHAUSTED: 'FRAMEWORK_REPLAY_EXHAUSTED',

@@ -1,9 +1,60 @@
 import { describe, expect, test } from 'bun:test';
 
-import { isRecord, parseFrame } from '../testing/common.ts';
+import { isRecord, parseFrame, sleep } from '../testing/common.ts';
 import { harness } from '../testing/connection-layer.ts';
 
 describe('ConnectionLayer bounded input queue (SPEC 3.5)', () => {
+  test('malformed frames consume the same bounded backlog without changing reply order or session binding', async () => {
+    const { transport, dispatcher, layer } = await harness({
+      maxQueuedPerConnection: 1,
+      timeoutMs: 5000,
+    });
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    dispatcher.register('bind', async (ctx) => {
+      ctx.bindSession('s1');
+      entered.resolve();
+      await release.promise;
+      return 'bound';
+    });
+    dispatcher.register('identity', async (ctx) => ctx.sessionId);
+    transport.connect('c1');
+    const slow = transport.receive('c1', '{"id":"slow","method":"bind"}');
+    await entered.promise;
+    const accepted = transport.receive('c1', 'not json');
+    const refused = transport.receive(
+      'c1',
+      '{"method":"bind","sessionId":"other"}',
+    );
+
+    try {
+      await sleep(0);
+      expect(transport.sentTo('c1').map(parseFrame)).toEqual([
+        {
+          id: '',
+          ok: false,
+          error: {
+            code: 'FRAMEWORK_QUEUE_FULL',
+            message: 'input queue is full (1 waiting)',
+          },
+        },
+      ]);
+      release.resolve();
+      await Promise.all([slow, accepted, refused]);
+      await transport.receive('c1', '{"id":"next","method":"identity"}');
+      expect(transport.sentTo('c1').map(parseFrame)).toMatchObject([
+        { id: '', ok: false, error: { code: 'FRAMEWORK_QUEUE_FULL' } },
+        { id: 'slow', ok: true, result: 'bound' },
+        { id: '', ok: false, error: { code: 'INVALID_ENVELOPE' } },
+        { id: 'next', ok: true, result: 's1' },
+      ]);
+    } finally {
+      release.resolve();
+      await Promise.all([slow, accepted, refused]);
+      await layer.stop();
+    }
+  });
+
   test('refuses a request with FRAMEWORK_QUEUE_FULL instead of executing it', async () => {
     const { transport, dispatcher } = await harness({
       maxQueuedPerConnection: 2,

@@ -22,12 +22,7 @@ import type {
   TransportConnection,
   TransportHandlers,
 } from '../transport/types.ts';
-import {
-  DEFAULT_MAX_SESSIONS,
-  DEFAULT_SESSION_HANDOFF_TIMEOUT_MS,
-  SessionRouter,
-} from './session-router.ts';
-import type { SessionGate, SessionHolder } from './session-router.ts';
+import { DEFAULT_MAX_SESSIONS, SessionRouter } from './session-router.ts';
 
 /**
  * SPEC 3.5 requires a hard per-connection cap. 1000 absorbs a legitimate burst
@@ -95,25 +90,12 @@ export interface ConnectionLayerOptions {
    * not a business failure.
    */
   maxSessions?: number;
-  /**
-   * How long a reconnecting connection waits for the previous holder's work to
-   * settle (SPEC 3.2, INV-004). Defaults to
-   * `DEFAULT_SESSION_HANDOFF_TIMEOUT_MS`; on expiry the wait is released and
-   * logged, because the previous connection may be stuck on a handler nobody
-   * can preempt (SPEC 3.4).
-   */
-  sessionHandoffTimeoutMs?: number;
 }
 
-type Status = 'idle' | 'started' | 'stopping' | 'stopped';
+type Status = 'idle' | 'starting' | 'started' | 'stopping' | 'stopped';
 
 interface ConnectionState {
   readonly connection: TransportConnection;
-  /**
-   * The router's view of this connection. Read live, not captured: `chain`
-   * advances with every request, so a handoff waits on the tail as it stands.
-   */
-  readonly holder: SessionHolder;
   /** Tail of this connection's work chain; see `enqueue`. */
   chain: Promise<unknown>;
   /**
@@ -128,22 +110,8 @@ interface ConnectionState {
    * could read its result (SPEC 3.6).
    */
   readonly inFlight: Set<string>;
-  /**
-   * The Session this connection currently holds, if any. Mirrors the router,
-   * which owns the table; kept here because the request path reads it on every
-   * message and it must not be re-derived from the route.
-   */
-  sessionId?: string;
-  /** Pending reconnect wait; consumed by the first request that waits on it. */
-  sessionGate?: SessionGate;
-  /**
-   * Resolves when this connection is gone, so a request waiting on
-   * `sessionGate` does not outlive the client it would answer. Otherwise a
-   * reconnect-then-drop would keep the chain, and shutdown's drain, waiting for
-   * the full handoff timeout.
-   */
-  readonly closed: Promise<void>;
-  readonly markClosed: () => void;
+  /** Aborts only waiting work; an unfinished Session barrier survives it. */
+  readonly closed: AbortController;
 }
 
 /**
@@ -167,8 +135,10 @@ export class ConnectionLayer implements TransportHandlers {
   /** Which connection holds which Session, and the reconnect gate (SPEC 3.2). */
   private readonly router: SessionRouter;
   private status: Status = 'idle';
-  /** Whether `transport.start` succeeded, so `stop` is only called on a live one. */
-  private transportStarted = false;
+  private executorStart: Promise<void> | undefined;
+  private transportStart: Promise<void> | undefined;
+  /** Retained after a bounded stop so a late listener is still released once. */
+  private transportStop: Promise<void> | undefined;
   /** Memoised executor close, so a failed start and a later stop cannot double-close. */
   private executorClose: Promise<void> | undefined;
   /** Memoised shutdown, so every caller observes the same single run. */
@@ -189,8 +159,6 @@ export class ConnectionLayer implements TransportHandlers {
       options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
     this.router = new SessionRouter({
       maxSessions: options.maxSessions ?? DEFAULT_MAX_SESSIONS,
-      handoffTimeoutMs:
-        options.sessionHandoffTimeoutMs ?? DEFAULT_SESSION_HANDOFF_TIMEOUT_MS,
       logger: this.logger,
     });
   }
@@ -199,27 +167,51 @@ export class ConnectionLayer implements TransportHandlers {
     if (this.status !== 'idle') {
       throw new Error(`connection layer cannot start while ${this.status}`);
     }
-    // SPEC 6.2 step 3: the transport must not accept input before the backend
-    // is ready, so the executor starts first and a failed start leaves no
-    // listener behind.
-    await this.executor.start();
+    this.status = 'starting';
+    this.executorStart = Promise.resolve().then(() => this.executor.start());
+    // SPEC 6.2: readiness must precede listener startup.
     try {
-      await this.transport.start(this);
+      await this.executorStart;
+      if (this.status !== 'starting') {
+        throw new Error('connection layer startup interrupted by shutdown');
+      }
+      this.transportStart = Promise.resolve().then(() =>
+        this.transport.start(this),
+      );
+      await this.transportStart;
     } catch (error) {
-      // The executor already started; leaving it running would leak a Server
-      // process nobody can reach. Memoised, so a caller that also calls stop()
-      // does not close it twice (a backend close is not always idempotent).
+      if (this.status === 'starting') {
+        this.status = 'stopped';
+      }
       await this.closeExecutor().catch(() => undefined);
       throw error;
     }
-    this.transportStarted = true;
+    if (this.status !== 'starting') {
+      await this.stopTransport();
+      throw new Error('connection layer startup interrupted by shutdown');
+    }
     this.status = 'started';
   }
 
   /** One close per executor, whether it comes from a failed start or `stop()`. */
   private closeExecutor(): Promise<void> {
-    this.executorClose ??= this.executor.close();
+    // Closing before an asynchronous start settles can leak resources that the
+    // late start creates after close. Retain the continuation after stop times out.
+    this.executorClose ??= (this.executorStart ?? Promise.resolve())
+      .catch(() => undefined)
+      .then(() => this.executor.close());
     return this.executorClose;
+  }
+
+  private stopTransport(): Promise<void> {
+    this.transportStop ??=
+      this.transportStart === undefined
+        ? Promise.resolve()
+        : this.transportStart.then(
+            () => this.transport.stop(),
+            () => undefined,
+          );
+    return this.transportStop;
   }
 
   onConnect(connection: TransportConnection): Promise<void> {
@@ -229,21 +221,12 @@ export class ConnectionLayer implements TransportHandlers {
       // ever looks the connection up, so nothing is silently dropped.
       return Promise.resolve();
     }
-    const closed = Promise.withResolvers<void>();
-    // The holder closes over `state`: `chain` advances on every request, and
-    // copying it here would freeze the tail a handoff later waits on.
     const state: ConnectionState = {
       connection,
-      holder: {
-        connectionId: connection.id,
-        chain: () => state.chain,
-        closed: () => state.closed,
-      },
       chain: Promise.resolve(),
       queued: 0,
       inFlight: new Set(),
-      closed: closed.promise,
-      markClosed: closed.resolve,
+      closed: new AbortController(),
     };
     this.connections.set(connection.id, state);
     return Promise.resolve();
@@ -264,75 +247,75 @@ export class ConnectionLayer implements TransportHandlers {
       // reconnects with a fresh object): there is nobody to answer.
       return Promise.resolve();
     }
-    // Decoded before the queue check because a refused request still needs its
-    // client id to be answerable. A frame that cannot be decoded has no id and
-    // is not a request, so it never occupies a queue slot.
+    // Decode for correlation, but budget every ordered reply, including bad
+    // frames: retaining uncounted callbacks would make this queue unbounded.
     let envelope: Envelope;
     try {
       envelope = this.codec.decode(payload);
     } catch (error) {
-      // A frame that cannot be decoded is not a request, so it never occupies
-      // a queue slot. It still runs on the chain, so its reply cannot overtake
-      // an accepted request's.
-      return this.enqueue(state, () =>
-        this.rejectEnvelope(connection, payload, error),
-      );
+      if (state.queued >= this.maxQueuedPerConnection) {
+        return this.refuseQueue(state, '');
+      }
+      const rawLength = rawLengthOf(payload);
+      const reason = messageOf(error);
+      state.queued += 1;
+      return this.enqueue(state, async () => {
+        state.queued -= 1;
+        await this.rejectEnvelope(connection, rawLength, reason);
+      });
     }
     if (state.queued >= this.maxQueuedPerConnection) {
-      // SPEC 3.5 refusal policy. Refusing is the queue's only strategy: it is
-      // the one the queue itself can enforce, and it fails a request visibly
-      // instead of stalling the connection behind a full input buffer.
-      this.logger.warn(
-        {
-          connectionId: connection.id,
-          clientRequestId: envelope.id,
-          method: envelope.method,
-          code: FRAMEWORK_QUEUE_FULL,
-          queued: state.queued,
-          limit: this.maxQueuedPerConnection,
-        },
-        'request refused: input queue is full',
-      );
-      return this.reply(connection, {
-        id: envelope.id,
-        ok: false,
-        error: {
-          code: FRAMEWORK_QUEUE_FULL,
-          message: `input queue is full (${this.maxQueuedPerConnection} waiting)`,
-        },
-      });
+      return this.refuseQueue(state, envelope.id, envelope.method);
     }
     state.queued += 1;
     return this.enqueue(state, () => this.startAfterGate(state, envelope));
   }
 
-  /**
-   * Waits out a pending reconnect gate, then runs the request. The wait sits at
-   * the head of this connection's chain, so it orders every later request on
-   * the new connection behind the old connection's work rather than only the
-   * first one (SPEC 3.2, INV-004).
-   *
-   * The wait itself belongs to the router, which owns the handoff bound; the
-   * placement at the chain head belongs here, because only this layer knows the
-   * chain.
-   */
+  private refuseQueue(
+    state: ConnectionState,
+    id: string,
+    method?: string,
+  ): Promise<void> {
+    this.logger.warn(
+      {
+        connectionId: state.connection.id,
+        clientRequestId: id,
+        method,
+        code: FRAMEWORK_QUEUE_FULL,
+        queued: state.queued,
+        limit: this.maxQueuedPerConnection,
+      },
+      'request refused: input queue is full',
+    );
+    return this.reply(state.connection, {
+      id,
+      ok: false,
+      error: {
+        code: FRAMEWORK_QUEUE_FULL,
+        message: `input queue is full (${this.maxQueuedPerConnection} waiting)`,
+      },
+    });
+  }
+
   private async startAfterGate(
     state: ConnectionState,
     envelope: Envelope,
   ): Promise<void> {
-    const gate = state.sessionGate;
-    if (gate !== undefined) {
-      // Consumed, not re-read: this request is the one that crosses the
-      // handoff, and the requests behind it are already ordered by the chain.
-      state.sessionGate = undefined;
-      await this.router.waitForHandoff(gate, state.holder);
+    const ran = await this.router.run(
+      state.connection.id,
+      state.closed.signal,
+      async (sessionId, terminal) => {
+        state.queued -= 1;
+        await this.handle(state.connection, envelope, sessionId, terminal);
+      },
+    );
+    if (!ran) {
+      state.queued -= 1;
+      // Shutdown can stop waiting, but cannot start overlapping Session work.
+      if (this.connections.get(state.connection.id) === state) {
+        await this.refuseWithId(state.connection, envelope.id);
+      }
     }
-    // Counted down when the request actually starts, not when it is refused or
-    // admitted: the cap measures work that is waiting, and a request blocked on
-    // the gate is still waiting. It also keeps the count aligned with
-    // "excluding the executing request".
-    state.queued -= 1;
-    return this.handle(state.connection, envelope);
   }
 
   async onDisconnect(connection: TransportConnection): Promise<void> {
@@ -341,17 +324,10 @@ export class ConnectionLayer implements TransportHandlers {
     if (state === undefined) {
       return;
     }
-    // SPEC 6.1: the layer keeps routing information only, so a route whose
-    // connection is gone is gone with it. A reconnect after this point binds as
-    // a first binding, not as a handoff from a dead connection. A gate orders
-    // this connection behind the previous holder of the Session it just left;
-    // that ordering no longer applies to whatever it binds next.
-    state.sessionId = undefined;
-    state.sessionGate = undefined;
-    this.router.release(state.holder);
-    // Releases a request still waiting on a reconnect gate: nobody can read its
-    // result, and shutdown's drain must not wait for the handoff timeout.
-    state.markClosed();
+    this.router.release(connection.id);
+    // Only this connection's wait is released; other holders still wait for
+    // its framework request completion, even when cancellation settles later.
+    state.closed.abort();
     // SPEC 3.6 default policy: a connection closing mid-request cancels it. The
     // handler may still be running, but nobody can read its result, and letting
     // it commit would leave a state change the player never saw.
@@ -361,31 +337,6 @@ export class ConnectionLayer implements TransportHandlers {
     }
     state.inFlight.clear();
     await Promise.all(cancels);
-  }
-
-  /**
-   * Applies the router's decision to this connection (SPEC 2, 3.2). A binding
-   * that lands on a Session another connection still holds is a reconnect: the
-   * gate returned makes this connection's next request wait for the old one's
-   * chain, so the two never process at the same time (INV-004). A refused
-   * binding changes nothing here — routing is not the business result, so the
-   * request that carried it still succeeds.
-   */
-  private bindSession(
-    state: ConnectionState,
-    sessionId: string,
-    logger: Logger,
-  ): void {
-    const gate = this.router.bind(state.holder, sessionId, logger);
-    // The router reports a refusal by leaving the holder on its previous
-    // Session, so a mismatch means this binding did not take effect.
-    if (this.router.sessionOf(state.connection.id) !== sessionId) {
-      return;
-    }
-    state.sessionId = sessionId;
-    // Always assigned, not merged: a gate is consumed by the request that
-    // crosses it, so none can be pending when a binding is applied.
-    state.sessionGate = gate;
   }
 
   stop(): Promise<void> {
@@ -402,12 +353,9 @@ export class ConnectionLayer implements TransportHandlers {
     // arrives while the drain is running is refused rather than queued.
     this.status = 'stopping';
     const timeoutMs = this.shutdownTimeoutMs;
-    // A request waiting on a reconnect gate would otherwise hold its chain for
-    // the full handoff timeout, which can be longer than this drain. Shutdown
-    // outranks the handoff: release every wait now so the drain measures real
-    // work rather than a routing delay.
+    // Waiting requests may fail during shutdown, never bypass their barrier.
     for (const state of this.connections.values()) {
-      state.markClosed();
+      state.closed.abort();
     }
 
     // Step 2: drain what was already accepted. New input is refused, so the
@@ -455,38 +403,46 @@ export class ConnectionLayer implements TransportHandlers {
             timeoutMs,
             this.executor.closeBudgetMs + EXECUTOR_CLOSE_SLACK_MS,
           );
+    let executorFailure: Error | undefined;
     const closed = await settleWithin(this.closeExecutor(), executorBudgetMs);
     if (closed.status === 'timeout') {
+      executorFailure = new Error(
+        'executor close did not settle before the shutdown timeout',
+      );
       this.logger.error(
         { timeoutMs: executorBudgetMs },
         'executor close did not settle before the shutdown timeout',
       );
     } else if (closed.status === 'rejected') {
+      executorFailure = toError(closed.error);
       this.logger.error(
         { reason: messageOf(closed.error) },
         'executor close failed',
       );
     }
 
-    const stopped = await settleWithin(
-      // A transport whose `start` failed has nothing to stop and would reject;
-      // its own lifecycle error must not mask the executor close above.
-      this.transportStarted ? this.transport.stop() : Promise.resolve(),
-      timeoutMs,
-    );
+    const stopped = await settleWithin(this.stopTransport(), timeoutMs);
     this.status = 'stopped';
     if (stopped.status === 'timeout') {
       this.logger.error(
         { timeoutMs },
         'transport stop did not settle before the shutdown timeout',
       );
-      return;
     }
     if (stopped.status === 'rejected') {
+      if (executorFailure !== undefined) {
+        throw new AggregateError(
+          [executorFailure, toError(stopped.error)],
+          'executor and transport failed to close',
+        );
+      }
       // The sequence is complete, but the transport never confirmed it closed:
       // that is the caller's to handle, so it is rethrown rather than logged
       // away.
       throw toError(stopped.error);
+    }
+    if (executorFailure !== undefined) {
+      throw executorFailure;
     }
   }
 
@@ -521,6 +477,13 @@ export class ConnectionLayer implements TransportHandlers {
       // Unreadable frame during shutdown: still answer, with no correlation.
       id = '';
     }
+    await this.refuseWithId(connection, id);
+  }
+
+  private async refuseWithId(
+    connection: TransportConnection,
+    id: string,
+  ): Promise<void> {
     this.logger.warn(
       {
         connectionId: connection.id,
@@ -541,8 +504,8 @@ export class ConnectionLayer implements TransportHandlers {
 
   private async rejectEnvelope(
     connection: TransportConnection,
-    payload: string | Uint8Array,
-    error: unknown,
+    rawLength: number,
+    reason: string,
   ): Promise<void> {
     // warn, not error: one unreadable frame is a rejected input, not a failed
     // request (SPEC 7.1).
@@ -550,8 +513,8 @@ export class ConnectionLayer implements TransportHandlers {
       {
         connectionId: connection.id,
         code: INVALID_ENVELOPE,
-        rawLength: rawLengthOf(payload),
-        reason: messageOf(error),
+        rawLength,
+        reason,
       },
       'envelope rejected',
     );
@@ -562,13 +525,15 @@ export class ConnectionLayer implements TransportHandlers {
     await this.reply(connection, {
       id: '',
       ok: false,
-      error: { code: INVALID_ENVELOPE, message: messageOf(error) },
+      error: { code: INVALID_ENVELOPE, message: reason },
     });
   }
 
   private async handle(
     connection: TransportConnection,
     envelope: Envelope,
+    sessionId: string | undefined,
+    terminal: Promise<void>,
   ): Promise<void> {
     const method = envelope.method;
     const clientRequestId = envelope.id;
@@ -583,7 +548,6 @@ export class ConnectionLayer implements TransportHandlers {
     // declares is applied only after it succeeds. Every request line carries it
     // (SPEC 7.1), which is why the logger is built after this lookup.
     const state = this.connections.get(connection.id);
-    const sessionId = state?.sessionId;
     const logger = this.logger.child({
       requestId,
       connectionId: connection.id,
@@ -617,7 +581,7 @@ export class ConnectionLayer implements TransportHandlers {
         // request line (SPEC 7.1). Read before the call, so a request that
         // binds a Session still runs as unbound — the binding it declares is
         // applied only after it succeeds.
-        sessionId: state.sessionId,
+        sessionId,
         method,
         payload: requestPayload,
       });
@@ -651,7 +615,7 @@ export class ConnectionLayer implements TransportHandlers {
         outcome.sessionId !== undefined &&
         this.connections.get(connection.id) === state
       ) {
-        this.bindSession(state, outcome.sessionId, logger);
+        this.router.bind(connection.id, outcome.sessionId, terminal, logger);
       }
       await this.reply(
         connection,

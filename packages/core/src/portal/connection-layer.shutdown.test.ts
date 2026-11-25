@@ -240,13 +240,62 @@ describe('ConnectionLayer shutdown (SPEC 6.3)', () => {
     ).toHaveLength(0);
   });
 
-  test('logs the executor budget it gave up on', async () => {
+  test('rejects stop after executor close times out, stops transport once, and handles a late close rejection', async () => {
+    const closing = Promise.withResolvers<void>();
+    let closes = 0;
+    const executor: RequestExecutor = {
+      start: () => Promise.resolve(),
+      execute: () => Promise.resolve({ ok: true, result: null }),
+      cancel: () => Promise.resolve(),
+      close: () => {
+        closes += 1;
+        return closing.promise;
+      },
+    };
+    const scripted = scriptedTransport([]);
+    const lines: string[] = [];
+    const layer = new ConnectionLayer({
+      transport: scripted.transport,
+      executor,
+      shutdownTimeoutMs: 10,
+      logger: createJsonLogger({ sink: (line) => lines.push(line) }),
+    });
+    await layer.start();
+
+    try {
+      const failure = await rejectionOf(layer.stop());
+      expect(failure.message).toMatch(/executor close.*shutdown timeout/);
+      expect(scripted.stopCalls()).toBe(1);
+      expect(closes).toBe(1);
+      expect(
+        lines
+          .map(parseFrame)
+          .filter(
+            (entry) =>
+              entry.msg ===
+              'executor close did not settle before the shutdown timeout',
+          ),
+      ).toMatchObject([{ timeoutMs: 10 }]);
+
+      closing.reject(new Error('late executor close failed'));
+      await sleep(0);
+      expect(await rejectionOf(layer.stop())).toBe(failure);
+      expect(scripted.stopCalls()).toBe(1);
+      expect(closes).toBe(1);
+    } finally {
+      closing.resolve();
+      await layer.stop().catch(() => undefined);
+    }
+  });
+
+  test('propagates executor close failure only after the transport is stopped', async () => {
+    const failure = new Error('server refused to die');
     const executor: RequestExecutor = {
       start: () => Promise.resolve(),
       execute: () => Promise.resolve({ ok: true, result: null }),
       cancel: () => Promise.resolve(),
       closeBudgetMs: 30,
-      close: () => Promise.reject(new Error('server refused to die')),
+      close: () => Promise.reject(failure),
     };
     const scripted = scriptedTransport([]);
     const lines: string[] = [];
@@ -262,13 +311,47 @@ describe('ConnectionLayer shutdown (SPEC 6.3)', () => {
     });
     await layer.start();
 
-    await layer.stop();
+    const error = await rejectionOf(layer.stop());
+    expect(error).toBe(failure);
+    expect(scripted.stopCalls()).toBe(1);
 
     // 20ms own timeout is below the 30ms budget, so the budget wins.
     const failed = lines
       .map(parseFrame)
       .find((entry) => entry.msg === 'executor close failed');
     expect(failed).toMatchObject({ reason: 'server refused to die' });
+  });
+
+  test('preserves both close failures and repeats the same failed shutdown without closing again', async () => {
+    const executorFailure = new Error('server refused to die');
+    const transportFailure = new Error('socket refused to close');
+    let closes = 0;
+    const executor: RequestExecutor = {
+      start: () => Promise.resolve(),
+      execute: () => Promise.resolve({ ok: true, result: null }),
+      cancel: () => Promise.resolve(),
+      close: () => {
+        closes += 1;
+        return Promise.reject(executorFailure);
+      },
+    };
+    const scripted = scriptedTransport([]);
+    scripted.failStop(transportFailure);
+    const layer = new ConnectionLayer({
+      transport: scripted.transport,
+      executor,
+      logger: createJsonLogger({ sink: () => undefined }),
+    });
+    await layer.start();
+
+    const failure = await rejectionOf(layer.stop());
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect(failure).toMatchObject({
+      errors: [executorFailure, transportFailure],
+    });
+    expect(await rejectionOf(layer.stop())).toBe(failure);
+    expect(closes).toBe(1);
+    expect(scripted.stopCalls()).toBe(1);
   });
 
   test('runs the shutdown once for concurrent and repeated calls', async () => {
