@@ -33,6 +33,30 @@ for (const value of Object.values(wireCodes)) {
 }
 
 describe('wire code table', () => {
+  test('matches the SPEC 7.2 snapshot exactly, in order', () => {
+    // The external wire contract (SPEC 7.2, INV-014), written out rather than
+    // derived from the table: a deletion, rename or reorder breaks downstream
+    // clients, so it must fail here until someone edits this snapshot on
+    // purpose. Adding a code appends it here and in SPEC 7.2.
+    const snapshot = [
+      'FRAMEWORK_TIMEOUT',
+      'FRAMEWORK_QUEUE_FULL',
+      'FRAMEWORK_SHUTDOWN',
+      'FRAMEWORK_REPLAY_EXHAUSTED',
+      'FRAMEWORK_CAPABILITY_UNSUPPORTED',
+      'TRANSPORT_CLOSED',
+      'TRANSPORT_SEND_FAILED',
+      'STORAGE_UNAVAILABLE',
+      'INVALID_ENVELOPE',
+      'UNKNOWN_METHOD',
+      'INTERNAL_ERROR',
+      'AUTH_REQUIRED',
+      'FORBIDDEN',
+    ];
+
+    expect(WIRE_CODES).toEqual(snapshot);
+  });
+
   test('every code in the table has a named export', () => {
     // A table entry with no constant would be unaddressable from the call sites
     // that emit it.
