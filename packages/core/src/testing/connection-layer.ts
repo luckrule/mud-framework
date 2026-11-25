@@ -2,20 +2,20 @@ import { Buffer } from 'node:buffer';
 
 import { isRecord, parseFrame } from 'mud-framework-test-support';
 
-import type { Codec, Envelope, ResponseEnvelope } from '../client/codec.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import type { Logger, LogLevel } from '../logging/types.ts';
 import { ConnectionLayer } from '../portal/connection-layer.ts';
 import { Dispatcher } from '../server/dispatcher.ts';
 import { LocalExecutor } from '../server/local-executor.ts';
+import type { Codec, Envelope, ResponseEnvelope } from '../shared/codec.ts';
 import type {
   ExecutorRequest,
   RequestExecutor,
   SessionChange,
 } from '../shared/executor.ts';
-import { MemoryStorageBackend } from '../storage/memory.ts';
-import { FakeTransport } from '../transport/fake.ts';
 import type { Transport, TransportConnection } from '../transport/types.ts';
+import { FakeTransport } from './fake-transport.ts';
+import { MemoryStorageBackend } from './memory-backend.ts';
 
 export function lastFrame(
   transport: FakeTransport,

@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { Buffer } from 'node:buffer';
 
-import { JsonCodec } from '../client/codec.ts';
+import { JsonCodec } from '../shared/codec.ts';
 import { parseFrame } from '../testing/common.ts';
 import {
   Base64Codec,

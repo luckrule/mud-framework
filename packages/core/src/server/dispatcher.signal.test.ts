@@ -1,9 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 
 import { FrameworkTimeoutError } from '../shared/wire-codes.ts';
-import { MemoryStorageBackend } from '../storage/memory.ts';
 import { rejectionOf, sleep } from '../testing/common.ts';
 import { deferred, quietDispatcher } from '../testing/dispatcher.ts';
+import { MemoryStorageBackend } from '../testing/memory-backend.ts';
 
 describe('Dispatcher.abortSignal', () => {
   test('hands the handler an unaborted AbortSignal', async () => {

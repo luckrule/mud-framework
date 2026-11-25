@@ -1,10 +1,10 @@
 import { randomUUID } from 'node:crypto';
 
-import { JsonCodec } from '../client/codec.ts';
-import type { Codec, Envelope, ResponseEnvelope } from '../client/codec.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import { safeLogger } from '../logging/safe-logger.ts';
 import type { Logger } from '../logging/types.ts';
+import { JsonCodec } from '../shared/codec.ts';
+import type { Codec, Envelope, ResponseEnvelope } from '../shared/codec.ts';
 import type {
   ExecutorOutcome,
   RequestExecutor,

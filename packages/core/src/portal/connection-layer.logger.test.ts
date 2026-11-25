@@ -3,7 +3,7 @@ import { describe, expect, test } from 'bun:test';
 import type { RequestExecutor } from '../shared/executor.ts';
 import { parseFrame, throwingLogger } from '../testing/common.ts';
 import { lastFrame } from '../testing/connection-layer.ts';
-import { FakeTransport } from '../transport/fake.ts';
+import { FakeTransport } from '../testing/fake-transport.ts';
 import { ConnectionLayer } from './connection-layer.ts';
 
 function immediateExecutor(

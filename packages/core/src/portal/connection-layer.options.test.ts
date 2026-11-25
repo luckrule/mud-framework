@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
 import { scriptedExecutor } from '../testing/connection-layer.ts';
-import { FakeTransport } from '../transport/fake.ts';
+import { FakeTransport } from '../testing/fake-transport.ts';
 import { ConnectionLayer } from './connection-layer.ts';
 import type { ConnectionLayerOptions } from './connection-layer.ts';
 

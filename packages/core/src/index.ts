@@ -62,8 +62,8 @@ export type {
 } from './logging/types.ts';
 export { createJsonLogger } from './logging/json-logger.ts';
 export { safeLogger } from './logging/safe-logger.ts';
-export type { Codec, Envelope, ResponseEnvelope } from './client/codec.ts';
-export { JsonCodec } from './client/codec.ts';
+export type { Codec, Envelope, ResponseEnvelope } from './shared/codec.ts';
+export { JsonCodec } from './shared/codec.ts';
 export type {
   ExecutorHealth,
   ExecutorHealthState,

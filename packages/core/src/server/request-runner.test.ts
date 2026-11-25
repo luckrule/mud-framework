@@ -2,13 +2,13 @@ import { describe, expect, test } from 'bun:test';
 
 import type { IpcMessage } from '../ipc/protocol.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
-import { MemoryStorageBackend } from '../storage/memory.ts';
 import { sleep, tick } from '../testing/common.ts';
+import { MemoryStorageBackend } from '../testing/memory-backend.ts';
 import { parseLine, requestMessage } from '../testing/server-process.ts';
 import { Dispatcher } from './dispatcher.ts';
 import type { Handler, HandlerOptions } from './dispatcher.ts';
 import { LocalExecutor } from './local-executor.ts';
-import { RequestRunner } from './requests.ts';
+import { RequestRunner } from './request-runner.ts';
 
 interface RunnerHarness {
   readonly runner: RequestRunner;

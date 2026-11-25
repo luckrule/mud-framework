@@ -5,7 +5,6 @@ import type { IpcChannel } from '../ipc/channel.ts';
 import { createInMemoryChannelPair } from '../ipc/channel.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import { BusinessError } from '../shared/wire-codes.ts';
-import { MemoryStorageBackend } from '../storage/memory.ts';
 import type { StorageBackend } from '../storage/types.ts';
 import {
   isRecord,
@@ -13,6 +12,7 @@ import {
   throwingLogger,
   tick,
 } from '../testing/common.ts';
+import { MemoryStorageBackend } from '../testing/memory-backend.ts';
 import {
   echoRegistration,
   parseLine,

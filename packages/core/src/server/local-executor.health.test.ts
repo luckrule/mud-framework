@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 
-import { MemoryStorageBackend } from '../storage/memory.ts';
+import { MemoryStorageBackend } from '../testing/memory-backend.ts';
 import { Dispatcher } from './dispatcher.ts';
 import { LocalExecutor } from './local-executor.ts';
 

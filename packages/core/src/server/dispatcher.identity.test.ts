@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
-import { MemoryStorageBackend } from '../storage/memory.ts';
 import { quietDispatcher } from '../testing/dispatcher.ts';
+import { MemoryStorageBackend } from '../testing/memory-backend.ts';
 import { Dispatcher } from './dispatcher.ts';
 
 describe('Dispatcher.identity', () => {

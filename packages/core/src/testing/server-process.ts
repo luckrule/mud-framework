@@ -18,8 +18,8 @@ import type { DispatcherOptions } from '../server/dispatcher.ts';
 import type { Extension, ExtensionRegistrar } from '../server/extension.ts';
 import { runServerProcess } from '../server/server-process.ts';
 import { ServerStartupError } from '../server/server-startup.ts';
-import { MemoryStorageBackend } from '../storage/memory.ts';
 import type { StorageBackend, StorageCapabilities } from '../storage/types.ts';
+import { MemoryStorageBackend } from './memory-backend.ts';
 
 export function requestMessage(
   overrides: Partial<RequestMessage> = {},

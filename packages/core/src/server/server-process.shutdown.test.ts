@@ -1,9 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 
 import { parseIpcMessage } from '../ipc/protocol.ts';
-import { MemoryStorageBackend } from '../storage/memory.ts';
 import type { StorageBackend } from '../storage/types.ts';
 import { tick } from '../testing/common.ts';
+import { MemoryStorageBackend } from '../testing/memory-backend.ts';
 import {
   echoRegistration,
   numberField,

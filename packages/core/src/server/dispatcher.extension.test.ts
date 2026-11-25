@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
-import { MemoryStorageBackend } from '../storage/memory.ts';
 import { parseLines, quietDispatcher } from '../testing/dispatcher.ts';
+import { MemoryStorageBackend } from '../testing/memory-backend.ts';
 
 describe('Dispatcher handler metadata', () => {
   test('exposes the registering Extension in the context and request logs', async () => {

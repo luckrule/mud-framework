@@ -4,7 +4,6 @@ import {
   FrameworkTimeoutError,
   RequestCancelledError,
 } from '../shared/wire-codes.ts';
-import { MemoryStorageBackend } from '../storage/memory.ts';
 import { rejectionOf, sleep } from '../testing/common.ts';
 import {
   SlowCommitBackend,
@@ -12,6 +11,7 @@ import {
   parseLines,
   quietDispatcher,
 } from '../testing/dispatcher.ts';
+import { MemoryStorageBackend } from '../testing/memory-backend.ts';
 
 describe('Dispatcher.cancel', () => {
   test('cancel rejects later writes and rolls the transaction back', async () => {

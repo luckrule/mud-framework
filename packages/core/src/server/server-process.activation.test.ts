@@ -8,8 +8,8 @@ import { parseIpcMessage } from '../ipc/protocol.ts';
 import type { ServerExitInfo, SpawnedServer } from '../ipc/spawn-port.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import { IpcExecutor } from '../portal/executor/ipc-executor.ts';
-import { MemoryStorageBackend } from '../storage/memory.ts';
 import { rejectionOf, tick } from '../testing/common.ts';
+import { MemoryStorageBackend } from '../testing/memory-backend.ts';
 import {
   parseLine,
   received,

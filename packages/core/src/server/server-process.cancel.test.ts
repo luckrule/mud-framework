@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
-import { MemoryStorageBackend } from '../storage/memory.ts';
 import { sleep, tick } from '../testing/common.ts';
+import { MemoryStorageBackend } from '../testing/memory-backend.ts';
 import {
   requestMessage,
   results,

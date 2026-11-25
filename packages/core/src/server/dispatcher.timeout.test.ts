@@ -1,13 +1,13 @@
 import { describe, expect, test } from 'bun:test';
 
 import { FrameworkTimeoutError } from '../shared/wire-codes.ts';
-import { MemoryStorageBackend } from '../storage/memory.ts';
 import { rejectionOf, sleep } from '../testing/common.ts';
 import {
   deferred,
   parseLines,
   quietDispatcher,
 } from '../testing/dispatcher.ts';
+import { MemoryStorageBackend } from '../testing/memory-backend.ts';
 import { Dispatcher } from './dispatcher.ts';
 
 describe('Dispatcher.timeout', () => {

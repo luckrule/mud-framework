@@ -6,7 +6,7 @@ import { createJsonLogger } from '../logging/json-logger.ts';
 import type { Logger } from '../logging/types.ts';
 import type { ExecutorRequest } from '../shared/executor.ts';
 import { BusinessError } from '../shared/wire-codes.ts';
-import { MemoryStorageBackend } from '../storage/memory.ts';
+import { MemoryStorageBackend } from '../testing/memory-backend.ts';
 import { Dispatcher } from './dispatcher.ts';
 import { LocalExecutor } from './local-executor.ts';
 

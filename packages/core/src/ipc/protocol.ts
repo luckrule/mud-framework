@@ -3,7 +3,7 @@ import type { ExecutorOutcome, SessionChange } from '../shared/executor.ts';
  * Portal <-> Server IPC protocol (ADR-0002).
  *
  * This is a different protocol from the client wire format in
- * `client/codec.ts`: that one is JSON over a Transport, this one is an object
+ * `shared/codec.ts`: that one is JSON over a Transport, this one is an object
  * channel with structured serialization. The two must not share types or
  * validators, because a change to one must not silently change the other.
  */

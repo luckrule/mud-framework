@@ -3,7 +3,6 @@ import { describe, expect, test } from 'bun:test';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import { Dispatcher } from '../server/dispatcher.ts';
 import { LocalExecutor } from '../server/local-executor.ts';
-import { MemoryStorageBackend } from '../storage/memory.ts';
 import { parseFrame, sleep } from '../testing/common.ts';
 import {
   fakeConnection,
@@ -12,6 +11,7 @@ import {
   scriptedTransport,
   sessionHarness,
 } from '../testing/connection-layer.ts';
+import { MemoryStorageBackend } from '../testing/memory-backend.ts';
 import { ConnectionLayer } from './connection-layer.ts';
 
 describe('ConnectionLayer session routing (SPEC 3.2, INV-004)', () => {

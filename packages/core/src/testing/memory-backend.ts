@@ -2,7 +2,7 @@ import type {
   StorageBackend,
   StorageCapabilities,
   StorageTransaction,
-} from './types.ts';
+} from '../storage/types.ts';
 
 export type MemoryQueryHandler = (
   sql: string,

@@ -1,3 +1,4 @@
+import { failure, requestMessage } from '../../ipc/outbound.ts';
 import type { Logger } from '../../logging/types.ts';
 import type { ExecutorOutcome } from '../../shared/executor.ts';
 import { messageOf } from '../../shared/guards.ts';
@@ -7,8 +8,7 @@ import {
   FRAMEWORK_SHUTDOWN,
   FRAMEWORK_TIMEOUT,
 } from '../../shared/wire-codes.ts';
-import { failure, requestMessage } from '../ipc-outbound.ts';
-import type { PendingBuffer, PendingRequest } from '../ipc-pending.ts';
+import type { PendingBuffer, PendingRequest } from './ipc-pending.ts';
 import type { ServerState } from './server-slot.ts';
 
 /**

@@ -3,8 +3,8 @@ import { describe, expect, test } from 'bun:test';
 import type { IpcChannel } from '../ipc/channel.ts';
 import { createInMemoryChannelPair } from '../ipc/channel.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
-import { MemoryStorageBackend } from '../storage/memory.ts';
 import { rejectionOf } from '../testing/common.ts';
+import { MemoryStorageBackend } from '../testing/memory-backend.ts';
 import {
   parseLine,
   received,

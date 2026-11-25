@@ -4,7 +4,7 @@
  * payload the handler interprets. Session routing and replay sit above this
  * (SPEC 5.2), so they do not appear here.
  */
-import { isRecord, messageOf } from '../shared/guards.ts';
+import { isRecord, messageOf } from './guards.ts';
 
 export interface Envelope {
   id: string;

@@ -2,8 +2,11 @@ import { describe, expect, test } from 'bun:test';
 
 import { rejectionOf } from 'mud-framework-test-support';
 
-import { FakeTransport } from './fake.ts';
-import type { TransportConnection, TransportHandlers } from './types.ts';
+import type {
+  TransportConnection,
+  TransportHandlers,
+} from '../transport/types.ts';
+import { FakeTransport } from './fake-transport.ts';
 
 interface Recorded {
   connected: TransportConnection[];

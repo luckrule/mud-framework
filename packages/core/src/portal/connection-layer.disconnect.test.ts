@@ -5,7 +5,7 @@ import type { Logger } from '../logging/types.ts';
 import type { RequestExecutor } from '../shared/executor.ts';
 import { parseFrame, sleep } from '../testing/common.ts';
 import { harness } from '../testing/connection-layer.ts';
-import { FakeTransport } from '../transport/fake.ts';
+import { FakeTransport } from '../testing/fake-transport.ts';
 import { ConnectionLayer } from './connection-layer.ts';
 
 describe('ConnectionLayer disconnect', () => {

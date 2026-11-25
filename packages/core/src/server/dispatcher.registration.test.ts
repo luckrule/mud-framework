@@ -1,9 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 
 import { UnknownHandlerError } from '../shared/wire-codes.ts';
-import { MemoryStorageBackend } from '../storage/memory.ts';
 import { rejectionOf } from '../testing/common.ts';
 import { quietDispatcher } from '../testing/dispatcher.ts';
+import { MemoryStorageBackend } from '../testing/memory-backend.ts';
 import type { Handler, HandlerAccess } from './dispatcher.ts';
 
 const handler: Handler = async () => null;

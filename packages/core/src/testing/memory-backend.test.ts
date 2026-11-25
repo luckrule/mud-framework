@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 
 import { rejectionOf } from 'mud-framework-test-support';
 
-import { MemoryStorageBackend } from './memory.ts';
+import { MemoryStorageBackend } from './memory-backend.ts';
 
 describe('MemoryStorageBackend', () => {
   test('declares the weakest honest capabilities by default', () => {

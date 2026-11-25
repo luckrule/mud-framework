@@ -1,7 +1,10 @@
 import { describe, expect, test } from 'bun:test';
 
-import type { ExecutorOutcome, ExecutorRequest } from '../shared/executor.ts';
-import { request } from '../testing/ipc-executor.ts';
+import type {
+  ExecutorOutcome,
+  ExecutorRequest,
+} from '../../shared/executor.ts';
+import { request } from '../../testing/ipc-executor.ts';
 import type { PendingRequest } from './ipc-pending.ts';
 import { PendingBuffer } from './ipc-pending.ts';
 

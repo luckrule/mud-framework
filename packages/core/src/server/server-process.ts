@@ -1,5 +1,6 @@
 import { createProcessChannel } from '../ipc/bun-child.ts';
 import type { IpcChannel } from '../ipc/channel.ts';
+import { preparedMessage, readyMessage } from '../ipc/outbound.ts';
 import type {
   CancelMessage,
   IpcMessage,
@@ -10,14 +11,13 @@ import { parseIpcMessage } from '../ipc/protocol.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import { safeLogger } from '../logging/safe-logger.ts';
 import type { Logger } from '../logging/types.ts';
-import { preparedMessage, readyMessage } from '../portal/ipc-outbound.ts';
 import { messageOf } from '../shared/guards.ts';
 import { requestLogFields } from '../shared/identity.ts';
 import { elapsedMs, settleWithin } from '../shared/timeout.ts';
 import type { StorageBackend } from '../storage/types.ts';
 import type { DispatcherOptions } from './dispatcher.ts';
 import type { Extension } from './extension.ts';
-import { RequestRunner } from './requests.ts';
+import { RequestRunner } from './request-runner.ts';
 import type { Runtime } from './server-startup.ts';
 import { ServerStartupError, startServer } from './server-startup.ts';
 

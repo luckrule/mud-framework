@@ -4,10 +4,10 @@ import { createJsonLogger } from '../logging/json-logger.ts';
 import { Dispatcher } from '../server/dispatcher.ts';
 import { LocalExecutor } from '../server/local-executor.ts';
 import type { RequestExecutor } from '../shared/executor.ts';
-import { MemoryStorageBackend } from '../storage/memory.ts';
 import { rejectionOf } from '../testing/common.ts';
 import { harness, scriptedExecutor } from '../testing/connection-layer.ts';
-import { FakeTransport } from '../transport/fake.ts';
+import { FakeTransport } from '../testing/fake-transport.ts';
+import { MemoryStorageBackend } from '../testing/memory-backend.ts';
 import type { Transport } from '../transport/types.ts';
 import { ConnectionLayer } from './connection-layer.ts';
 

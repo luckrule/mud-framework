@@ -3,7 +3,7 @@ import { describe, expect, test } from 'bun:test';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import type { Logger } from '../logging/types.ts';
 import type { ExecutorHealth, RequestExecutor } from '../shared/executor.ts';
-import { FakeTransport } from '../transport/fake.ts';
+import { FakeTransport } from '../testing/fake-transport.ts';
 import type { Transport } from '../transport/types.ts';
 import { ConnectionLayer } from './connection-layer.ts';
 

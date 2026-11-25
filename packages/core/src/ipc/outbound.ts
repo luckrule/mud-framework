@@ -1,10 +1,10 @@
+import type { ExecutorOutcome, ExecutorRequest } from '../shared/executor.ts';
+import type { StorageCapabilities } from '../storage/types.ts';
 import type {
   PreparedMessage,
   ReadyMessage,
   RequestMessage,
-} from '../ipc/protocol.ts';
-import type { ExecutorOutcome, ExecutorRequest } from '../shared/executor.ts';
-import type { StorageCapabilities } from '../storage/types.ts';
+} from './protocol.ts';
 
 /**
  * Builds the wire message for a request delivery or replay.

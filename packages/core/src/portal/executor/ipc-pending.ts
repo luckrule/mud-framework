@@ -1,4 +1,7 @@
-import type { ExecutorOutcome, ExecutorRequest } from '../shared/executor.ts';
+import type {
+  ExecutorOutcome,
+  ExecutorRequest,
+} from '../../shared/executor.ts';
 
 /**
  * A Request that has been accepted but not acknowledged (SPEC §2: only a

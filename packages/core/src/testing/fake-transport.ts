@@ -2,7 +2,7 @@ import type {
   Transport,
   TransportConnection,
   TransportHandlers,
-} from './types.ts';
+} from '../transport/types.ts';
 
 interface ConnectionState {
   connection: TransportConnection;

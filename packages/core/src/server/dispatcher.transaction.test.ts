@@ -1,6 +1,5 @@
 import { describe, expect, test } from 'bun:test';
 
-import { MemoryStorageBackend } from '../storage/memory.ts';
 import { rejectionOf } from '../testing/common.ts';
 import {
   CountingBackend,
@@ -9,6 +8,7 @@ import {
   parseLines,
   quietDispatcher,
 } from '../testing/dispatcher.ts';
+import { MemoryStorageBackend } from '../testing/memory-backend.ts';
 import { Dispatcher } from './dispatcher.ts';
 import type { RequestContext } from './dispatcher.ts';
 

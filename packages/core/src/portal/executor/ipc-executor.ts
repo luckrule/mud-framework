@@ -1,3 +1,4 @@
+import { failure } from '../../ipc/outbound.ts';
 import type { ResultMessage } from '../../ipc/protocol.ts';
 import type { SpawnedServer } from '../../ipc/spawn-port.ts';
 import { createJsonLogger } from '../../logging/json-logger.ts';
@@ -24,8 +25,6 @@ import {
   FRAMEWORK_SHUTDOWN,
   INTERNAL_ERROR,
 } from '../../shared/wire-codes.ts';
-import { failure } from '../ipc-outbound.ts';
-import { PendingBuffer } from '../ipc-pending.ts';
 import type { DeliveryHost } from './delivery-ledger.ts';
 import { DeliveryLedger } from './delivery-ledger.ts';
 import { ipcExecutorHealth } from './executor-health.ts';
@@ -34,6 +33,7 @@ import { doClose } from './executor-shutdown.ts';
 import type { IpcExecutorOptions } from './ipc-executor-options.ts';
 import type { MessageHost } from './ipc-inbound.ts';
 import { onServerMessage } from './ipc-inbound.ts';
+import { PendingBuffer } from './ipc-pending.ts';
 import { RestartPolicy } from './restart-policy.ts';
 import type { ServerHandlers } from './server-launcher.ts';
 import {

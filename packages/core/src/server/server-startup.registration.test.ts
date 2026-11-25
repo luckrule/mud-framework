@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 
 import { createJsonLogger } from '../logging/json-logger.ts';
-import { MemoryStorageBackend } from '../storage/memory.ts';
 import { rejectionOf } from '../testing/common.ts';
+import { MemoryStorageBackend } from '../testing/memory-backend.ts';
 import type { HandlerAccess } from './dispatcher.ts';
 import type { Extension, HandlerRegistrationOptions } from './extension.ts';
 import { startServer } from './server-startup.ts';

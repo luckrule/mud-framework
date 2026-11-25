@@ -4,8 +4,8 @@ import {
   FrameworkTimeoutError,
   UnknownHandlerError,
 } from '../shared/wire-codes.ts';
-import { MemoryStorageBackend } from '../storage/memory.ts';
 import { rejectionOf, throwingLogger } from '../testing/common.ts';
+import { MemoryStorageBackend } from '../testing/memory-backend.ts';
 import { Dispatcher } from './dispatcher.ts';
 
 describe('Dispatcher logger safety', () => {

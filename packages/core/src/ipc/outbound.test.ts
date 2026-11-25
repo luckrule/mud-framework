@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
 import type { ExecutorRequest } from '../shared/executor.ts';
-import { failure, requestMessage } from './ipc-outbound.ts';
+import { failure, requestMessage } from './outbound.ts';
 
 const request: ExecutorRequest = {
   requestId: 'req-1',
