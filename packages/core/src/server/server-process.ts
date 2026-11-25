@@ -12,11 +12,12 @@ import { safeLogger } from '../logging/safe-logger.ts';
 import type { Logger } from '../logging/types.ts';
 import { preparedMessage, readyMessage } from '../portal/ipc-outbound.ts';
 import { messageOf } from '../shared/guards.ts';
-import { settleWithin } from '../shared/timeout.ts';
+import { requestLogFields } from '../shared/identity.ts';
+import { elapsedMs, settleWithin } from '../shared/timeout.ts';
 import type { StorageBackend } from '../storage/types.ts';
 import type { DispatcherOptions } from './dispatcher.ts';
 import type { Extension } from './extension.ts';
-import { RequestRunner, requestIds } from './requests.ts';
+import { RequestRunner } from './requests.ts';
 import type { Runtime } from './server-startup.ts';
 import { ServerStartupError, startServer } from './server-startup.ts';
 
@@ -145,11 +146,10 @@ class ServerProcess {
   private readonly channel: IpcChannel;
   private readonly completion = Promise.withResolvers<void>();
   /**
-   * Resolves true once the Server is ready and the request handlers are
-   * attached, false when an orderly shutdown ended the process before that
-   * possibly happened, and rejects when startup failed.
+   * Resolves once the Server is ready, or when an orderly shutdown ended the
+   * process before that happened; rejects when startup failed.
    */
-  private readonly activation = Promise.withResolvers<boolean>();
+  private readonly activation = Promise.withResolvers<void>();
   private phase: Phase = 'awaiting-hello';
   /**
    * True once input that arrived before `ready` has been reported. A request or
@@ -395,7 +395,7 @@ class ServerProcess {
     // would otherwise be left without a drain.
     if (this.channelClosedReason !== undefined) {
       this.phase = 'shutting-down';
-      this.activation.resolve(false);
+      this.activation.resolve();
       void this.abort(runtime, runner, this.channelClosedReason);
       return;
     }
@@ -404,20 +404,20 @@ class ServerProcess {
       // to, and the backend this start just opened must be closed here: the
       // poll could not do it because the runtime did not exist yet.
       this.phase = 'shutting-down';
-      this.activation.resolve(false);
+      this.activation.resolve();
       void this.abort(runtime, runner, this.parentGoneReason);
       return;
     }
     const pendingShutdown = this.pendingShutdown;
     if (pendingShutdown !== undefined) {
-      this.activation.resolve(false);
+      this.activation.resolve();
       this.beginShutdown(runtime, runner, pendingShutdown);
       return;
     }
     if (this.isShuttingDown()) {
       // A `shutdown` delivered at registration found the runtime and started
       // its own drain; there is nothing left to begin.
-      this.activation.resolve(false);
+      this.activation.resolve();
       return;
     }
     // SPEC 6.2 step 3, in this order and no other: the handler is installed, the
@@ -439,16 +439,12 @@ class ServerProcess {
       //
       // The drain is here for the channel that delivers `ready` and only then
       // throws: a request flushed by that delivery may already be running, and
-      // the backend must not close under it. One deadline covers both steps,
-      // like `abort`.
+      // the backend must not close under it.
       this.phase = 'shutting-down';
-      const limitMs = this.options.abortTimeoutMs ?? ABORT_TIMEOUT_MS;
-      const deadlineAt = performance.now() + limitMs;
-      await runner.drain(limitMs);
-      await this.closeStorage(
+      await this.drainAndClose(
         runtime,
         runner,
-        Math.max(1, deadlineAt - performance.now()),
+        this.options.abortTimeoutMs ?? ABORT_TIMEOUT_MS,
       );
       this.activation.reject(error);
       return;
@@ -457,7 +453,7 @@ class ServerProcess {
       { pid: process.pid, capabilities: runtime.capabilities },
       'server process ready',
     );
-    this.activation.resolve(true);
+    this.activation.resolve();
   }
 
   private onMessage(raw: unknown): void {
@@ -563,7 +559,7 @@ class ServerProcess {
     this.preReadyInputLogged = true;
     this.logger.warn(
       {
-        ...requestIds(message),
+        ...requestLogFields(message),
         code: 'REQUEST_BEFORE_READY',
         phase: this.phase,
         reason: 'no handler can run before the server is ready',
@@ -632,7 +628,7 @@ class ServerProcess {
     this.sendQuietly({ type: 'closed', reason: 'shutdown' }, 'closed');
     this.channel.close('shutdown complete');
     this.completion.resolve();
-    this.activation.resolve(false);
+    this.activation.resolve();
   }
 
   private beginShutdown(
@@ -665,30 +661,39 @@ class ServerProcess {
     limitMs: number,
   ): Promise<void> {
     const startedAt = performance.now();
-    // One deadline for both steps, like `abort`: the Portal declared a single
-    // budget for the whole close, so spending it twice would overrun it by
-    // exactly the amount that made the Portal kill a Server that was closing
-    // correctly.
-    const deadlineAt = performance.now() + limitMs;
     // SPEC 6.3 steps 2-3: every accepted request settles to a terminal state,
     // bounded by the per-request timeout the dispatcher already enforces, and
-    // its result still goes out before `closed`.
+    // its result still goes out before `closed`. Step 4 closes the backend
+    // before announcing, so Portal never restarts a Server whose storage is
+    // still open.
+    await this.drainAndClose(runtime, runner, limitMs);
+    this.sendQuietly({ type: 'closed', reason: 'shutdown' }, 'closed');
+    // Step 5: the link itself goes last, after the final message.
+    this.channel.close('shutdown complete');
+    this.logger.info(
+      { durationMs: elapsedMs(startedAt) },
+      'server process stopped',
+    );
+    this.completion.resolve();
+  }
+
+  /**
+   * Drains and closes the backend under one deadline: the caller declared a
+   * single budget for the whole close, so the second step spends what the first
+   * left rather than a second full one.
+   */
+  private async drainAndClose(
+    runtime: Runtime,
+    runner: RequestRunner,
+    limitMs: number,
+  ): Promise<void> {
+    const deadlineAt = performance.now() + limitMs;
     await runner.drain(limitMs);
-    // Step 4: close the backend before announcing, so Portal never restarts a
-    // Server whose storage is still open.
     await this.closeStorage(
       runtime,
       runner,
       Math.max(1, Math.round(deadlineAt - performance.now())),
     );
-    this.sendQuietly({ type: 'closed', reason: 'shutdown' }, 'closed');
-    // Step 5: the link itself goes last, after the final message.
-    this.channel.close('shutdown complete');
-    this.logger.info(
-      { durationMs: elapsedSince(startedAt) },
-      'server process stopped',
-    );
-    this.completion.resolve();
   }
 
   /**
@@ -777,13 +782,7 @@ class ServerProcess {
     // Server both hold the storage (INV-002). It is one deadline shared by both
     // steps, not one per step, so the total is what the constant promises.
     const limitMs = this.options.abortTimeoutMs ?? ABORT_TIMEOUT_MS;
-    const deadlineAt = performance.now() + limitMs;
-    await runner.drain(limitMs);
-    await this.closeStorage(
-      runtime,
-      runner,
-      Math.max(1, deadlineAt - performance.now()),
-    );
+    await this.drainAndClose(runtime, runner, limitMs);
     // On the parent-gone path the link is still open, and an open IPC channel
     // keeps the event loop alive: the whole point is that an orphaned process
     // goes away rather than lingering as a second writer (INV-002).
@@ -825,8 +824,4 @@ class ServerProcess {
       throw failure;
     }
   }
-}
-
-function elapsedSince(startedAt: number): number {
-  return Math.round(performance.now() - startedAt);
 }

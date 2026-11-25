@@ -203,14 +203,7 @@ async function shutdownServer(host: ShutdownHost): Promise<boolean> {
         },
         'server did not finish shutting down; killing it',
       );
-      try {
-        server.kill();
-      } catch (error) {
-        host.logger.warn(
-          { pid: server.pid, reason: messageOf(error) },
-          'server could not be killed',
-        );
-      }
+      killQuietly(server, host.logger);
     }
   }
   // A `closed` message says the Server finished its work, not that the
@@ -227,14 +220,7 @@ async function shutdownServer(host: ShutdownHost): Promise<boolean> {
       { pid: server.pid, timeoutMs: EXIT_WAIT_TIMEOUT_MS },
       'server process did not exit; killing it before close returns',
     );
-    try {
-      server.kill();
-    } catch (error) {
-      host.logger.warn(
-        { pid: server.pid, reason: messageOf(error) },
-        'server could not be killed',
-      );
-    }
+    killQuietly(server, host.logger);
     exited = await waitForExit(server, host.logger);
     if (!exited) {
       host.logger.warn(

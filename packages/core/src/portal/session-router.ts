@@ -1,6 +1,6 @@
 import type { Logger } from '../logging/types.ts';
 
-export interface SessionRouterOptions {
+interface SessionRouterOptions {
   readonly logger: Logger;
 }
 

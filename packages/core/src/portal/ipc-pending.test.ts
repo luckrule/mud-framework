@@ -34,7 +34,7 @@ describe('PendingBuffer registration', () => {
     expect(buffer.size).toBe(1);
     expect(buffer.isEmpty).toBe(false);
     expect(first.request.requestId).toBe('req-1');
-    expect(first.perConnectionSeq).toBe(1);
+    expect(first.globalSeq).toBe(1);
     expect(first.replayCount).toBe(0);
     expect(first.sentOn).toBeUndefined();
     expect(first.timer).toBeUndefined();
@@ -43,7 +43,7 @@ describe('PendingBuffer registration', () => {
     expect(first.deadlineAt - first.startedAt).toBe(250);
 
     const second = add(buffer, { requestId: 'req-2' });
-    expect(second.perConnectionSeq).toBe(2);
+    expect(second.globalSeq).toBe(2);
     expect(buffer.size).toBe(2);
   });
 
@@ -86,18 +86,21 @@ describe('PendingBuffer removal', () => {
     expect(buffer.take('req-1')).toBeUndefined();
   });
 
-  test('clear returns everything in insertion order and empties the buffer', () => {
+  test('values exposes everything in insertion order; take empties the buffer', () => {
     const buffer = new PendingBuffer({ maxPending: 3 });
     add(buffer, { requestId: 'req-3', connectionId: 'c2' });
     add(buffer, { requestId: 'req-1', connectionId: 'c1' });
     add(buffer, { requestId: 'req-2', connectionId: 'c1' });
 
-    expect(ids(buffer.clear())).toEqual(['req-3', 'req-1', 'req-2']);
+    expect(ids([...buffer.values()])).toEqual(['req-3', 'req-1', 'req-2']);
+    buffer.take('req-3');
+    buffer.take('req-1');
+    buffer.take('req-2');
     expect(buffer.size).toBe(0);
     expect(buffer.isEmpty).toBe(true);
     expect(buffer.get('req-1')).toBeUndefined();
     // Still usable afterwards.
-    expect(add(buffer, { requestId: 'req-4' }).perConnectionSeq).toBe(4);
+    expect(add(buffer, { requestId: 'req-4' }).globalSeq).toBe(4);
   });
 });
 
@@ -116,7 +119,7 @@ describe('PendingBuffer.undelivered', () => {
     expect(second.sentOn).toBeUndefined();
   });
 
-  test('orders one connection by perConnectionSeq, whatever the interleaving', () => {
+  test('orders one connection by globalSeq, whatever the interleaving', () => {
     const buffer = new PendingBuffer({ maxPending: 4 });
     add(buffer, { requestId: 'a1', connectionId: 'c1' });
     add(buffer, { requestId: 'b1', connectionId: 'c2' });
@@ -150,12 +153,12 @@ describe('PendingBuffer.undelivered', () => {
       const ofConnection = buffer
         .undelivered(1)
         .filter((entry) => entry.request.connectionId === connectionId)
-        .map((entry) => entry.perConnectionSeq);
+        .map((entry) => entry.globalSeq);
       expect(ofConnection).toEqual(ofConnection.toSorted((a, b) => a - b));
     }
   });
 
-  test('orders by perConnectionSeq alone: a never-sent request keeps its place', () => {
+  test('orders by globalSeq alone: a never-sent request keeps its place', () => {
     const buffer = new PendingBuffer({ maxPending: 2 });
     const neverSent = add(buffer, {
       requestId: 'never-sent',
@@ -171,7 +174,7 @@ describe('PendingBuffer.undelivered', () => {
     // state (it flushes in sequence order), so the buffer pins the rule.
     replay.sentOn = 1;
 
-    expect(neverSent.perConnectionSeq).toBeLessThan(replay.perConnectionSeq);
+    expect(neverSent.globalSeq).toBeLessThan(replay.globalSeq);
     expect(ids(buffer.undelivered(2))).toEqual(['never-sent', 'needs-replay']);
   });
 });

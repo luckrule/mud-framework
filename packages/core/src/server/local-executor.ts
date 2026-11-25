@@ -7,7 +7,7 @@ import type {
 import { describeFailure } from '../shared/wire-codes.ts';
 import type { Dispatcher } from './dispatcher.ts';
 
-export interface LocalExecutorOptions {
+interface LocalExecutorOptions {
   dispatcher: Dispatcher;
 }
 

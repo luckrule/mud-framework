@@ -17,6 +17,7 @@ import type {
   RequestExecutor,
 } from '../../shared/executor.ts';
 import { messageOf } from '../../shared/guards.ts';
+import { requestLogFields } from '../../shared/identity.ts';
 import { effectiveTimeoutMs, tightenTimeout } from '../../shared/timeout.ts';
 import {
   FRAMEWORK_QUEUE_FULL,
@@ -26,7 +27,7 @@ import {
 import { failure } from '../ipc-outbound.ts';
 import { PendingBuffer } from '../ipc-pending.ts';
 import type { DeliveryHost } from './delivery-ledger.ts';
-import { DeliveryLedger, requestFields } from './delivery-ledger.ts';
+import { DeliveryLedger } from './delivery-ledger.ts';
 import { ipcExecutorHealth } from './executor-health.ts';
 import type { ShutdownHost } from './executor-shutdown.ts';
 import { doClose } from './executor-shutdown.ts';
@@ -39,6 +40,7 @@ import {
   ClosedWaiter,
   attachServer,
   buildServer,
+  closeChannelQuietly,
   killQuietly,
   waitForExit,
 } from './server-launcher.ts';
@@ -331,14 +333,7 @@ export class IpcExecutor implements RequestExecutor {
         );
       }
     }
-    try {
-      server.channel.close('start timeout');
-    } catch (error) {
-      this.logger.debug(
-        { reason: messageOf(error) },
-        'ipc channel close failed',
-      );
-    }
+    closeChannelQuietly(server, 'start timeout', this.logger);
   }
 
   execute(request: ExecutorRequest): Promise<ExecutorOutcome> {
@@ -348,7 +343,7 @@ export class IpcExecutor implements RequestExecutor {
       // backend instead of a missing `start()` (SPEC 6.2 step 3).
       this.logger.error(
         {
-          ...requestFields(request),
+          ...requestLogFields(request),
           code: INTERNAL_ERROR,
           reason: 'ipc executor was never started',
         },
@@ -364,7 +359,7 @@ export class IpcExecutor implements RequestExecutor {
       // never coming. Failing now is the same answer as the start rejection.
       this.logger.error(
         {
-          ...requestFields(request),
+          ...requestLogFields(request),
           code: INTERNAL_ERROR,
           reason: 'ipc executor failed to start',
         },
@@ -384,7 +379,7 @@ export class IpcExecutor implements RequestExecutor {
       // connection layer records the failed outcome at error level already.
       this.logger.warn(
         {
-          ...requestFields(request),
+          ...requestLogFields(request),
           code: FRAMEWORK_SHUTDOWN,
           reason: `executor ${this.slot.status}`,
         },
@@ -416,7 +411,7 @@ export class IpcExecutor implements RequestExecutor {
       // bug. Failing it beats overwriting a promise nobody would ever settle.
       this.logger.warn(
         {
-          ...requestFields(request),
+          ...requestLogFields(request),
           code: INTERNAL_ERROR,
           reason: 'duplicate requestId',
         },
@@ -480,7 +475,7 @@ export class IpcExecutor implements RequestExecutor {
   private refuseQueueFull(request: ExecutorRequest): Promise<ExecutorOutcome> {
     this.logger.warn(
       {
-        ...requestFields(request),
+        ...requestLogFields(request),
         code: FRAMEWORK_QUEUE_FULL,
         pending: this.buffer.size,
         limit: this.buffer.maxPending,
@@ -553,7 +548,7 @@ export class IpcExecutor implements RequestExecutor {
     // warn, not error: this is a request ending by policy, not a failure.
     this.logger.warn(
       {
-        ...requestFields(pending.request),
+        ...requestLogFields(pending.request),
         code,
         durationMs: Date.now() - pending.startedAt,
       },
@@ -665,7 +660,7 @@ export class IpcExecutor implements RequestExecutor {
         { reason: messageOf(error), backoffMs },
         'server spawn failed',
       );
-      this.slot.markStartingAfterLoss();
+      this.slot.beginStart();
       this.scheduleRestart(backoffMs);
       return;
     }
@@ -755,10 +750,10 @@ export class IpcExecutor implements RequestExecutor {
       return;
     }
     const fields: LogFields = {
-      ...requestFields(pending.request),
+      ...requestLogFields(pending.request),
       durationMs: Date.now() - pending.startedAt,
     };
-    // `sessionId` stays the entry Session from `requestFields`; a routing
+    // `sessionId` stays the entry Session from `requestLogFields`; a routing
     // change is reported separately, never as a replacement id.
     if (message.ok && message.sessionChange !== undefined) {
       fields.sessionChange = message.sessionChange;
@@ -830,7 +825,7 @@ export class IpcExecutor implements RequestExecutor {
     if (this.slot.isTerminal) {
       return;
     }
-    this.slot.markStartingAfterLoss();
+    this.slot.beginStart();
     const recovery = { backoffMs, blocked: false };
     this.pendingRecovery = recovery;
     const pending = this.slot.pendingExits;

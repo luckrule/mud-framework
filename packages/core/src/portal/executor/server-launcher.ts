@@ -2,6 +2,7 @@ import type { ServerExitInfo, SpawnedServer } from '../../ipc/spawn-port.ts';
 import type { Logger } from '../../logging/types.ts';
 import { EXIT_WAIT_TIMEOUT_MS } from '../../shared/budget.ts';
 import { messageOf } from '../../shared/guards.ts';
+import { settleWithin } from '../../shared/timeout.ts';
 import type { ServerState } from './server-slot.ts';
 
 /**
@@ -137,24 +138,15 @@ export async function waitForExit(
   if (server.exited) {
     return true;
   }
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<'timeout'>((resolve) => {
-    timer = setTimeout(() => {
-      resolve('timeout');
-    }, EXIT_WAIT_TIMEOUT_MS);
-  });
-  const info = await Promise.race([
+  const outcome = await settleWithin(
     server.exitPromise.catch((): ServerExitInfo => ({
       code: null,
       signal: null,
       observed: false,
     })),
-    timeout,
-  ]);
-  if (timer !== undefined) {
-    clearTimeout(timer);
-  }
-  if (info === 'timeout' || !info.observed) {
+    EXIT_WAIT_TIMEOUT_MS,
+  );
+  if (outcome.status !== 'settled' || !outcome.value.observed) {
     logger.warn(
       { pid: server.pid, timeoutMs: EXIT_WAIT_TIMEOUT_MS },
       'server process did not exit within the wait; it may still be running',

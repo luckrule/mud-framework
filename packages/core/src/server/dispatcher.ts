@@ -6,7 +6,7 @@ import type { Logger } from '../logging/types.ts';
 import type { SessionChange } from '../shared/executor.ts';
 import { describeValue, messageOf } from '../shared/guards.ts';
 import type { RequestIdentity } from '../shared/identity.ts';
-import { tightenTimeout } from '../shared/timeout.ts';
+import { elapsedMs, tightenTimeout } from '../shared/timeout.ts';
 import {
   AUTH_REQUIRED,
   AuthenticationRequiredError,
@@ -540,7 +540,7 @@ export class Dispatcher {
     // internally, but someone should know a request was dropped mid-flight
     // (SPEC 7.1).
     entry.logger.warn(
-      { code, durationMs: Math.round(performance.now() - entry.startedAt) },
+      { code, durationMs: elapsedMs(entry.startedAt) },
       'request cancelled',
     );
     return true;
@@ -576,7 +576,7 @@ function logLostCommit(logger: Logger, startedAt: number): void {
   logger.warn(
     {
       code: 'CANCEL_LOST_TO_COMMIT',
-      durationMs: Math.round(performance.now() - startedAt),
+      durationMs: elapsedMs(startedAt),
     },
     'transaction committed after the request reached a terminal state',
   );

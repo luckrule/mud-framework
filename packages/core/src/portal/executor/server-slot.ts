@@ -1,24 +1,6 @@
 import type { IpcChannel } from '../../ipc/channel.ts';
 import type { ServerExitInfo } from '../../ipc/spawn-port.ts';
-
-/**
- * `failed` is a terminal state that is not `closed`: the executor gave up
- * because the Server never became ready within `startTimeoutMs`. It is distinct
- * from `closed` so `execute` can report a different message and so a failed
- * start cannot be mistaken for an orderly shutdown.
- *
- * `switching` is not terminal: a replacement is being prepared or the previous
- * process is being retired. Requests keep arriving and stay buffered; only the
- * promotion to the new generation delivers them.
- */
-type Status =
-  | 'idle'
-  | 'starting'
-  | 'ready'
-  | 'switching'
-  | 'closing'
-  | 'closed'
-  | 'failed';
+import type { IpcHealthStatus } from './executor-health.ts';
 
 export interface ServerState {
   readonly generation: number;
@@ -77,7 +59,7 @@ interface SwitchOwner {
  * returned a copy would make the executor compare stale values.
  */
 export class ServerSlot<Op extends SwitchOwner = SwitchOwner> {
-  private currentStatus: Status = 'idle';
+  private currentStatus: IpcHealthStatus = 'idle';
   private currentServer: ServerState | undefined;
   private currentSwitch: Op | undefined;
   private generations = 0;
@@ -97,7 +79,7 @@ export class ServerSlot<Op extends SwitchOwner = SwitchOwner> {
     }
   }
 
-  get status(): Status {
+  get status(): IpcHealthStatus {
     return this.currentStatus;
   }
 
@@ -128,7 +110,7 @@ export class ServerSlot<Op extends SwitchOwner = SwitchOwner> {
     );
   }
 
-  /** `start()` leaves `idle`; a restart after a loss uses `markStartingAfterLoss`. */
+  /** The first `start()` and a restart after a loss both need a Server. */
   beginStart(): void {
     this.currentStatus = 'starting';
   }
@@ -139,7 +121,11 @@ export class ServerSlot<Op extends SwitchOwner = SwitchOwner> {
     this.currentServer = server;
   }
 
-  /** The handshake completed: this generation is current and may serve. */
+  /**
+   * The Server is serving: a completed handshake, or a promoted replacement.
+   * A switch's own finish step still releases its operation and reports the
+   * outcome.
+   */
   markReady(server: ServerState): void {
     this.currentServer = server;
     this.currentStatus = 'ready';
@@ -149,16 +135,6 @@ export class ServerSlot<Op extends SwitchOwner = SwitchOwner> {
   beginSwitch(op: Op): void {
     this.currentSwitch = op;
     this.currentStatus = 'switching';
-  }
-
-  /**
-   * The replacement was promoted: it becomes the current Server and the
-   * recovery barrier opens. The operation itself is released by the switch's
-   * own finish step, which still has to report the outcome.
-   */
-  adopt(server: ServerState): void {
-    this.currentServer = server;
-    this.currentStatus = 'ready';
   }
 
   /** The switch failed before disturbing the previous process, which keeps serving. */
@@ -197,11 +173,6 @@ export class ServerSlot<Op extends SwitchOwner = SwitchOwner> {
     this.currentStatus = 'failed';
   }
 
-  /** No Server is live any more and the executor is trying to get one. */
-  markStartingAfterLoss(): void {
-    this.currentStatus = 'starting';
-  }
-
   /** Allocates the identity stamped on a Server and its deliveries. */
   nextGeneration(): number {
     this.generations += 1;
@@ -215,14 +186,10 @@ export class ServerSlot<Op extends SwitchOwner = SwitchOwner> {
    * Channel closure and a sent kill never release this gate.
    */
   assertNoOtherLiveServer(except?: ServerState): void {
-    const candidates: (ServerState | undefined)[] = [
-      ...this.processes,
-      this.currentServer,
-      this.currentSwitch?.staged,
-      this.currentSwitch?.previous,
-    ];
-    for (const candidate of candidates) {
-      if (candidate === undefined || candidate === except || candidate.exited) {
+    // Every process is `track`ed at creation, so `processes` already covers the
+    // current Server and both switch participants.
+    for (const candidate of this.processes) {
+      if (candidate === except || candidate.exited) {
         continue;
       }
       throw new Error(

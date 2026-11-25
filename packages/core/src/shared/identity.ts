@@ -1,3 +1,5 @@
+import type { LogFields } from '../logging/types.ts';
+
 /**
  * The ids every request carries from entry to terminal state (SPEC 7.3).
  *
@@ -23,4 +25,24 @@ export interface RequestIdentity {
   readonly connectionId: string;
   readonly clientRequestId: string;
   readonly sessionId?: string;
+}
+
+/**
+ * `RequestIdentity` as request-level log bindings (SPEC 7.1). Both processes
+ * build these fields, so the mapping lives here rather than in either one.
+ *
+ * `sessionId` is omitted, not written as `undefined` or an empty string, when
+ * the connection holds no Session: absence is the contract for "unbound"
+ * (SPEC 2).
+ */
+export function requestLogFields(identity: RequestIdentity): LogFields {
+  const fields: LogFields = {
+    requestId: identity.requestId,
+    connectionId: identity.connectionId,
+    clientRequestId: identity.clientRequestId,
+  };
+  if (identity.sessionId !== undefined) {
+    fields.sessionId = identity.sessionId;
+  }
+  return fields;
 }

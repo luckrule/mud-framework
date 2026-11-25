@@ -46,3 +46,12 @@ export function describeValue(value: unknown): string {
 export function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
+
+/**
+ * A value thrown by outside code, as an `Error`. Callers need `instanceof` or a
+ * message, and a rejection may carry anything; a non-`Error` throw keeps the
+ * text `messageOf` gives it.
+ */
+export function toError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(messageOf(error));
+}

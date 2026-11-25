@@ -1,9 +1,7 @@
-import type { LogFields, Logger } from '../../logging/types.ts';
-import type {
-  ExecutorOutcome,
-  ExecutorRequest,
-} from '../../shared/executor.ts';
+import type { Logger } from '../../logging/types.ts';
+import type { ExecutorOutcome } from '../../shared/executor.ts';
 import { messageOf } from '../../shared/guards.ts';
+import { requestLogFields } from '../../shared/identity.ts';
 import {
   FRAMEWORK_REPLAY_EXHAUSTED,
   FRAMEWORK_SHUTDOWN,
@@ -104,7 +102,7 @@ export class DeliveryLedger {
       // retried, otherwise one bad input becomes a crash loop.
       this.host.logger.error(
         {
-          ...requestFields(pending.request),
+          ...requestLogFields(pending.request),
           replayCount: pending.replayCount,
           code: FRAMEWORK_REPLAY_EXHAUSTED,
         },
@@ -141,7 +139,7 @@ export class DeliveryLedger {
     if (isReplay) {
       this.host.logger.warn(
         {
-          ...requestFields(pending.request),
+          ...requestLogFields(pending.request),
           replayCount,
           durationMs: Date.now() - pending.startedAt,
         },
@@ -171,7 +169,7 @@ export class DeliveryLedger {
     // level, and one request failure should not produce two error lines.
     this.host.logger.warn(
       {
-        ...requestFields(pending.request),
+        ...requestLogFields(pending.request),
         code: FRAMEWORK_TIMEOUT,
         durationMs: Date.now() - pending.startedAt,
       },
@@ -213,7 +211,7 @@ export class DeliveryLedger {
     } catch (error) {
       this.host.logger.warn(
         {
-          ...requestFields(pending.request),
+          ...requestLogFields(pending.request),
           code,
           reason: messageOf(error),
         },
@@ -248,36 +246,16 @@ export class DeliveryLedger {
    * Fails the requests that never reached a live Server, so they do not burn
    * their whole deadline while the executor closes (SPEC 6.3 step 3).
    * `reason` is log-only and names the call site.
-   *
-   * Removing the current entry during iteration is safe for a Map, and settling
-   * only resolves a promise (the continuation runs as a microtask), so this
-   * cannot mutate the map mid-loop.
    */
   failUndelivered(reason: string): void {
     const server = this.host.currentServer();
-    for (const pending of this.buffer.values()) {
-      if (
-        server === undefined ||
-        server.closed ||
-        pending.sentOn === undefined
-      ) {
-        // Per-request line: this is the only trace of why the request ended,
-        // since no Server result or deadline will ever reach it.
-        this.host.logger.warn(
-          {
-            ...requestFields(pending.request),
-            code: FRAMEWORK_SHUTDOWN,
-            reason,
-            durationMs: Date.now() - pending.startedAt,
-          },
-          'pending request failed',
-        );
-        this.settle(
-          pending,
-          failure(FRAMEWORK_SHUTDOWN, 'ipc executor is closing'),
-        );
-      }
-    }
+    this.failWhere(
+      (pending) =>
+        server === undefined || server.closed || pending.sentOn === undefined,
+      FRAMEWORK_SHUTDOWN,
+      'ipc executor is closing',
+      reason,
+    );
   }
 
   /**
@@ -303,12 +281,32 @@ export class DeliveryLedger {
    * several paths share a code and would otherwise look identical in the logs.
    */
   failAllPending(code: string, message: string, reason: string): void {
+    this.failWhere(() => true, code, message, reason);
+  }
+
+  /**
+   * Fails every buffered request `predicate` selects.
+   *
+   * Removing the current entry during iteration is safe for a Map, and settling
+   * only resolves a promise (the continuation runs as a microtask), so this
+   * cannot mutate the map mid-loop. The per-request line is the only trace of
+   * why a request that no Server result or deadline reaches ended.
+   */
+  private failWhere(
+    predicate: (pending: PendingRequest) => boolean,
+    code: string,
+    message: string,
+    reason: string,
+  ): void {
     for (const pending of this.buffer.values()) {
+      if (!predicate(pending)) {
+        continue;
+      }
       // warn, not error: the connection layer records the failed outcome at
       // error level, and one request failure should not produce two error lines.
       this.host.logger.warn(
         {
-          ...requestFields(pending.request),
+          ...requestLogFields(pending.request),
           code,
           reason,
           durationMs: Date.now() - pending.startedAt,
@@ -328,27 +326,4 @@ export class DeliveryLedger {
       this.drainedWaiter = resolve;
     });
   }
-}
-
-/**
- * Request-level log bindings (SPEC 7.1): the ids every request carries plus the
- * Session its connection already held on entry.
- *
- * `sessionId` is omitted, not written as `undefined` or an empty string, when
- * the connection holds no Session: absence is the contract for "unbound"
- * (SPEC 2, identity.ts).
- *
- * Lives here rather than in the executor because the ledger writes most of the
- * request-level lines; the executor's admission lines share the same fields.
- */
-export function requestFields(request: ExecutorRequest): LogFields {
-  const fields: LogFields = {
-    requestId: request.requestId,
-    connectionId: request.connectionId,
-    clientRequestId: request.clientRequestId,
-  };
-  if (request.sessionId !== undefined) {
-    fields.sessionId = request.sessionId;
-  }
-  return fields;
 }

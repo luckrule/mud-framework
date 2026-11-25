@@ -10,8 +10,13 @@ import type {
   RequestExecutor,
   SessionChange,
 } from '../shared/executor.ts';
-import { describeValue, isRecord, messageOf } from '../shared/guards.ts';
-import { settleWithin } from '../shared/timeout.ts';
+import {
+  describeValue,
+  isRecord,
+  messageOf,
+  toError,
+} from '../shared/guards.ts';
+import { elapsedMs, settleWithin } from '../shared/timeout.ts';
 import {
   FRAMEWORK_QUEUE_FULL,
   FRAMEWORK_SHUTDOWN,
@@ -26,7 +31,7 @@ import type {
   TransportConnection,
   TransportHandlers,
 } from '../transport/types.ts';
-import type { ConnectionHealth } from './health.ts';
+import type { ConnectionLayerStatus, ConnectionHealth } from './health.ts';
 import { connectionHealthSnapshot, readExecutorHealth } from './health.ts';
 import { SessionRouter } from './session-router.ts';
 
@@ -43,7 +48,7 @@ const DEFAULT_MAX_QUEUED_PER_CONNECTION = 1000;
  * rollback with room to spare, and is short enough that a deploy hitting a
  * stuck handler looks slow rather than hung.
  */
-const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
+const DEFAULT_STOP_TIMEOUT_MS = 10_000;
 
 /**
  * Slack added to the executor's own close budget. The executor's bound is
@@ -91,7 +96,7 @@ export interface ConnectionLayerOptions {
   /**
    * Ceiling on each shutdown wait: draining in-flight requests, closing the
    * executor and stopping the transport (SPEC 6.3). Defaults to
-   * `DEFAULT_SHUTDOWN_TIMEOUT_MS`. Must be a finite number of at least 1.
+   * `DEFAULT_STOP_TIMEOUT_MS`. Must be a finite number of at least 1.
    *
    * This is a floor, not the executor's ceiling: when the executor can bound
    * its own `close()` (`RequestExecutor.closeBudgetMs`, which `IpcExecutor`
@@ -108,8 +113,6 @@ export interface ConnectionLayerOptions {
    */
   maxConnections?: number;
 }
-
-type Status = 'idle' | 'starting' | 'started' | 'stopping' | 'stopped';
 
 interface ConnectionState {
   readonly connection: TransportConnection;
@@ -152,7 +155,7 @@ export class ConnectionLayer implements TransportHandlers {
   private readonly connections = new Map<string, ConnectionState>();
   /** Which connection holds which Session, and the reconnect gate (SPEC 3.2). */
   private readonly router: SessionRouter;
-  private status: Status = 'idle';
+  private status: ConnectionLayerStatus = 'idle';
   private executorStart: Promise<void> | undefined;
   private transportStart: Promise<void> | undefined;
   /** Retained after a bounded stop so a late listener is still released once. */
@@ -169,7 +172,7 @@ export class ConnectionLayer implements TransportHandlers {
       options.maxQueuedPerConnection ?? DEFAULT_MAX_QUEUED_PER_CONNECTION;
     assertPositiveInteger(maxQueuedPerConnection, 'maxQueuedPerConnection');
     const shutdownTimeoutMs =
-      options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
+      options.shutdownTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
     assertFiniteAtLeastOne(shutdownTimeoutMs, 'shutdownTimeoutMs');
     this.transport = options.transport;
     this.executor = options.executor;
@@ -699,7 +702,7 @@ export class ConnectionLayer implements TransportHandlers {
         {
           method,
           code: outcome.error.code,
-          durationMs: elapsedSince(startedAt),
+          durationMs: elapsedMs(startedAt),
         },
         'request ended after the connection closed',
       );
@@ -713,7 +716,7 @@ export class ConnectionLayer implements TransportHandlers {
       {
         method,
         code: outcome.error.code,
-        durationMs: elapsedSince(startedAt),
+        durationMs: elapsedMs(startedAt),
         reason: outcome.error.message,
       },
       'request failed',
@@ -822,10 +825,6 @@ function assertFiniteAtLeastOne(value: unknown, name: string): void {
   }
 }
 
-function toError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
-}
-
 /**
  * A guard, not a normaliser. The executor is outside code, so a returned object
  * is not proof of the field the branches below read: a bare `{ok:false}` would
@@ -879,8 +878,4 @@ function toFailure(error: unknown): ExecutorOutcome {
     ok: false,
     error: { code: INTERNAL_ERROR, message: messageOf(error) },
   };
-}
-
-function elapsedSince(startedAt: number): number {
-  return Math.round(performance.now() - startedAt);
 }

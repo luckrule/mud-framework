@@ -55,7 +55,6 @@ export class SqliteBackend implements StorageBackend {
   private readonly busyTimeoutMs: number;
   private readonly logger: Logger | undefined;
   private closing = false;
-  private closed = false;
   private unusableReason: string | undefined;
   private queue: Promise<unknown> = Promise.resolve();
 
@@ -139,7 +138,6 @@ export class SqliteBackend implements StorageBackend {
     // Drain first so close never cuts an in-flight COMMIT in half.
     await this.queue;
     this.db.close(true);
-    this.closed = true;
   }
 
   private async run<T>(fn: (tx: StorageTransaction) => Promise<T>): Promise<T> {
@@ -193,54 +191,56 @@ export class SqliteBackend implements StorageBackend {
     const journal = this.db
       .query<JournalModeRow, []>('PRAGMA journal_mode')
       .get();
-    if (journal?.journal_mode.toLowerCase() !== this.requestedJournalMode) {
-      this.logger?.error(
-        {
-          pragma: 'journal_mode',
-          expected: this.requestedJournalMode,
-          actual: String(journal?.journal_mode),
-        },
-        'PRAGMA verification failed',
-      );
-      throw new Error(
-        `SQLite journal_mode is ${String(journal?.journal_mode)} but ` +
-          `${this.requestedJournalMode} was requested`,
-      );
-    }
+    const journalMode = journal?.journal_mode;
+    this.requirePragma(
+      'journal_mode',
+      this.requestedJournalMode,
+      journalMode,
+      journalMode?.toLowerCase() === this.requestedJournalMode,
+      `SQLite journal_mode is ${String(journalMode)} but ` +
+        `${this.requestedJournalMode} was requested`,
+    );
 
     this.db.run(`PRAGMA busy_timeout = ${this.busyTimeoutMs}`);
     const timeout = this.db.query<TimeoutRow, []>('PRAGMA busy_timeout').get();
     // Readback key is `timeout`, not `busy_timeout`.
-    if (timeout?.timeout !== this.busyTimeoutMs) {
-      this.logger?.error(
-        {
-          pragma: 'busy_timeout',
-          expected: this.busyTimeoutMs,
-          actual: String(timeout?.timeout),
-        },
-        'PRAGMA verification failed',
-      );
-      throw new Error(
-        `SQLite busy_timeout is ${String(timeout?.timeout)} but ` +
-          `${this.busyTimeoutMs} was requested`,
-      );
-    }
+    this.requirePragma(
+      'busy_timeout',
+      this.busyTimeoutMs,
+      timeout?.timeout,
+      timeout?.timeout === this.busyTimeoutMs,
+      `SQLite busy_timeout is ${String(timeout?.timeout)} but ` +
+        `${this.busyTimeoutMs} was requested`,
+    );
 
     this.db.run('PRAGMA foreign_keys = ON');
     const foreignKeys = this.db
       .query<ForeignKeysRow, []>('PRAGMA foreign_keys')
       .get();
-    if (foreignKeys?.foreign_keys !== 1) {
-      this.logger?.error(
-        {
-          pragma: 'foreign_keys',
-          expected: 1,
-          actual: String(foreignKeys?.foreign_keys),
-        },
-        'PRAGMA verification failed',
-      );
-      throw new Error('SQLite foreign_keys could not be enabled');
+    this.requirePragma(
+      'foreign_keys',
+      1,
+      foreignKeys?.foreign_keys,
+      foreignKeys?.foreign_keys === 1,
+      'SQLite foreign_keys could not be enabled',
+    );
+  }
+
+  private requirePragma(
+    pragma: string,
+    expected: string | number,
+    actual: string | number | undefined,
+    verified: boolean,
+    failure: string,
+  ): void {
+    if (verified) {
+      return;
     }
+    this.logger?.error(
+      { pragma, expected, actual: String(actual) },
+      'PRAGMA verification failed',
+    );
+    throw new Error(failure);
   }
 
   private rollbackOrInvalidate(): void {
@@ -260,7 +260,7 @@ export class SqliteBackend implements StorageBackend {
   }
 
   private assertOpen(): void {
-    if (this.closed || this.closing) {
+    if (this.closing) {
       throw new Error('storage backend is closed');
     }
   }

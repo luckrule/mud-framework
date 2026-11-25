@@ -43,6 +43,15 @@ export async function settleWithin<T>(
 }
 
 /**
+ * Milliseconds since a `performance.now()` reading, rounded the way every
+ * `durationMs` log field is. One helper so the two processes cannot report the
+ * same measurement at different precisions.
+ */
+export function elapsedMs(startedAt: number): number {
+  return Math.round(performance.now() - startedAt);
+}
+
+/**
  * Caps `overrideMs` by `ceilingMs`. Only a smaller usable value wins: the
  * ceiling is the promise already made — the dispatcher's configured timeout or
  * this executor's established portal deadline — so a caller-supplied override

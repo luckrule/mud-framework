@@ -1,6 +1,17 @@
 import type { ExecutorHealth } from '../../shared/executor.ts';
 
-/** The executor statuses health classifies; `ServerSlot` remains their writer. */
+/**
+ * The statuses health classifies; `ServerSlot` remains their writer.
+ *
+ * `failed` is a terminal state that is not `closed`: the executor gave up
+ * because the Server never became ready within `startTimeoutMs`. It is distinct
+ * from `closed` so `execute` can report a different message and so a failed
+ * start cannot be mistaken for an orderly shutdown.
+ *
+ * `switching` is not terminal: a replacement is being prepared or the previous
+ * process is being retired. Requests keep arriving and stay buffered; only the
+ * promotion to the new generation delivers them.
+ */
 export type IpcHealthStatus =
   | 'idle'
   | 'starting'
@@ -10,7 +21,7 @@ export type IpcHealthStatus =
   | 'closed'
   | 'failed';
 
-export interface IpcHealthFacts {
+interface IpcHealthFacts {
   readonly status: IpcHealthStatus;
   /** True once a Server completed the handshake at least once. */
   readonly handshakeCompleted: boolean;

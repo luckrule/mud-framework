@@ -4,7 +4,7 @@ import {
   EXIT_WAIT_TIMEOUT_MS,
   SHUTDOWN_ACK_SLACK_MS,
 } from '../../shared/budget.ts';
-import { messageOf } from '../../shared/guards.ts';
+import { messageOf, toError } from '../../shared/guards.ts';
 import { settleWithin } from '../../shared/timeout.ts';
 import {
   buildServer,
@@ -43,7 +43,6 @@ export interface SwitchOperation {
   abortError: Error | undefined;
   /** True when `close()` interrupted the switch and owns the cleanup. */
   closeAborted: boolean;
-  settled: boolean;
   phase: 'preparing' | 'retiring' | 'activating';
   /** The process being promoted; not the current Server until `ready`. */
   staged: ServerState | undefined;
@@ -188,7 +187,6 @@ export class VersionSwitch {
       },
       abortError: undefined,
       closeAborted: false,
-      settled: false,
       phase: 'preparing',
       staged: undefined,
       previous: slot.server,
@@ -500,7 +498,7 @@ export class VersionSwitch {
     // the only thing that releases the buffered requests to it.
     staged.staged = false;
     op.promoted = true;
-    this.host.slot.adopt(staged);
+    this.host.slot.markReady(staged);
     // A crash after this point restarts the process factory that is now
     // serving. A rollback keeps the old one because this only runs after the
     // promotion succeeded.
@@ -540,25 +538,15 @@ export class VersionSwitch {
       op.failure ??= new Error('the replacement was never spawned');
       return false;
     }
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<'timeout'>((resolve) => {
-      timer = setTimeout(() => {
-        resolve('timeout');
-      }, timeoutMs);
-    });
-    const raced = Promise.race([
-      barrier.promise.then(() => 'barrier' as const),
-      op.abortSignal.then(() => 'aborted' as const),
-      staged.closedSignal.promise.then(() => 'lost' as const),
-    ]);
-    const result = await Promise.race([raced, timeout]);
-    if (timer !== undefined) {
-      clearTimeout(timer);
-    }
-    if (result === 'barrier') {
-      return true;
-    }
-    if (result === 'timeout') {
+    const outcome = await settleWithin(
+      Promise.race([
+        barrier.promise.then(() => 'barrier' as const),
+        op.abortSignal.then(() => 'aborted' as const),
+        staged.closedSignal.promise.then(() => 'lost' as const),
+      ]),
+      timeoutMs,
+    );
+    if (outcome.status === 'timeout') {
       this.host.logger.warn(
         { pid: staged.pid, timeoutMs, expected: what },
         'replacement server did not reach its barrier before the switch timeout',
@@ -567,6 +555,14 @@ export class VersionSwitch {
         `replacement did not ${what} within ${timeoutMs}ms`,
       );
       return false;
+    }
+    if (outcome.status === 'rejected') {
+      op.failure ??= toError(outcome.error);
+      return false;
+    }
+    const result = outcome.value;
+    if (result === 'barrier') {
+      return true;
     }
     if (result === 'aborted') {
       op.failure ??= op.abortError;
@@ -586,21 +582,14 @@ export class VersionSwitch {
       return true;
     }
     const waitMs = this.host.shutdownTimeoutMs + SHUTDOWN_ACK_SLACK_MS;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<'timeout'>((resolve) => {
-      timer = setTimeout(() => {
-        resolve('timeout');
-      }, waitMs);
-    });
-    const raced = Promise.race([
-      previous.closedSignal.promise.then(() => 'closed' as const),
-      op.abortSignal.then(() => 'aborted' as const),
-    ]);
-    const result = await Promise.race([raced, timeout]);
-    if (timer !== undefined) {
-      clearTimeout(timer);
-    }
-    return result === 'closed';
+    const outcome = await settleWithin(
+      Promise.race([
+        previous.closedSignal.promise.then(() => 'closed' as const),
+        op.abortSignal.then(() => 'aborted' as const),
+      ]),
+      waitMs,
+    );
+    return outcome.status === 'settled' && outcome.value === 'closed';
   }
 
   /**
@@ -627,7 +616,6 @@ export class VersionSwitch {
     }
     this.host.slot.releaseSwitch(op);
     if (op.promoted) {
-      op.settled = true;
       if (op.promotedLost) {
         // Promotion succeeded, but the process died before the switch could
         // report it. `onServerLost` already owns the recovery (crash path:
@@ -645,14 +633,11 @@ export class VersionSwitch {
       op.markComplete();
       return;
     }
-    if (!op.settled) {
-      op.settled = true;
-      op.reject(
-        op.abortError ??
-          op.failure ??
-          new Error('ipc executor switch ended unexpectedly'),
-      );
-    }
+    op.reject(
+      op.abortError ??
+        op.failure ??
+        new Error('ipc executor switch ended unexpectedly'),
+    );
     if (op.previous !== undefined && !op.previousGone) {
       // The previous Server can still serve; it is still the current one, so it
       // must be restartable again if it later crashes.
@@ -754,8 +739,4 @@ function newBarrier(): SwitchBarrier {
     resolve: deferred.resolve,
     seen: false,
   };
-}
-
-function toError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(messageOf(error));
 }

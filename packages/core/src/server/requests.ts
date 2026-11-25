@@ -6,8 +6,8 @@ import type {
 import type { LogFields, Logger } from '../logging/types.ts';
 import type { ExecutorOutcome } from '../shared/executor.ts';
 import { messageOf } from '../shared/guards.ts';
-import type { RequestIdentity } from '../shared/identity.ts';
-import { settleWithin } from '../shared/timeout.ts';
+import { requestLogFields } from '../shared/identity.ts';
+import { elapsedMs, settleWithin } from '../shared/timeout.ts';
 import {
   FRAMEWORK_SHUTDOWN,
   INTERNAL_ERROR,
@@ -278,7 +278,7 @@ export class RequestRunner {
    * no `extension` key at all rather than an `undefined` one.
    */
   private requestFields(message: RequestMessage): LogFields {
-    const fields: LogFields = { ...requestIds(message) };
+    const fields: LogFields = requestLogFields(message);
     const extension = this.deps.runtime.dispatcher.extensionOf(message.method);
     if (extension !== undefined) {
       fields.extension = extension;
@@ -331,14 +331,14 @@ export class RequestRunner {
           {
             ...this.requestFields(message),
             code: entry.cancelledCode,
-            durationMs: elapsedSince(startedAt),
+            durationMs: elapsedMs(startedAt),
             reason: 'result suppressed after cancel',
           },
           'cancelled request finished; result not sent',
         );
         return;
       }
-      this.report(message, outcome, elapsedSince(startedAt));
+      this.report(message, outcome, elapsedMs(startedAt));
     } finally {
       this.inFlight.delete(message.requestId);
       // The id is terminal, so a later delivery of it is a fresh request rather
@@ -423,25 +423,4 @@ function resultEnvelope(message: RequestMessage): {
     requestId: message.requestId,
     requestSessionId: message.sessionId,
   };
-}
-
-/**
- * The identity fields of one request, ready to be used as log bindings. Shared
- * with the process-level lines (`REQUEST_BEFORE_READY` and friends) so the two
- * sides cannot drift into logging different ids for the same request.
- */
-export function requestIds(message: RequestMessage): RequestIdentity {
-  const ids: RequestIdentity = {
-    requestId: message.requestId,
-    connectionId: message.connectionId,
-    clientRequestId: message.clientRequestId,
-  };
-  if (message.sessionId === undefined) {
-    return ids;
-  }
-  return { ...ids, sessionId: message.sessionId };
-}
-
-function elapsedSince(startedAt: number): number {
-  return Math.round(performance.now() - startedAt);
 }

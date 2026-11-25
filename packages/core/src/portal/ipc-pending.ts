@@ -12,7 +12,7 @@ export interface PendingRequest {
    * ascending within any connection (all SPEC 6.5 needs) without a
    * per-connection map that would never shrink.
    */
-  readonly perConnectionSeq: number;
+  readonly globalSeq: number;
   /** When the Portal accepted the request; the deadline is measured from here. */
   readonly startedAt: number;
   readonly resolve: (outcome: ExecutorOutcome) => void;
@@ -24,7 +24,7 @@ export interface PendingRequest {
   timer: ReturnType<typeof setTimeout> | undefined;
 }
 
-export interface PendingBufferOptions {
+interface PendingBufferOptions {
   /**
    * Requests buffered but not yet acknowledged. Their lifetime is bounded by
    * the request deadline, so this is the brake for the one case the deadline
@@ -46,7 +46,7 @@ export interface PendingBufferOptions {
 export class PendingBuffer {
   private readonly pending = new Map<string, PendingRequest>();
   private readonly capacity: number;
-  /** Global and monotonic: see `perConnectionSeq`. */
+  /** Global and monotonic: see `globalSeq`. */
   private seq = 0;
 
   constructor(options: PendingBufferOptions) {
@@ -94,7 +94,7 @@ export class PendingBuffer {
     const startedAt = Date.now();
     const pending: PendingRequest = {
       request,
-      perConnectionSeq: this.nextSeq(),
+      globalSeq: this.nextSeq(),
       startedAt,
       resolve: outcome.resolve,
       replayCount: 0,
@@ -123,7 +123,7 @@ export class PendingBuffer {
   /**
    * The requests not yet sent on `generation`, in delivery order (SPEC 6.5).
    *
-   * Ordered per connection by `perConnectionSeq`. Replays and never-sent
+   * Ordered per connection by `globalSeq`. Replays and never-sent
    * requests share that one ordering: a request enqueued during a restart
    * always has a higher sequence than the replays on its connection, so one
    * sort per connection satisfies both rules and correctness does not depend on
@@ -148,9 +148,7 @@ export class PendingBuffer {
     }
     const ordered: PendingRequest[] = [];
     for (const group of byConnection.values()) {
-      group.sort(
-        (left, right) => left.perConnectionSeq - right.perConnectionSeq,
-      );
+      group.sort((left, right) => left.globalSeq - right.globalSeq);
       for (const pending of group) {
         ordered.push(pending);
       }
@@ -164,13 +162,6 @@ export class PendingBuffer {
    */
   values(): IterableIterator<PendingRequest> {
     return this.pending.values();
-  }
-
-  /** Empties the buffer and returns everything it held, in insertion order. */
-  clear(): PendingRequest[] {
-    const all = [...this.pending.values()];
-    this.pending.clear();
-    return all;
   }
 
   private nextSeq(): number {

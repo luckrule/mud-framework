@@ -88,13 +88,13 @@ describe('ServerSlot status transitions', () => {
     expect(slot.switching).toBe(op);
   });
 
-  test('adopt promotes the replacement and keeps the switch in flight', () => {
+  test('markReady promotes the replacement and keeps the switch in flight', () => {
     const slot = new ServerSlot();
     const op = { staged: fakeServer(), previous: fakeServer() };
     const replacement = fakeServer({ generation: 2 });
 
     slot.beginSwitch(op);
-    slot.adopt(replacement);
+    slot.markReady(replacement);
 
     expect(slot.status).toBe('ready');
     expect(slot.server).toBe(replacement);
@@ -138,13 +138,13 @@ describe('ServerSlot status transitions', () => {
     expect(slot.status).toBe('failed');
   });
 
-  test('markStartingAfterLoss moves a failed slot back to starting', () => {
+  test('beginStart moves a failed slot back to starting', () => {
     const slot = new ServerSlot();
     const lost = fakeServer();
 
     slot.markReady(lost);
     slot.markFailed();
-    slot.markStartingAfterLoss();
+    slot.beginStart();
 
     expect(slot.status).toBe('starting');
     // The dead server is still the identity the crash path compares against.
@@ -272,7 +272,7 @@ describe('ServerSlot clearIfCurrent', () => {
     const stale = fakeServer({ generation: 1 });
     const replacement = fakeServer({ generation: 2 });
     slot.markReady(stale);
-    slot.adopt(replacement);
+    slot.markReady(replacement);
 
     expect(slot.clearIfCurrent(stale)).toBe(false);
     expect(slot.server).toBe(replacement);
@@ -291,6 +291,7 @@ describe('ServerSlot assertNoOtherLiveServer', () => {
     const slot = new ServerSlot();
     const live = fakeServer({ generation: 3 });
     const activating = fakeServer({ generation: 4 });
+    slot.track(live);
     slot.markReady(live);
 
     expect(() => slot.assertNoOtherLiveServer(activating)).toThrow();
@@ -299,6 +300,7 @@ describe('ServerSlot assertNoOtherLiveServer', () => {
   test('throws when the staged server is live', () => {
     const slot = new ServerSlot();
     const staged = fakeServer({ generation: 5 });
+    slot.track(staged);
     slot.beginSwitch({ staged, previous: undefined });
 
     expect(() => slot.assertNoOtherLiveServer()).toThrow();
@@ -307,6 +309,7 @@ describe('ServerSlot assertNoOtherLiveServer', () => {
   test('throws when the previous server is live', () => {
     const slot = new ServerSlot();
     const previous = fakeServer({ generation: 6 });
+    slot.track(previous);
     slot.beginSwitch({ staged: undefined, previous });
 
     expect(() => slot.assertNoOtherLiveServer()).toThrow();
@@ -336,6 +339,7 @@ describe('ServerSlot assertNoOtherLiveServer', () => {
   test('the error names the blocking generation and pid', () => {
     const slot = new ServerSlot();
     const live = fakeServer({ generation: 11, pid: 4242 });
+    slot.track(live);
     slot.markReady(live);
 
     expect(() =>
@@ -346,6 +350,7 @@ describe('ServerSlot assertNoOtherLiveServer', () => {
   test('the error reports an unknown pid as unknown', () => {
     const slot = new ServerSlot();
     const live = fakeServer({ generation: 13, pid: undefined });
+    slot.track(live);
     slot.markReady(live);
 
     expect(() => slot.assertNoOtherLiveServer()).toThrow(
@@ -372,6 +377,8 @@ describe('ServerSlot assertNoOtherLiveServer', () => {
     const slot = new ServerSlot();
     const previous = fakeServer({ generation: 22 });
     const staged = fakeServer({ generation: 23 });
+    slot.track(previous);
+    slot.track(staged);
     slot.markReady(previous);
     slot.beginSwitch({ staged, previous });
 

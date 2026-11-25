@@ -9,10 +9,7 @@ import type { ExecutorOutcome, SessionChange } from '../shared/executor.ts';
  */
 import { describeValue, isRecord, messageOf } from '../shared/guards.ts';
 import type { RequestIdentity } from '../shared/identity.ts';
-import {
-  type CapabilityCheck,
-  checkWireCapabilities,
-} from '../storage/capabilities.ts';
+import { checkWireCapabilities } from '../storage/capabilities.ts';
 import type { StorageCapabilities } from '../storage/types.ts';
 
 /** Portal -> Server: handshake. */
@@ -336,16 +333,7 @@ function readCapabilities(
   field: string,
 ): StorageCapabilities {
   const path = `${messageType}.${field}`;
-  let checked: CapabilityCheck;
-  try {
-    checked = checkWireCapabilities(raw[field], path);
-  } catch (error) {
-    // The shared validator reports its own rejections as `ok: false`; anything
-    // it throws comes from the input, so it is a shape problem too.
-    throw new ShapeError(
-      `capability "${path}" could not be validated: ${messageOf(error)}`,
-    );
-  }
+  const checked = checkWireCapabilities(raw[field], path);
   if (!checked.ok) {
     throw new ShapeError(checked.reason);
   }
