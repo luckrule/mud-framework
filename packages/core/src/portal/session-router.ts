@@ -1,23 +1,17 @@
 import type { Logger } from '../logging/types.ts';
 
-/** A brake on active routes, not on the lifetime of business Session state. */
-export const DEFAULT_MAX_SESSIONS = 10_000;
-
 export interface SessionRouterOptions {
-  readonly maxSessions: number;
   readonly logger: Logger;
 }
 
 /** Routing ownership and unfinished Session work have independent lifetimes. */
 export class SessionRouter {
-  private readonly maxSessions: number;
   private readonly logger: Logger;
   private readonly routes = new Map<string, string>();
   private readonly heldBy = new Map<string, string>();
   private readonly unfinished = new Map<string, Set<Promise<void>>>();
 
   constructor(options: SessionRouterOptions) {
-    this.maxSessions = options.maxSessions;
     this.logger = options.logger;
   }
 
@@ -31,16 +25,6 @@ export class SessionRouter {
     const previousConnectionId = this.routes.get(sessionId);
     if (previousConnectionId === connectionId) {
       this.track(sessionId, terminal);
-      return;
-    }
-    if (
-      previousConnectionId === undefined &&
-      this.routes.size >= this.maxSessions
-    ) {
-      logger.warn(
-        { sessionId, connectionId, limit: this.maxSessions },
-        'session binding refused: session table is full',
-      );
       return;
     }
     this.release(connectionId);

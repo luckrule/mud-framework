@@ -284,6 +284,8 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 
 状态归属随之确定：Session 的业务状态归业务进程，连接层只保存路由信息与未确认输入。连接层重启会断开连接，但不会丢失已提交的业务状态。
 
+连接层对同时活跃的连接数设准入上限（默认 10000）。达到上限时，新连接 MUST 被关闭且不进入请求处理；连接断开后空出的名额 MUST 可供后续连接使用。该上限只约束准入，不是业务 Session 的生命周期限制。理由：绑定在 Handler 成功后才声明，连接层无法在执行前预检 Session 容量；活跃连接数是唯一能在副作用前拒绝的位置，而路由表大小不会超过连接数。
+
 ### 6.2 启动顺序
 
 1. 存储后端初始化并自检能力声明。
@@ -345,7 +347,7 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 
 边界：请求结算之后产生的日志（如 `late result discarded`）依靠结果消息恢复 Session ID。结果消息回显请求进入框架时的入口 Session ID（`requestSessionId`，成功与失败结果都携带；入口无 Session 时不带），迟到结果用它填 `sessionId`；结果消息的 `sessionChange` 仍只表示 handler 在本次请求内声明的 Session 变更（bind 携带新 Session，unbind 表示解绑）。结果未带 `requestSessionId` 时，已结算的日志退回用稳定的请求标识（§7.3）与同一请求的其它日志行关联。
 
-结果/完成类日志（`request completed`、`result received`、失败日志）的 `sessionId` 表示请求入口 Session（与 `RequestIdentity` 同义），不会因 Handler 绑定而被改写；入口无 Session 时不写。成功请求声明了 Session 变更时写 `sessionChange`，值为 `SessionChange` 对象（`{type:'bind',sessionId}` 或 `{type:'unbind'}`）；没有变更不写。字段名与语义都是契约。路由事件行（`session bound`、`session rebound to a new connection`、`session binding refused: session table is full`）的 `sessionId` 表示本次被建立、接管或拒绝的路由 id，与请求入口 Session 无关。
+结果/完成类日志（`request completed`、`result received`、失败日志）的 `sessionId` 表示请求入口 Session（与 `RequestIdentity` 同义），不会因 Handler 绑定而被改写；入口无 Session 时不写。成功请求声明了 Session 变更时写 `sessionChange`，值为 `SessionChange` 对象（`{type:'bind',sessionId}` 或 `{type:'unbind'}`）；没有变更不写。字段名与语义都是契约。路由事件行（`session bound`、`session rebound to a new connection`）的 `sessionId` 表示本次被建立或接管的路由 id，与请求入口 Session 无关。
 
 ### 7.2 错误码
 

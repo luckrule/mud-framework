@@ -2,16 +2,15 @@ import { describe, expect, test } from 'bun:test';
 
 import { createJsonLogger } from '../logging/json-logger.ts';
 import { parseLine } from '../testing/server-process.ts';
-import { DEFAULT_MAX_SESSIONS, SessionRouter } from './session-router.ts';
+import { SessionRouter } from './session-router.ts';
 
-function harness(maxSessions = DEFAULT_MAX_SESSIONS): {
+function harness(): {
   router: SessionRouter;
   bind: (connectionId: string, sessionId: string) => void;
   logs: () => Record<string, unknown>[];
 } {
   const lines: string[] = [];
   const router = new SessionRouter({
-    maxSessions,
     logger: createJsonLogger({
       sink: (line) => {
         lines.push(line);
@@ -91,47 +90,6 @@ describe('SessionRouter ownership', () => {
 
     expect(router.sessionOf('c2')).toBe('s1');
     expect(router.sessionOf('c1')).toBeUndefined();
-  });
-
-  test('refuses a new session once the table is full', () => {
-    const { router, bind, logs } = harness(1);
-    bind('c1', 's1');
-    bind('c2', 's2');
-
-    expect(router.sessionOf('c2')).toBeUndefined();
-    expect(
-      logs().find(
-        (entry) =>
-          entry.msg === 'session binding refused: session table is full',
-      ),
-    ).toMatchObject({
-      level: 'warn',
-      sessionId: 's2',
-      connectionId: 'c2',
-      limit: 1,
-    });
-  });
-
-  test('a refused binding leaves the holder on its previous session', () => {
-    const { router, bind } = harness(1);
-    bind('c1', 's1');
-    bind('c1', 's2');
-
-    expect(router.sessionOf('c1')).toBe('s1');
-  });
-
-  test('rebinding an existing session is allowed at the cap', () => {
-    const { router, bind, logs } = harness(1);
-    bind('c1', 's1');
-    bind('c2', 's1');
-
-    expect(router.sessionOf('c2')).toBe('s1');
-    expect(
-      logs().filter(
-        (entry) =>
-          entry.msg === 'session binding refused: session table is full',
-      ),
-    ).toHaveLength(0);
   });
 
   test('clear releases every route', () => {

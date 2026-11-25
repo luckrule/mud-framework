@@ -26,7 +26,7 @@ import type {
   TransportConnection,
   TransportHandlers,
 } from '../transport/types.ts';
-import { DEFAULT_MAX_SESSIONS, SessionRouter } from './session-router.ts';
+import { SessionRouter } from './session-router.ts';
 
 /**
  * SPEC 3.5 requires a hard per-connection cap. 1000 absorbs a legitimate burst
@@ -51,6 +51,15 @@ const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
  * caller gave up first".
  */
 const EXECUTOR_CLOSE_SLACK_MS = 1000;
+
+/**
+ * SPEC 6.1: a cap on live connections, not on business Session lifetime. A
+ * route is held by a connection, so bounding admissions also bounds the
+ * routing table without refusing a binding after its handler succeeded.
+ * 10k leaves room for a large deployment; an operator with more concurrent
+ * players raises it explicitly.
+ */
+const DEFAULT_MAX_CONNECTIONS = 10_000;
 
 export interface ConnectionLayerOptions {
   transport: Transport;
@@ -88,12 +97,12 @@ export interface ConnectionLayerOptions {
    */
   shutdownTimeoutMs?: number;
   /**
-   * Session routes this layer may hold at once (SPEC 6.1). Defaults to
-   * `DEFAULT_MAX_SESSIONS`; a binding beyond the cap is refused and logged, but
-   * the request that carried it still succeeds, because a routing failure is
-   * not a business failure.
+   * Connections this layer admits at once (SPEC 6.1). Defaults to
+   * `DEFAULT_MAX_CONNECTIONS`. This is an admission cap, not a business
+   * Session lifetime limit: a connection beyond it is closed (code `1013`)
+   * before any request on it is read.
    */
-  maxSessions?: number;
+  maxConnections?: number;
 }
 
 type Status = 'idle' | 'starting' | 'started' | 'stopping' | 'stopped';
@@ -134,6 +143,7 @@ export class ConnectionLayer implements TransportHandlers {
   private readonly logger: Logger;
   private readonly createRequestId: () => string;
   private readonly maxQueuedPerConnection: number;
+  private readonly maxConnections: number;
   private readonly shutdownTimeoutMs: number;
   private readonly connections = new Map<string, ConnectionState>();
   /** Which connection holds which Session, and the reconnect gate (SPEC 3.2). */
@@ -159,12 +169,10 @@ export class ConnectionLayer implements TransportHandlers {
     this.createRequestId = options.createRequestId ?? randomUUID;
     this.maxQueuedPerConnection =
       options.maxQueuedPerConnection ?? DEFAULT_MAX_QUEUED_PER_CONNECTION;
+    this.maxConnections = options.maxConnections ?? DEFAULT_MAX_CONNECTIONS;
     this.shutdownTimeoutMs =
       options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
-    this.router = new SessionRouter({
-      maxSessions: options.maxSessions ?? DEFAULT_MAX_SESSIONS,
-      logger: this.logger,
-    });
+    this.router = new SessionRouter({ logger: this.logger });
   }
 
   async start(): Promise<void> {
@@ -225,6 +233,16 @@ export class ConnectionLayer implements TransportHandlers {
       // ever looks the connection up, so nothing is silently dropped.
       return Promise.resolve();
     }
+    if (this.connections.size >= this.maxConnections) {
+      // Admission is the only point before a request is read, so it is the
+      // only place a refusal has no side effect. The client is told to retry
+      // rather than left waiting on a connection this layer will not serve.
+      this.logger.warn(
+        { connectionId: connection.id, limit: this.maxConnections },
+        'connection refused: connection limit reached',
+      );
+      return this.closeRefused(connection);
+    }
     const state: ConnectionState = {
       connection,
       chain: Promise.resolve(),
@@ -234,6 +252,18 @@ export class ConnectionLayer implements TransportHandlers {
     };
     this.connections.set(connection.id, state);
     return Promise.resolve();
+  }
+
+  /** Best effort: a failed close must not escape into the transport. */
+  private async closeRefused(connection: TransportConnection): Promise<void> {
+    try {
+      await connection.close(1013, 'connection limit reached');
+    } catch (error) {
+      this.logger.warn(
+        { connectionId: connection.id, reason: messageOf(error) },
+        'refused connection could not be closed',
+      );
+    }
   }
 
   onMessage(

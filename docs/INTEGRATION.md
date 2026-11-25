@@ -165,6 +165,7 @@ Portal 侧 `IpcExecutor` 的 `timeoutMs` 决定请求何时在 Portal 结算；�
 - **`stop()` 的语义**：Portal 停止接受输入，排空已接受的输入（受 `ConnectionLayer.shutdownTimeoutMs` 约束）；仍在 Session 屏障前、尚未调用 executor 的请求以 `FRAMEWORK_SHUTDOWN` 结束，不绕过屏障执行。随后执行器关闭 Server：声明 `shutdown` 预算，Server 在该预算内排空并关闭存储、回 `closed`，Portal 再有界等待实际退出，必要时 kill 后再等。退出仍未确认时保留写者屏障并拒绝关闭，`ConnectionLayer` 尽力关闭传输后传播失败，不静默成功。`FRAMEWORK_SHUTDOWN` 本身没有阶段信息：明确未调度的请求未执行，可能已投递而未成功确认的请求则可能已执行或提交，不能仅凭错误码安全重试。外部停止时限必须覆盖连接层排空、执行器关闭、传输关闭三段完整上界，公式见 ADR-0004；`IpcExecutor.closeBudgetMs` 只是中间一段的预算。systemd `TimeoutStopSec` 等应长于完整上界；Server 的请求 `timeoutMs` 不改变 Portal 声明的关闭预算。
 - **确认没有孤儿进程**：`process.kill(pid, 0)` 抛 `ESRCH` 可用于检查该 pid 已消失。`pid` 来自 Server 的 `ready` 消息（普通启动会记入 `server ready` 日志）。框架内部只有 `observed: true` 的退出确认才解除写者屏障；等待超时说明尚未确认，不能仅凭日志诊断进程不可中断。退出 Promise 仍 pending 时，迟到确认可在执行器未到终态时恢复一次；一次性 `observed: false` 结果不保证自动恢复，需要部署方处理，不能另起写者绕过。
 - **`maxPending`**：Portal 未确认缓冲的硬上限（默认值见 ADR-0004），超出后请求以 `FRAMEWORK_QUEUE_FULL` 拒绝。deadline 在 Server 未就绪或不可用时仍会结算请求，只限制单条请求的驻留时间；总数上限控制同时在途的数量，不能用来延长请求的 deadline。
+- **`maxConnections`**：连接层同时接纳的活跃连接上限（默认 10000，见 SPEC 6.1）。达到上限后，新连接以 WebSocket close code `1013`（Try Again Later）关闭，不进入请求处理；连接断开才释放名额。它是准入上限，不是业务 Session 的生命周期限制。
 
 ## 常见错误
 

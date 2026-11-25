@@ -412,42 +412,6 @@ describe('ConnectionLayer session routing (SPEC 3.2, INV-004)', () => {
     }
   });
 
-  test('refuses a binding once the session table is full but still answers the request', async () => {
-    let bound = 's1';
-    const { transport, layer, logs } = sessionHarness({
-      maxSessions: 1,
-      sessionOf: (method) => (method === 'bind' ? bound : undefined),
-    });
-    await layer.start();
-    transport.connect('c1');
-    await transport.receive('c1', '{"id":"1","method":"bind"}');
-
-    bound = 's2';
-    await transport.receive('c1', '{"id":"2","method":"bind"}');
-
-    // The request succeeded: a routing limit is not a business failure.
-    expect(lastFrame(transport, 'c1')).toEqual({
-      id: '2',
-      ok: true,
-      result: 'bind',
-    });
-    const refused = logs().filter(
-      (entry) => entry.msg === 'session binding refused: session table is full',
-    );
-    expect(refused).toHaveLength(1);
-    expect(refused[0]).toMatchObject({
-      level: 'warn',
-      sessionId: 's2',
-      connectionId: 'c1',
-      limit: 1,
-    });
-    // The refused id left no route behind.
-    expect(
-      logs().filter((entry) => entry.msg === 'session bound'),
-    ).toHaveLength(1);
-    await layer.stop();
-  });
-
   test('passes the bound session to the executor on the next request', async () => {
     const { transport, layer, controlled } = sessionHarness();
     await layer.start();

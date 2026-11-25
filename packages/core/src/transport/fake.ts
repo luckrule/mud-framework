@@ -10,6 +10,11 @@ interface ConnectionState {
   open: boolean;
 }
 
+interface CloseRecord {
+  readonly code: number | undefined;
+  readonly reason: string;
+}
+
 type Status = 'idle' | 'started' | 'stopped';
 
 /**
@@ -24,6 +29,7 @@ type Status = 'idle' | 'started' | 'stopped';
  */
 export class FakeTransport implements Transport {
   private readonly connections = new Map<string, ConnectionState>();
+  private readonly closes = new Map<string, CloseRecord>();
   private status: Status = 'idle';
   private handlers: TransportHandlers | undefined;
   private events: Promise<unknown> = Promise.resolve();
@@ -84,6 +90,13 @@ export class FakeTransport implements Transport {
     return [...this.lookup(id).sent];
   }
 
+  /** What the framework asked `close()` to do, if it closed this connection. */
+  closedWith(id: string): CloseRecord | undefined {
+    this.assertStarted();
+    this.lookup(id);
+    return this.closes.get(id);
+  }
+
   private register(id: string): ConnectionState {
     this.assertStarted();
     if (this.connections.has(id)) {
@@ -115,6 +128,10 @@ export class FakeTransport implements Transport {
           if (current === undefined || !current.open) {
             return Promise.reject(new Error(`connection "${id}" is not open`));
           }
+          this.closes.set(id, {
+            code,
+            reason: reason ?? describeClose(code),
+          });
           return this.disconnect(id, reason ?? describeClose(code));
         },
       },

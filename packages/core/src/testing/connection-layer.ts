@@ -51,7 +51,7 @@ export async function harness(
     level?: LogLevel;
     maxQueuedPerConnection?: number;
     shutdownTimeoutMs?: number;
-    maxSessions?: number;
+    maxConnections?: number;
     /** Access policy handed to the dispatcher (SPEC 3.7). */
     authorize?: ConstructorParameters<typeof Dispatcher>[0]['authorize'];
   } = {},
@@ -82,7 +82,7 @@ export async function harness(
     createRequestId: options.createRequestId,
     maxQueuedPerConnection: options.maxQueuedPerConnection,
     shutdownTimeoutMs: options.shutdownTimeoutMs,
-    maxSessions: options.maxSessions,
+    maxConnections: options.maxConnections,
   });
   await layer.start();
   return {
@@ -268,7 +268,7 @@ export interface SessionHarness {
 /** A layer whose executor changes the Session for the methods the options name. */
 export function sessionHarness(
   options: {
-    maxSessions?: number;
+    maxConnections?: number;
     sessionOf?: (method: string) => string | undefined;
     changeOf?: (method: string) => SessionChange | undefined;
   } = {},
@@ -289,7 +289,7 @@ export function sessionHarness(
     transport,
     executor: controlled.executor,
     logger,
-    maxSessions: options.maxSessions,
+    maxConnections: options.maxConnections,
   });
   return {
     transport,
