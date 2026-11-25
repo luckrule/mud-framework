@@ -157,6 +157,12 @@ interface Expiry {
 
 interface StorageScope {
   active: boolean;
+  /**
+   * Set after a write fails on a backend that declares `transactions: 'none'`.
+   * Such a backend cannot roll back, so later writes would land on top of a
+   * half-applied request (SPEC 4.3). Scoped per request, never shared.
+   */
+  writeFailed: boolean;
 }
 
 /** What `register` remembers about a handler: the function and its contract. */
@@ -181,6 +187,9 @@ interface InFlight {
 
 const EXPIRED_MESSAGE =
   'storage transaction expired: the request already reached a terminal state';
+
+const WRITE_ABORTED_MESSAGE =
+  'write rejected: an earlier write in this request failed and the backend declares transactions "none" (no rollback), so later writes in this request are aborted';
 
 export class Dispatcher {
   private readonly backend: StorageBackend;
@@ -296,18 +305,16 @@ export class Dispatcher {
       throw new AuthenticationRequiredError(name);
     }
 
+    const capabilities = this.backend.capabilities();
     const effectiveTimeoutMs = tightenTimeout(
-      Math.min(
-        this.timeoutMs,
-        this.backend.capabilities().maxTransactionDurationMs,
-      ),
+      Math.min(this.timeoutMs, capabilities.maxTransactionDurationMs),
       meta.timeoutMs,
     );
     const expiry: Expiry = {
       expired: false,
       controller: new AbortController(),
     };
-    const storageScope: StorageScope = { active: true };
+    const storageScope: StorageScope = { active: true, writeFailed: false };
     // Both the timer and `cancel` settle this, and only the first settles it:
     // a request has exactly one terminal state (SPEC 2).
     const terminal = Promise.withResolvers<never>();
@@ -394,7 +401,11 @@ export class Dispatcher {
             recordSessionChange(change, { type: 'unbind' });
           },
           logger,
-          storage: guard(tx, storageScope),
+          storage: guard(
+            tx,
+            storageScope,
+            capabilities.transactions === 'none',
+          ),
         };
         try {
           const result = await registered.handler(context, payload);
@@ -574,6 +585,7 @@ function logLostCommit(logger: Logger, startedAt: number): void {
 function guard(
   tx: StorageTransaction,
   scope: StorageScope,
+  abortOnWriteFailure: boolean,
 ): StorageTransaction {
   return {
     async query<T>(sql: string, params?: readonly unknown[]): Promise<T[]> {
@@ -581,8 +593,22 @@ function guard(
       return tx.query<T>(sql, params);
     },
     async execute(sql: string, params?: readonly unknown[]): Promise<void> {
+      // The terminal state wins: an ended request reports expiry whatever its
+      // earlier writes did (SPEC 3.3, 3.4).
       assertActive(scope);
-      return tx.execute(sql, params);
+      if (abortOnWriteFailure && scope.writeFailed) {
+        throw new Error(WRITE_ABORTED_MESSAGE);
+      }
+      try {
+        await tx.execute(sql, params);
+      } catch (error) {
+        if (abortOnWriteFailure) {
+          scope.writeFailed = true;
+        }
+        // The handler sees the original error; the framework never replaces or
+        // swallows the cause of the first failure.
+        throw error;
+      }
     },
   };
 }

@@ -47,6 +47,188 @@ describe('Dispatcher.transaction', () => {
     expect(backend.stats()).toEqual({ committed: 0, rolledBack: 1 });
   });
 
+  test('rejects later writes after the first write fails on a transactions:none backend', async () => {
+    const attempted: string[] = [];
+    const backend = new MemoryStorageBackend({
+      capabilities: { transactions: 'none' },
+      handler: (sql) => {
+        attempted.push(sql);
+        if (sql === 'first write') {
+          throw new Error('disk full');
+        }
+        return [];
+      },
+    });
+    const dispatcher = new Dispatcher({ backend, timeoutMs: 1000 });
+    dispatcher.register(
+      'write-twice',
+      async (ctx) => {
+        expect(
+          (await rejectionOf(ctx.storage.execute('first write'))).message,
+        ).toBe('disk full');
+        const blocked = await rejectionOf(ctx.storage.execute('second write'));
+        expect(blocked.message).toMatch(/earlier write in this request failed/);
+        expect(blocked.message).toMatch(/transactions "none"/);
+        return 'recovered';
+      },
+      { access: 'public' },
+    );
+
+    expect(await dispatcher.dispatch('write-twice', null)).toEqual({
+      result: 'recovered',
+    });
+    // The second write never reached the backend.
+    expect(attempted).toEqual(['first write']);
+  });
+
+  test('fails the request when the first write failure is not caught', async () => {
+    const attempted: string[] = [];
+    const backend = new MemoryStorageBackend({
+      capabilities: { transactions: 'none' },
+      handler: (sql) => {
+        attempted.push(sql);
+        if (sql === 'first write') {
+          throw new Error('disk full');
+        }
+        return [];
+      },
+    });
+    const dispatcher = new Dispatcher({ backend, timeoutMs: 1000 });
+    dispatcher.register(
+      'write-twice',
+      async (ctx) => {
+        await ctx.storage.execute('first write');
+        await ctx.storage.execute('second write');
+        return 'unreachable';
+      },
+      { access: 'public' },
+    );
+
+    const error = await rejectionOf(dispatcher.dispatch('write-twice', null));
+
+    expect(error.message).toBe('disk full');
+    expect(attempted).toEqual(['first write']);
+  });
+
+  test('still allows reads after a write failed on a transactions:none backend', async () => {
+    const backend = new MemoryStorageBackend({
+      capabilities: { transactions: 'none' },
+      handler: (sql) => {
+        if (sql === 'first write') {
+          throw new Error('disk full');
+        }
+        return [{ ok: true }];
+      },
+    });
+    const dispatcher = new Dispatcher({ backend, timeoutMs: 1000 });
+    dispatcher.register(
+      'write-then-read',
+      async (ctx) => {
+        await rejectionOf(ctx.storage.execute('first write'));
+        return ctx.storage.query<{ ok: boolean }>('read something');
+      },
+      { access: 'public' },
+    );
+
+    expect(await dispatcher.dispatch('write-then-read', null)).toEqual({
+      result: [{ ok: true }],
+    });
+  });
+
+  test('does not block later writes on a transactions:full backend', async () => {
+    const attempted: string[] = [];
+    const backend = new MemoryStorageBackend({
+      handler: (sql) => {
+        attempted.push(sql);
+        if (sql === 'first write') {
+          throw new Error('disk full');
+        }
+        return [];
+      },
+    });
+    const dispatcher = new Dispatcher({ backend, timeoutMs: 1000 });
+    dispatcher.register(
+      'write-twice',
+      async (ctx) => {
+        await rejectionOf(ctx.storage.execute('first write'));
+        await ctx.storage.execute('second write');
+        return 'recovered';
+      },
+      { access: 'public' },
+    );
+
+    expect(await dispatcher.dispatch('write-twice', null)).toEqual({
+      result: 'recovered',
+    });
+    expect(attempted).toEqual(['first write', 'second write']);
+  });
+
+  test('keeps a failed write scoped to its own request', async () => {
+    const attempted: string[] = [];
+    const backend = new MemoryStorageBackend({
+      capabilities: { transactions: 'none' },
+      handler: (sql) => {
+        attempted.push(sql);
+        if (sql === 'first write') {
+          throw new Error('disk full');
+        }
+        return [];
+      },
+    });
+    const dispatcher = new Dispatcher({ backend, timeoutMs: 1000 });
+    dispatcher.register(
+      'write',
+      async (ctx, payload) => {
+        await ctx.storage.execute(String(payload));
+        return payload;
+      },
+      { access: 'public' },
+    );
+
+    expect(
+      (await rejectionOf(dispatcher.dispatch('write', 'first write'))).message,
+    ).toBe('disk full');
+    expect(await dispatcher.dispatch('write', 'second write')).toEqual({
+      result: 'second write',
+    });
+    expect(attempted).toEqual(['first write', 'second write']);
+  });
+
+  test('reports expiry before the failed-write marker once the request ends', async () => {
+    const attempted: string[] = [];
+    const backend = new MemoryStorageBackend({
+      capabilities: { transactions: 'none' },
+      handler: (sql) => {
+        attempted.push(sql);
+        if (sql === 'first write') {
+          throw new Error('disk full');
+        }
+        return [];
+      },
+    });
+    const dispatcher = new Dispatcher({ backend, timeoutMs: 1000 });
+    const saved = deferred<RequestContext>();
+    dispatcher.register(
+      'write-then-return',
+      async (ctx) => {
+        saved.resolve(ctx);
+        await rejectionOf(ctx.storage.execute('first write'));
+        return 'done';
+      },
+      { access: 'public' },
+    );
+
+    expect(await dispatcher.dispatch('write-then-return', null)).toEqual({
+      result: 'done',
+    });
+    const late = await rejectionOf(
+      (await saved.promise).storage.execute('late write'),
+    );
+
+    expect(late.message).toMatch(/transaction expired/);
+    expect(attempted).toEqual(['first write']);
+  });
+
   test.each([
     { first: 'success', second: 'success', committed: 2, rolledBack: 0 },
     { first: 'success', second: 'failure', committed: 1, rolledBack: 1 },
