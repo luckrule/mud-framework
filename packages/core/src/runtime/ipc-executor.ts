@@ -5,6 +5,8 @@ import type { SpawnedServer } from '../ipc/spawn-port.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import { safeLogger } from '../logging/safe-logger.ts';
 import type { LogFields, Logger } from '../logging/types.ts';
+import type { DeliveryHost } from './delivery-ledger.ts';
+import { DeliveryLedger, requestFields } from './delivery-ledger.ts';
 import type {
   ExecutorOutcome,
   ExecutorRequest,
@@ -20,12 +22,7 @@ import {
   SHUTDOWN_ACK_SLACK_MS,
   closeBudget,
 } from './ipc-budget.ts';
-import {
-  failure,
-  nextPortalGeneration,
-  requestMessage,
-} from './ipc-messages.ts';
-import type { PendingRequest } from './ipc-pending.ts';
+import { failure, nextPortalGeneration } from './ipc-messages.ts';
 import { PendingBuffer } from './ipc-pending.ts';
 import type { ServerHandlers } from './server-launcher.ts';
 import {
@@ -41,9 +38,7 @@ import { ServerSlot } from './server-slot.ts';
 import { effectiveTimeoutMs, settleWithin, tightenTimeout } from './timeout.ts';
 import {
   FRAMEWORK_QUEUE_FULL,
-  FRAMEWORK_REPLAY_EXHAUSTED,
   FRAMEWORK_SHUTDOWN,
-  FRAMEWORK_TIMEOUT,
   INTERNAL_ERROR,
 } from './wire-codes.ts';
 
@@ -204,6 +199,8 @@ export class IpcExecutor implements RequestExecutor {
   private readonly logger: Logger;
   private readonly portalGeneration: number;
   private readonly buffer: PendingBuffer;
+  /** Delivery, deadlines and settlement: everything that resolves a pending entry. */
+  private readonly ledger: DeliveryLedger;
   /** Sole owner of `status`, `server`, the generation counter and `switching`. */
   private readonly slot = new ServerSlot<SwitchOperation>();
   private effectiveTimeoutMs: number;
@@ -220,7 +217,6 @@ export class IpcExecutor implements RequestExecutor {
     | { resolve: () => void; reject: (error: Error) => void }
     | undefined;
   private readonly closedWaiter = new ClosedWaiter();
-  private drainedWaiter: (() => void) | undefined;
   private closePromise: Promise<void> | undefined;
   /**
    * Processes a `close()`-aborted switch abandoned, kept until their exit is
@@ -291,6 +287,22 @@ export class IpcExecutor implements RequestExecutor {
     this.portalGeneration = nextPortalGeneration();
     // Until `ready` declares the backend ceiling, the Portal ceiling applies.
     this.effectiveTimeoutMs = options.timeoutMs;
+    // The host is a live view, not a snapshot: the getter and the method read
+    // this executor's state when the ledger decides, so a value captured here
+    // could not go stale across a status transition.
+    const slot = this.slot;
+    const host: DeliveryHost = {
+      logger: this.logger,
+      maxReplays: this.maxReplays,
+      get isTerminal(): boolean {
+        return slot.isTerminal;
+      },
+      currentServer: () => slot.server,
+      onServerLost: (server, code, signal, reason) => {
+        this.onServerLost(server, code, signal, reason);
+      },
+    };
+    this.ledger = new DeliveryLedger({ buffer: this.buffer, host });
   }
 
   /** Spawns the Server, sends `hello` and resolves once the Server is `ready`. */
@@ -336,7 +348,7 @@ export class IpcExecutor implements RequestExecutor {
     if (server !== undefined && this.slot.clearIfCurrent(server)) {
       this.abandonServer(server);
     }
-    this.failAllPending(
+    this.ledger.failAllPending(
       INTERNAL_ERROR,
       `ipc executor failed to start: server did not become ready within ${this.startTimeoutMs}ms`,
       'executor failed to start',
@@ -481,7 +493,7 @@ export class IpcExecutor implements RequestExecutor {
       // one place.
       return this.refuseQueueFull(request);
     }
-    this.armTimer(pending);
+    this.ledger.armTimer(pending);
     try {
       const server = this.slot.server;
       if (
@@ -493,17 +505,17 @@ export class IpcExecutor implements RequestExecutor {
         // Nothing older can be undelivered while the Server is ready: every
         // flush completes or leaves no Server. Sending only this request keeps
         // the hot path O(1) instead of scanning the buffer per request.
-        this.deliver(server, pending);
+        this.ledger.deliver(server, pending);
       } else {
         // Queued until a Server is ready; a no-op otherwise. During a switch
         // this is the whole policy: the request waits for the new generation
         // rather than reaching a process that is about to be retired.
-        this.flush();
+        this.pump();
       }
     } catch (error) {
       // Delivery is defensive against a throwing channel or callback. The
       // promise must settle regardless.
-      this.settle(pending, failure(INTERNAL_ERROR, messageOf(error)));
+      this.ledger.settle(pending, failure(INTERNAL_ERROR, messageOf(error)));
     }
     return deferred.promise;
   }
@@ -856,7 +868,7 @@ export class IpcExecutor implements RequestExecutor {
       { pid: staged.pid, codeVersion: staged.reportedCodeVersion },
       'replacement server ready',
     );
-    this.flush();
+    this.pump();
     if (op.promotedLost) {
       // The first flush killed the promoted process; `onServerLost` already
       // took the crash path (restart scheduled), so this is not a completed
@@ -1038,7 +1050,7 @@ export class IpcExecutor implements RequestExecutor {
       );
       if (!this.slot.isTerminal) {
         this.slot.resumeServing();
-        this.flush();
+        this.pump();
       }
     }
     op.markComplete();
@@ -1165,8 +1177,11 @@ export class IpcExecutor implements RequestExecutor {
       },
       'request cancelled',
     );
-    this.cancelOnServer(pending, code);
-    this.settle(pending, failure(code, `request ${requestId} was cancelled`));
+    this.ledger.cancelOnServer(pending, code);
+    this.ledger.settle(
+      pending,
+      failure(code, `request ${requestId} was cancelled`),
+    );
     return Promise.resolve();
   }
 
@@ -1203,7 +1218,7 @@ export class IpcExecutor implements RequestExecutor {
           },
           'pending request failed',
         );
-        this.settle(
+        this.ledger.settle(
           pending,
           failure(FRAMEWORK_SHUTDOWN, 'ipc executor is closing'),
         );
@@ -1216,7 +1231,7 @@ export class IpcExecutor implements RequestExecutor {
     // timeouts were unrelated). Past the budget the requests are failed and the
     // Server is shut down anyway.
     const drained = await settleWithin(
-      this.awaitPendingSettled(),
+      this.ledger.awaitPendingSettled(),
       this.shutdownTimeoutMs,
     );
     // A rejection counts as "no longer pending" here, on purpose: the waiter
@@ -1228,7 +1243,7 @@ export class IpcExecutor implements RequestExecutor {
         { timeoutMs: this.shutdownTimeoutMs, pending: this.buffer.size },
         'pending requests did not settle before the shutdown timeout',
       );
-      this.failAllPending(
+      this.ledger.failAllPending(
         FRAMEWORK_SHUTDOWN,
         'ipc executor closed before the request settled',
         'shutdown drain timed out',
@@ -1236,7 +1251,7 @@ export class IpcExecutor implements RequestExecutor {
     }
     await this.shutdownServer();
     await this.confirmAbandonedExits();
-    this.failAllPending(
+    this.ledger.failAllPending(
       FRAMEWORK_SHUTDOWN,
       'ipc executor closed',
       'executor closed',
@@ -1432,15 +1447,6 @@ export class IpcExecutor implements RequestExecutor {
     }
     clearTimeout(this.startTimer);
     this.startTimer = undefined;
-  }
-
-  private awaitPendingSettled(): Promise<void> {
-    if (this.buffer.isEmpty) {
-      return Promise.resolve();
-    }
-    return new Promise<void>((resolve) => {
-      this.drainedWaiter = resolve;
-    });
   }
 
   private launch(): void {
@@ -1684,7 +1690,7 @@ export class IpcExecutor implements RequestExecutor {
       'server ready',
     );
     this.resolveStart();
-    this.flush();
+    this.pump();
   }
 
   /**
@@ -1733,7 +1739,7 @@ export class IpcExecutor implements RequestExecutor {
       }
       pending.effectiveTimeoutMs = tightened;
       pending.deadlineAt = pending.startedAt + tightened;
-      this.armTimer(pending);
+      this.ledger.armTimer(pending);
     }
   }
 
@@ -1775,7 +1781,7 @@ export class IpcExecutor implements RequestExecutor {
       fields.sessionId = message.sessionId;
     }
     this.logger.debug(fields, 'result received');
-    this.settle(pending, outcome);
+    this.ledger.settle(pending, outcome);
   }
 
   private onServerLost(
@@ -1864,7 +1870,7 @@ export class IpcExecutor implements RequestExecutor {
     }
     if (this.slot.isTerminal) {
       // SPEC 6.3: no restart while shutting down; nothing can complete these.
-      this.failAllPending(
+      this.ledger.failAllPending(
         FRAMEWORK_SHUTDOWN,
         'server process exited during shutdown',
         'server lost during shutdown',
@@ -1943,214 +1949,19 @@ export class IpcExecutor implements RequestExecutor {
   }
 
   /**
-   * Delivers everything `undelivered` reports for the current generation, in
-   * the order it reports them (SPEC 6.5).
+   * Delivers the buffered requests to the current generation (SPEC 6.5).
    *
-   * A request that keeps killing the process starves the later requests on its
-   * connection: every flush stops at it (its replay budget runs out, and the
-   * flush returns), so those requests wait until it reaches a terminal state.
-   * That is the necessary cost of the SPEC 6.5 ordering guarantee, not a drop.
+   * The switching gate stays here because it is executor state: while a
+   * replacement is being staged or the previous process is being retired,
+   * delivering now would send a request to a process the switch is draining.
+   * It stays buffered until the replacement is promoted and this runs again.
    */
-  private flush(): void {
+  private pump(): void {
     if (this.slot.status === 'switching') {
-      // The current Server is about to be retired; delivering now would send a
-      // request to a process the switch is draining. It stays buffered until
-      // the replacement is promoted and this method runs again.
       return;
     }
-    const server = this.slot.server;
-    if (server === undefined || !server.ready) {
-      return;
-    }
-    if (this.slot.isTerminal) {
-      return;
-    }
-    for (const pending of this.buffer.undelivered(server.generation)) {
-      if (!this.deliver(server, pending)) {
-        return;
-      }
-    }
+    this.ledger.flush(this.slot.server);
   }
-
-  /** Returns false when the channel died and delivery must stop. */
-  private deliver(server: ServerState, pending: PendingRequest): boolean {
-    if (this.buffer.get(pending.request.requestId) !== pending) {
-      return true;
-    }
-    const isReplay = pending.sentOn !== undefined;
-    // The count is only committed after a successful send: a send that dies on
-    // a closing channel did not reach any Server and must not burn budget.
-    const replayCount = isReplay ? pending.replayCount + 1 : 0;
-    if (replayCount > this.maxReplays) {
-      // SPEC 6.5: a request that keeps killing the process must stop being
-      // retried, otherwise one bad input becomes a crash loop.
-      this.logger.error(
-        {
-          ...requestFields(pending.request),
-          replayCount: pending.replayCount,
-          code: FRAMEWORK_REPLAY_EXHAUSTED,
-        },
-        'request replay exhausted',
-      );
-      this.settle(
-        pending,
-        failure(
-          FRAMEWORK_REPLAY_EXHAUSTED,
-          `request ${pending.request.requestId} exceeded ${this.maxReplays} replays`,
-        ),
-      );
-      return true;
-    }
-    try {
-      server.channel.send(
-        requestMessage(
-          pending.request,
-          Math.max(1, pending.deadlineAt - Date.now()),
-          replayCount,
-        ),
-      );
-    } catch (error) {
-      this.onServerLost(server, null, null, `send failed: ${messageOf(error)}`);
-      return false;
-    }
-    pending.replayCount = replayCount;
-    pending.sentOn = server.generation;
-    if (isReplay) {
-      this.logger.warn(
-        {
-          ...requestFields(pending.request),
-          replayCount,
-          durationMs: Date.now() - pending.startedAt,
-        },
-        'request replayed',
-      );
-    }
-    return true;
-  }
-
-  private armTimer(pending: PendingRequest): void {
-    if (pending.timer !== undefined) {
-      clearTimeout(pending.timer);
-    }
-    const remaining = Math.max(0, pending.deadlineAt - Date.now());
-    pending.timer = setTimeout(() => {
-      this.onDeadline(pending);
-    }, remaining);
-  }
-
-  private onDeadline(pending: PendingRequest): void {
-    if (this.buffer.get(pending.request.requestId) !== pending) {
-      return;
-    }
-    pending.timer = undefined;
-    // warn, not error: the connection layer records the failed outcome at error
-    // level, and one request failure should not produce two error lines.
-    this.logger.warn(
-      {
-        ...requestFields(pending.request),
-        code: FRAMEWORK_TIMEOUT,
-        durationMs: Date.now() - pending.startedAt,
-      },
-      'request timed out',
-    );
-    // The Server may still be working on it; tell it to stop. Best effort: the
-    // terminal state is decided here, and a result that arrives later is
-    // discarded by requestId.
-    this.cancelOnServer(pending, FRAMEWORK_TIMEOUT);
-    this.settle(
-      pending,
-      failure(
-        FRAMEWORK_TIMEOUT,
-        `request ${pending.request.requestId} timed out after ${pending.effectiveTimeoutMs}ms`,
-      ),
-    );
-  }
-
-  private cancelOnServer(pending: PendingRequest, code: string): void {
-    const server = this.slot.server;
-    if (
-      server === undefined ||
-      !server.ready ||
-      pending.sentOn !== server.generation
-    ) {
-      return;
-    }
-    try {
-      server.channel.send({
-        type: 'cancel',
-        requestId: pending.request.requestId,
-        code,
-      });
-    } catch (error) {
-      this.logger.warn(
-        {
-          ...requestFields(pending.request),
-          code,
-          reason: messageOf(error),
-        },
-        'cancel could not be sent',
-      );
-    }
-  }
-
-  private settle(pending: PendingRequest, outcome: ExecutorOutcome): void {
-    if (this.buffer.get(pending.request.requestId) !== pending) {
-      return;
-    }
-    this.buffer.take(pending.request.requestId);
-    if (pending.timer !== undefined) {
-      clearTimeout(pending.timer);
-      pending.timer = undefined;
-    }
-    pending.resolve(outcome);
-    if (this.buffer.isEmpty) {
-      const drained = this.drainedWaiter;
-      this.drainedWaiter = undefined;
-      drained?.();
-    }
-  }
-
-  /**
-   * Settles every buffered request with one failure. `message` is the outcome
-   * text the caller sees; `reason` is log-only and names the call site, because
-   * several paths share a code and would otherwise look identical in the logs.
-   */
-  private failAllPending(code: string, message: string, reason: string): void {
-    for (const pending of this.buffer.values()) {
-      // warn, not error: the connection layer records the failed outcome at
-      // error level, and one request failure should not produce two error lines.
-      this.logger.warn(
-        {
-          ...requestFields(pending.request),
-          code,
-          reason,
-          durationMs: Date.now() - pending.startedAt,
-        },
-        'pending request failed',
-      );
-      this.settle(pending, failure(code, message));
-    }
-  }
-}
-
-/**
- * Request-level log bindings (SPEC 7.1): the ids every request carries plus the
- * Session its connection already held on entry.
- *
- * `sessionId` is omitted, not written as `undefined` or an empty string, when
- * the connection holds no Session: absence is the contract for "unbound"
- * (SPEC 2, identity.ts).
- */
-function requestFields(request: ExecutorRequest): LogFields {
-  const fields: LogFields = {
-    requestId: request.requestId,
-    connectionId: request.connectionId,
-    clientRequestId: request.clientRequestId,
-  };
-  if (request.sessionId !== undefined) {
-    fields.sessionId = request.sessionId;
-  }
-  return fields;
 }
 
 /** A one-shot, never-rejecting barrier for one handshake step. */
