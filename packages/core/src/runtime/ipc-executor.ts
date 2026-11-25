@@ -1,7 +1,7 @@
 import { messageOf } from '../internal/guards.ts';
 import type { ResultMessage } from '../ipc/protocol.ts';
 import { parseIpcMessage } from '../ipc/protocol.ts';
-import type { ServerExitInfo, SpawnedServer } from '../ipc/spawn-port.ts';
+import type { SpawnedServer } from '../ipc/spawn-port.ts';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import { safeLogger } from '../logging/safe-logger.ts';
 import type { LogFields, Logger } from '../logging/types.ts';
@@ -27,6 +27,15 @@ import {
 } from './ipc-messages.ts';
 import type { PendingRequest } from './ipc-pending.ts';
 import { PendingBuffer } from './ipc-pending.ts';
+import type { ServerHandlers } from './server-launcher.ts';
+import {
+  ClosedWaiter,
+  attachServer,
+  buildServer,
+  closeChannelQuietly,
+  killQuietly,
+  waitForExit,
+} from './server-launcher.ts';
 import type { ServerState } from './server-slot.ts';
 import { ServerSlot } from './server-slot.ts';
 import { effectiveTimeoutMs, settleWithin, tightenTimeout } from './timeout.ts';
@@ -210,8 +219,7 @@ export class IpcExecutor implements RequestExecutor {
   private startWaiter:
     | { resolve: () => void; reject: (error: Error) => void }
     | undefined;
-  private closedWaiter: (() => void) | undefined;
-  private closedTimer: ReturnType<typeof setTimeout> | undefined;
+  private readonly closedWaiter = new ClosedWaiter();
   private drainedWaiter: (() => void) | undefined;
   private closePromise: Promise<void> | undefined;
   /**
@@ -680,10 +688,10 @@ export class IpcExecutor implements RequestExecutor {
       op.failure = new Error(`spawn failed: ${messageOf(error)}`);
       return false;
     }
-    const server = this.buildServer(spawned);
+    const server = buildServer(spawned, this.slot.nextGeneration());
     server.staged = true;
     op.staged = server;
-    this.attachServer(server);
+    attachServer(server, this.serverHandlers(server));
     try {
       server.channel.send({
         type: 'hello',
@@ -739,19 +747,19 @@ export class IpcExecutor implements RequestExecutor {
           },
           'server did not finish shutting down; killing it',
         );
-        this.killQuietly(previous);
+        killQuietly(previous, this.logger);
       }
     }
-    let exited = await this.waitForExit(previous);
+    let exited = await waitForExit(previous, this.logger);
     if (!exited) {
       this.logger.warn(
         { pid: previous.pid, timeoutMs: EXIT_WAIT_TIMEOUT_MS },
         'server process did not exit; killing it before switching',
       );
-      this.killQuietly(previous);
-      exited = await this.waitForExit(previous);
+      killQuietly(previous, this.logger);
+      exited = await waitForExit(previous, this.logger);
     }
-    this.closeChannelQuietly(previous, 'portal is switching servers');
+    closeChannelQuietly(previous, 'portal is switching servers', this.logger);
     if (op.abortError !== undefined) {
       // `close()` took over while the old process was exiting. Its own path
       // finishes the shutdown, including the exit wait, so nothing is recorded
@@ -1076,9 +1084,9 @@ export class IpcExecutor implements RequestExecutor {
     server.closed = true;
     server.closedSignal.resolve();
     if (!server.exited) {
-      this.killQuietly(server);
+      killQuietly(server, this.logger);
     }
-    this.closeChannelQuietly(server, 'switch abandoned');
+    closeChannelQuietly(server, 'switch abandoned', this.logger);
   }
 
   /**
@@ -1110,7 +1118,7 @@ export class IpcExecutor implements RequestExecutor {
       this.recordAbandonedForClose(server);
     }
     void Promise.all(
-      pendingExits.map((server) => this.waitForExit(server)),
+      pendingExits.map((server) => waitForExit(server, this.logger)),
     ).then(() => {
       for (const server of pendingExits) {
         this.forgetAbandonedForClose(server);
@@ -1118,28 +1126,6 @@ export class IpcExecutor implements RequestExecutor {
       this.scheduleRestart(backoffMs);
       return undefined;
     });
-  }
-
-  private killQuietly(server: ServerState): void {
-    try {
-      server.kill();
-    } catch (error) {
-      this.logger.warn(
-        { pid: server.pid, reason: messageOf(error) },
-        'server could not be killed',
-      );
-    }
-  }
-
-  private closeChannelQuietly(server: ServerState, reason: string): void {
-    try {
-      server.channel.close(reason);
-    } catch (error) {
-      this.logger.debug(
-        { reason: messageOf(error) },
-        'ipc channel close failed',
-      );
-    }
   }
 
   private currentPid(): number | undefined {
@@ -1277,7 +1263,7 @@ export class IpcExecutor implements RequestExecutor {
     // counts one bounded wait→kill→wait, not one per process.
     await Promise.all(
       pending.map(async (server) => {
-        const exited = await this.waitForExit(server);
+        const exited = await waitForExit(server, this.logger);
         if (exited) {
           return;
         }
@@ -1285,8 +1271,8 @@ export class IpcExecutor implements RequestExecutor {
           { pid: server.pid, timeoutMs: EXIT_WAIT_TIMEOUT_MS },
           'abandoned replacement did not exit; killing it before close returns',
         );
-        this.killQuietly(server);
-        const afterKill = await this.waitForExit(server);
+        killQuietly(server, this.logger);
+        const afterKill = await waitForExit(server, this.logger);
         if (!afterKill) {
           this.logger.warn(
             { pid: server.pid, timeoutMs: EXIT_WAIT_TIMEOUT_MS },
@@ -1320,9 +1306,9 @@ export class IpcExecutor implements RequestExecutor {
         staged.closed = true;
         staged.closedSignal.resolve();
         if (!staged.exited) {
-          this.killQuietly(staged);
+          killQuietly(staged, this.logger);
         }
-        this.closeChannelQuietly(staged, 'switch aborted by close');
+        closeChannelQuietly(staged, 'switch aborted by close', this.logger);
         if (op.activated) {
           this.recordAbandonedForClose(staged);
         }
@@ -1360,7 +1346,10 @@ export class IpcExecutor implements RequestExecutor {
         }
       }
       if (server.ready) {
-        await this.waitForClosed(server);
+        await this.closedWaiter.waitForClosed(
+          server,
+          this.shutdownTimeoutMs + SHUTDOWN_ACK_SLACK_MS,
+        );
       }
       if (!server.closed && !server.shutdownAcknowledged) {
         // A stalled graceful shutdown, or a Server that never finished
@@ -1388,7 +1377,7 @@ export class IpcExecutor implements RequestExecutor {
     // process is gone; the storage must not be reopened while it lingers
     // (INV-002). This also covers a process that was already killed from the
     // channel-loss path. Waiting is bounded, and a lingering process is logged.
-    const exited = await this.waitForExit(server);
+    const exited = await waitForExit(server, this.logger);
     if (!exited) {
       // `close()` must not return while the Server may still be writing: a
       // caller that then reopens storage gets two writers, which is exactly the
@@ -1406,7 +1395,7 @@ export class IpcExecutor implements RequestExecutor {
           'server could not be killed',
         );
       }
-      await this.waitForExit(server);
+      await waitForExit(server, this.logger);
     }
     try {
       server.channel.close('portal is shutting down');
@@ -1419,79 +1408,8 @@ export class IpcExecutor implements RequestExecutor {
     this.slot.clearIfCurrent(server);
   }
 
-  private waitForClosed(server: ServerState): Promise<void> {
-    if (server.closed || server.shutdownAcknowledged) {
-      return Promise.resolve();
-    }
-    // The declared grace plus the slack: the Server spends the grace starting
-    // one IPC hop after this timer does, so waiting exactly the grace would
-    // always give up first on a Server that used its whole budget.
-    const waitMs = this.shutdownTimeoutMs + SHUTDOWN_ACK_SLACK_MS;
-    return new Promise<void>((resolve) => {
-      this.closedWaiter = resolve;
-      this.closedTimer = setTimeout(() => {
-        this.resolveClosed();
-      }, waitMs);
-      // The exit may have landed between the check above and this assignment,
-      // in which case its `resolveClosed` found no waiter. Re-check so the
-      // grace period is not paid for a process that is already gone.
-      if (server.closed || server.shutdownAcknowledged) {
-        this.resolveClosed();
-      }
-    });
-  }
-
-  /**
-   * Waits until the child process is known to be gone, bounded so an
-   * uninterruptible process cannot stall shutdown or restart forever. Resolves
-   * true when the exit was observed, false when the wait gave up: the caller
-   * decides whether that is fatal (the close path kills and retries, the restart
-   * path logs and moves on).
-   *
-   * The exit info is read here rather than from `server.exited`, because that
-   * flag is set by the launch continuation and the two awaits are not ordered
-   * against each other.
-   */
-  private async waitForExit(server: ServerState): Promise<boolean> {
-    if (server.exited) {
-      return true;
-    }
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<'timeout'>((resolve) => {
-      timer = setTimeout(() => {
-        resolve('timeout');
-      }, EXIT_WAIT_TIMEOUT_MS);
-    });
-    const info = await Promise.race([
-      server.exitPromise.catch((): ServerExitInfo => ({
-        code: null,
-        signal: null,
-        observed: false,
-      })),
-      timeout,
-    ]);
-    if (timer !== undefined) {
-      clearTimeout(timer);
-    }
-    if (info === 'timeout' || !info.observed) {
-      this.logger.warn(
-        { pid: server.pid, timeoutMs: EXIT_WAIT_TIMEOUT_MS },
-        'server process did not exit within the wait; it may still be running',
-      );
-      return false;
-    }
-    server.exited = true;
-    return true;
-  }
-
   private resolveClosed(): void {
-    if (this.closedTimer !== undefined) {
-      clearTimeout(this.closedTimer);
-      this.closedTimer = undefined;
-    }
-    const waiter = this.closedWaiter;
-    this.closedWaiter = undefined;
-    waiter?.();
+    this.closedWaiter.resolve();
   }
 
   private resolveStart(): void {
@@ -1543,9 +1461,9 @@ export class IpcExecutor implements RequestExecutor {
       this.scheduleRestart(backoffMs);
       return;
     }
-    const server = this.buildServer(spawned);
+    const server = buildServer(spawned, this.slot.nextGeneration());
     this.slot.trackSpawning(server);
-    this.attachServer(server);
+    attachServer(server, this.serverHandlers(server));
     try {
       server.channel.send({
         type: 'hello',
@@ -1561,82 +1479,19 @@ export class IpcExecutor implements RequestExecutor {
     }
   }
 
-  /** Wraps a spawn result in the executor's own per-process bookkeeping. */
-  private buildServer(spawned: SpawnedServer): ServerState {
-    return {
-      generation: this.slot.nextGeneration(),
-      channel: spawned.channel,
-      kill: () => {
-        spawned.kill();
-      },
-      exitPromise: spawned.exited,
-      lastExit: () => spawned.lastExit(),
-      ready: false,
-      closed: false,
-      exited: false,
-      shutdownAcknowledged: false,
-      pid: undefined,
-      staged: false,
-      retiring: false,
-      declaredMaxDurationMs: undefined,
-      reportedCodeVersion: undefined,
-      shutdownSent: false,
-      closedSignal: Promise.withResolvers<void>(),
-    };
-  }
-
   /**
-   * Installs the message, close and exit handlers on one process. Shared by the
-   * ordinary start/restart path and by `switchTo`, so a staged process is
+   * Binds this executor's handlers to one process, so a staged process is
    * observed exactly like the current one.
    */
-  private attachServer(server: ServerState): void {
-    // Handlers before the handshake: a `ready` that beats the registration is
-    // still delivered (the channel queues it), but registering first keeps the
-    // real Bun channel from dropping an early message.
-    server.channel.onMessage((raw) => {
-      this.onServerMessage(server, raw);
-    });
-    server.channel.onClose((reason) => {
-      // The exit event may already have happened: `exited` resolves on the same
-      // tick, but its continuation is a microtask and this callback is
-      // synchronous, so the promise is not readable yet. The synchronous view
-      // is what keeps the real exit code in the crash line instead of a null.
-      const recorded = server.lastExit();
-      if (recorded?.observed === true) {
-        server.exited = true;
-        this.onServerLost(server, recorded.code, recorded.signal, reason);
-        return;
-      }
-      this.onServerLost(server, null, null, reason);
-    });
-    // Both signals mean "this process is gone" and race each other; the
-    // `closed` flag inside `onServerLost` makes the handling run once.
-    void (async () => {
-      // `exited` resolves with `observed: false` rather than rejecting, so a
-      // failed waitpid still reaches the same handling path. The catch is for a
-      // spawn implementation that rejects instead.
-      const info = await server.exitPromise.catch((): ServerExitInfo => ({
-        code: null,
-        signal: null,
-        observed: false,
-      }));
-      // `exited` means "known to be gone". An unobserved exit must leave it
-      // false so `onServerLost` still takes the defensive kill path: claiming
-      // it exited would skip the only kill and start a second writer beside a
-      // process that may still be running (INV-002).
-      if (info.observed) {
-        server.exited = true;
-      }
-      this.onServerLost(
-        server,
-        info.code,
-        info.signal,
-        info.observed
-          ? 'server process exited'
-          : 'server exit could not be observed',
-      );
-    })();
+  private serverHandlers(server: ServerState): ServerHandlers {
+    return {
+      onMessage: (raw) => {
+        this.onServerMessage(server, raw);
+      },
+      onLost: (code, signal, reason) => {
+        this.onServerLost(server, code, signal, reason);
+      },
+    };
   }
 
   private onServerMessage(server: ServerState, raw: unknown): void {
@@ -1940,7 +1795,7 @@ export class IpcExecutor implements RequestExecutor {
       // loss; the switch's own await reacts to `closedSignal` and reports it.
       op.stagedLost ??= new Error(`replacement server lost: ${reason}`);
       if (!server.exited) {
-        this.killQuietly(server);
+        killQuietly(server, this.logger);
       }
       return;
     }
@@ -1962,7 +1817,7 @@ export class IpcExecutor implements RequestExecutor {
       if (server.retiring || op.previousGone) {
         op.previousGone = true;
         if (!server.exited) {
-          this.killQuietly(server);
+          killQuietly(server, this.logger);
           this.recordPendingExit(op, server);
         }
         return;
@@ -1974,7 +1829,7 @@ export class IpcExecutor implements RequestExecutor {
       this.slot.clearIfCurrent(server);
       this.resolveClosed();
       if (!server.exited) {
-        this.killQuietly(server);
+        killQuietly(server, this.logger);
         this.recordPendingExit(op, server);
       }
       op.abort(
@@ -2005,7 +1860,7 @@ export class IpcExecutor implements RequestExecutor {
         { pid: server.pid, reason },
         'server channel lost while the process was alive; killing it',
       );
-      this.killQuietly(server);
+      killQuietly(server, this.logger);
     }
     if (this.slot.isTerminal) {
       // SPEC 6.3: no restart while shutting down; nothing can complete these.
@@ -2024,7 +1879,7 @@ export class IpcExecutor implements RequestExecutor {
     this.slot.markStartingAfterLoss();
     // Wait for the exit before restarting even when the kill was issued: the
     // replacement must not open storage while the old process still holds it.
-    void this.waitForExit(server).then(() => {
+    void waitForExit(server, this.logger).then(() => {
       this.scheduleRestart(backoffMs);
       return undefined;
     });
