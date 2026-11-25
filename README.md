@@ -17,7 +17,7 @@ bash scripts/ci.sh --skip-install # 完整门禁
 - `packages/` — 框架各包：core、connector-ws、storage-sqlite，以及仅测试用的 test-support
 - `examples/` — 最小双进程示例与可运行的游戏切片（房间、移动、拾取、同房间广播）
 - `tests/` — 跨包集成测试
-- `benchmarks/` — logger 性能基准，不接入 CI
+- `benchmarks/` — logger 与游戏热路径基准，不接入 CI
 - `docs/` — 契约、不变量与协作规范
 - `scripts/` — 本地与 CI 共用的门禁脚本
 - `.githooks/`、`.github/` — 提交钩子与 CI 配置
