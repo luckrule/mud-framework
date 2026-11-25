@@ -17,12 +17,12 @@ import {
   DEFAULT_RESTART_BACKOFF_MS,
   DEFAULT_SHUTDOWN_TIMEOUT_MS,
   EXIT_WAIT_TIMEOUT_MS,
-  MAX_RESTART_BACKOFF_MS,
   SHUTDOWN_ACK_SLACK_MS,
   closeBudget,
 } from './ipc-budget.ts';
 import { failure, nextPortalGeneration } from './ipc-messages.ts';
 import { PendingBuffer } from './ipc-pending.ts';
+import { RestartPolicy } from './restart-policy.ts';
 import type { ServerHandlers } from './server-launcher.ts';
 import {
   ClosedWaiter,
@@ -132,8 +132,6 @@ export class IpcExecutor implements RequestExecutor {
   private spawn: () => SpawnedServer;
   private readonly portalTimeoutMs: number;
   private readonly maxReplays: number;
-  private readonly restartBackoffMs: number;
-  private readonly stableResetMs: number;
   private readonly shutdownTimeoutMs: number;
   private readonly startTimeoutMs: number;
   /** Stamped on new requests and compared against `ready`; follows `spawn`. */
@@ -150,14 +148,8 @@ export class IpcExecutor implements RequestExecutor {
   /** The Server→Portal handlers' view of this executor. */
   private readonly messageHost: MessageHost;
   private effectiveTimeoutMs: number;
-  /**
-   * Crashes since the last stable run; drives the restart backoff. Reset only
-   * by `stableTimer`, never by `ready`: a Server that reaches the handshake and
-   * then dies on its first request is still part of the same crash streak.
-   */
-  private restartAttempts = 0;
-  private restartTimer: ReturnType<typeof setTimeout> | undefined;
-  private stableTimer: ReturnType<typeof setTimeout> | undefined;
+  /** The crash streak, its backoff and the stability window that ends it. */
+  private readonly restart: RestartPolicy;
   private startTimer: ReturnType<typeof setTimeout> | undefined;
   private startWaiter:
     | { resolve: () => void; reject: (error: Error) => void }
@@ -194,12 +186,14 @@ export class IpcExecutor implements RequestExecutor {
     this.spawn = options.spawn;
     this.portalTimeoutMs = options.timeoutMs;
     this.maxReplays = maxReplays;
-    this.restartBackoffMs = restartBackoffMs;
     // Defaults must exceed the backoff cap (5000ms) and the longest request,
     // otherwise a Server that dies on its first request would reset the streak
     // before it crashed and restart with zero backoff every time.
-    this.stableResetMs =
-      options.stableResetMs ?? Math.max(30_000, options.timeoutMs);
+    this.restart = new RestartPolicy({
+      baseBackoffMs: restartBackoffMs,
+      stableResetMs:
+        options.stableResetMs ?? Math.max(30_000, options.timeoutMs),
+    });
     this.shutdownTimeoutMs =
       options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
     const startTimeoutMs =
@@ -291,15 +285,15 @@ export class IpcExecutor implements RequestExecutor {
         this.resolveClosed();
       },
       clearRestartTimer: () => {
-        this.clearRestartTimer();
+        this.restart.clearRestartTimer();
       },
       startStableTimer: () => {
-        this.startStableTimer();
+        this.restart.startStableClock();
       },
       adoptCeiling: (declaredMaxDurationMs) => {
         this.adoptCeiling(declaredMaxDurationMs);
       },
-      nextBackoffMs: () => this.nextBackoffMs(),
+      nextBackoffMs: () => this.restart.nextBackoffMs(),
       scheduleRestart: (backoffMs) => {
         this.scheduleRestart(backoffMs);
       },
@@ -321,7 +315,7 @@ export class IpcExecutor implements RequestExecutor {
         // The crash streak ends only after a stable run, not at the handshake:
         // a Server that reaches `ready` and then dies on its first request
         // would otherwise reset the backoff and restart immediately, forever.
-        this.startStableTimer();
+        this.restart.startStableClock();
         this.adoptCeiling(declaredMaxDurationMs);
         return this.effectiveTimeoutMs;
       },
@@ -372,9 +366,9 @@ export class IpcExecutor implements RequestExecutor {
     if (this.startWaiter === undefined) {
       return;
     }
-    const attempts = this.restartAttempts;
-    this.clearRestartTimer();
-    this.clearStableTimer();
+    const attempts = this.restart.attempts;
+    this.restart.clearRestartTimer();
+    this.restart.clearStableClock();
     this.slot.markFailed();
     this.logger.error(
       { timeoutMs: this.startTimeoutMs, attempts },
@@ -674,8 +668,8 @@ export class IpcExecutor implements RequestExecutor {
 
   private async doClose(): Promise<void> {
     this.slot.markClosing();
-    this.clearRestartTimer();
-    this.clearStableTimer();
+    this.restart.clearRestartTimer();
+    this.restart.clearStableClock();
     this.clearStartTimer();
     // A switch in flight must not keep spawning, activating or restarting: it is
     // interrupted here and its staged process abandoned, so `close()` ends with
@@ -882,7 +876,7 @@ export class IpcExecutor implements RequestExecutor {
       spawned = this.spawn();
     } catch (error) {
       // A failed spawn is another crash: keep buffering and back off.
-      const backoffMs = this.nextBackoffMs();
+      const backoffMs = this.restart.nextBackoffMs();
       this.logger.error(
         { reason: messageOf(error), backoffMs },
         'server spawn failed',
@@ -997,7 +991,7 @@ export class IpcExecutor implements RequestExecutor {
       return;
     }
     // A stable clock from the dead generation must not end the crash streak.
-    this.clearStableTimer();
+    this.restart.clearStableClock();
     if (server.retiring) {
       // A switch retired this process but had already settled (promoted or
       // rolled back) before its exit landed. Its exit is expected: no crash
@@ -1029,7 +1023,7 @@ export class IpcExecutor implements RequestExecutor {
       );
       return;
     }
-    const backoffMs = this.nextBackoffMs();
+    const backoffMs = this.restart.nextBackoffMs();
     this.logger.error(
       { pid: server.pid, exitCode: code, signal, backoffMs, reason },
       'server process lost',
@@ -1043,61 +1037,18 @@ export class IpcExecutor implements RequestExecutor {
     });
   }
 
+  /**
+   * Arms the restart unless the executor is already shutting down. The terminal
+   * check stays here because it is the process state machine's decision, not the
+   * policy's: a `RestartPolicy` never reads the slot.
+   */
   private scheduleRestart(backoffMs: number): void {
     if (this.slot.isTerminal) {
       return;
     }
-    this.restartTimer = setTimeout(() => {
-      this.restartTimer = undefined;
+    this.restart.scheduleRestart(backoffMs, () => {
       this.launch();
-    }, backoffMs);
-  }
-
-  private clearRestartTimer(): void {
-    if (this.restartTimer === undefined) {
-      return;
-    }
-    clearTimeout(this.restartTimer);
-    this.restartTimer = undefined;
-  }
-
-  /**
-   * Restarts the stability clock for the current Server. Only its expiry ends
-   * the crash streak; `ready` alone does not, because a Server can reach the
-   * handshake and still die on its first request.
-   */
-  private startStableTimer(): void {
-    this.clearStableTimer();
-    this.stableTimer = setTimeout(() => {
-      this.stableTimer = undefined;
-      this.restartAttempts = 0;
-    }, this.stableResetMs);
-  }
-
-  private clearStableTimer(): void {
-    if (this.stableTimer === undefined) {
-      return;
-    }
-    clearTimeout(this.stableTimer);
-    this.stableTimer = undefined;
-  }
-
-  /**
-   * Exponential backoff, but the first restart of a crash streak is immediate:
-   * a one-off crash should not cost the player 100ms of latency. The streak
-   * only ends once a Server has been up for `stableResetMs`, so an immediate
-   * restart cannot repeat indefinitely.
-   */
-  private nextBackoffMs(): number {
-    const attempt = this.restartAttempts;
-    this.restartAttempts += 1;
-    if (attempt === 0) {
-      return 0;
-    }
-    return Math.min(
-      this.restartBackoffMs * 2 ** (attempt - 1),
-      MAX_RESTART_BACKOFF_MS,
-    );
+    });
   }
 
   /**
