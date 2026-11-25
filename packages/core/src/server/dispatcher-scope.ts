@@ -1,0 +1,126 @@
+import type { Logger } from '../logging/types.ts';
+import type { SessionChange } from '../shared/executor.ts';
+import { elapsedMs } from '../shared/timeout.ts';
+import type { StorageTransaction } from '../storage/types.ts';
+
+/** Abnormal termination, separate from the storage handle's lifetime. */
+export interface Expiry {
+  expired: boolean;
+  readonly controller: AbortController;
+}
+
+export interface StorageScope {
+  active: boolean;
+  /**
+   * Set after a write fails on a backend that declares `transactions: 'none'`.
+   * Such a backend cannot roll back, so later writes would land on top of a
+   * half-applied request (SPEC 4.3). Scoped per request, never shared.
+   */
+  writeFailed: boolean;
+}
+
+/** A pending request: cancellation ends its scope and rejects dispatch. */
+export interface InFlight {
+  readonly expiry: Expiry;
+  readonly storageScope: StorageScope;
+  /** Request-bound, so the cancellation line carries the same ids as the rest. */
+  readonly logger: Logger;
+  readonly startedAt: number;
+  /** Settles the dispatch race as failed. A second call is a no-op. */
+  readonly fail: (error: Error) => void;
+}
+
+/** At most one change per request; `recordSessionChange` enforces it. */
+export interface SessionChangeHolder {
+  value?: SessionChange;
+}
+
+export const EXPIRED_MESSAGE =
+  'storage transaction expired: the request already reached a terminal state';
+
+export const WRITE_ABORTED_MESSAGE =
+  'write rejected: an earlier write in this request failed and the backend declares transactions "none" (no rollback), so later writes in this request are aborted';
+
+/**
+ * Records a commit that landed after the request already had a terminal state
+ * (a cancel or a timeout). Both are the same defect from the operator's side —
+ * a write nobody is waiting for — so the line is named for the outcome, not for
+ * one of the two causes.
+ */
+export function logLostCommit(logger: Logger, startedAt: number): void {
+  logger.warn(
+    {
+      code: 'CANCEL_LOST_TO_COMMIT',
+      durationMs: elapsedMs(startedAt),
+    },
+    'transaction committed after the request reached a terminal state',
+  );
+}
+
+export function guard(
+  tx: StorageTransaction,
+  scope: StorageScope,
+  abortOnWriteFailure: boolean,
+): StorageTransaction {
+  return {
+    async query<T>(sql: string, params?: readonly unknown[]): Promise<T[]> {
+      assertActive(scope);
+      return tx.query<T>(sql, params);
+    },
+    async execute(sql: string, params?: readonly unknown[]): Promise<void> {
+      // The terminal state wins: an ended request reports expiry whatever its
+      // earlier writes did (SPEC 3.3, 3.4).
+      assertActive(scope);
+      if (abortOnWriteFailure && scope.writeFailed) {
+        throw new Error(WRITE_ABORTED_MESSAGE);
+      }
+      try {
+        await tx.execute(sql, params);
+      } catch (error) {
+        if (abortOnWriteFailure) {
+          scope.writeFailed = true;
+        }
+        // The handler sees the original error; the framework never replaces or
+        // swallows the cause of the first failure.
+        throw error;
+      }
+    },
+  };
+}
+
+export function assertActive(scope: StorageScope): void {
+  if (!scope.active) {
+    throw new Error(EXPIRED_MESSAGE);
+  }
+}
+
+export function assertSessionChangeAllowed(mayChangeSession: boolean): void {
+  if (!mayChangeSession) {
+    throw new Error(
+      'handler must be registered with mayChangeSession: true to change the session',
+    );
+  }
+}
+
+/**
+ * At most one change per request. Two changes have no defined meaning, and
+ * letting the last call win would make the outcome depend on call order while
+ * looking successful. A rejected request commits neither change.
+ */
+export function recordSessionChange(
+  holder: SessionChangeHolder,
+  next: SessionChange,
+): void {
+  if (holder.value !== undefined) {
+    throw new Error(
+      `a request may change its session at most once: ${describeSessionChange(holder.value)} then ${describeSessionChange(next)}`,
+    );
+  }
+  holder.value = next;
+}
+
+function describeSessionChange(change: SessionChange): string {
+  return change.type === 'bind'
+    ? `bindSession("${change.sessionId}")`
+    : 'unbindSession()';
+}

@@ -3,9 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import { safeLogger } from '../logging/safe-logger.ts';
 import type { Logger } from '../logging/types.ts';
-import type { SessionChange } from '../shared/executor.ts';
 import { describeValue, messageOf } from '../shared/guards.ts';
-import type { RequestIdentity } from '../shared/identity.ts';
 import { elapsedMs, tightenTimeout } from '../shared/timeout.ts';
 import {
   AUTH_REQUIRED,
@@ -16,118 +14,40 @@ import {
   RequestCancelledError,
   UnknownHandlerError,
 } from '../shared/wire-codes.ts';
-import type { StorageBackend, StorageTransaction } from '../storage/types.ts';
+import type { StorageBackend } from '../storage/types.ts';
+import type {
+  AccessContext,
+  DispatchMeta,
+  DispatchResult,
+  Handler,
+  HandlerAccess,
+  HandlerOptions,
+  RequestContext,
+} from './dispatcher-context.ts';
+import {
+  assertActive,
+  assertSessionChangeAllowed,
+  EXPIRED_MESSAGE,
+  guard,
+  logLostCommit,
+  recordSessionChange,
+} from './dispatcher-scope.ts';
+import type {
+  Expiry,
+  InFlight,
+  SessionChangeHolder,
+  StorageScope,
+} from './dispatcher-scope.ts';
 
-/**
- * What the caller knows about a request before it is dispatched. All optional:
- * a direct `dispatch` has no connection, and a replayed request supplies the
- * original `requestId` so the id survives the replay (SPEC 7.3).
- *
- * `sessionId` here means "this request already belongs to a Session", which is
- * not the same thing as the `SessionChange` a successful dispatch may report
- * ("the handler bound or unbound one").
- */
-export type DispatchMeta = Partial<RequestIdentity> & {
-  /**
-   * A tighter deadline for this request only. It can shorten a request but
-   * never extend one: the effective timeout is still
-   * `min(this, configured timeoutMs, backend max)`, because the configured
-   * value is the promise this dispatcher made to the rest of the framework and
-   * a caller (or a Portal relaying its own budget) must not be able to relax it
-   * (SPEC 3.4).
-   */
-  timeoutMs?: number;
-};
-
-export interface RequestContext extends RequestIdentity {
-  /**
-   * Aborts when the request reaches a terminal state before the handler
-   * returns: timeout, cancellation, or disconnect (SPEC 3.6). It is a
-   * notification, not a preemption — JS cannot stop running code, so a handler
-   * that ignores it keeps running and only loses its transaction (SPEC 3.4).
-   * Pass it to `fetch`, `Bun.sleep`, or anything else that accepts one.
-   */
-  readonly signal: AbortSignal;
-  /**
-   * Binds the current connection to a Session. The framework stores the mapping
-   * and routes by it; it does not validate the id — who a player is, and when a
-   * session starts or ends, belongs to the business (SPEC 2).
-   *
-   * Only a successful request commits the binding: a handler that throws or
-   * times out leaves the connection unbound, so a failed login cannot leave a
-   * half-created session behind. Calls after the handler settles are rejected.
-   * Requires `mayChangeSession: true` on the handler's registration.
-   */
-  bindSession(sessionId: string): void;
-  /**
-   * Ends the current connection's Session binding. Like `bindSession`, it is
-   * recorded for the request and applied only if the request succeeds, so a
-   * failed unbind leaves the route in place. Requires `mayChangeSession: true`
-   * and shares the one-change-per-request budget with `bindSession`.
-   */
-  unbindSession(): void;
-  /** The Extension that registered this handler, when one did (SPEC 7.1). */
-  readonly extension?: string;
-  /** Already bound to the request's ids; handlers never build one. */
-  logger: Logger;
-  /** Ends with the handler's scope, or earlier on timeout or cancellation. */
-  storage: StorageTransaction;
-}
-
-/**
- * What a successful dispatch yields: the handler's value plus the Session
- * change it declared, if any. Failures are still thrown — `instanceof` only
- * works in process, and `LocalExecutor` is the one place that turns them into
- * the cross-process `ExecutorOutcome` union.
- *
- * The change was recorded, not applied: the caller owns the routing table and
- * commits it only after this result arrives (SPEC 2).
- */
-export interface DispatchResult {
-  /** The handler's return value. */
-  result: unknown;
-  /** Set when the handler bound or unbound a Session (SPEC 2). */
-  sessionChange?: SessionChange;
-}
-
-export type Handler = (
-  ctx: RequestContext,
-  payload: unknown,
-) => Promise<unknown>;
-
-/** Whether a handler needs a Session on entry (SPEC 3.7). */
-export type HandlerAccess = 'public' | 'session';
-
-export interface HandlerOptions {
-  /** The Extension that owns this handler, for request logs (SPEC 7.1). */
-  readonly extension?: string;
-  /**
-   * Defaults to `'session'`: a handler is assumed to need an authenticated
-   * Session unless it explicitly opts out with `'public'` (SPEC 3.7). Must be
-   * exactly one of those two values.
-   */
-  readonly access?: HandlerAccess;
-  /**
-   * Defaults to false. Only a handler that declares true may call
-   * `bindSession`/`unbindSession`; the declaration makes the mutation an
-   * explicit part of the handler's contract rather than an accident. Must be a
-   * boolean when provided.
-   */
-  readonly mayChangeSession?: boolean;
-}
-
-/**
- * What an access policy sees. Deliberately narrower than `RequestContext`: the
- * policy runs before the transaction exists, so it has no storage to write and
- * no Session change to declare (SPEC 3.7).
- */
-export interface AccessContext extends RequestIdentity {
-  /** The Extension that registered the handler, when one did (SPEC 7.1). */
-  readonly extension?: string;
-  /** Aborts at the request deadline, so a slow policy can stop early. */
-  readonly signal: AbortSignal;
-  readonly logger: Logger;
-}
+export type {
+  AccessContext,
+  DispatchMeta,
+  DispatchResult,
+  Handler,
+  HandlerAccess,
+  HandlerOptions,
+  RequestContext,
+} from './dispatcher-context.ts';
 
 export interface DispatcherOptions {
   backend: StorageBackend;
@@ -149,22 +69,6 @@ export interface DispatcherOptions {
   logger?: Logger;
 }
 
-/** Abnormal termination, separate from the storage handle's lifetime. */
-interface Expiry {
-  expired: boolean;
-  readonly controller: AbortController;
-}
-
-interface StorageScope {
-  active: boolean;
-  /**
-   * Set after a write fails on a backend that declares `transactions: 'none'`.
-   * Such a backend cannot roll back, so later writes would land on top of a
-   * half-applied request (SPEC 4.3). Scoped per request, never shared.
-   */
-  writeFailed: boolean;
-}
-
 /** What `register` remembers about a handler: the function and its contract. */
 interface HandlerEntry {
   readonly handler: Handler;
@@ -173,23 +77,6 @@ interface HandlerEntry {
   readonly access: HandlerAccess;
   readonly mayChangeSession: boolean;
 }
-
-/** A pending request: cancellation ends its scope and rejects dispatch. */
-interface InFlight {
-  readonly expiry: Expiry;
-  readonly storageScope: StorageScope;
-  /** Request-bound, so the cancellation line carries the same ids as the rest. */
-  readonly logger: Logger;
-  readonly startedAt: number;
-  /** Settles the dispatch race as failed. A second call is a no-op. */
-  readonly fail: (error: Error) => void;
-}
-
-const EXPIRED_MESSAGE =
-  'storage transaction expired: the request already reached a terminal state';
-
-const WRITE_ABORTED_MESSAGE =
-  'write rejected: an earlier write in this request failed and the backend declares transactions "none" (no rollback), so later writes in this request are aborted';
 
 export class Dispatcher {
   private readonly backend: StorageBackend;
@@ -358,7 +245,7 @@ export class Dispatcher {
     // succeeds, so a failed request leaves the route untouched (SPEC 2). A
     // holder object rather than a `let`, because the handler closure assigns it
     // and control-flow narrowing would otherwise treat it as still undefined.
-    const change: { value?: SessionChange } = {};
+    const change: SessionChangeHolder = {};
 
     try {
       if (this.authorize !== undefined) {
@@ -572,88 +459,4 @@ export class Dispatcher {
       throw new Error('dispatcher is closed');
     }
   }
-}
-
-/**
- * Records a commit that landed after the request already had a terminal state
- * (a cancel or a timeout). Both are the same defect from the operator's side —
- * a write nobody is waiting for — so the line is named for the outcome, not for
- * one of the two causes.
- */
-function logLostCommit(logger: Logger, startedAt: number): void {
-  logger.warn(
-    {
-      code: 'CANCEL_LOST_TO_COMMIT',
-      durationMs: elapsedMs(startedAt),
-    },
-    'transaction committed after the request reached a terminal state',
-  );
-}
-
-function guard(
-  tx: StorageTransaction,
-  scope: StorageScope,
-  abortOnWriteFailure: boolean,
-): StorageTransaction {
-  return {
-    async query<T>(sql: string, params?: readonly unknown[]): Promise<T[]> {
-      assertActive(scope);
-      return tx.query<T>(sql, params);
-    },
-    async execute(sql: string, params?: readonly unknown[]): Promise<void> {
-      // The terminal state wins: an ended request reports expiry whatever its
-      // earlier writes did (SPEC 3.3, 3.4).
-      assertActive(scope);
-      if (abortOnWriteFailure && scope.writeFailed) {
-        throw new Error(WRITE_ABORTED_MESSAGE);
-      }
-      try {
-        await tx.execute(sql, params);
-      } catch (error) {
-        if (abortOnWriteFailure) {
-          scope.writeFailed = true;
-        }
-        // The handler sees the original error; the framework never replaces or
-        // swallows the cause of the first failure.
-        throw error;
-      }
-    },
-  };
-}
-
-function assertActive(scope: StorageScope): void {
-  if (!scope.active) {
-    throw new Error(EXPIRED_MESSAGE);
-  }
-}
-
-function assertSessionChangeAllowed(mayChangeSession: boolean): void {
-  if (!mayChangeSession) {
-    throw new Error(
-      'handler must be registered with mayChangeSession: true to change the session',
-    );
-  }
-}
-
-/**
- * At most one change per request. Two changes have no defined meaning, and
- * letting the last call win would make the outcome depend on call order while
- * looking successful. A rejected request commits neither change.
- */
-function recordSessionChange(
-  holder: { value?: SessionChange },
-  next: SessionChange,
-): void {
-  if (holder.value !== undefined) {
-    throw new Error(
-      `a request may change its session at most once: ${describeSessionChange(holder.value)} then ${describeSessionChange(next)}`,
-    );
-  }
-  holder.value = next;
-}
-
-function describeSessionChange(change: SessionChange): string {
-  return change.type === 'bind'
-    ? `bindSession("${change.sessionId}")`
-    : 'unbindSession()';
 }
