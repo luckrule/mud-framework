@@ -153,7 +153,9 @@ export class SendQueue {
         this.fail(toError(error));
         return;
       }
-      if (status === 0 && head.bytes > 0) {
+      if (status === 0) {
+        // Bun rejected the frame outright, including a zero-byte one: bytes
+        // is not evidence of a write, `status` is.
         this.settle(
           head,
           new Error(

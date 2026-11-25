@@ -185,6 +185,23 @@ describe('SendQueue', () => {
     expect(queue.depth).toBe(0);
   });
 
+  test('rejects a zero-byte payload Bun dropped, then keeps draining', async () => {
+    const { sink, written } = fakeSink([0, 1]);
+    const queue = new SendQueue('c1', 10_000, sink);
+
+    const dropped = tracked(queue.send(new Uint8Array(0), 0));
+    await settle();
+
+    expect(dropped.state()).toBe('rejected');
+    expect(dropped.error()?.message).toMatch(/dropped a 0 byte/);
+    expect(queue.depth).toBe(0);
+
+    // A dropped frame must not wedge the queue behind it.
+    await queue.send('next', 4);
+    expect(written).toEqual([new Uint8Array(0), 'next']);
+    expect(queue.depth).toBe(0);
+  });
+
   test('a drain arriving mid-write does not reorder the queue', async () => {
     // `write` calls back into `drain` while the flush loop is still running,
     // which is what a synchronous Bun drain would look like.

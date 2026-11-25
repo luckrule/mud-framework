@@ -117,6 +117,58 @@ function tracked(promise: Promise<void>): Tracked {
   return { promise, state: () => state, error: () => error };
 }
 
+/**
+ * Records process-level escapes a transport callback must never cause. Bun
+ * terminates on an unhandled rejection or uncaught exception, so the test
+ * installs listeners itself: they both observe and prevent that exit.
+ */
+function captureProcessFailures(): {
+  unhandledRejections: unknown[];
+  uncaughtExceptions: unknown[];
+  stop: () => void;
+} {
+  const unhandledRejections: unknown[] = [];
+  const uncaughtExceptions: unknown[] = [];
+  const onRejection = (reason: unknown): void => {
+    unhandledRejections.push(reason);
+  };
+  const onException = (error: unknown): void => {
+    uncaughtExceptions.push(error);
+  };
+  process.on('unhandledRejection', onRejection);
+  process.on('uncaughtException', onException);
+  return {
+    unhandledRejections,
+    uncaughtExceptions,
+    stop: () => {
+      process.off('unhandledRejection', onRejection);
+      process.off('uncaughtException', onException);
+    },
+  };
+}
+
+/** Just enough of a server socket to drive a private transport callback. */
+interface FakeSocket {
+  readonly data: { readonly id: string };
+  close(code: number, reason: string): void;
+}
+
+function closeRecorder(id: string): {
+  ws: FakeSocket;
+  closes: { code: number; reason: string }[];
+} {
+  const closes: { code: number; reason: string }[] = [];
+  return {
+    closes,
+    ws: {
+      data: { id },
+      close: (code, reason) => {
+        closes.push({ code, reason });
+      },
+    },
+  };
+}
+
 /** Large enough to fill the kernel and Bun buffers on its own. */
 const FILLER_BYTES = 900_000;
 /** Enough payloads to overflow the socket buffer even on a paused client. */
@@ -577,5 +629,156 @@ describe('WsTransport', () => {
       socket.destroy();
       await safeStop(transport);
     }
+  });
+
+  test('closes the connection when onMessage rejects, without escaping', async () => {
+    const { logger, entries } = captureLogger();
+    const failures = captureProcessFailures();
+    const { handlers, recorded } = recorder();
+    handlers.onMessage = () =>
+      Promise.reject(new Error('message handler boom'));
+    const transport = new WsTransport({ logger });
+    await transport.start(handlers);
+    const port = transport.port;
+    if (port === undefined) {
+      throw new Error('expected the transport to bind a port');
+    }
+    const client = await openClient(`ws://127.0.0.1:${port}/`);
+    let closeCode: number | undefined;
+    client.addEventListener('close', (event) => {
+      closeCode = event.code;
+    });
+    try {
+      await until(() => recorded.connected.length === 1, 'onConnect');
+      client.send('look');
+      await settle();
+
+      expect(failures.unhandledRejections).toHaveLength(0);
+      expect(failures.uncaughtExceptions).toHaveLength(0);
+
+      await until(() => closeCode !== undefined, 'the connection to close');
+      expect(closeCode).toBe(1011);
+
+      const failure = entries().find(
+        (entry) => entry.code === 'TRANSPORT_HANDLER_FAILED',
+      );
+      expect(failure).toMatchObject({
+        level: 'error',
+        connectionId: first(recorded.connected).id,
+        reason: 'message handler boom',
+      });
+      // The failure close still runs the disconnect path exactly once.
+      expect(recorded.disconnected).toHaveLength(1);
+    } finally {
+      failures.stop();
+      client.close();
+      await safeStop(transport);
+    }
+  });
+
+  test('closes the connection when onConnect throws, without escaping', async () => {
+    const { logger, entries } = captureLogger();
+    const failures = captureProcessFailures();
+    const transport = new WsTransport({ logger });
+    const handlers: TransportHandlers = {
+      onConnect: () => {
+        throw new Error('connect handler boom');
+      },
+      onMessage: () => undefined,
+      onDisconnect: () => undefined,
+    };
+    await transport.start(handlers);
+    const port = transport.port;
+    if (port === undefined) {
+      throw new Error('expected the transport to bind a port');
+    }
+    const client = new WebSocket(`ws://127.0.0.1:${port}/`);
+    let closeCode: number | undefined;
+    client.addEventListener('close', (event) => {
+      closeCode = event.code;
+    });
+    try {
+      await until(() => closeCode !== undefined, 'the connection to close');
+      await settle();
+
+      expect(closeCode).toBe(1011);
+      expect(failures.unhandledRejections).toHaveLength(0);
+      expect(failures.uncaughtExceptions).toHaveLength(0);
+
+      const failure = entries().find(
+        (entry) => entry.code === 'TRANSPORT_HANDLER_FAILED',
+      );
+      expect(failure).toMatchObject({
+        level: 'error',
+        reason: 'connect handler boom',
+      });
+      expect(failure?.connectionId).toBeString();
+    } finally {
+      failures.stop();
+      client.close();
+      await safeStop(transport);
+    }
+  });
+
+  test('logs a rejected onDisconnect without escaping the process', async () => {
+    const { logger, entries } = captureLogger();
+    const failures = captureProcessFailures();
+    const disconnected: TransportConnection[] = [];
+    const transport = new WsTransport({ logger });
+    await transport.start({
+      onConnect: () => undefined,
+      onMessage: () => undefined,
+      onDisconnect: (connection) => {
+        disconnected.push(connection);
+        return Promise.reject(new Error('disconnect handler boom'));
+      },
+    });
+    const port = transport.port;
+    if (port === undefined) {
+      throw new Error('expected the transport to bind a port');
+    }
+    const client = await openClient(`ws://127.0.0.1:${port}/`);
+    try {
+      client.close(1000, 'bye');
+      await until(
+        () =>
+          entries().some((entry) => entry.code === 'TRANSPORT_HANDLER_FAILED'),
+        'the handler failure log',
+      );
+      await settle();
+
+      expect(failures.unhandledRejections).toHaveLength(0);
+      expect(failures.uncaughtExceptions).toHaveLength(0);
+      expect(disconnected).toHaveLength(1);
+    } finally {
+      failures.stop();
+      client.close();
+      await safeStop(transport);
+    }
+  });
+
+  test('warns and closes a late event for an unknown connection id', async () => {
+    const { logger, entries } = captureLogger();
+    const transport = new WsTransport({ logger });
+    const { ws, closes } = closeRecorder('missing');
+    const internals = transport as unknown as {
+      handleMessage(ws: FakeSocket, message: string): void | Promise<void>;
+      handleOpen(ws: FakeSocket): void | Promise<void>;
+    };
+
+    await internals.handleMessage(ws, 'late');
+    await internals.handleOpen(ws);
+
+    expect(closes).toHaveLength(2);
+    expect(closes.every((close) => close.code === 1011)).toBe(true);
+    const warnings = entries().filter(
+      (entry) => entry.code === 'TRANSPORT_UNKNOWN_CONNECTION',
+    );
+    expect(warnings).toHaveLength(2);
+    expect(warnings[0]).toMatchObject({
+      level: 'warn',
+      transport: 'ws',
+      connectionId: 'missing',
+    });
   });
 });

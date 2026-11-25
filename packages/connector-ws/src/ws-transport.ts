@@ -221,11 +221,14 @@ export class WsTransport implements Transport {
   private handleOpen(ws: Bun.ServerWebSocket<WsData>): void | Promise<void> {
     const state = this.connections.get(ws.data.id);
     if (state === undefined) {
-      throw new Error(`unknown connection "${ws.data.id}"`);
+      this.handleUnknownConnection(ws, 'open');
+      return undefined;
     }
     state.ws = ws;
     state.open = true;
-    return this.invoke((handlers) => handlers.onConnect(state.connection));
+    return this.invoke(state, (handlers) =>
+      handlers.onConnect(state.connection),
+    );
   }
 
   private handleMessage(
@@ -234,10 +237,11 @@ export class WsTransport implements Transport {
   ): void | Promise<void> {
     const state = this.connections.get(ws.data.id);
     if (state === undefined) {
-      throw new Error(`unknown connection "${ws.data.id}"`);
+      this.handleUnknownConnection(ws, 'message');
+      return undefined;
     }
     const payload = normalizePayload(message);
-    return this.invoke((handlers) =>
+    return this.invoke(state, (handlers) =>
       handlers.onMessage(state.connection, payload),
     );
   }
@@ -263,7 +267,7 @@ export class WsTransport implements Transport {
       // the connection layer (SPEC 6.3), matching the fake transport.
       return undefined;
     }
-    return this.invoke((handlers) =>
+    return this.invoke(state, (handlers) =>
       handlers.onDisconnect(state.connection, describeClose(code, reason)),
     );
   }
@@ -303,18 +307,63 @@ export class WsTransport implements Transport {
   }
 
   private handleError(error: Error, ws: Bun.ServerWebSocket<WsData>): void {
-    this.connections
-      .get(ws.data.id)
-      ?.logger?.error(
-        { code: 'TRANSPORT_ERROR', reason: error.message },
-        'websocket handler failed',
+    const state = this.connections.get(ws.data.id);
+    const logger =
+      state?.logger ?? this.logger?.child({ connectionId: ws.data.id });
+    logger?.error(
+      { code: 'TRANSPORT_ERROR', reason: error.message },
+      'websocket handler failed',
+    );
+    // Bun reports only exceptions that escaped a socket callback. Escaping
+    // again from here would terminate every connection, so the failure is
+    // contained to this socket; its `close` callback still runs cleanup.
+    if (state !== undefined) {
+      state.open = false;
+      state.queue.fail(
+        new Error(`connection "${ws.data.id}" closed after a websocket error`, {
+          cause: error,
+        }),
       );
-    // Bun calls this only for synchronous handler throws. Rethrowing inline
-    // would re-enter this handler, so surface it as an uncaught exception
-    // instead of swallowing it.
-    queueMicrotask(() => {
-      throw error;
-    });
+    }
+    closeQuietly(ws, 1011, 'websocket handler failed');
+  }
+
+  private handleHandlerFailure(state: ConnectionState, error: Error): void {
+    state.open = false;
+    state.logger?.error(
+      {
+        code: 'TRANSPORT_HANDLER_FAILED',
+        connectionId: state.connection.id,
+        reason: error.message,
+      },
+      'transport handler failed; closing connection',
+    );
+    state.queue.fail(
+      new Error(
+        `connection "${state.connection.id}" closed after a handler failure`,
+        { cause: error },
+      ),
+    );
+    closeQuietly(state.ws, 1011, 'handler failed');
+  }
+
+  /**
+   * A late `open`/`message` for an id that is no longer registered. Closing
+   * the socket is best effort and keeps the event off the event loop.
+   */
+  private handleUnknownConnection(
+    ws: Bun.ServerWebSocket<WsData>,
+    event: 'open' | 'message',
+  ): void {
+    this.logger?.warn(
+      {
+        code: 'TRANSPORT_UNKNOWN_CONNECTION',
+        connectionId: ws.data.id,
+        event,
+      },
+      'websocket event for unknown connection; closing socket',
+    );
+    closeQuietly(ws, 1011, 'unknown connection');
   }
 
   private createConnection(id: string, queue: SendQueue): TransportConnection {
@@ -355,32 +404,47 @@ export class WsTransport implements Transport {
   }
 
   /**
-   * Runs a handler and keeps the promise for `stop`. The promise is also
-   * returned to Bun, which is the only channel a WebSocket callback has for a
-   * rejection; observing settlement here would mark it handled, so a rejection
-   * is re-raised on a detached promise to stay visible.
+   * Runs a handler and keeps the promise for `stop`. Failures are contained
+   * here: they are logged and the connection is closed, and the returned
+   * promise always fulfills. A socket callback has no caller to propagate to —
+   * Bun treats an escaped error or rejection as fatal — so re-raising would
+   * take the whole process, and every other connection, down with it.
    */
   private invoke(
+    state: ConnectionState,
     call: (handlers: TransportHandlers) => void | Promise<void>,
   ): Promise<void> {
     const handlers = this.handlers;
     if (handlers === undefined) {
       return Promise.resolve();
     }
-    const settled = Promise.resolve(call(handlers));
+    const settled = this.runHandler(state, handlers, call);
     this.pending.add(settled);
     void settled.then(
       () => {
         this.pending.delete(settled);
         return undefined;
       },
-      (error: unknown) => {
+      () => {
+        // `runHandler` absorbs failures; this arm only keeps a bug in the
+        // failure path from becoming an unhandled rejection.
         this.pending.delete(settled);
-        void Promise.reject(toError(error));
         return undefined;
       },
     );
     return settled;
+  }
+
+  private async runHandler(
+    state: ConnectionState,
+    handlers: TransportHandlers,
+    call: (handlers: TransportHandlers) => void | Promise<void>,
+  ): Promise<void> {
+    try {
+      await call(handlers);
+    } catch (error) {
+      this.handleHandlerFailure(state, toError(error));
+    }
   }
 }
 
@@ -480,6 +544,22 @@ function payloadBytes(payload: string | Uint8Array): number {
 
 function describeClose(code: number, reason: string): string {
   return reason.length > 0 ? `${code} ${reason}` : `code ${code}`;
+}
+
+function closeQuietly(
+  ws: Bun.ServerWebSocket<WsData> | undefined,
+  code: number,
+  reason: string,
+): void {
+  if (ws === undefined) {
+    return;
+  }
+  try {
+    ws.close(code, reason);
+  } catch {
+    // The failure path may run after the socket is already gone; a second
+    // close must not turn a contained failure into a thrown one.
+  }
 }
 
 function statusError(status: Status): Error {
