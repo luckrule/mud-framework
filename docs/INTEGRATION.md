@@ -165,11 +165,23 @@ Portal 侧 `IpcExecutor` 的 `timeoutMs` 决定请求何时在 Portal 结算；�
 
 ## 部署检查清单
 
+- **TLS 终止**：不得把明文 WS 直接暴露到不可信网络。部署方必须在不可信网络前终止 TLS（对外 WSS）：推荐由反向代理前置终止，或由具体传输实现自行终止。core 与 `WsTransport` 都不承担 TLS，`WsTransport` 没有 `tls` 选项；TLS 落点见 SPEC 5.2。
+- **回环转发**：反向代理转发到 `WsTransport` 时指向 `127.0.0.1`（它的默认 `hostname`）；健康端点同样只放在受保护网络或 TLS 之后，不要单独暴露明文端口。
+- **TLS 不是鉴权**：TLS 只保护链路，访问检查与 `authorize` 策略仍由消费方注入（SPEC 3.7）。终止 TLS 不改变 `AUTH_REQUIRED` / `FORBIDDEN` 的语义，也不改变 Envelope 线格式（SPEC 5.4）。
 - **Portal 崩溃**：Server 的 IPC 链路断开，`createProcessChannel` 收到 `disconnect`，日志出现 `IPC_CHANNEL_CLOSED`（`reason: process disconnected`）；Server 排空在途请求、关闭后端，`runServerProcess` 以 `ServerChannelClosedError` reject。进程是否随之退出由入口脚本决定——上例把它映射为非零退出码，这是让 Portal 的崩溃处理看见"异常结束"而不是"正常关闭"的必要一步。它不会变成孤儿继续写存储。未确认输入随 Portal 一起丢失，这是 SPEC 6.1 允许的。
 - **`stop()` 的语义**：Portal 停止接受输入，排空已接受的输入（受 `ConnectionLayer.shutdownTimeoutMs` 约束）；仍在 Session 屏障前、尚未调用 executor 的请求以 `FRAMEWORK_SHUTDOWN` 结束，不绕过屏障执行。随后执行器关闭 Server：声明 `shutdown` 预算，Server 在该预算内排空并关闭存储、回 `closed`，Portal 再有界等待实际退出，必要时 kill 后再等。退出仍未确认时保留写者屏障并拒绝关闭，`ConnectionLayer` 尽力关闭传输后传播失败，不静默成功。`FRAMEWORK_SHUTDOWN` 本身没有阶段信息：明确未调度的请求未执行，可能已投递而未成功确认的请求则可能已执行或提交，不能仅凭错误码安全重试。外部停止时限必须覆盖连接层排空、执行器关闭、传输关闭三段完整上界，公式见 ADR-0004；`IpcExecutor.closeBudgetMs` 只是中间一段的预算。systemd `TimeoutStopSec` 等应长于完整上界；Server 的请求 `timeoutMs` 不改变 Portal 声明的关闭预算。
 - **确认没有孤儿进程**：`process.kill(pid, 0)` 抛 `ESRCH` 可用于检查该 pid 已消失。`pid` 来自 Server 的 `ready` 消息（普通启动会记入 `server ready` 日志）。框架内部只有 `observed: true` 的退出确认才解除写者屏障；等待超时说明尚未确认，不能仅凭日志诊断进程不可中断。退出 Promise 仍 pending 时，迟到确认可在执行器未到终态时恢复一次；一次性 `observed: false` 结果不保证自动恢复，需要部署方处理，不能另起写者绕过。
 - **`maxPending`**：Portal 未确认缓冲的硬上限（默认值见 ADR-0004），超出后请求以 `FRAMEWORK_QUEUE_FULL` 拒绝。deadline 在 Server 未就绪或不可用时仍会结算请求，只限制单条请求的驻留时间；总数上限控制同时在途的数量，不能用来延长请求的 deadline。
 - **`maxConnections`**：连接层同时接纳的活跃连接上限（默认 10000，见 SPEC 6.1）。达到上限后，新连接以 WebSocket close code `1013`（Try Again Later）关闭，不进入请求处理；连接断开才释放名额。它是准入上限，不是业务 Session 的生命周期限制。
+
+### TLS 终止配置要点
+
+反向代理终止 TLS 只需要三件事：对外只监听 TLS 端口、转发 WebSocket upgrade 头、后端只监听回环地址。
+
+- nginx：`listen 443 ssl;` 配 `ssl_certificate` / `ssl_certificate_key`；`location /` 使用 `proxy_http_version 1.1;`、`proxy_set_header Upgrade $http_upgrade;`、`proxy_set_header Connection "upgrade";`，转发到 `http://127.0.0.1:8080`。
+- Caddy：`example.com { reverse_proxy 127.0.0.1:8080 }`；证书申请与续期由 Caddy 负责。
+
+具体传输实现自行终止 TLS 时，证书、密钥与监听暴露面由该实现负责；core 不读取任何 TLS 配置。
 
 ## 常见错误
 

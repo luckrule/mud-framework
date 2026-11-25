@@ -12,6 +12,8 @@
 
 想先看到双进程跑起来：在仓库根执行 `bun run examples/minimal/src/portal.ts`，另开终端执行 `bun run examples/minimal/src/client.ts`；端口、数据目录与健康检查见 `examples/minimal/README.md`。
 
+生产装配先过一遍 `docs/INTEGRATION.md` 的部署检查清单：TLS 由反向代理或具体传输实现终止，明文 WS 不直接暴露到不可信网络。
+
 ## 目录结构
 
 ```
