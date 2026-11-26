@@ -84,10 +84,10 @@ Server → Portal 使用独立消息：
 
 ### 决定
 
-- 连接层持有的每一处事件缓冲（每 Connection 的事件队列、每 Session 的待投递队列）都有显式上界，按帧数与字节数分别计量。默认 `maxQueuedEvents` 为 1024 帧、`maxQueuedEventBytes` 为 4 MiB；这两个数字的权威定义在 `packages/core/src/portal/connection-layer.ts` 的 `ConnectionLayerOptions`，此处记录决策值并与其保持同步。上限是每个队列实例的上界，不是每 Connection 汇总的上界。达到任一边界时丢弃新事件，记录 warn（`EVENT_DROPPED`，`reason: 'backlog'`，字段见 SPEC §7.1），不静默丢弃，不改变请求终态。
+- 连接层持有的每一处事件缓冲（每 Connection 的事件队列、每 Session 的待投递队列）都有显式上界，按帧数与字节数分别计量。默认 `maxQueuedEvents` 为 1024 帧、`maxQueuedEventBytes` 为 4 MiB；这两个数字的权威常量定义在 `packages/core/src/portal/connection-admission.ts`（与 `DEFAULT_MAX_QUEUED_PER_CONNECTION` 同处）；选项 `maxQueuedEvents` 与 `maxQueuedEventBytes` 声明在 `ConnectionLayerOptions`。此处记录决策值并与其保持同步。上限是每个队列实例的上界，不是每 Connection 汇总的上界。达到任一边界时丢弃新事件，记录 warn（`EVENT_DROPPED`，`reason: 'backlog'`，字段见 SPEC §7.1），不静默丢弃，不改变请求终态。
 - 写出仍是单写者：每个 Connection 的写出由其内部调度器串行执行，不同 Connection 之间并发。请求工作指从输入准入到结果写出的整段（读输入 → 准入 gate → 执行 → 写结果），是一个调度单元，不是仅写结果帧；请求执行不得留在原链而只把结果帧交给新队列，否则会出现两个写者。调度改为请求工作优先——有就绪的请求工作时先处理，没有才写事件。结果帧因此可以越过尚未写出的事件帧；事件帧之间仍保持发射序（具体范围见上文“投递语义”）。
 - 请求优先不得使事件无限期饥饿：该 Connection 每完成一个请求工作，若其事件队列非空，必须取出队首事件写出。请求优先只决定两者同时就绪时的顺序，公平规则给出事件等待的有界性，两者并存。
-- 连接层开始关闭后停止接收新事件；每一处事件缓冲内尚未写出的事件丢弃，并记一条 `EVENT_BACKLOG_DISCARDED` 汇总日志（`reason: 'shutdown'`，字段见 SPEC §7.1）。关闭只排空请求工作，不为事件消耗关闭预算。
+- 连接层开始关闭后停止接收新事件；每一处事件缓冲内尚未写出的事件丢弃，并记一条 `EVENT_BACKLOG_DISCARDED` 汇总日志（`reason: 'shutdown'`，字段见 SPEC §7.1）。关闭只排空请求工作，不为事件消耗关闭预算。断线或关闭时，尚未开始写出的事件帧被取消并记 `EVENT_DROPPED`；已经开始写出的帧不被抢占，按实际写结果结算，失败记 `TRANSPORT_SEND_FAILED`。
 
 ### 理由
 
