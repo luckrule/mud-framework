@@ -33,7 +33,6 @@ import { doClose } from './executor-shutdown.ts';
 import type { IpcExecutorOptions } from './ipc-executor-options.ts';
 import { PendingBuffer } from './ipc-pending.ts';
 import { RestartPolicy } from './restart-policy.ts';
-import type { ServerState } from './server-slot.ts';
 import { ServerSlot } from './server-slot.ts';
 import { ServerSupervisor } from './server-supervisor.ts';
 import type { SwitchDeps, SwitchOperation } from './version-switch.ts';
@@ -62,15 +61,15 @@ export type { IpcExecutorOptions };
  * The process lifecycle lives in `ServerSupervisor`; this class owns the
  * admission and settlement surface those processes serve.
  */
-export class IpcExecutor implements RequestExecutor, SwitchDeps {
-  readonly shutdownTimeoutMs: number;
-  readonly startTimeoutMs: number;
-  readonly logger: Logger;
+export class IpcExecutor implements RequestExecutor {
+  private readonly shutdownTimeoutMs: number;
+  private readonly startTimeoutMs: number;
+  private readonly logger: Logger;
   private readonly buffer: PendingBuffer;
   /** Delivery, deadlines and settlement: everything that resolves a pending entry. */
   private readonly ledger: DeliveryLedger;
   /** Sole owner of `status`, `server`, the generation counter and `switching`. */
-  readonly slot = new ServerSlot<SwitchOperation>();
+  private readonly slot = new ServerSlot<SwitchOperation>();
   /** The `switchTo` sequence; it writes state only through `slot`. */
   private readonly versionSwitch: VersionSwitch;
   /** Launch, crash recovery, restart backoff and Server→Portal messages. */
@@ -139,7 +138,7 @@ export class IpcExecutor implements RequestExecutor, SwitchDeps {
         this.supervisor.onServerLost(server, code, signal, reason);
       },
     });
-    this.versionSwitch = new VersionSwitch(this);
+    this.versionSwitch = new VersionSwitch(this.switchDeps());
     this.supervisor = new ServerSupervisor({
       logger: this.logger,
       slot: this.slot,
@@ -156,39 +155,28 @@ export class IpcExecutor implements RequestExecutor, SwitchDeps {
   }
 
   /**
-   * The switch's dependencies. They delegate to the process supervisor, which
-   * owns launching, delivery and the restart clock.
+   * The switch's dependencies, as a narrow adapter: it sees the slot and the
+   * operations it actually calls, never the executor. The methods delegate to
+   * the process supervisor, which owns launching, delivery and the restart
+   * clock. Lookups are deferred so the adapter can be built before `supervisor`
+   * exists in the constructor.
    */
-  adoptSpawn(spawn: () => SpawnedServer): void {
-    this.supervisor.adoptSpawn(spawn);
-  }
-
-  attach(server: ServerState): void {
-    this.supervisor.attach(server);
-  }
-
-  pump(): void {
-    this.supervisor.pump();
-  }
-
-  resolveClosed(server: ServerState): void {
-    this.supervisor.resolveClosed(server);
-  }
-
-  clearRestartTimer(): void {
-    this.supervisor.clearRestartTimer();
-  }
-
-  startStableTimer(): void {
-    this.supervisor.startStableClock();
-  }
-
-  adoptCeiling(declaredMaxDurationMs: number): void {
-    this.supervisor.adoptCeiling(declaredMaxDurationMs);
-  }
-
-  recoverAfterExits(): void {
-    this.supervisor.recoverAfterExits();
+  private switchDeps(): SwitchDeps {
+    return {
+      logger: this.logger,
+      slot: this.slot,
+      startTimeoutMs: this.startTimeoutMs,
+      shutdownTimeoutMs: this.shutdownTimeoutMs,
+      adoptSpawn: (spawn) => this.supervisor.adoptSpawn(spawn),
+      attach: (server) => this.supervisor.attach(server),
+      pump: () => this.supervisor.pump(),
+      resolveClosed: (server) => this.supervisor.resolveClosed(server),
+      clearRestartTimer: () => this.supervisor.clearRestartTimer(),
+      startStableTimer: () => this.supervisor.startStableClock(),
+      adoptCeiling: (declaredMaxDurationMs) =>
+        this.supervisor.adoptCeiling(declaredMaxDurationMs),
+      recoverAfterExits: () => this.supervisor.recoverAfterExits(),
+    };
   }
 
   /** Spawns the Server, sends `hello` and resolves once the Server is `ready`. */

@@ -73,8 +73,8 @@ export interface SwitchOperation {
 
 /**
  * The switch's dependencies: the operations it actually calls. `IpcExecutor`
- * implements them; there is no getter and no adapter object between the switch
- * and its owner.
+ * supplies a private adapter over its supervisor, so the switch never holds the
+ * executor and none of these operations are part of its public surface.
  *
  * The switch never writes `status` or `server` directly; it only asks the slot
  * for a semantic transition, so a state write cannot skip the meaning attached
