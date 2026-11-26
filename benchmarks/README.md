@@ -1,12 +1,13 @@
 # Benchmarks
 
-三个基准，都不进 CI 门禁，也不做性能断言：`bench:logger` 测 `safeLogger` 包装的每调用开销；`bench:game` 测 `examples/game-slice` 真实双进程装配下的热路径与空闲重启恢复；`bench:load` 用独立的生成器进程驱动真实玩家级负载。`bench` 只聚合前两个，`bench:load` 单独运行：它需要更多资源，时长也由环境变量决定。
+四个基准，都不进 CI 门禁，也不做性能断言：`bench:logger` 测 `safeLogger` 包装的每调用开销；`bench:game` 测 `examples/game-slice` 真实双进程装配下的热路径与空闲重启恢复；`bench:switch` 在真实 Portal + Server + WebSocket 上观测一次热升级期间的请求等待与切换耗时；`bench:load` 用独立的生成器进程驱动真实玩家级负载。`bench` 只聚合前两个，`bench:switch` 与 `bench:load` 单独运行：后两者需要更多资源，时长也由环境变量决定。
 
 ## 运行
 
 ```bash
 bun run bench:logger
 bun run bench:game
+bun run bench:switch   # 版本切换时延，不包含在 bench 里
 bun run bench:load     # 玩家级负载，不包含在 bench 里
 bun run bench          # logger + game 微基准
 ```
@@ -38,6 +39,28 @@ bun run bench          # logger + game 微基准
 - 空闲重启恢复：从 Portal 日志的 `server process ready` 取 Server pid；空闲时 SIGKILL，再以短间隔发 `look` 直到成功，报告 kill 到首个成功响应的时间与尝试次数。拿不到 pid 时打印跳过，不让整次基准失败。只测空闲恢复；在途请求的重放语义由 `tests/integration` 覆盖，基准不伪造该指标。
 
 方法：每组先 warmup，样本不含 warmup；延迟用客户端单调时钟测量，单位 ms（µs 精度），吞吐为 wall-clock ops/s；只报告观测值，不与阈值比较。退出时关闭所有客户端、SIGTERM Portal 并在有界时间内确认退出，必要时 SIGKILL；只有 Portal 停止成功（未走 SIGKILL 兜底）、退出已观测且没有幸存 Server pid 时才删除临时数据目录，否则保留目录并打印路径与原因（`cleanup: kept data dir ...`），同时非零退出。信号退出（拿不到退出码但进程已消失）且没有幸存 Server pid 时视为退出已观测，可以删除；走 SIGKILL 兜底（`forced`）一律视为非优雅停止，即使没有幸存进程也保留目录。`BENCH_KEEP=1` 保留目录，`BENCH_DATA_DIR` 指向自备目录时视为用户数据、不删除。只有装配、连接或清理失败才非零退出。
+
+## 版本切换时延基准
+
+`bench:switch` 在真实 Portal + Server + WebSocket 上执行一次热升级（`IpcExecutor.switchTo`），测的是客户端请求在切换期间实际等了多久，而不是只验证连接不断。
+
+实现拆在 `benchmarks/game/switch/`：`portal.ts` 是基准 Portal，装配与 `examples/game-slice/src/portal.ts` 相同（`WsTransport` + `IpcExecutor` + `ConnectionLayer`），额外起一个只监听 `127.0.0.1`、端口由系统分配的 `POST /switch` 控制端点；同一时刻只接受一个切换，响应带服务端测得的 `switchTo` 耗时。`index.ts` 是负载、触发、分相统计与报告，`support.ts` 放配置、分相分类、Portal 生命周期与清理。Server 入口复用 `examples/game-slice/src/server.ts`，两个进程世代共用同一个临时 `GAME_SLICE_DATA_DIR`，替换顺序由框架保证旧写者退出后才激活新进程。
+
+时间线：
+
+- 客户端先登录，再按固定 start-to-start 间隔发 `game.look`（每个客户端同一时刻一个在途请求）。
+- warmup 段不计入样本；随后先跑一段基线，再通过控制端点触发一次 `switchTo`。
+- 切换窗口 = 触发 → `switchTo` resolve → 固定余量。请求按时间区间归类：在触发前完成的是基线，与窗口有重叠的是窗口（包括触发时已在途、切换结束后才返回的请求），窗口结束后开始的是恢复段。
+- 报告服务端测得的切换耗时、`POST /switch` 往返时间、窗口跨度，以及基线/窗口/恢复三段的 p50/p95/p99/max、失败数、超时数、连接关闭数与错误 code 分布。
+- 从 Portal 日志统计 `request replayed`、`request timed out` 与 `server switch completed`；报告所有 Server pid、当前 pid 和已退役 pid 是否已消失。
+- 默认附带一个两客户端的 `say` 探针（`SWITCH_EVENTS=0` 关闭）：发送方的序号只在 `game.say` 被接受后推进，失败尝试复用同一序号。接收方按到达阶段统计 within-epoch 序号缺口与 duplicate。duplicate 可能来自“超时但已提交的 say 被重试”，与真实重复投递无法区分，不能当丢包；缺口只说明成功 say 的事件没有按序号到达。
+- 所有 look 客户端也在 square，会收到探针的 `room.say`，但它们注册空监听器排空事件，不参与事件统计。
+
+环境变量（默认值见 `benchmarks/game/switch/support.ts` 顶部常量）：`SWITCH_CLIENTS`、`SWITCH_INTERVAL_MS`、`SWITCH_DURATION_SEC`（客户端运行总时长，含 warmup）、`SWITCH_WARMUP_SEC`、`SWITCH_DATA_DIR`、`SWITCH_KEEP=1`、`SWITCH_EVENTS=0`、`REQUEST_TIMEOUT_MS`。同时设 `SWITCH_URL` 与 `SWITCH_CONTROL_URL` 可复用外部 Portal：跳过 spawn、Server pid 检查与数据目录清理，控制端点由外部 Portal 自己提供。
+
+清理：关闭客户端、SIGTERM Portal、在有界时间内确认 Portal 与所有已见 Server pid 消失，必要时 SIGKILL；只有 Portal 优雅停止、退出已观测、没有幸存 Server pid 且运行没有失败时才删除临时目录。失败、`SWITCH_KEEP=1` 或 `SWITCH_DATA_DIR` 指定的用户目录都会保留现场并打印路径。只有装配、连接、切换被拒绝、cleanup 或“窗口/基线没有样本”才非零退出；请求失败、超时、掉线与事件缺口只报告，不设阈值。
+
+限制：所有进程同机，切换耗时受本机进程启动、文件系统与调度影响；默认数据目录通常是 tmpfs，SQLite 与 Server 启动会比真实磁盘快；look 客户端与协调器同进程，客户端侧 JSON 解析与事件循环调度也算进请求延迟；结果是单机近似，跨机器没有可比性。结果不写入仓库文档。
 
 ## 玩家级负载基准
 

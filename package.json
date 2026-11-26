@@ -16,6 +16,7 @@
     "test:integration": "bun test tests/integration --parallel",
     "bench:logger": "bun run benchmarks/logger.ts",
     "bench:game": "bun run benchmarks/game/index.ts",
+    "bench:switch": "bun run benchmarks/game/switch/index.ts",
     "bench:load": "bun run benchmarks/game/load/index.ts",
     "bench": "bun run bench:logger && bun run bench:game",
     "prepare": "git config core.hooksPath .githooks || true"
