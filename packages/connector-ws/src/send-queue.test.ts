@@ -304,6 +304,40 @@ describe('SendQueue', () => {
     expect(queue.queuedBytes).toBe(0);
   });
 
+  test('accounts with the caller-measured size when one is passed', async () => {
+    // The transport measures the payload for its message ceiling anyway; the
+    // queue must bill that number, not measure the frame a second time.
+    const { sink } = fakeSink([-1, -1]);
+    const queue = new SendQueue('c1', 10_000, limits(), sink);
+
+    const first = tracked(queue.send('abc', 10));
+    const second = tracked(queue.send(new Uint8Array(3), 7));
+    await settle();
+
+    expect(queue.depth).toBe(2);
+    expect(queue.queuedBytes).toBe(17);
+    queue.fail(new Error('closed'));
+    await settle();
+    expect(first.state()).toBe('rejected');
+    expect(second.state()).toBe('rejected');
+  });
+
+  test('falls back to measuring the payload when no size is passed', async () => {
+    const { sink } = fakeSink([-1, -1]);
+    const queue = new SendQueue('c1', 10_000, limits(), sink);
+
+    const first = tracked(queue.send('你好'));
+    const second = tracked(queue.send(new Uint8Array(4)));
+    await settle();
+
+    // 6 UTF-8 bytes for the string, 4 for the array.
+    expect(queue.queuedBytes).toBe(10);
+    queue.fail(new Error('closed'));
+    await settle();
+    expect(first.state()).toBe('rejected');
+    expect(second.state()).toBe('rejected');
+  });
+
   test('rejects capacity limits that are not positive integers', () => {
     const invalid: readonly [unknown, typeof RangeError | typeof TypeError][] =
       [

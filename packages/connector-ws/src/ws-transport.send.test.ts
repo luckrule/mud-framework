@@ -156,30 +156,49 @@ describe('WsTransport sends', () => {
 
   test('closes a connection once when the send queue exceeds its byte limit', async () => {
     const { logger, entries } = captureLogger();
-    const { transport, recorded, url } = await startTransport({
-      maxQueuedBytes: 1,
+    // The queue must hold one maximum-size frame, so the byte limit can only be
+    // exceeded by a second frame arriving behind a blocked head. A paused
+    // client supplies that backpressure; the frame limit stays out of the way.
+    const { transport, recorded } = await startTransport({
+      maxQueuedFrames: 256,
+      maxQueuedBytes: 1024 * 1024,
+      sendTimeoutMs: 10_000,
       logger,
     });
-    const client = await openClient(url);
+    const port = transport.port;
+    if (port === undefined) {
+      throw new Error('expected the transport to bind a port');
+    }
+    const socket = await rawClient(port);
     try {
       await until(() => recorded.connected.length === 1, 'onConnect');
       const connection = first(recorded.connected);
-      const closed = new Promise<number>((resolve) => {
-        client.addEventListener(
-          'close',
-          (event) => {
-            resolve(event.code);
-          },
-          { once: true },
-        );
-      });
+      const flood = [
+        ...floodConnection(connection),
+        ...floodConnection(connection),
+      ];
+      await until(
+        () =>
+          flood.some((entry) =>
+            (entry.error()?.message ?? '').includes('send queue overflow'),
+          ),
+        'the overflow rejection',
+      );
+      await until(
+        () => flood.every((entry) => entry.state() !== 'pending'),
+        'the whole queue to settle',
+      );
 
-      const send = tracked(connection.send('ab'));
-      await until(() => send.state() === 'rejected', 'the overflow rejection');
-      expect(send.error()?.message).toMatch(/send queue overflow/);
-
-      expect(await closed).toBe(1013);
-      await until(() => recorded.disconnected.length === 1, 'onDisconnect');
+      const overflowed = flood.filter((entry) =>
+        (entry.error()?.message ?? '').includes('send queue overflow'),
+      );
+      // Every frame that was already queued when the limit broke is rejected
+      // with the same error, so the count is not the assertion; the single
+      // close below is.
+      expect(overflowed.length).toBeGreaterThanOrEqual(1);
+      expect(overflowed[0]?.error()?.message).toMatch(
+        /overflow \(maxQueuedBytes\)/,
+      );
 
       const warnings = entries().filter(
         (entry) => entry.msg === 'send queue overflow; closing connection',
@@ -190,11 +209,11 @@ describe('WsTransport sends', () => {
         transport: 'ws',
         connectionId: connection.id,
         limit: 'maxQueuedBytes',
-        queuedFrames: 0,
-        queuedBytes: 0,
-        maxQueuedBytes: 1,
-        incomingBytes: 2,
+        maxQueuedBytes: 1024 * 1024,
+        incomingBytes: 900_000,
       });
+      expect(typeof warnings[0]?.queuedFrames).toBe('number');
+      expect(typeof warnings[0]?.queuedBytes).toBe('number');
 
       const after = await rejectionOf(connection.send('later'));
       expect(after.message).toMatch(/not open|overflow|closed/);
@@ -204,7 +223,7 @@ describe('WsTransport sends', () => {
         ),
       ).toHaveLength(1);
     } finally {
-      client.close();
+      socket.destroy();
       await safeStop(transport);
     }
   });

@@ -86,6 +86,20 @@ describe('WsTransport option validation', () => {
     expect(() => createTransport({ sendTimeoutMs: 1 })).not.toThrow();
   });
 
+  test('exposes the validated send bound so the layer can honour it', () => {
+    // SPEC 3.8: the connection layer holds a Session's serial slot at least as
+    // long as this transport may take to fail a write, so the exposed value
+    // must be the one the send queue actually uses.
+    expect(createTransport({ sendTimeoutMs: 60_000 }).sendTimeoutMs).toBe(
+      60_000,
+    );
+    expect(
+      createTransport({ sendTimeoutMs: Number.POSITIVE_INFINITY })
+        .sendTimeoutMs,
+    ).toBe(Number.POSITIVE_INFINITY);
+    expect(createTransport().sendTimeoutMs).toBe(30_000);
+  });
+
   test('rejects maxQueuedFrames and maxQueuedBytes that are not positive integers', () => {
     const invalid: readonly [unknown, typeof RangeError | typeof TypeError][] =
       [
@@ -111,9 +125,34 @@ describe('WsTransport option validation', () => {
       const options =
         name === 'maxQueuedFrames'
           ? { maxQueuedFrames: 1 }
-          : { maxQueuedBytes: 1 };
+          : // At least maxMessageBytes: a smaller queue cannot hold one frame.
+            { maxQueuedBytes: 1024 * 1024 };
       expect(() => createTransport(options)).not.toThrow();
     }
+  });
+
+  test('rejects a queue smaller than one legal maximum-size frame', () => {
+    const tooSmall = { maxMessageBytes: 1024, maxQueuedBytes: 1023 };
+    expect(() => createTransport(tooSmall)).toThrow(RangeError);
+    expect(() => createTransport(tooSmall)).toThrow(/maxQueuedBytes/);
+    expect(() => createTransport(tooSmall)).toThrow(/maxMessageBytes/);
+    expect(() => createTransport(tooSmall)).toThrow(/1023/);
+    expect(() => createTransport(tooSmall)).toThrow(/1024/);
+    // Equal is the smallest queue that can hold a maximum-size frame.
+    expect(() =>
+      createTransport({ maxMessageBytes: 1024, maxQueuedBytes: 1024 }),
+    ).not.toThrow();
+  });
+
+  test('raises the default queue to a maxMessageBytes above 4 MiB', () => {
+    // The default is the larger of 4 MiB and maxMessageBytes, so a caller that
+    // allows bigger frames does not get a queue that rejects them.
+    const big = 8 * 1024 * 1024;
+    expect(() => createTransport({ maxMessageBytes: big })).not.toThrow();
+    // An explicit queue below the message ceiling is still refused.
+    expect(() =>
+      createTransport({ maxMessageBytes: big, maxQueuedBytes: big - 1 }),
+    ).toThrow(RangeError);
   });
 
   test('rejects an empty hostname or path, and a path without a leading slash', () => {

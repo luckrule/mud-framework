@@ -49,8 +49,9 @@ export interface WsTransportOptions {
   maxQueuedFrames?: number;
   /**
    * Unsettled outbound bytes per connection before it is failed. Must be a
-   * positive integer; defaults to 4 MiB, raised to `maxMessageBytes` when that
-   * is larger so a single maximum-size frame always fits.
+   * positive integer no smaller than `maxMessageBytes`, so one legal
+   * maximum-size frame always fits; defaults to 4 MiB, raised to
+   * `maxMessageBytes` when that is larger.
    */
   maxQueuedBytes?: number;
   /**
@@ -136,6 +137,13 @@ export class WsTransport implements Transport {
       options.maxQueuedBytes ??
       Math.max(DEFAULT_MAX_QUEUED_BYTES, maxMessageBytes);
     assertPositiveInteger(maxQueuedBytes, 'maxQueuedBytes');
+    if (maxQueuedBytes < maxMessageBytes) {
+      // A queue smaller than one legal frame would fail that frame on arrival
+      // and drop the connection, so the limit could never be reached legally.
+      throw new RangeError(
+        `maxQueuedBytes (${maxQueuedBytes}) must be at least maxMessageBytes (${maxMessageBytes}), or a maximum-size frame overflows the queue`,
+      );
+    }
     const hostname = options.hostname ?? '127.0.0.1';
     assertNonEmptyString(hostname, 'hostname');
     const path = options.path ?? '/';
@@ -159,6 +167,15 @@ export class WsTransport implements Transport {
   /** The port actually bound, or `undefined` before `start` and after `stop`. */
   get port(): number | undefined {
     return this.server?.port;
+  }
+
+  /**
+   * The validated per-frame send bound (SPEC 3.8). Exposed so the connection
+   * layer can hold a Session's serial slot at least as long as this transport
+   * may take to fail a write, instead of releasing it mid-frame.
+   */
+  get sendTimeoutMs(): number {
+    return this.settings.sendTimeoutMs;
   }
 
   async start(handlers: TransportHandlers): Promise<void> {
@@ -465,8 +482,9 @@ export class WsTransport implements Transport {
         }
         // May stay pending for a long time: the socket buffer is full and only
         // `drain` (or `sendTimeoutMs`) settles it. Awaiting is the point —
-        // that is how the transport pushes back on the writer.
-        await queue.send(payload);
+        // that is how the transport pushes back on the writer. `bytes` is
+        // already measured above, so the queue must not measure it again.
+        await queue.send(payload, bytes);
       },
       close: async (code, reason) => {
         if (this.status !== 'started') {

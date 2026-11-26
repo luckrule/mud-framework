@@ -98,23 +98,26 @@ export class SendQueue {
    * backpressure it stays pending — neither resolved nor rejected — until
    * `drain` or the timeout, which is what slows the writer down. A frame that
    * would exceed either capacity fails the queue and rejects at once.
+   *
+   * `bytes` lets a caller that already measured the payload skip the second
+   * `Buffer.byteLength` pass; omitted, the size is computed here.
    */
-  send(payload: string | Uint8Array): Promise<void> {
+  send(payload: string | Uint8Array, bytes?: number): Promise<void> {
     const closed = this.closed;
     if (closed !== undefined) {
       return Promise.reject(closed);
     }
-    const bytes = payloadBytes(payload);
+    const size = bytes ?? payloadBytes(payload);
     if (this.entries.length + 1 > this.maxQueuedFrames) {
-      return this.overflow('maxQueuedFrames', bytes);
+      return this.overflow('maxQueuedFrames', size);
     }
-    if (this.unsettledBytes + bytes > this.maxQueuedBytes) {
-      return this.overflow('maxQueuedBytes', bytes);
+    if (this.unsettledBytes + size > this.maxQueuedBytes) {
+      return this.overflow('maxQueuedBytes', size);
     }
     return new Promise<void>((resolve, reject) => {
       const entry: Entry = {
         payload,
-        bytes,
+        bytes: size,
         resolve,
         reject,
         written: false,
@@ -126,7 +129,7 @@ export class SendQueue {
         }, this.timeoutMs);
       }
       this.entries.push(entry);
-      this.unsettledBytes += bytes;
+      this.unsettledBytes += size;
       this.pump();
     });
   }
