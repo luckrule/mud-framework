@@ -40,7 +40,7 @@ ADR-0002 决定了拆成两个进程，但没定两件事：两个进程之间�
 
 ### 确认的边界：框架做不到什么
 
-- **取消与超时不保证回滚**。`StorageBackend.transaction(fn)` 在 `fn` resolve 后提交；若取消或超时到达时 COMMIT 已开始但尚未完成，框架没有中止该 COMMIT 的句柄，事务仍可能提交，并记录 `CANCEL_LOST_TO_COMMIT` 告警。不增加提交中止能力；事务能力较弱时还须接受 SPEC 4.3 的降级。
+- **取消与超时不保证回滚**。`StorageBackend.transaction(fn)` 在 `fn` resolve 后提交；若取消或超时到达时 COMMIT 已开始但尚未完成，框架没有中止该 COMMIT 的句柄，事务仍可能提交，并记录 `CANCEL_LOST_TO_COMMIT` 告警。不增加提交中止能力；事务能力较弱时还须接受 SPEC 4.3 的降级。COMMIT 完成晚于 deadline 时，请求仍以超时终态结束，不返回成功、Session 变更或事件，也不回滚已提交内容；提交可能已经生效，并记录迟到提交告警。定时器未触发或结果已经算出都不是成功依据（SPEC 3.4）。
 - **终态保证结果确定与事务句柄失效，不保证 handler 已停止或没有副作用**。成功、业务失败与框架失败后均拒绝保留句柄上的后续读写；正常成功不触发异常 abort。框架外副作用与已经开始的 COMMIT 不会因此撤销（SPEC 3.3、3.4）。
 - **Portal 的 deadline 是权威**。发给 Server 的 `timeoutMs` 是剩余预算而非总预算，且 Server 只能收紧不能放松（取 `min(Server 配置, 后端上限, 收到的值)`）。否则会出现 Portal 已超时结算、Server 仍在提交；而超时路径不重放。
 

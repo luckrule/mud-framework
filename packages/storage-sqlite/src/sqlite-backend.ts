@@ -134,9 +134,10 @@ export class SqliteBackend implements StorageBackend {
   }
 
   /**
-   * Memoised and retryable: a second close joins the first attempt instead of
-   * throwing on `closing`, and a failed `db.close` stays observable rather than
-   * being replaced by a later "already closed" success.
+   * Memoised and idempotent: a second close joins the first attempt instead of
+   * throwing on `closing`; a failed `db.close` keeps the returned promise
+   * rejected and observable rather than being replaced by a later "already
+   * closed" success. There is no retry.
    */
   close(): Promise<void> {
     this.closePromise ??= this.doClose();

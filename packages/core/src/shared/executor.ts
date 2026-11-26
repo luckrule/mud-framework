@@ -7,8 +7,9 @@ export interface ExecutorRequest extends RequestIdentity {
   payload: unknown;
   /**
    * The caller's own deadline, which may only tighten the executor's configured
-   * ceiling (SPEC 3.4). A remote executor also forwards it, so the other side
-   * rolls back at the same instant instead of writing after this side gave up.
+   * ceiling (SPEC 3.4). A remote executor also forwards the remaining budget
+   * and tries to cancel, but the other side may still be executing or
+   * committing.
    */
   timeoutMs?: number;
 }

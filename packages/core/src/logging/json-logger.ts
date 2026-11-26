@@ -19,8 +19,7 @@ function createLevelState(level: LogLevel = 'info'): LevelState {
 /**
  * One JSON object per line on stdout. Hand-written on purpose: a structured
  * logger is a dozen lines of `JSON.stringify`, and ADR-0001 keeps the runtime
- * dependency-free (the benchmark put this at ~470k lines/s, 27% ahead of
- * `console.log`).
+ * dependency-free.
  *
  * Levels are filtered before formatting, so a filtered event costs one integer
  * comparison and nothing else. A logger tree shares one mutable level: setting

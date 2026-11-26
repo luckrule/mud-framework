@@ -107,7 +107,7 @@ registrar.register('room.enter', async (ctx, payload) => {
 });
 ```
 
-事件在 handler 内只进入缓冲：请求失败、超时、取消或回滚时全部丢弃，成功提交后才在响应之后发送。目标 Session 在投递时解析当前持有者，所以重连后事件会跟随 Session；当时没有持有者则丢弃。投递是 best-effort，不排队、不重试、不保证不重复；事件失败不会改变请求结果。
+事件在 handler 内只进入缓冲：请求失败、超时、取消或回滚时全部丢弃，成功提交后才在响应之后发送。目标 Session 在实际写出前解析当前持有者，所以排队期间的重连会把事件改投新持有者；写出时没有持有者则丢弃。投递是 best-effort，不为离线目标排队、不因失败重试、不保证不重复；事件失败不会改变请求结果。
 
 客户端收到两类下行帧。响应帧保持 `{id, ok, ...}`，事件帧是 `{kind:'event', eventId, event, payload}`：
 
@@ -149,10 +149,11 @@ core 只提供同步快照，不提供 HTTP 端点（SPEC 6.6）。应用在自�
 - **回环转发**：反向代理转发到 `WsTransport` 时指向 `127.0.0.1`；健康端点同样只放在受保护网络或 TLS 之后，不要单独暴露明文端口。
 - **TLS 不是鉴权**：TLS 只保护链路，访问检查与 `authorize` 策略仍由消费方注入（SPEC 3.7）。终止 TLS 不改变 `AUTH_REQUIRED` / `FORBIDDEN` 的语义，也不改变 Envelope 线格式（SPEC 5.4）。
 - **Portal 崩溃**：Server 的 IPC 链路断开，日志出现 `IPC_CHANNEL_CLOSED`（`reason: process disconnected`）；Server 排空在途请求、关闭后端，`runServerProcess` 以 `ServerChannelClosedError` reject。入口脚本应把它映射为非零退出码，让 Portal 看见“异常结束”而不是“正常关闭”。未确认输入随 Portal 一起丢失，这是 SPEC 6.1 允许的。
-- **`stop()` 的语义**：Portal 停止接受输入，排空已接受的输入；仍在 Session 屏障前、尚未调用 executor 的请求以 `FRAMEWORK_SHUTDOWN` 结束。随后执行器关闭 Server：声明 `shutdown` 预算，Server 在该预算内排空并关闭存储、回 `closed`，Portal 再有界等待实际退出，必要时 kill 后再等。退出仍未确认时保留写者屏障并拒绝关闭，`ConnectionLayer` 尽力关闭传输后传播失败。`FRAMEWORK_SHUTDOWN` 本身没有阶段信息，不能仅凭它安全重试。外部停止时限必须覆盖连接层排空、执行器关闭、传输关闭三段完整上界，公式见 ADR-0004；`IpcExecutor.closeBudgetMs` 只是中间一段的预算。
+- **`stop()` 的语义**：Portal 停止接受输入，排空已接受的输入；仍在 Session 屏障前、尚未调用 executor 的请求以 `FRAMEWORK_SHUTDOWN` 结束。随后执行器关闭 Server：声明 `shutdown` 预算，Server 在该预算内排空并关闭存储、回 `closed`，Portal 再有界等待实际退出，必要时 kill 后再等。所有关闭等待都有界；执行器或传输的关闭失败、超时都会被传播（两者同时失败为 `AggregateError`），`stopped` 状态不代表资源已确认释放，重复 `stop()` 返回同一结果。退出仍未确认时保留写者屏障并拒绝关闭，`ConnectionLayer` 在尽力关闭传输后传播失败。`FRAMEWORK_SHUTDOWN` 本身没有阶段信息，不能仅凭它安全重试。外部停止时限必须覆盖连接层排空、执行器关闭、传输关闭三段完整上界，公式见 ADR-0004；`IpcExecutor.closeBudgetMs` 只是中间一段的预算。
 - **确认没有孤儿进程**：`process.kill(pid, 0)` 抛 `ESRCH` 可用于检查该 pid 已消失。`pid` 来自 Server 的 `ready` 消息。框架内部只有 `observed: true` 的退出确认才解除写者屏障；等待超时说明尚未确认，不能仅凭日志诊断进程不可中断。迟到确认只允许在执行器尚可恢复时解除屏障；一次性 `observed: false` 不保证自动恢复，需要部署方处理。
 - **`maxPending`**：Portal 未确认缓冲的硬上限（默认值见 `IpcExecutorOptions`），超出后请求以 `FRAMEWORK_QUEUE_FULL` 拒绝。deadline 在 Server 未就绪或不可用时仍会结算请求，只限制单条请求的驻留时间；总数上限控制同时在途的数量，不能用来延长 deadline。
 - **`maxConnections`**：连接层同时接纳的活跃连接上限（默认值见 `ConnectionLayerOptions`）。达到上限后，新连接以 WebSocket close code `1013`（Try Again Later）关闭，不进入请求处理；连接断开才释放名额。它是准入上限，不是业务 Session 的生命周期限制。
+- **出站队列有界**：传输实现必须限制每个连接的出站缓冲；慢客户端积压到上限时会被关闭，而不是无限占用 Portal 内存（SPEC 5.2）。
 
 ### TLS 终止配置要点
 

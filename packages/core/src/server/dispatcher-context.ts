@@ -56,8 +56,8 @@ export interface RequestContext extends RequestIdentity {
    * Buffers one Server-initiated event for this request's Connection
    * (ADR-0008). The event is sent only after this request commits; a failed,
    * timed-out, cancelled or rolled-back request discards it. Delivery is
-   * best-effort and at-least-once: a replay may send it again with the same
-   * `eventId`, and a client that cares can dedupe on that id.
+   * best-effort: it may be lost, and a replay may send it again with the same
+   * `eventId`; a client that cares can dedupe on that id.
    *
    * Events are not what the request returns: the client gets its result first,
    * then the events. `event` must be non-empty; the buffer is bounded and

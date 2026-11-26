@@ -275,7 +275,7 @@ export function buildSummary(aggregate: Aggregate, config: MainConfig): string {
   const event = aggregate.events.histogram.summary();
   const drops =
     aggregate.events.gaps === 0
-      ? 'no event drops'
+      ? 'no event drops detected (sequence gaps 0)'
       : `${integerText(aggregate.events.gaps)} event gaps`;
   return `summary: ${integerText(config.clients)} clients, ${config.shared.mode}, ${integerText(successes)} successful ops in ${(windowMs / 1000).toFixed(1)} s = ${throughputText(successes, windowMs * 1e6)}; look p50/p95 ${millisecondsText(look.p50Ns)}/${millisecondsText(look.p95Ns)} ms; move p50/p95 ${millisecondsText(move.p50Ns)}/${millisecondsText(move.p95Ns)} ms; say p50/p95 ${millisecondsText(say.p50Ns)}/${millisecondsText(say.p95Ns)} ms; room.say p50/p95 ${millisecondsText(event.p50Ns)}/${millisecondsText(event.p95Ns)} ms; errors ${integerText(errorCount(aggregate.errors))}; ${drops}; numbers are observations, not assertions`;
 }

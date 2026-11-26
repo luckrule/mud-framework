@@ -19,7 +19,7 @@
 - `ctx.emit(event, payload)`：发给当前请求的 Connection。
 - `ctx.emitToSession(sessionId, event, payload)`：发给该 Session 当前的 holder。
 
-`emit` 的地址是请求入口的 Connection，不是 Session：一个请求在入口无 Session 时也可以发事件。`emitToSession` 存的是 Session id，Portal 在投递时才用路由表解析当前 holder；因此事件会跟随重连，而不会钉在 handler 运行时的那条连接上。目标 Session 当时没有 holder 就丢弃，不排队等它上线。
+`emit` 的地址是请求入口的 Connection，不是 Session：一个请求在入口无 Session 时也可以发事件。`emitToSession` 存的是 Session id，Portal 在真正写出前才用路由表解析当前 holder。收件人因此是“写出时”的 holder，而不是 handler 运行或事件入队时的连接：排队期间 takeover 会把事件改投新 holder，至多重投递一次，二次变化即丢弃；没有 holder 就丢弃，不排队等它上线。事件随重连跟随 Session，但只跟随一次写出前的变化，不是对所有后续 takeover 的保证。
 
 事件名与 payload 对框架不透明，框架只校验事件名非空、`emitToSession` 的 Session id 非空。事件名是业务契约的一部分，框架不维护枚举。
 
@@ -29,7 +29,7 @@ handler 调用 `emit`/`emitToSession` 时只写入本请求的缓冲，不触碰
 
 - 请求成功提交后，框架才发送缓冲的事件。顺序固定为“先结果、后事件”，Portal 按 IPC 顺序处理。
 - handler 抛错、请求超时、被取消、事务回滚时，缓冲的事件随请求一起丢弃。没有“半个请求的通知”。
-- 事件一旦发出就不回滚：Handler 无法得知投递结果，框架也不在事后撤销。因此事件语义是 at-least-once：重放可能让同一事件再次发送，客户端用稳定的 `eventId` 自行去重。
+- 事件一旦发出就不回滚：Handler 无法得知投递结果，框架也不在事后撤销。投递是 best-effort：可能因目标缺失、连接已关闭、编码或写失败而丢失；请求重放可能让同一事件以相同 `eventId` 再次发送。框架不提供投递确认或去重，需要去重的客户端可用稳定的 `eventId` 自行判断。
 - 请求终态后（超时、取消）再调用 `emit`/`emitToSession` 会被拒绝，与事务句柄的失效边界一致。
 
 事件数量按请求有界。超过上限时 `emit` 抛普通错误，handler 可以捕获并决定丢弃哪些；未捕获则整个请求失败，缓冲的事件全部丢弃。这样做而不是静默丢弃，是因为只有 handler 知道哪些事件可以放弃。
@@ -53,7 +53,8 @@ Server → Portal 使用独立消息：
 
 ### 投递语义：best-effort
 
-- Portal 收到事件消息后，`connection` 目标查连接表，`session` 目标查当前 holder。目标不存在、连接已关闭、编码失败或传输写失败时，记一条 warn 并丢弃。不缓冲、不重试、不让任何请求失败。
+- Portal 收到事件消息后，`connection` 目标查连接表，`session` 目标在实际写出前重新解析当前 holder。目标不存在、连接已关闭、没有 holder、编码失败或传输写失败时，记一条 warn 并丢弃。不因失败缓冲或重试，不让任何请求失败。
+- `session` 目标排队期间发生 takeover 时改投新 holder，至多重投递一次；再次变化即丢弃（`EVENT_DROPPED`）。
 - 同一 Connection 上的写顺序由该连接的有序链与传输发送队列保证。不同 Connection 之间不承诺全局顺序。
 - 结果发送失败时，Server 跳过该请求的全部事件并记录；请求本身的成功状态不变。
 - Portal 开始关闭后不再向事件通道注册/派发；关闭期间及之后到达的事件按 best-effort 丢弃。

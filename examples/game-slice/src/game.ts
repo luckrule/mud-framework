@@ -110,8 +110,8 @@ export function gameExtension(): Extension {
         const player = await currentPlayer(ctx);
 
         // A replayed request carries the same `requestId` as the committed
-        // original. Re-emit its events (at-least-once, same `eventId`) but do
-        // not move the player again.
+        // original. Re-emit its events (best-effort; the replay repeats the
+        // same `eventId`) but do not move the player again.
         const applied = await findAppliedMove(ctx.storage, ctx.requestId);
         if (applied !== undefined) {
           await emitMoveEvents(ctx, applied);

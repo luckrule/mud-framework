@@ -123,6 +123,8 @@ JS 无法抢占执行中的 Handler。超时保证结果确定与后续事务调
 
 已经开始的 COMMIT 是明确边界：`StorageBackend.transaction(fn)` 在 `fn` resolve 后提交，取消或超时可能发生在提交完成之前，框架没有中止该 COMMIT 的句柄。此时事务仍可能提交，并记录 `CANCEL_LOST_TO_COMMIT` 告警（ADR-0004）；MUST NOT 把超时或取消当作“未生效”的证明。
 
+COMMIT 完成时刻晚于 deadline 时，请求仍以超时终态结束：不返回成功、Session 变更或事件，也不回滚已提交内容。提交可能已经生效，框架记录迟到提交告警（`CANCEL_LOST_TO_COMMIT`）；定时器是否触发、结果是否已经算出都不是“按时完成”的证明（ADR-0004）。
+
 事务内 MUST NOT 出现无界等待，包括：等待另一个 Request 的结果、等待用户输入、等待无超时的外部网络调用、等待一个无上界的锁。理由：事务持有后端资源或锁，一次无界等待会把单请求超时放大成整条连接乃至整个后端的停顿。
 
 ### 3.5 有界队列
@@ -158,19 +160,20 @@ Handler 的访问检查在业务进程内、Dispatcher 上执行，顺序是契�
 
 ### 3.8 Server 主动事件
 
-Handler 可以为一个请求声明要发送的事件（ADR-0008）。`ctx.emit(event, payload)` 发给当前请求的 Connection；`ctx.emitToSession(sessionId, event, payload)` 发给该 Session 在投递时的当前 holder。事件名与 payload 对框架不透明；事件名 MUST 非空，`emitToSession` 的 Session id MUST 非空。
+Handler 可以为一个请求声明要发送的事件（ADR-0008）。`ctx.emit(event, payload)` 发给当前请求的 Connection；`ctx.emitToSession(sessionId, event, payload)` 发给该 Session 在实际写出时的当前 holder。事件名与 payload 对框架不透明；事件名 MUST 非空，`emitToSession` 的 Session id MUST 非空。
 
 事务边界：
 
 - 事件在 Handler 内只进入本请求的缓冲，MUST 在请求成功提交后才发送；同一请求 MUST 先发结果、再发事件。
 - Handler 抛错、请求超时、被取消或事务回滚时，缓冲的事件 MUST 丢弃，MUST NOT 发送。
 - 请求到达终态后再声明事件 MUST 被拒绝，与事务句柄的失效边界一致。
-- 事件发出后不回滚；投递语义是 at-least-once，重放可能以相同 `eventId` 重发。框架不提供去重，业务用 `eventId` 自行判断。
+- 事件发出后不回滚。投递是 best-effort：可能因目标缺失、连接关闭、编码或写失败而丢失；请求重放可能让同一事件以相同 `eventId` 重复发送。框架不提供投递确认或去重，需要去重的业务可用 `eventId` 自行判断。
 - 每个请求可缓冲的事件数量 MUST 有界；超出时声明事件的调用抛出普通错误，Handler 可以捕获。该错误未逃逸时请求仍可成功，逃逸时按 Handler 失败处理。
 
 投递语义（best-effort）：
 
-- 目标 Connection 不存在或已关闭、目标 Session 当前没有 holder、编码失败或传输写失败时，事件 MUST 被丢弃并记录 warn；MUST NOT 缓冲、重试或让请求失败。
+- 目标 Connection 不存在或已关闭、目标 Session 当前没有 holder 时，事件 MUST 被丢弃并记录 warn（`EVENT_DROPPED`）；编码失败或传输写失败时同样丢弃并记录 `TRANSPORT_SEND_FAILED`。MUST NOT 因失败而缓冲或重试，也不得让请求失败。
+- Session 目标的收件人按实际写出时的当前 holder 解析：排队期间 takeover 会改投新 holder，至多重投递一次，再次变化即丢弃。
 - 结果发送失败时，该请求的全部事件 MUST 跳过并记录；请求的成功状态不变。
 - 同一 Connection 上，结果帧与事件帧、事件帧之间的写顺序由连接层的有序链与传输发送队列保证；不同 Connection 之间不承诺全局顺序。
 - 事件是附加通道：MUST NOT 改变请求的终态、超时、取消、重放、Session 屏障或关闭语义。
@@ -243,6 +246,8 @@ Extension 对存储能力的依赖 MUST 显式声明。启动时若后端能力�
 
 Transport 只负责四件事：接受连接、交付入站数据、写出发站数据、关闭。MUST NOT 承担：Session 路由、输入缓冲、重放、访问检查。理由：这些职责依赖 Session 与 Request 语义，属于框架契约；下沉到传输会让每个传输实现各自重写一遍，且无法保证跨传输一致。
 
+Transport MUST 对每个连接的发站缓冲设上限。缓冲耗尽时 MUST 显式失败并终止该连接，不得让未写出的数据无界积压，也不得静默丢弃。单条发送的超时只约束“已接受的帧迟迟写不出去”，MUST NOT 用它代替容量上限：慢客户端可以在超时前持续制造积压。
+
 `TransportConnection.id` 在连接层实例的生命周期内 MUST 唯一：连接断开后，同一 id MUST NOT 被新连接复用。连接层以该 id 维护活跃连接、Session 路由、请求入口查找与事件投递；复用会让迟到入站消息落到替换连接，或让本应发给旧连接的事件误投到替换连接。需要重连语义时，传输 MUST 铸造新 id（默认 WS 传输的 UUID 满足此约束）。连接层按连接对象身份忽略迟到的旧断线事件，但按 id 投递的事件无法区分新旧，因此唯一性由传输保证。
 
 职责拆分：Session 路由、输入缓冲与重放在连接层进程（§6.1）；访问检查点与拒绝语义（`AUTH_REQUIRED` / `FORBIDDEN`、检查顺序）在 core 的 Dispatcher 内，随 Handler 在业务进程执行（§3.7）；认证与授权策略、登录流程属于消费方。
@@ -302,9 +307,9 @@ TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：
 1. 连接层停止接受新输入。
 2. 排空已接受输入，受连接层关闭预算约束；仍在 Session 屏障前、尚未调用 executor 的请求以 `FRAMEWORK_SHUTDOWN` 结束，不绕过屏障继续执行。
 3. 执行器等待已接受工作，并关闭 Server 与存储，所有等待有界；超时或失败必须可观测，不得当作已确认资源释放。
-4. 尽力关闭传输，即使执行器关闭已经失败也不得跳过。
+4. 尽力关闭传输并传播其失败，即使执行器关闭已经失败也不得跳过。
 
-`ConnectionLayer.stop()` MUST 在传输收尾后传播执行器关闭失败，不得以成功返回掩盖退出未确认。执行器有界返回不等于进程已经退出；旧写者退出未被观测时 MUST NOT 启动新的写者。完整外部停止预算必须覆盖连接层排空、执行器关闭与传输关闭三段，不能只使用 `IpcExecutor.closeBudgetMs`；公式与常量来源见 ADR-0004。
+所有关闭等待 MUST 有界。`ConnectionLayer.stop()` MUST 在传输收尾后传播执行器与传输的关闭失败或超时：仅执行器失败时传播该失败，仅传输失败时直接拒绝，两者都失败时以 `AggregateError` 同时报告；不得以成功返回掩盖退出或监听未确认。`status` 变为 `stopped` 不等于资源已确认释放。重复调用 `stop()` MUST 返回同一关闭结果，不重新发起关闭。执行器有界返回不等于进程已经退出；旧写者退出未被观测时 MUST NOT 启动新的写者。完整外部停止预算必须覆盖连接层排空、执行器关闭与传输关闭三段，不能只使用 `IpcExecutor.closeBudgetMs`；公式与常量来源见 ADR-0004。
 
 顺序的理由是先结束业务调度，再释放存储与传输；但关闭错误码不证明请求未执行或未提交，阶段边界见 §7.2。
 

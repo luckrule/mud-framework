@@ -4,6 +4,14 @@ import { createJsonLogger } from '../logging/json-logger.ts';
 import { SessionRouter } from './session-router.ts';
 import type { UnbindResult } from './session-router.ts';
 
+/**
+ * `RoutingModel` mirrors the implementation's two-map design (session →
+ * connection and connection → session). It is a regression oracle for that
+ * implementation, not an independent spec oracle: a wrong design repeated in
+ * both would still match. The barrier checks here and the hand-written
+ * scenarios in `session-router.test.ts` are the independent assertions.
+ */
+
 const CONNECTIONS = ['c1', 'c2', 'c3', 'c4'] as const;
 const SESSIONS = ['s1', 's2', 's3'] as const;
 
