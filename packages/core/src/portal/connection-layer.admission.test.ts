@@ -4,6 +4,15 @@ import { CONNECTION_LIMIT_CLOSE_CODE } from '../shared/close-codes.ts';
 import { sessionHarness } from '../testing/connection-layer.ts';
 
 describe('ConnectionLayer connection admission (SPEC 6.1)', () => {
+  test('pins the close code to the value SPEC 6.1 mandates', () => {
+    // SPEC 6.1 says the admission refusal MUST pass `1013` (Try Again Later) to
+    // the transport. The behavioral test below compares against the constant so
+    // it reads in domain terms; on its own it would still pass if the constant
+    // were changed to any other number. This literal is the contract itself:
+    // changing it requires changing SPEC 6.1 first.
+    expect(CONNECTION_LIMIT_CLOSE_CODE).toBe(1013);
+  });
+
   test('refuses a new connection once maxConnections is reached', async () => {
     const { transport, layer, controlled, logs } = sessionHarness({
       maxConnections: 1,

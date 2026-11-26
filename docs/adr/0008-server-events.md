@@ -19,7 +19,7 @@
 - `ctx.emit(event, payload)`：发给当前请求的 Connection。
 - `ctx.emitToSession(sessionId, event, payload)`：发给该 Session 当前的 holder。
 
-`emit` 的地址是请求入口的 Connection，不是 Session：一个请求在入口无 Session 时也可以发事件。`emitToSession` 存的是 Session id，Portal 在真正写出前才用路由表解析当前 holder。收件人因此是“写出时”的 holder，而不是 handler 运行或事件入队时的连接：排队期间 takeover 会把事件改投新 holder，至多重投递一次，二次变化即丢弃；没有 holder 就丢弃，不排队等它上线。事件随重连跟随 Session，但只跟随一次写出前的变化，不是对所有后续 takeover 的保证。同一 Session 的 session 目标事件按发射序串行：后一条等前一条写出或丢弃后才投递，因此 takeover 不改变同一收件 Connection 上这些事件之间的顺序。串行只覆盖 session 目标事件：同一 Connection 上 connection 目标与 session 目标之间不保证发射序，两者只是共享该连接的有序链。
+`emit` 的地址是请求入口的 Connection，不是 Session：一个请求在入口无 Session 时也可以发事件。`emitToSession` 存的是 Session id，Portal 在真正写出前才用路由表解析当前 holder。收件人因此是“写出时”的 holder，而不是 handler 运行或事件入队时的连接：排队期间 takeover 会把事件改投新 holder，至多重投递一次，二次变化即丢弃；没有 holder 就丢弃，不排队等它上线。事件随重连跟随 Session，但只跟随一次写出前的变化，不是对所有后续 takeover 的保证。同一 Session 的 session 目标事件按发射序串行：后一条等前一条写出或丢弃后才投递，因此 takeover 不改变同一收件 Connection 上这些事件之间的顺序。串行只覆盖 session 目标事件：同一 Connection 上 connection 目标与 session 目标之间不保证发射序，两者只是共享该连接的写出调度器。
 
 事件名与 payload 对框架不透明，框架只校验事件名非空、`emitToSession` 的 Session id 非空。事件名是业务契约的一部分，框架不维护枚举。
 
@@ -56,7 +56,7 @@ Server → Portal 使用独立消息：
 - Portal 收到事件消息后，`connection` 目标查连接表，`session` 目标在实际写出前重新解析当前 holder。目标不存在、连接已关闭、没有 holder、编码失败或传输写失败时，记一条 warn 并丢弃。不因失败缓冲或重试，不让任何请求失败。
 - `session` 目标排队期间发生 takeover 时改投新 holder，至多重投递一次；再次变化即丢弃（`EVENT_DROPPED`）。
 - `session` 目标按 Session 串行：同一 Session 的事件按到达顺序逐条处理，后一条在前一条写出或丢弃后才开始投递。串行分两段，只有前一段可取消：**queued**（尚未开始写出）时旧连接被移除或 abort，事件丢弃（`EVENT_DROPPED`，reason 指明写出前连接已关闭）并立即释放串行位，后续事件继续，不会因旧链不再前进而永久阻塞；**writing**（已开始写出）时 abort 不提前释放串行位，必须等实际写结果结算：帧可能已写出，提前释放会让后一条越过前一条。写失败记 `TRANSPORT_SEND_FAILED`（`stage: 'send'`）而不是 `EVENT_DROPPED`。写出本身有界：传输发送受其 `sendTimeoutMs` 约束，底层发送 Promise 不保证 settle 时以发送超时为上界，不用 abort 信号代替。串行只保证顺序，不改变 best-effort 语义：事件仍可能被丢弃。
-- 同一 Connection 上事件帧的相对顺序由该连接的有序链与传输发送队列保证；同一 Session 的 session 目标事件另由串行队列保证发射序。connection 目标与 session 目标之间不保证发射序，不同 Connection 之间不承诺全局顺序。结果帧与事件帧之间的顺序按文末决策记录的请求工作优先规则。
+- 同一 Connection 上事件帧的相对顺序由该连接的写出调度器与传输发送队列保证；同一 Session 的 session 目标事件另由串行队列保证发射序。connection 目标与 session 目标之间不保证发射序，不同 Connection 之间不承诺全局顺序。结果帧与事件帧之间的顺序按文末决策记录的请求工作优先规则。
 - 结果发送失败时，Server 跳过该请求的全部事件并记录；请求本身的成功状态不变。
 - Portal 开始关闭后不再向事件通道注册/派发；关闭期间及之后到达的事件按 best-effort 丢弃。
 
@@ -93,7 +93,7 @@ Server → Portal 使用独立消息：
 ### 理由
 
 - 慢读者可让事件无界增长：事件发射速率 λ 持续大于写出速率 μ 时，积压按 (λ−μ)t 线性增长，进程内存没有上限。传输层的发送超时只约束单帧，不约束积压深度；每 Connection 的事件队列之外，Session 待投递队列在解析出 holder 前同样无界，只给连接队列加界会漏掉这条路径。
-- `SendQueue` 的有界保护对事件路径失效：事件写出经连接的有序链串行，链上同时最多一个事件帧在途，传输发送队列的深度恒约为 1，`maxQueuedFrames` / `maxQueuedBytes` 永远达不到。
+- `SendQueue` 的有界保护对事件路径失效：事件写出经连接调度器串行，同一时刻最多一个事件帧在途，传输发送队列的深度恒约为 1，`maxQueuedFrames` / `maxQueuedBytes` 永远达不到。
 - 事件与请求共用一条链：FIFO 下大量待写事件排在请求结果之前，一次慢读会推迟整条连接上的所有结果。
 
 ### 被否决的方案

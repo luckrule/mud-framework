@@ -101,6 +101,12 @@ export class EventWrite {
   started = false;
   /** Set with the outcome; a settled frame never writes. */
   settled = false;
+  /**
+   * The outcome once settled. A Session queue reads it at shutdown to tell a
+   * frame handed back for redelivery (still unwritten) from one that already
+   * ended in a connection queue, which that queue has counted.
+   */
+  settledAs: EventOutcome | undefined;
   readonly outcome: Promise<EventOutcome>;
   private readonly write: () => EventOutcome | Promise<EventOutcome>;
   private readonly settleOutcome: (outcome: EventOutcome) => void;
@@ -121,6 +127,7 @@ export class EventWrite {
       return;
     }
     this.settled = true;
+    this.settledAs = outcome;
     this.settleOutcome(outcome);
   }
 
@@ -269,17 +276,70 @@ export interface SessionEventQueue {
   frames: number;
   bytes: number;
   pumping: boolean;
+  /**
+   * The frame the pump holds right now: shifted out of `entries`, so no longer
+   * counted by `frames`/`bytes`, and either waiting in a connection queue or
+   * between buffers during a takeover redelivery (SPEC 3.8).
+   */
+  inHand: InHandFrame | undefined;
 }
 
 export function createSessionQueue(sessionId: string): SessionEventQueue {
-  return { sessionId, entries: [], frames: 0, bytes: 0, pumping: false };
+  return {
+    sessionId,
+    entries: [],
+    frames: 0,
+    bytes: 0,
+    pumping: false,
+    inHand: undefined,
+  };
 }
 
 /**
- * Discards every frame still waiting in a Session's own queue at shutdown.
- * Frames already handed to a connection queue belong to that queue and are
- * discarded there. Resolving `done` keeps the promise returned when the event
- * was accepted from hanging.
+ * The frame the pump currently holds. `write` is the latest delivery attempt,
+ * replaced on each redelivery.
+ */
+export interface InHandFrame {
+  readonly bytes: number;
+  write: EventWrite | undefined;
+}
+
+/**
+ * True when this in-hand frame was released by a connection queue for a
+ * takeover redelivery and no buffer holds it now (SPEC 3.8).
+ *
+ * This is the only state that needs shutdown's attention, and it is why the
+ * predicate is narrow. The pump shifts a frame out of the Session queue before
+ * delivering it, so the Session queue already stopped counting it; from
+ * `queueEvent` until the write settles, the connection queue counts it. A
+ * `'moved'` settle is the connection queue releasing it without writing it and
+ * without re-queueing it, leaving a frame that no buffer reports.
+ *
+ * Every other settle means the frame was written (`'settled'`), already
+ * reported as a drop (`'dropped'`, `'aborted'`), or discarded by the connection
+ * queue that counted it in its own totals (`'discarded'`). Counting those again
+ * would report one frame twice.
+ */
+function isUnaccountedInHand(frame: InHandFrame): boolean {
+  return frame.write?.settledAs === 'moved';
+}
+
+/**
+ * Discards every frame still waiting in a Session's own queue at shutdown, plus
+ * the one frame the pump holds while it is in no buffer at all (SPEC 3.8).
+ *
+ * The in-hand frame is the gap this closes: the pump shifts a frame out of the
+ * Session queue before delivering it, so the Session queue stops counting it,
+ * and a takeover that settles the attempt as `'moved'` releases it from the
+ * connection queue without queueing it anywhere else. At that instant no queue
+ * can report it, yet it was accepted and never written. Counting it here keeps
+ * shutdown from dropping it silently, and `isUnaccountedInHand` keeps it out of
+ * the totals whenever a connection queue still holds it, so one frame is
+ * reported once.
+ *
+ * Frames already handed to a connection queue that still holds them belong to
+ * that queue and are discarded there. Resolving `done` keeps the promise
+ * returned when the event was accepted from hanging.
  */
 export function discardSessionQueues(
   queues: Map<string, SessionEventQueue>,
@@ -297,6 +357,12 @@ export function discardSessionQueues(
     queue.entries.length = 0;
     queue.frames = 0;
     queue.bytes = 0;
+    const inHand = queue.inHand;
+    if (inHand !== undefined && isUnaccountedInHand(inHand)) {
+      frames += 1;
+      bytes += inHand.bytes;
+    }
+    queue.inHand = undefined;
   }
   queues.clear();
   return { frames, bytes };
@@ -382,9 +448,17 @@ async function pumpSession(
       queue.bytes -= entry.bytes;
       host.backlog.sessionFrameRemoved(entry.bytes);
       // The frame now belongs to the holder's connection queue, so the Session
-      // queue's bound no longer covers it (SPEC 3.8).
-      // oxlint-disable-next-line eslint/no-await-in-loop -- the serial slot must be held until this frame settles
-      await deliverSessionEntry(host, queue.sessionId, entry);
+      // queue's bound no longer covers it (SPEC 3.8). `inHand` keeps it visible
+      // to shutdown while it is between buffers, which is the only state no
+      // queue accounts for: shifted out here, not yet queued there.
+      const inHand: InHandFrame = { bytes: entry.bytes, write: undefined };
+      queue.inHand = inHand;
+      try {
+        // oxlint-disable-next-line eslint/no-await-in-loop -- the serial slot must be held until this frame settles
+        await deliverSessionEntry(host, queue.sessionId, entry, inHand);
+      } finally {
+        queue.inHand = undefined;
+      }
       entry.done();
     }
   } finally {
@@ -409,6 +483,7 @@ async function deliverSessionEntry(
   host: EventDeliveryHost,
   sessionId: string,
   entry: SessionQueuedEvent,
+  inHand: InHandFrame,
 ): Promise<void> {
   const { event, frame, bytes } = entry;
   let redeliveries = 0;
@@ -428,6 +503,7 @@ async function deliverSessionEntry(
       event,
       frame,
       bytes,
+      inHand,
     );
     if (
       outcome === 'settled' ||
@@ -476,6 +552,7 @@ async function deliverToHolder(
   event: ServerEvent,
   frame: string | Uint8Array,
   bytes: number,
+  inHand: InHandFrame,
 ): Promise<EventOutcome> {
   const write = new EventWrite(bytes, async () => {
     const current = holderState(host, sessionId, event);
@@ -488,6 +565,9 @@ async function deliverToHolder(
     await writeEventFrame(host, current, event, frame);
     return 'settled';
   });
+  // Recorded before queueing: shutdown may run between the queue call and this
+  // frame's turn, and it needs to know whether a connection queue holds it.
+  inHand.write = write;
   const queued = host.queueEvent(queuedFor, write);
   if (!queued.accepted) {
     logBacklogDrop(

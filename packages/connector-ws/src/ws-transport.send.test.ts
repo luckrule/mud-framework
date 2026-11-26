@@ -1,11 +1,13 @@
 import { describe, expect, test } from 'bun:test';
 
+import type { TransportConnection } from 'mud-framework-core';
 import {
   openClient,
   rejectionOf,
   tick as settle,
 } from 'mud-framework-test-support';
 
+import { SEND_BACKLOG_CLOSE_CODE } from './close-codes.ts';
 import {
   captureLogger,
   first,
@@ -17,6 +19,78 @@ import {
   tracked,
   until,
 } from './ws-transport.support.ts';
+import { WsTransport } from './ws-transport.ts';
+
+/**
+ * A connection registered through the transport's own upgrade path whose socket
+ * is a test double, so a test can decide what Bun's `send` returns and read the
+ * close the transport asks for.
+ *
+ * The outbound-overflow close code is only observable this way: the overflow
+ * fires because the client's buffer is full, and in that state a real client
+ * cannot receive the close frame the transport then writes. This borrows the
+ * private callbacks the same way the message tests do.
+ */
+async function fakeConnection(
+  transport: WsTransport,
+  write: (payload: string | Uint8Array) => number,
+): Promise<{
+  connection: TransportConnection;
+  closes: { code: number; reason: string }[];
+}> {
+  const internals = transport as unknown as {
+    handleFetch(request: Request, server: unknown): Response | undefined;
+    handleOpen(ws: {
+      readonly data: { readonly id: string };
+      close(code: number, reason: string): void;
+      send(payload: string | Uint8Array): number;
+    }): void | Promise<void>;
+    connections: Map<string, { readonly connection: TransportConnection }>;
+  };
+  const closes: { code: number; reason: string }[] = [];
+  let socket:
+    | {
+        readonly data: { readonly id: string };
+        close(code: number, reason: string): void;
+        send(payload: string | Uint8Array): number;
+      }
+    | undefined;
+  const server = {
+    // Bun's `upgrade(request, options)` takes `{ data }`, and the transport
+    // stores its per-connection record there.
+    upgrade: (
+      _request: Request,
+      options: {
+        readonly data: {
+          readonly id: string;
+          readonly connection: TransportConnection;
+        };
+      },
+    ): boolean => {
+      socket = {
+        data: options.data,
+        send: write,
+        close: (code, reason) => {
+          closes.push({ code, reason });
+        },
+      };
+      return true;
+    },
+  };
+  internals.handleFetch(
+    new Request('http://127.0.0.1/', { headers: { upgrade: 'websocket' } }),
+    server,
+  );
+  if (socket === undefined) {
+    throw new Error('expected the transport to upgrade the fake request');
+  }
+  await internals.handleOpen(socket);
+  const connection = [...internals.connections.values()][0]?.connection;
+  if (connection === undefined) {
+    throw new Error('expected the fake connection to be registered');
+  }
+  return { connection, closes };
+}
 
 /**
  * The flood reaches tens of megabytes. Timeout and disconnect tests need it
@@ -224,6 +298,48 @@ describe('WsTransport sends', () => {
       ).toHaveLength(1);
     } finally {
       socket.destroy();
+      await safeStop(transport);
+    }
+  });
+
+  test('closes an overflowing connection with the send-backlog close code', async () => {
+    // The code is this transport's choice, not a SPEC MUST: SPEC 5.2 only says
+    // an exhausted outbound buffer MAY close with 1013. So the assertion is
+    // behavioral — the close the transport requests equals the constant it
+    // declares — rather than pinning the literal, which the admission path
+    // already pins for SPEC 6.1. A full buffer is what triggers the overflow,
+    // and a client in that state cannot read the close frame, so the socket is
+    // a double and the assertion is on what the transport asked for.
+    const transport = new WsTransport({
+      maxQueuedFrames: 1,
+      maxQueuedBytes: 1024 * 1024,
+      sendTimeoutMs: 10_000,
+    });
+    await transport.start({
+      onConnect: () => undefined,
+      onMessage: () => undefined,
+      onDisconnect: () => undefined,
+    });
+    try {
+      // `-1` is Bun's "accepted, buffer now full", which holds the head and
+      // makes the next frame overflow the one-frame capacity.
+      const { connection, closes } = await fakeConnection(transport, () => -1);
+
+      const blocked = tracked(connection.send(new Uint8Array(100)));
+      const overflow = tracked(connection.send(new Uint8Array(100)));
+      await until(
+        () => overflow.state() !== 'pending',
+        'the overflowing send to be rejected',
+      );
+
+      expect(overflow.error()?.message).toMatch(/send queue overflow/);
+      expect(closes).toHaveLength(1);
+      expect(closes[0]).toEqual({
+        code: SEND_BACKLOG_CLOSE_CODE,
+        reason: 'send queue full',
+      });
+      await blocked.promise.catch(() => undefined);
+    } finally {
       await safeStop(transport);
     }
   });

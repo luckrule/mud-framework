@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { Buffer } from 'node:buffer';
 
 import { withDeadline } from 'mud-framework-test-support';
 
@@ -764,7 +765,17 @@ describe('ConnectionLayer event write scheduling', () => {
     ).toEqual([]);
   });
 
-  test('stop during a takeover redelivery does not queue the event on the new holder', async () => {
+  test('stop during a takeover hand-off counts the in-hand frame in the shutdown summary', async () => {
+    const payload = 'first';
+    const frameBytes = Buffer.byteLength(
+      JSON.stringify({
+        kind: 'event',
+        eventId: 'e:0',
+        event: 'room.description',
+        payload,
+      }),
+      'utf8',
+    );
     const h = sessionHarness({ shutdownTimeoutMs: 30 });
     await h.layer.start();
     h.transport.connect('c1');
@@ -773,7 +784,7 @@ describe('ConnectionLayer event write scheduling', () => {
     await sleep(0);
 
     // E1 is queued for s1 on c1, behind the hanging request.
-    h.controlled.emit(sessionEvent('e:0', 'first'));
+    h.controlled.emit(sessionEvent('e:0', payload));
     await tick();
 
     // c2 takes s1 over while E1 waits, so E1's write will observe a moved
@@ -811,8 +822,23 @@ describe('ConnectionLayer event write scheduling', () => {
     expect(
       h.logs().filter((line) => line.code === 'TRANSPORT_SEND_FAILED'),
     ).toEqual([]);
-    // Nothing is left counted: the frame left the Session queue, was never
-    // re-queued, and no overflow drop was recorded.
+    // The frame was between buffers when shutdown ran: out of the Session
+    // queue, not yet in c2's connection queue. SPEC 3.8 requires every
+    // unwritten frame to be discarded and reported, so the in-hand frame must
+    // appear in the one summary line. It is not a connection queue's frame, so
+    // `connections` stays 0 (SPEC 3.8 names Session queues as excluded).
+    const summary = h
+      .logs()
+      .filter((line) => line.code === 'EVENT_BACKLOG_DISCARDED');
+    expect(summary).toHaveLength(1);
+    expect(summary[0]).toMatchObject({
+      reason: 'shutdown',
+      count: 1,
+      connections: 0,
+      frames: 1,
+      bytes: frameBytes,
+    });
+    // Nothing is left counted once the frame is accounted for.
     expect(h.layer.health().eventBacklog).toEqual({
       connections: 0,
       frames: 0,
