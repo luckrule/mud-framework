@@ -47,6 +47,16 @@ export interface TransportHandlers {
  * the connection process and MUST NOT be pushed down here (SPEC 5.2).
  */
 export interface Transport {
+  /**
+   * Optional: the transport's own upper bound on one frame write. A transport
+   * that bounds its sends MAY expose it so the framework can bound a Server
+   * event write at least as loosely. That keeps the Session's serial slot held
+   * until the transport itself fails, instead of releasing it while a frame is
+   * still being written and letting the next event overtake it (SPEC 3.8).
+   *
+   * Absent means "no declaration"; the layer then uses its own configuration.
+   */
+  readonly sendTimeoutMs?: number;
   start(handlers: TransportHandlers): Promise<void>;
   stop(): Promise<void>;
 }

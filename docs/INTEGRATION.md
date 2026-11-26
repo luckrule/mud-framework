@@ -153,6 +153,7 @@ core 只提供同步快照，不提供 HTTP 端点（SPEC 6.6）。应用在自�
 - **确认没有孤儿进程**：`process.kill(pid, 0)` 抛 `ESRCH` 可用于检查该 pid 已消失。`pid` 来自 Server 的 `ready` 消息。框架内部只有 `observed: true` 的退出确认才解除写者屏障；等待超时说明尚未确认，不能仅凭日志诊断进程不可中断。迟到确认只允许在执行器尚可恢复时解除屏障；一次性 `observed: false` 不保证自动恢复，需要部署方处理。
 - **`maxPending`**：Portal 未确认缓冲的硬上限（默认值见 `IpcExecutorOptions`），超出后请求以 `FRAMEWORK_QUEUE_FULL` 拒绝。deadline 在 Server 未就绪或不可用时仍会结算请求，只限制单条请求的驻留时间；总数上限控制同时在途的数量，不能用来延长 deadline。
 - **`maxConnections`**：连接层同时接纳的活跃连接上限（默认值见 `ConnectionLayerOptions`）。达到上限后，新连接以 WebSocket close code `1013`（Try Again Later）关闭，不进入请求处理；连接断开才释放名额。它是准入上限，不是业务 Session 的生命周期限制。
+- **`eventSendTimeoutMs`**：单条 Server 事件写出的上界（默认值见 `ConnectionLayerOptions`）。优先级是：该选项，其次传输暴露的 `Transport.sendTimeoutMs`（SPEC 5.2），最后默认值。传输声明可用时以它为准，串行位不会早于传输自身失败而释放；声明为 `Infinity` 等不可用值时按未声明处理，回退默认值，避免串行位无界等待。它约束的是写出，不是断线：帧已开始写出后，断线不会提前释放串行位，因为字节可能已经写出（SPEC 3.8）。
 - **出站队列有界**：传输实现必须限制每个连接的出站缓冲；慢客户端积压到上限时会被关闭，而不是无限占用 Portal 内存（SPEC 5.2）。
 
 ### TLS 终止配置要点

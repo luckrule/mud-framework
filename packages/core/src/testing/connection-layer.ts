@@ -294,9 +294,15 @@ export function sessionHarness(
     createRequestId?: () => string;
     sessionOf?: (method: string) => string | undefined;
     changeOf?: (method: string) => SessionChange | undefined;
+    eventSendTimeoutMs?: number;
+    shutdownTimeoutMs?: number;
+    /** Declared as `Transport.sendTimeoutMs` on the harness transport. */
+    transportSendTimeoutMs?: number;
   } = {},
 ): SessionHarness {
-  const transport = new FakeTransport();
+  const transport = new FakeTransport({
+    sendTimeoutMs: options.transportSendTimeoutMs,
+  });
   const lines: string[] = [];
   const logger = createJsonLogger({
     sink: (line) => {
@@ -315,6 +321,8 @@ export function sessionHarness(
     maxConnections: options.maxConnections,
     maxQueuedPerConnection: options.maxQueuedPerConnection,
     createRequestId: options.createRequestId,
+    eventSendTimeoutMs: options.eventSendTimeoutMs,
+    shutdownTimeoutMs: options.shutdownTimeoutMs,
   });
   return {
     transport,

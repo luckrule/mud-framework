@@ -22,7 +22,10 @@ import {
   onDisconnect as disconnectConnection,
 } from './connection-admission.ts';
 import type { EventDeliveryHost } from './connection-events.ts';
-import { deliverServerEvent } from './connection-events.ts';
+import {
+  DEFAULT_EVENT_SEND_TIMEOUT_MS,
+  deliverServerEvent,
+} from './connection-events.ts';
 import type { RequestHost } from './connection-request.ts';
 import {
   cancelQuietly,
@@ -92,6 +95,20 @@ export interface ConnectionLayerOptions {
    * before any request on it is read. Must be a positive integer.
    */
   maxConnections?: number;
+  /**
+   * Upper bound on one Server event write. Defaults to the transport's declared
+   * `Transport.sendTimeoutMs` when that is a finite number of at least 1, and
+   * to `DEFAULT_EVENT_SEND_TIMEOUT_MS` otherwise. Taking the transport's own
+   * bound keeps the Session's serial slot held until the transport itself would
+   * fail the write, so the slot is never released while a frame is still being
+   * written (SPEC 3.8). An explicit value here wins over the declaration and
+   * must be a positive finite number.
+   *
+   * It bounds the write, not the disconnect: once a frame is being written an
+   * abort does not release the Session's serial slot, because the bytes may
+   * already be on the wire (SPEC 3.8).
+   */
+  eventSendTimeoutMs?: number;
 }
 
 /**
@@ -112,6 +129,7 @@ export class ConnectionLayer implements TransportHandlers {
   private readonly maxQueuedPerConnection: number;
   private readonly maxConnections: number;
   private readonly shutdownTimeoutMs: number;
+  private readonly eventSendTimeoutMs: number;
   private readonly connections = new Map<string, ConnectionState>();
   /** Per-Session serialization of Server events (ADR-0008); empty when idle. */
   private readonly sessionTails = new Map<string, Promise<void>>();
@@ -142,6 +160,7 @@ export class ConnectionLayer implements TransportHandlers {
     const shutdownTimeoutMs =
       options.shutdownTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
     assertFiniteAtLeastOne(shutdownTimeoutMs, 'shutdownTimeoutMs');
+    const eventSendTimeoutMs = resolveEventSendTimeoutMs(options);
     this.transport = options.transport;
     this.executor = options.executor;
     this.codec = options.codec ?? new JsonCodec();
@@ -153,6 +172,7 @@ export class ConnectionLayer implements TransportHandlers {
     this.maxQueuedPerConnection = maxQueuedPerConnection;
     this.maxConnections = maxConnections;
     this.shutdownTimeoutMs = shutdownTimeoutMs;
+    this.eventSendTimeoutMs = eventSendTimeoutMs;
     this.router = new SessionRouter({ logger: this.logger });
     this.requestHost = {
       codec: this.codec,
@@ -172,6 +192,7 @@ export class ConnectionLayer implements TransportHandlers {
       router: this.router,
       enqueue: (state, work) => this.enqueue(state, work),
       sessionTails: this.sessionTails,
+      sendTimeoutMs: this.eventSendTimeoutMs,
     };
   }
 
@@ -279,10 +300,10 @@ export class ConnectionLayer implements TransportHandlers {
       state.closed.abort();
     }
 
-    // Step 2: drain what was already accepted. New input is refused, so the
-    // chains can only shrink. Bounded because a handler that never returns
-    // would otherwise keep the process alive forever, which is worse than the
-    // leak the wait is meant to avoid.
+    // SPEC 6.3 step 2: drain what was already accepted. New input is refused,
+    // so the chains can only shrink. Bounded because a handler that never
+    // returns would otherwise keep the process alive forever, which is worse
+    // than the leak the wait is meant to avoid.
     const drained = await settleWithin(
       Promise.all([...this.connections.values()].map((state) => state.chain)),
       timeoutMs,
@@ -303,13 +324,16 @@ export class ConnectionLayer implements TransportHandlers {
     this.connections.clear();
     // SPEC 6.1: routes outlive neither their connections nor the layer. Leaving
     // them behind would make a restarted layer route a reconnect to a
-    // connection id that no longer exists.
+    // connection id that no longer exists. The Session event tails are cleared
+    // with them: a delivery still parked on a dropped chain can never write,
+    // and keeping its promise would retain one entry per Session addressed.
     this.router.clear();
+    this.sessionTails.clear();
 
-    // Step 4 before step 5 (SPEC 6.3): storage closes before the transport, so
-    // no write can land after the connection that would report it is gone.
-    // Closing storage while a request still held a transaction is why the
-    // drain above comes first.
+    // SPEC 6.3 step 3: close the executor (and with it the Server and storage)
+    // before the transport, so no write can land after the connection that
+    // would report it is gone. Closing storage while a request still held a
+    // transaction is why the drain above comes first.
     //
     // The budget is the larger of this layer's own timeout and the executor's
     // declared worst case plus slack. A remote executor has to drain, ask the
@@ -343,6 +367,8 @@ export class ConnectionLayer implements TransportHandlers {
     }
 
     let transportFailure: Error | undefined;
+    // SPEC 6.3 step 4: best-effort transport close, propagated even when the
+    // executor step already failed.
     const stopped = await settleWithin(this.stopTransport(), timeoutMs);
     this.status = 'stopped';
     if (stopped.status === 'timeout') {
@@ -399,6 +425,28 @@ export class ConnectionLayer implements TransportHandlers {
   ): Promise<void> {
     return appendToChain(state, work);
   }
+}
+
+/**
+ * Resolves the bound on one event write: the layer's explicit option first,
+ * then the transport's declaration, then the default.
+ *
+ * A transport's value is only taken when it is usable (finite and at least 1).
+ * `Infinity` is legal for a transport — `WsTransport` accepts it to disable its
+ * own send timeout — but it must not become this bound: an unbounded wait would
+ * pin the Session's serial slot forever, the very failure the bound prevents.
+ * Such a declaration counts as "no declaration" and falls back to the default.
+ */
+function resolveEventSendTimeoutMs(options: ConnectionLayerOptions): number {
+  if (options.eventSendTimeoutMs !== undefined) {
+    assertFiniteAtLeastOne(options.eventSendTimeoutMs, 'eventSendTimeoutMs');
+    return options.eventSendTimeoutMs;
+  }
+  const declared = options.transport.sendTimeoutMs;
+  if (declared !== undefined && Number.isFinite(declared) && declared >= 1) {
+    return declared;
+  }
+  return DEFAULT_EVENT_SEND_TIMEOUT_MS;
 }
 
 function assertPositiveInteger(value: unknown, name: string): void {

@@ -174,9 +174,9 @@ Handler 可以为一个请求声明要发送的事件（ADR-0008）。`ctx.emit(
 
 - 目标 Connection 不存在或已关闭、目标 Session 当前没有 holder 时，事件 MUST 被丢弃并记录 warn（`EVENT_DROPPED`）；编码失败或传输写失败时同样丢弃并记录 `TRANSPORT_SEND_FAILED`。MUST NOT 因失败而缓冲或重试，也不得让请求失败。
 - Session 目标的收件人按实际写出时的当前 holder 解析：排队期间 takeover 会改投新 holder，至多重投递一次，再次变化即丢弃。
-- 同一 Session 的事件 MUST 按到达顺序串行投递：后一条必须等前一条写出或丢弃后才开始，因此 takeover 不改变同一收件 Connection 上这些事件之间的顺序。事件在等待旧 holder 的有序链期间旧连接被移除或 abort 时，该事件丢弃（`EVENT_DROPPED`）并释放串行位，后续事件继续，不得永久阻塞。
+- 同一 Session 的 session 目标事件 MUST 按发射序串行投递：后一条必须等前一条写出或丢弃后才开始，因此 takeover 不改变同一收件 Connection 上这些事件之间的顺序。投递分两段，只有第一段可取消：**queued**（尚未开始写出）时旧连接被移除或 abort，该事件丢弃（`EVENT_DROPPED`，reason 指明写出前连接已关闭）并立即释放串行位；**writing**（已开始写出）时 abort MUST NOT 提前释放串行位，必须等实际写结果（成功或传输失败）结算后再释放，写失败记 `TRANSPORT_SEND_FAILED` 而不是 `EVENT_DROPPED`，因为帧可能已写出。写出本身必须有界：传输发送受其 `sendTimeoutMs` 约束，底层发送 Promise 不保证 settle 时以发送超时为上界，不得用 abort 信号代替。这个写出上界优先取传输声明的单帧发送上界（§5.2），其次取连接层配置，最后取默认值；传输声明不可用（例如 `Infinity`）时按未声明处理，回退到默认值。
 - 结果发送失败时，该请求的全部事件 MUST 跳过并记录；请求的成功状态不变。
-- 同一 Connection 上，结果帧与事件帧、事件帧之间的写顺序由连接层的有序链与传输发送队列保证；Session 目标的事件另由按 Session 的串行队列保证到达顺序；不同 Connection 之间不承诺全局顺序。
+- 同一 Connection 上，结果帧与事件帧、事件帧之间的写顺序由连接层的有序链与传输发送队列保证；session 目标的事件另由按 Session 的串行队列保证发射序；connection 目标与 session 目标之间、不同 Connection 之间不承诺发射序。
 - 事件是附加通道：MUST NOT 改变请求的终态、超时、取消、重放、Session 屏障或关闭语义。
 
 安全边界：框架不对事件做授权。Handler 可以向任意 Session 声明事件；房间成员资格、可见性与内容过滤属于业务。
@@ -248,6 +248,8 @@ Extension 对存储能力的依赖 MUST 显式声明。启动时若后端能力�
 Transport 只负责四件事：接受连接、交付入站数据、写出发站数据、关闭。MUST NOT 承担：Session 路由、输入缓冲、重放、访问检查。理由：这些职责依赖 Session 与 Request 语义，属于框架契约；下沉到传输会让每个传输实现各自重写一遍，且无法保证跨传输一致。
 
 Transport MUST 对每个连接的发站缓冲设上限。缓冲耗尽时 MUST 显式失败并终止该连接，不得让未写出的数据无界积压，也不得静默丢弃。单条发送的超时只约束“已接受的帧迟迟写不出去”，MUST NOT 用它代替容量上限：慢客户端可以在超时前持续制造积压。
+
+Transport MAY 暴露自己的单帧发送上界（`Transport.sendTimeoutMs`）。暴露时框架用它给 Server 事件的写出设界，保证同一 Session 的串行位不会早于传输自身失败而释放（§3.8）。该字段可选，未暴露或值不可用（例如 `Infinity`）时框架按自己的配置与默认值处理。
 
 `TransportConnection.id` 在连接层实例的生命周期内 MUST 唯一：连接断开后，同一 id MUST NOT 被新连接复用。连接层以该 id 维护活跃连接、Session 路由、请求入口查找与事件投递；复用会让迟到入站消息落到替换连接，或让本应发给旧连接的事件误投到替换连接。需要重连语义时，传输 MUST 铸造新 id（默认 WS 传输的 UUID 满足此约束）。连接层按连接对象身份忽略迟到的旧断线事件，但按 id 投递的事件无法区分新旧，因此唯一性由传输保证。
 
@@ -330,7 +332,7 @@ TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：
 
 ### 6.6 就绪快照
 
-`ConnectionLayer.health()` MUST 返回同步快照，可在 `start()` 之前与 `stop()` 过程中调用，不得产生副作用。`ready` 仅在连接层已启动且执行器就绪时为 true；连接层已启动但执行器未就绪时 `state` 为 `degraded`。`listening` 只表示传输仍在接受连接，不表示业务可用；`connections` 是当前已准入的连接数。
+`ConnectionLayer.health()` MUST 返回同步快照，可在 `start()` 之前与 `stop()` 过程中调用，不得产生副作用。`ready` 仅在连接层已启动且执行器就绪时为 true；连接层已启动但执行器未就绪时 `state` 为 `degraded`。`listening` 只表示传输仍在接受连接，不表示业务可用；`connections` 是当前已准入的连接数。传输关闭未确认时 `listening` 不可信：`status=stopped` 会让 `listening=false`，但监听可能仍在运行；此时以 `stop()` 的失败（或超时）为准，不能把快照当作“监听已释放”的证据。
 
 执行器通过 `RequestExecutor.health()` 自报状态：`ready` 只在当前可以立即执行、无需等待恢复时为 true，启动中、重启中、等待新一代 `ready`、已关闭与阻塞都为 false。`blocked` 表示旧写者退出未确认，恢复屏障未解除（INV-002）；此时 MUST NOT 以恢复可用性为由启动新的写者。关闭失败未能确认退出时同样保持 `blocked`。
 

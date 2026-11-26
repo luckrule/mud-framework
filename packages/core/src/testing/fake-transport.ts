@@ -8,6 +8,15 @@ interface ConnectionState {
   connection: TransportConnection;
   sent: (string | Uint8Array)[];
   open: boolean;
+  /** Set while a test holds this connection's writes; see `holdSends`. */
+  hold?: HoldState;
+  /** Set while a test makes this connection's writes throw; see `throwOnSend`. */
+  throwWith?: Error;
+}
+
+interface HoldState {
+  readonly entered: () => void;
+  readonly gate: Promise<void>;
 }
 
 interface CloseRecord {
@@ -16,6 +25,20 @@ interface CloseRecord {
 }
 
 type Status = 'idle' | 'started' | 'stopped';
+
+/**
+ * A write a test keeps pending, so the connection layer can be observed while
+ * `send` has not settled. The frame is recorded on entry: a real transport can
+ * have the bytes on the wire while it still waits for the socket to drain.
+ */
+export interface HeldSends {
+  /** Resolves once the held write was attempted. */
+  readonly entered: Promise<void>;
+  /** Records the frame and settles the pending write successfully. */
+  release(): void;
+  /** Fails the pending write, as a broken socket would, without recording it. */
+  fail(error: Error): void;
+}
 
 /**
  * Test double for transports (SPEC 5.3): no socket, no framing. Tests drive the
@@ -28,11 +51,20 @@ type Status = 'idle' | 'started' | 'stopped';
  * cannot become an unhandled rejection.
  */
 export class FakeTransport implements Transport {
+  /**
+   * Test hook for `Transport.sendTimeoutMs`: a declared value lets a test
+   * observe which bound the layer picks for an event write.
+   */
+  readonly sendTimeoutMs?: number;
   private readonly connections = new Map<string, ConnectionState>();
   private readonly closes = new Map<string, CloseRecord>();
   private status: Status = 'idle';
   private handlers: TransportHandlers | undefined;
   private events: Promise<unknown> = Promise.resolve();
+
+  constructor(options: { sendTimeoutMs?: number } = {}) {
+    this.sendTimeoutMs = options.sendTimeoutMs;
+  }
 
   start(handlers: TransportHandlers): Promise<void> {
     // Rejects rather than throws: `start`/`stop` both promise a result, so a
@@ -97,6 +129,35 @@ export class FakeTransport implements Transport {
     return this.closes.get(id);
   }
 
+  /**
+   * Holds the next write on `id` until the returned handle settles it; later
+   * writes are unaffected. The frame is still recorded when `send` is entered,
+   * so a test can distinguish "the write started" from "the write finished" —
+   * the case where the layer must not treat an abort as a reason to release its
+   * ordering slot.
+   */
+  holdSends(id: string): HeldSends {
+    this.assertStarted();
+    const state = this.lookup(id);
+    const entered = Promise.withResolvers<void>();
+    const gate = Promise.withResolvers<void>();
+    state.hold = { entered: () => entered.resolve(), gate: gate.promise };
+    return {
+      entered: entered.promise,
+      release: () => gate.resolve(),
+      fail: (error) => gate.reject(error),
+    };
+  }
+
+  /**
+   * Makes every later write on `id` throw synchronously instead of returning a
+   * promise, which the interface forbids but a real implementation can do.
+   */
+  throwOnSend(id: string, error: Error): void {
+    this.assertStarted();
+    this.lookup(id).throwWith = error;
+  }
+
   private register(id: string): ConnectionState {
     this.assertStarted();
     if (this.connections.has(id)) {
@@ -117,8 +178,22 @@ export class FakeTransport implements Transport {
           if (current === undefined || !current.open) {
             return Promise.reject(new Error(`connection "${id}" is not open`));
           }
+          if (current.throwWith !== undefined) {
+            // A deliberately interface-breaking transport: the layer must
+            // contain a synchronous throw instead of letting it escape.
+            throw current.throwWith;
+          }
           current.sent.push(payload);
-          return Promise.resolve();
+          const hold = current.hold;
+          if (hold === undefined) {
+            return Promise.resolve();
+          }
+          // One-shot: a later write on the same connection is not held, so a
+          // test can let the follow-up event through while it inspects the
+          // first one.
+          current.hold = undefined;
+          hold.entered();
+          return hold.gate;
         },
         close: (code?: number, reason?: string): Promise<void> => {
           if (this.status !== 'started') {

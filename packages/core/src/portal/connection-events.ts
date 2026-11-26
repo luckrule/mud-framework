@@ -2,6 +2,7 @@ import type { Logger } from '../logging/types.ts';
 import type { Codec } from '../shared/codec.ts';
 import type { ServerEvent } from '../shared/events.ts';
 import { messageOf } from '../shared/guards.ts';
+import { settleWithin } from '../shared/timeout.ts';
 import { TRANSPORT_SEND_FAILED } from '../shared/wire-codes.ts';
 import type { ConnectionState } from './connection-admission.ts';
 import type { SessionRouter } from './session-router.ts';
@@ -28,6 +29,12 @@ export interface EventDeliveryHost {
    * delivery work.
    */
   readonly sessionTails: Map<string, Promise<void>>;
+  /**
+   * Upper bound on one event write. A transport bounds its own sends, but the
+   * layer cannot assume every implementation does: without this bound a send
+   * that never settles would pin the Session's serial slot forever (SPEC 3.8).
+   */
+  readonly sendTimeoutMs: number;
 }
 
 /**
@@ -38,6 +45,16 @@ export interface EventDeliveryHost {
 const MAX_SESSION_REDELIVERIES = 1;
 
 /**
+ * Backstop for one event write, used when the layer has no explicit option and
+ * the transport declares no usable send bound (SPEC 3.8). A transport that
+ * bounds its own sends normally settles first, so this only covers one that
+ * never settles a send: without it, such a send would pin the Session's serial
+ * slot forever, and an abort signal is not a substitute — the frame may already
+ * be on the wire.
+ */
+export const DEFAULT_EVENT_SEND_TIMEOUT_MS = 30_000;
+
+/**
  * Delivers one Server event (ADR-0008), best-effort: every failure is a warn
  * line, none is thrown, and nothing is buffered for a retry.
  *
@@ -45,8 +62,14 @@ const MAX_SESSION_REDELIVERIES = 1;
  * `send` directly. The Server sends a result and then its events on IPC, but
  * the result's reply is written by an async continuation; without the chain a
  * later IPC message could win the race and put an event in front of the
- * response it belongs to. Joining the chain also keeps two events for the same
- * connection in the order the Server emitted them.
+ * response it belongs to.
+ *
+ * Ordering between events is narrower than "the order the Server emitted them".
+ * Events addressed to the same Session are serialized by that Session's queue,
+ * so they keep emission order even across a takeover (SPEC 3.8). A
+ * connection-target event only shares its connection's ordered chain, so on one
+ * connection a connection-target event and a Session-target event are not
+ * guaranteed to appear in emission order.
  */
 export function deliverServerEvent(
   host: EventDeliveryHost,
@@ -114,7 +137,15 @@ function enqueueSessionEvent(
   return delivery;
 }
 
-type DeliveryOutcome = 'written' | 'dropped' | 'moved' | 'aborted';
+type DeliveryOutcome =
+  /** The write attempt finished: the transport accepted the frame or failed it. */
+  | 'settled'
+  /** The holder was gone when the write's turn came. */
+  | 'dropped'
+  /** The holder changed while this event waited; the caller may redeliver. */
+  | 'moved'
+  /** The connection closed before the write started. */
+  | 'aborted';
 
 /**
  * Delivers one Session event while holding that Session's serial slot. The
@@ -136,14 +167,15 @@ async function deliverSessionEvent(
     }
     // oxlint-disable-next-line eslint/no-await-in-loop -- a redelivery must observe the previous attempt before re-resolving the holder
     const outcome = await deliverOnChain(host, sessionId, state, event);
-    if (outcome === 'written' || outcome === 'dropped') {
+    if (outcome === 'settled' || outcome === 'dropped') {
       return;
     }
     if (outcome === 'aborted') {
       // The connection whose chain this event joined closed while the event
-      // still waited behind earlier work. The chain does not settle on
-      // disconnect, so waiting for the queued callback could pin the Session's
-      // serial slot forever; drop the event and let the next one proceed.
+      // was still queued behind earlier work, so nothing was written. The
+      // chain does not settle on disconnect, so waiting for the queued callback
+      // could pin the Session's serial slot forever; drop the event and let the
+      // next one proceed.
       warnDropped(
         host,
         event,
@@ -152,7 +184,7 @@ async function deliverSessionEvent(
           sessionId,
           connectionId: state.connection.id,
         },
-        'the target connection closed while the event waited',
+        'the target connection closed before the event was written',
       );
       return;
     }
@@ -171,11 +203,17 @@ async function deliverSessionEvent(
 
 /**
  * Joins the current holder's ordered chain and reports what its turn observed.
- * The write re-resolves the holder, so a takeover between queueing and
- * execution is handled here rather than by pinning the old connection. The
- * abort race is what keeps a Session queue from waiting forever on a chain that
- * was removed: `appendToChain` still runs queued work after a disconnect, but
- * only once its predecessor settles, which may never happen.
+ *
+ * Delivery has two phases, and only the first is cancellable:
+ *
+ * - **queued**: the frame has not started writing. A disconnect aborts it,
+ *   the event is dropped, and the Session's serial slot is released at once —
+ *   waiting for a chain whose connection is gone could block the queue forever.
+ * - **writing**: `send` was called. An abort no longer releases the slot: the
+ *   frame may already be on the wire, so the write's own bound (the host's
+ *   `sendTimeoutMs`) decides when it ends, and a failure is a transport
+ *   failure, not a drop. Releasing on abort here would let the next event
+ *   overtake one that is still being written (SPEC 3.8).
  */
 async function deliverOnChain(
   host: EventDeliveryHost,
@@ -188,17 +226,22 @@ async function deliverOnChain(
     return 'aborted';
   }
   const result = Promise.withResolvers<DeliveryOutcome>();
-  let cancelled = false;
+  // The phase decides whether an abort may still cancel this delivery. It is
+  // changed synchronously before the first await, so an abort that lands on
+  // the same tick as the write start cannot slip between the two.
+  let phase: 'queued' | 'writing' | 'aborted' = 'queued';
   const onAbort = (): void => {
-    cancelled = true;
-    result.resolve('aborted');
+    if (phase === 'queued') {
+      phase = 'aborted';
+      result.resolve('aborted');
+    }
   };
   signal.addEventListener('abort', onAbort, { once: true });
   try {
     const queued = host.enqueue(queuedFor, async () => {
-      // The abort race already reported this event; writing now would only
-      // target a connection that is gone.
-      if (cancelled) {
+      // The abort already reported this event; the connection is gone, so
+      // writing now would only target a connection that no longer exists.
+      if (phase === 'aborted') {
         return;
       }
       const current = holderState(host, sessionId, event);
@@ -210,8 +253,9 @@ async function deliverOnChain(
         result.resolve('moved');
         return;
       }
+      phase = 'writing';
       await writeEvent(host, current, event);
-      result.resolve('written');
+      result.resolve('settled');
     });
     // A rejected chain link must not strand the Session queue. The connection
     // chain itself already catches, so this is defensive.
@@ -309,19 +353,49 @@ async function writeEvent(
     );
     return;
   }
+  // The write is bounded here rather than by the abort signal: once the frame
+  // is handed to the transport an abort says nothing about whether it reached
+  // the wire, so the bound is the transport's own send budget. `settleWithin`
+  // also consumes a rejection, so a late failure cannot escape.
+  let pending: Promise<void>;
   try {
-    await state.connection.send(frame);
+    // Called inside `try` because a transport that throws instead of rejecting
+    // would otherwise escape and reject the delivery, which nothing awaits.
+    pending = state.connection.send(frame);
   } catch (error) {
-    host.logger.warn(
-      {
-        eventId: event.eventId,
-        event: event.event,
-        connectionId,
-        code: TRANSPORT_SEND_FAILED,
-        stage: 'send',
-        reason: messageOf(error),
-      },
-      'server event could not be sent',
-    );
+    logSendFailure(host, event, connectionId, messageOf(error));
+    return;
   }
+  const written = await settleWithin(pending, host.sendTimeoutMs);
+  if (written.status === 'timeout') {
+    logSendFailure(
+      host,
+      event,
+      connectionId,
+      `the transport did not settle the write within ${host.sendTimeoutMs}ms`,
+    );
+    return;
+  }
+  if (written.status === 'rejected') {
+    logSendFailure(host, event, connectionId, messageOf(written.error));
+  }
+}
+
+function logSendFailure(
+  host: EventDeliveryHost,
+  event: ServerEvent,
+  connectionId: string,
+  reason: string,
+): void {
+  host.logger.warn(
+    {
+      eventId: event.eventId,
+      event: event.event,
+      connectionId,
+      code: TRANSPORT_SEND_FAILED,
+      stage: 'send',
+      reason,
+    },
+    'server event could not be sent',
+  );
 }

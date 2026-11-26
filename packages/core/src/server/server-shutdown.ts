@@ -49,8 +49,8 @@ export class ServerShutdown {
     message: ShutdownMessage,
   ): void {
     this.deps.markShuttingDown();
-    // SPEC 6.3 step 1: stop accepting before draining, so the drain below has a
-    // closed set of requests and nothing new can enter the backend.
+    // Stop accepting before draining, so the drain below has a closed set of
+    // requests and nothing new can enter the backend (SPEC 6.3 step 1).
     const budgetMs = message.timeoutMs;
     this.deps.logger.info(
       { pendingRequests: runner.running, budgetMs },
@@ -73,14 +73,13 @@ export class ServerShutdown {
     limitMs: number,
   ): Promise<void> {
     const startedAt = performance.now();
-    // SPEC 6.3 steps 2-3: every accepted request settles to a terminal state,
-    // bounded by the per-request timeout the dispatcher already enforces, and
-    // its result still goes out before `closed`. Step 4 closes the backend
-    // before announcing, so Portal never restarts a Server whose storage is
-    // still open.
+    // Every accepted request settles to a terminal state, bounded by the
+    // per-request timeout the dispatcher already enforces, and its result still
+    // goes out before `closed`. Storage closes before `closed` is announced, so
+    // Portal never restarts a Server whose backend is still open.
     await this.drainAndClose(runtime, runner, limitMs);
     this.deps.sendQuietly({ type: 'closed', reason: 'shutdown' }, 'closed');
-    // Step 5: the link itself goes last, after the final message.
+    // The link itself goes last, after the final message.
     this.deps.channel.close('shutdown complete');
     this.deps.logger.info(
       { durationMs: elapsedMs(startedAt) },
@@ -109,7 +108,7 @@ export class ServerShutdown {
   }
 
   /**
-   * Closes the backend, which is mandatory (SPEC 6.3 step 4), but bounded: a
+   * Closes the backend, which is mandatory (SPEC 6.3 step 3), but bounded: a
    * backend that waits for its queue would otherwise keep `closed` from ever
    * being sent when a handler never returns. The wait is abandoned, not the
    * close: the call is still made and its own failure is still logged.
