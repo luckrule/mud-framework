@@ -22,7 +22,7 @@
     "prepare": "git config core.hooksPath .githooks || true"
   },
   "devDependencies": {
-    "bun-types": "1.4.5",
+    "@types/bun": "1.4.5",
     "mud-framework-connector-ws": "workspace:*",
     "mud-framework-core": "workspace:*",
     "mud-framework-storage-sqlite": "workspace:*",

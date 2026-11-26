@@ -6,7 +6,7 @@
 
 ## 决定
 
-锁定单一 Bun 版本，三处一致：`.bun-version`、`package.json` 的 `engines`、`bun-types`；具体版本以 `.bun-version` 为准。
+锁定单一 Bun 版本，三处一致：`.bun-version`、`package.json` 的 `engines`、`@types/bun`；具体版本以 `.bun-version` 为准。
 
 用内置能力替代外部依赖，不引入运行时 npm 依赖：
 
