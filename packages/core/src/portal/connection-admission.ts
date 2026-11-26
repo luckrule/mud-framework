@@ -1,3 +1,4 @@
+import { CONNECTION_LIMIT_CLOSE_CODE } from '../shared/close-codes.ts';
 import { messageOf } from '../shared/guards.ts';
 import {
   FRAMEWORK_QUEUE_FULL,
@@ -126,7 +127,10 @@ async function closeRefused(
   connection: TransportConnection,
 ): Promise<void> {
   try {
-    await connection.close(1013, 'connection limit reached');
+    await connection.close(
+      CONNECTION_LIMIT_CLOSE_CODE,
+      'connection limit reached',
+    );
   } catch (error) {
     host.logger.warn(
       { connectionId: connection.id, reason: messageOf(error) },

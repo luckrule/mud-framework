@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 
+import { CONNECTION_LIMIT_CLOSE_CODE } from '../shared/close-codes.ts';
 import { sessionHarness } from '../testing/connection-layer.ts';
 
 describe('ConnectionLayer connection admission (SPEC 6.1)', () => {
@@ -12,8 +13,9 @@ describe('ConnectionLayer connection admission (SPEC 6.1)', () => {
     transport.connect('c1');
     transport.connect('c2');
 
+    // SPEC 6.1 mandates 1013 here; the constant names it.
     expect(transport.closedWith('c2')).toEqual({
-      code: 1013,
+      code: CONNECTION_LIMIT_CLOSE_CODE,
       reason: 'connection limit reached',
     });
     // The refused connection never reaches the executor or receives a frame.

@@ -161,6 +161,44 @@ describe('IpcExecutor replay', () => {
     await h.executor.close();
   });
 
+  test('logs the original receive time with the replay count', async () => {
+    const h = harness({ timeoutMs: 5000 });
+    const before = Date.now();
+    const first = await started(h);
+
+    const outcomePromise = h.executor.execute(
+      request({ requestId: 'req-1', sessionId: 's1' }),
+    );
+
+    first.crash();
+    await flushTicks();
+    const second = serverAt(h, 1);
+    second.send(readyMessage());
+    await flushTicks();
+
+    const replayed = h.logs().find((line) => line.msg === 'request replayed');
+    expect(replayed?.replayCount).toBe(1);
+    expect(typeof replayed?.durationMs).toBe('number');
+
+    // Absolute epoch milliseconds, not the relative `durationMs`: it falls in
+    // the window the request was accepted in, which is what lets the two
+    // processes align their logs on the original receipt (SPEC 7.3).
+    const receivedAt = replayed?.receivedAt;
+    if (typeof receivedAt !== 'number') {
+      throw new Error('expected the replay log to carry a numeric receivedAt');
+    }
+    expect(receivedAt).toBeGreaterThan(1_000_000_000_000);
+    expect(receivedAt).toBeGreaterThanOrEqual(before);
+    expect(receivedAt).toBeLessThanOrEqual(Date.now());
+
+    second.send(successMessage('req-1', 'after restart'));
+    expect(await outcomePromise).toEqual({
+      ok: true,
+      result: 'after restart',
+    });
+    await h.executor.close();
+  });
+
   test('resumes the flush after a mid-flush delivery failure', async () => {
     const h = harness({ timeoutMs: 5000 });
     const startPromise = h.executor.start();

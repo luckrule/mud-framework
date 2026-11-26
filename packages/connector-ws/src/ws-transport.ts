@@ -10,6 +10,12 @@ import type {
 } from 'mud-framework-core';
 
 import {
+  HANDLER_FAILED_CLOSE_CODE,
+  SEND_BACKLOG_CLOSE_CODE,
+  TRANSPORT_STOPPED_CLOSE_CODE,
+  UNKNOWN_CONNECTION_CLOSE_CODE,
+} from './close-codes.ts';
+import {
   SendQueue,
   assertPositiveInteger,
   payloadBytes,
@@ -217,7 +223,7 @@ export class WsTransport implements Transport {
       // Settle queued promises before the socket goes away; otherwise `stop`
       // would leave callers waiting on a connection that no longer exists.
       state.queue.fail(new Error(`connection "${state.connection.id}" closed`));
-      state.ws?.close(1001, 'transport stopped');
+      state.ws?.close(TRANSPORT_STOPPED_CLOSE_CODE, 'transport stopped');
     }
     const server = this.server;
     this.server = undefined;
@@ -400,7 +406,7 @@ export class WsTransport implements Transport {
       },
       'send queue overflow; closing connection',
     );
-    closeQuietly(state.ws, 1013, 'send queue full');
+    closeQuietly(state.ws, SEND_BACKLOG_CLOSE_CODE, 'send queue full');
   }
 
   private handleError(error: Error, ws: Bun.ServerWebSocket<WsData>): void {
@@ -422,7 +428,7 @@ export class WsTransport implements Transport {
         }),
       );
     }
-    closeQuietly(ws, 1011, 'websocket handler failed');
+    closeQuietly(ws, HANDLER_FAILED_CLOSE_CODE, 'websocket handler failed');
   }
 
   private handleHandlerFailure(state: ConnectionState, error: Error): void {
@@ -441,7 +447,7 @@ export class WsTransport implements Transport {
         { cause: error },
       ),
     );
-    closeQuietly(state.ws, 1011, 'handler failed');
+    closeQuietly(state.ws, HANDLER_FAILED_CLOSE_CODE, 'handler failed');
   }
 
   /**
@@ -460,7 +466,7 @@ export class WsTransport implements Transport {
       },
       'websocket event for unknown connection; closing socket',
     );
-    closeQuietly(ws, 1011, 'unknown connection');
+    closeQuietly(ws, UNKNOWN_CONNECTION_CLOSE_CODE, 'unknown connection');
   }
 
   private createConnection(id: string, queue: SendQueue): TransportConnection {

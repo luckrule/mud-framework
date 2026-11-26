@@ -16,7 +16,10 @@ export interface PendingRequest {
    * per-connection map that would never shrink.
    */
   readonly globalSeq: number;
-  /** When the Portal accepted the request; the deadline is measured from here. */
+  /**
+   * When the Portal accepted the request; the deadline is measured from here.
+   * Also the replay log's `receivedAt` (SPEC 7.3).
+   */
   readonly startedAt: number;
   readonly resolve: (outcome: ExecutorOutcome) => void;
   replayCount: number;

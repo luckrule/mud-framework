@@ -153,6 +153,9 @@ export class DeliveryLedger {
         {
           ...requestLogFields(pending.request),
           replayCount,
+          // Absolute receive time so the two processes' logs can be aligned;
+          // `durationMs` answers "how long" instead (SPEC 7.3).
+          receivedAt: pending.startedAt,
           durationMs: Date.now() - pending.startedAt,
         },
         'request replayed',
