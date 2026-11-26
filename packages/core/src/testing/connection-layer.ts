@@ -291,6 +291,8 @@ export function sessionHarness(
   options: {
     maxConnections?: number;
     maxQueuedPerConnection?: number;
+    maxQueuedEvents?: number;
+    maxQueuedEventBytes?: number;
     createRequestId?: () => string;
     sessionOf?: (method: string) => string | undefined;
     changeOf?: (method: string) => SessionChange | undefined;
@@ -320,6 +322,8 @@ export function sessionHarness(
     logger,
     maxConnections: options.maxConnections,
     maxQueuedPerConnection: options.maxQueuedPerConnection,
+    maxQueuedEvents: options.maxQueuedEvents,
+    maxQueuedEventBytes: options.maxQueuedEventBytes,
     createRequestId: options.createRequestId,
     eventSendTimeoutMs: options.eventSendTimeoutMs,
     shutdownTimeoutMs: options.shutdownTimeoutMs,

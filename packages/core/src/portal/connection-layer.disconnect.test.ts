@@ -219,7 +219,8 @@ describe('ConnectionLayer disconnect', () => {
     );
     transport.connect('c1');
 
-    // Queued behind the chain, so the disconnect wins the race to start it.
+    // Queued behind the current request work, so the disconnect wins the race
+    // to start it.
     const inFlight = transport.receive('c1', '{"id":"r1","method":"echo"}');
     await transport.disconnect('c1', 'client left');
     await inFlight;

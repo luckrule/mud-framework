@@ -18,7 +18,7 @@ import type { SessionRouter } from './session-router.ts';
 /**
  * What request handling needs from the layer: the admission view plus the three
  * collaborators a request touches (id minting, Session routing, execution).
- * `enqueue` is passed in so the connection's ordered chain has one owner.
+ * `enqueue` is passed in so the connection writer's request queue has one owner.
  */
 export interface RequestHost extends AdmissionHost {
   readonly createRequestId: () => string;
@@ -213,8 +213,8 @@ async function handle(
     // SPEC 2: a Session change a handler declared takes effect only when the
     // request succeeded, so a failed login leaves no route behind. Applied
     // before the reply so a reconnect sees the new holder as soon as the client
-    // can, and so the reply itself is part of the chain a later handoff waits
-    // for.
+    // can, and so the reply itself is part of the request work a later handoff
+    // waits for.
     //
     // Skipped once the connection is gone: `onDisconnect` already removed its
     // route, and re-adding one here would route a future reconnect to a

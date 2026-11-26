@@ -20,6 +20,9 @@ function stubExecutor(health: () => ExecutorHealth): RequestExecutor {
 
 const READY: ExecutorHealth = { state: 'ready', ready: true };
 
+/** No event buffer holds a frame in these cases. */
+const EMPTY_BACKLOG = { connections: 0, frames: 0, bytes: 0, dropped: 0 };
+
 describe('ConnectionLayer health', () => {
   test('reports an idle snapshot before start', () => {
     const layer = new ConnectionLayer({
@@ -33,6 +36,7 @@ describe('ConnectionLayer health', () => {
       listening: false,
       connections: 0,
       executor: { state: 'ready', ready: true },
+      eventBacklog: EMPTY_BACKLOG,
     });
   });
 
@@ -54,6 +58,7 @@ describe('ConnectionLayer health', () => {
       listening: false,
       connections: 0,
       executor: { state: 'ready', ready: true },
+      eventBacklog: EMPTY_BACKLOG,
     });
     gate.resolve();
     await starting;
@@ -76,6 +81,7 @@ describe('ConnectionLayer health', () => {
       listening: true,
       connections: 2,
       executor: { state: 'ready', ready: true },
+      eventBacklog: EMPTY_BACKLOG,
     });
 
     await transport.disconnect('c1');
@@ -99,6 +105,7 @@ describe('ConnectionLayer health', () => {
       listening: true,
       connections: 0,
       executor: { state: 'recovering', ready: false },
+      eventBacklog: EMPTY_BACKLOG,
     });
 
     await layer.stop();
@@ -128,6 +135,7 @@ describe('ConnectionLayer health', () => {
         listening: true,
         connections: 0,
         executor: { state: 'unknown', ready: false },
+        eventBacklog: EMPTY_BACKLOG,
       });
     }
     expect(lines).toEqual([]);
@@ -168,6 +176,7 @@ describe('ConnectionLayer health', () => {
       listening: false,
       connections: 0,
       executor: { state: 'ready', ready: true },
+      eventBacklog: EMPTY_BACKLOG,
     });
 
     await stopping;
@@ -177,6 +186,7 @@ describe('ConnectionLayer health', () => {
       listening: false,
       connections: 0,
       executor: { state: 'ready', ready: true },
+      eventBacklog: EMPTY_BACKLOG,
     });
   });
 });

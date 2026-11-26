@@ -108,6 +108,7 @@ export type {
   ConnectionHealth,
   ConnectionHealthState,
 } from './portal/health.ts';
+export type { EventBacklogSnapshot } from './portal/event-backlog.ts';
 export { ConnectionLayer } from './portal/connection-layer.ts';
 export type { IpcExecutorOptions } from './portal/executor/ipc-executor-options.ts';
 export { IpcExecutor } from './portal/executor/ipc-executor.ts';

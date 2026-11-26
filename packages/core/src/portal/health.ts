@@ -4,6 +4,7 @@ import type {
   RequestExecutor,
 } from '../shared/executor.ts';
 import { isRecord } from '../shared/guards.ts';
+import type { EventBacklogSnapshot } from './event-backlog.ts';
 
 export type ConnectionHealthState =
   | 'idle'
@@ -24,6 +25,12 @@ export interface ConnectionHealth {
   readonly listening: boolean;
   readonly connections: number;
   readonly executor: ExecutorHealth;
+  /**
+   * Event buffers across every connection and Session (SPEC 6.6). `dropped` is
+   * cumulative and counts overflow only, so a probe can tell sustained
+   * backpressure from the one-off discard line a shutdown produces.
+   */
+  readonly eventBacklog: EventBacklogSnapshot;
 }
 
 export type ConnectionLayerStatus =
@@ -64,12 +71,13 @@ export function connectionHealthSnapshot(
   status: ConnectionLayerStatus,
   connections: number,
   executor: ExecutorHealth,
+  eventBacklog: EventBacklogSnapshot,
 ): ConnectionHealth {
   const listening = status === 'started';
   const ready = listening && executor.ready;
   const state: ConnectionHealthState =
     status === 'started' ? (ready ? 'ready' : 'degraded') : status;
-  return { state, ready, listening, connections, executor };
+  return { state, ready, listening, connections, executor, eventBacklog };
 }
 
 function isExecutorHealth(value: unknown): value is ExecutorHealth {

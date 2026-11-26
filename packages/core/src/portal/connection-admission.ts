@@ -6,6 +6,8 @@ import {
 import type { TransportConnection } from '../transport/types.ts';
 import type { ReplyHost } from './connection-reply.ts';
 import { reply } from './connection-reply.ts';
+import { ConnectionWriter } from './connection-writer.ts';
+import type { EventBacklog } from './event-backlog.ts';
 import type { ConnectionLayerStatus } from './health.ts';
 
 /**
@@ -25,10 +27,30 @@ export const DEFAULT_MAX_QUEUED_PER_CONNECTION = 1000;
  */
 export const DEFAULT_MAX_CONNECTIONS = 10_000;
 
+/**
+ * SPEC 3.8: events allowed to wait in one buffer before new events are dropped.
+ * The same bound applies to each connection's event queue and each Session's
+ * pending queue. 1024 covers a burst a healthy transport is still draining while
+ * capping the memory one slow reader can pin; events are best-effort, so a
+ * deeper backlog is better dropped than buffered.
+ */
+export const DEFAULT_MAX_QUEUED_EVENTS = 1024;
+
+/**
+ * SPEC 3.8: byte side of the same bound. 4 MiB matches the frame cap's order of
+ * magnitude: a client that cannot drain a few MiB of events is not going to
+ * catch up, and unbounded growth is exactly the failure INV-020 forbids.
+ */
+export const DEFAULT_MAX_QUEUED_EVENT_BYTES = 4 * 1024 * 1024;
+
 export interface ConnectionState {
   readonly connection: TransportConnection;
-  /** Tail of this connection's work chain; see `appendToChain`. */
-  chain: Promise<unknown>;
+  /**
+   * The connection's single writer (SPEC 3.8): request work runs first, one
+   * queued event follows each completed request, and events fill the idle
+   * moments between requests. Ordering state is per connection.
+   */
+  readonly writer: ConnectionWriter;
   /**
    * Requests accepted on this connection that are waiting for their turn,
    * excluding the one executing. The SPEC 3.5 cap is about this backlog: a
@@ -55,6 +77,10 @@ export interface AdmissionHost extends ReplyHost {
   readonly connections: Map<string, ConnectionState>;
   readonly maxConnections: number;
   readonly maxQueuedPerConnection: number;
+  readonly maxQueuedEvents: number;
+  readonly maxQueuedEventBytes: number;
+  /** Layer-wide event totals the new connection's queue reports to. */
+  readonly backlog: EventBacklog;
 }
 
 export function onConnect(
@@ -80,7 +106,12 @@ export function onConnect(
   }
   const state: ConnectionState = {
     connection,
-    chain: Promise.resolve(),
+    writer: new ConnectionWriter({
+      maxQueuedEvents: host.maxQueuedEvents,
+      maxQueuedEventBytes: host.maxQueuedEventBytes,
+      backlog: host.backlog,
+      logger: host.logger,
+    }),
     queued: 0,
     inFlight: new Set(),
     closed: new AbortController(),
@@ -102,25 +133,6 @@ async function closeRefused(
       'refused connection could not be closed',
     );
   }
-}
-
-/**
- * Appends work to the connection's ordered chain. Per-connection rather than
- * global: requests on one connection must observe their predecessor's writes
- * (SPEC 3.1), while different connections must stay concurrent (SPEC 3.2).
- * Awaiting the previous tail also makes a request that timed out release the
- * next one immediately, because the executor settles at the timeout, not at
- * handler return.
- */
-export function appendToChain(
-  state: ConnectionState,
-  work: () => Promise<void>,
-): Promise<void> {
-  const next = state.chain.then(work);
-  // The chain must survive a rejected link, otherwise one failure would poison
-  // every later request on this connection.
-  state.chain = next.catch(() => undefined);
-  return next;
 }
 
 export function refuseQueue(

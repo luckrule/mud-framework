@@ -74,6 +74,44 @@ describe('ConnectionLayer option validation', () => {
     expect(() => createLayer({ maxQueuedPerConnection: 1 })).not.toThrow();
   });
 
+  test('rejects maxQueuedEvents that is not a positive integer, and accepts 1', () => {
+    const invalid: readonly [unknown, typeof RangeError | typeof TypeError][] =
+      [
+        [0, RangeError],
+        [-1, RangeError],
+        [1.5, RangeError],
+        [Number.NaN, RangeError],
+        [Number.POSITIVE_INFINITY, RangeError],
+        ['5', TypeError],
+      ];
+    for (const [value, Expected] of invalid) {
+      const call = () => createLayer({ maxQueuedEvents: value as number });
+      expect(call).toThrow(Expected);
+      expect(call).toThrow(/maxQueuedEvents/);
+      expect(call).toThrow(new RegExp(String(value)));
+    }
+    expect(() => createLayer({ maxQueuedEvents: 1 })).not.toThrow();
+  });
+
+  test('rejects maxQueuedEventBytes that is not a positive integer, and accepts 1', () => {
+    const invalid: readonly [unknown, typeof RangeError | typeof TypeError][] =
+      [
+        [0, RangeError],
+        [-1, RangeError],
+        [1.5, RangeError],
+        [Number.NaN, RangeError],
+        [Number.POSITIVE_INFINITY, RangeError],
+        ['5', TypeError],
+      ];
+    for (const [value, Expected] of invalid) {
+      const call = () => createLayer({ maxQueuedEventBytes: value as number });
+      expect(call).toThrow(Expected);
+      expect(call).toThrow(/maxQueuedEventBytes/);
+      expect(call).toThrow(new RegExp(String(value)));
+    }
+    expect(() => createLayer({ maxQueuedEventBytes: 1 })).not.toThrow();
+  });
+
   test('rejects shutdownTimeoutMs below 1, NaN or Infinity, and accepts 1', () => {
     const invalid: readonly [unknown, typeof RangeError | typeof TypeError][] =
       [

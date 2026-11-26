@@ -88,7 +88,7 @@ export interface RequestExecutor {
   /**
    * MUST settle within the request deadline, never hang, and MUST NOT throw:
    * every failure is returned as `{ok: false, error}`. The connection layer
-   * advances a connection's ordered chain only when this promise settles, so a
+   * serializes request work per connection and waits for this promise, so a
    * call that never settles because the other side died would stall every later
    * request on that connection (SPEC 3.1, 3.4).
    */

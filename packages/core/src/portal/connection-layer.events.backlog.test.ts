@@ -1,0 +1,579 @@
+import { describe, expect, test } from 'bun:test';
+import { Buffer } from 'node:buffer';
+
+import type { ServerEvent } from '../shared/events.ts';
+import { parseFrame, sleep, tick } from '../testing/common.ts';
+import { sessionHarness } from '../testing/connection-layer.ts';
+
+function connectionEvent(eventId: string, payload: unknown = 'x'): ServerEvent {
+  return {
+    eventId,
+    target: { kind: 'connection', connectionId: 'c1' },
+    event: 'note',
+    payload,
+  };
+}
+
+function sessionEvent(eventId: string, payload: unknown): ServerEvent {
+  return {
+    eventId,
+    target: { kind: 'session', sessionId: 's1' },
+    event: 'note',
+    payload,
+  };
+}
+
+function dropLines(
+  lines: Record<string, unknown>[],
+): Record<string, unknown>[] {
+  return lines.filter((line) => line.code === 'EVENT_DROPPED');
+}
+
+function frameLabels(frames: readonly (string | Uint8Array)[]): unknown[] {
+  return frames.map(parseFrame).map((frame) => frame.id ?? frame.eventId);
+}
+
+describe('ConnectionLayer event backlog bounds', () => {
+  test('drops a new event at the frame bound without failing a request', async () => {
+    const h = sessionHarness({
+      maxQueuedEvents: 2,
+      maxQueuedEventBytes: 1_000_000,
+    });
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+
+    // The first event is on the wire but not settled (counted until it is);
+    // everything after it competes for the remaining slot.
+    const held = h.transport.holdSends('c1');
+    h.controlled.emit(connectionEvent('e:0'));
+    h.controlled.emit(connectionEvent('e:1'));
+    h.controlled.emit(connectionEvent('e:2'));
+    await held.entered;
+    h.controlled.emit(connectionEvent('e:3'));
+    await tick();
+
+    const drops = dropLines(h.logs());
+    expect(drops.map((line) => line.eventId)).toEqual(['e:2', 'e:3']);
+    expect(drops[0]).toMatchObject({
+      event: 'note',
+      targetKind: 'connection',
+      connectionId: 'c1',
+      reason: 'backlog',
+      queuedEvents: 2,
+      maxQueuedEvents: 2,
+      maxQueuedEventBytes: 1_000_000,
+    });
+    expect(typeof drops[0]?.queuedEventBytes).toBe('number');
+
+    // The event channel is additional: the request still succeeds, and the
+    // events that fit are still written in order.
+    held.release();
+    await tick();
+    await h.transport.receive('c1', '{"id":"r1","method":"work"}');
+    await tick();
+
+    expect(frameLabels(h.transport.sentTo('c1'))).toEqual([
+      'bind',
+      'e:0',
+      'e:1',
+      'r1',
+    ]);
+  });
+
+  test('drops a new event at the byte bound and reports the frame wire size', async () => {
+    // Non-ASCII payload: its UTF-8 wire size is larger than its code-unit
+    // length, so the charged size must follow the bytes the transport sends.
+    const payload = '洞穴';
+    const frameBytes = Buffer.byteLength(
+      JSON.stringify({
+        kind: 'event',
+        eventId: 'e:0',
+        event: 'note',
+        payload,
+      }),
+      'utf8',
+    );
+    const h = sessionHarness({
+      maxQueuedEvents: 100,
+      maxQueuedEventBytes: frameBytes * 2,
+    });
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+
+    const held = h.transport.holdSends('c1');
+    h.controlled.emit(connectionEvent('e:0', payload));
+    h.controlled.emit(connectionEvent('e:1', payload));
+    h.controlled.emit(connectionEvent('e:2', payload));
+    await held.entered;
+
+    const drops = dropLines(h.logs());
+    expect(drops.map((line) => line.eventId)).toEqual(['e:2']);
+    expect(drops[0]).toMatchObject({
+      reason: 'backlog',
+      queuedEvents: 2,
+      queuedEventBytes: frameBytes * 2,
+      maxQueuedEventBytes: frameBytes * 2,
+    });
+
+    held.release();
+    await tick();
+    expect(frameLabels(h.transport.sentTo('c1'))).toEqual([
+      'bind',
+      'e:0',
+      'e:1',
+    ]);
+  });
+
+  test('bounds the Session pending queue separately and names its target', async () => {
+    const payload = { text: 'held' };
+    const frameBytes = Buffer.byteLength(
+      JSON.stringify({
+        kind: 'event',
+        eventId: 'e:1',
+        event: 'note',
+        payload,
+      }),
+      'utf8',
+    );
+    const h = sessionHarness({
+      maxQueuedEvents: 2,
+      maxQueuedEventBytes: 1_000_000,
+    });
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+
+    // e:0 is handed to c1's connection queue and held there; e:1 and e:2 fill
+    // the Session's own queue, so e:3 is the one the Session bound refuses.
+    const held = h.transport.holdSends('c1');
+    h.controlled.emit(sessionEvent('e:0', payload));
+    h.controlled.emit(sessionEvent('e:1', payload));
+    h.controlled.emit(sessionEvent('e:2', payload));
+    h.controlled.emit(sessionEvent('e:3', payload));
+    await held.entered;
+    await tick();
+
+    const drops = dropLines(h.logs());
+    expect(drops.map((line) => line.eventId)).toEqual(['e:3']);
+    expect(drops[0]).toMatchObject({
+      targetKind: 'session',
+      sessionId: 's1',
+      reason: 'backlog',
+      queuedEvents: 2,
+      queuedEventBytes: frameBytes * 2,
+      maxQueuedEvents: 2,
+      maxQueuedEventBytes: 1_000_000,
+    });
+
+    held.release();
+    await tick();
+    await tick();
+    expect(frameLabels(h.transport.sentTo('c1'))).toEqual([
+      'bind',
+      'e:0',
+      'e:1',
+      'e:2',
+    ]);
+  });
+
+  test('drops a Session event at the Session byte bound and keeps the request working', async () => {
+    // CJK payload: the UTF-8 frame is larger than its code-unit length, so only
+    // a byte-based bound can be the one that trips here.
+    const payload = { text: '洞窟洞窟' };
+    const frameBytes = Buffer.byteLength(
+      JSON.stringify({
+        kind: 'event',
+        eventId: 'e:1',
+        event: 'note',
+        payload,
+      }),
+      'utf8',
+    );
+    const h = sessionHarness({
+      maxQueuedEvents: 100,
+      maxQueuedEventBytes: frameBytes * 2,
+    });
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+
+    // e:0 is held on c1's connection queue; e:1 and e:2 fill the Session queue
+    // to its byte bound, so e:3 is refused by bytes, not by frame count.
+    const held = h.transport.holdSends('c1');
+    h.controlled.emit(sessionEvent('e:0', payload));
+    h.controlled.emit(sessionEvent('e:1', payload));
+    h.controlled.emit(sessionEvent('e:2', payload));
+    h.controlled.emit(sessionEvent('e:3', payload));
+    await held.entered;
+    await tick();
+
+    const drops = dropLines(h.logs());
+    expect(drops.map((line) => line.eventId)).toEqual(['e:3']);
+    expect(drops[0]).toMatchObject({
+      targetKind: 'session',
+      sessionId: 's1',
+      reason: 'backlog',
+      queuedEvents: 2,
+      queuedEventBytes: frameBytes * 2,
+      maxQueuedEvents: 100,
+      maxQueuedEventBytes: frameBytes * 2,
+    });
+    expect(h.layer.health().eventBacklog.dropped).toBe(1);
+
+    // The event channel is additional: a refused Session event changes nothing
+    // about the request path.
+    held.release();
+    await tick();
+    await h.transport.receive('c1', '{"id":"r1","method":"work"}');
+    await tick();
+    await tick();
+    expect(frameLabels(h.transport.sentTo('c1'))).toEqual([
+      'bind',
+      'e:0',
+      'e:1',
+      'e:2',
+      'r1',
+    ]);
+  });
+
+  test('reports every event buffer and counts only overflow drops as dropped', async () => {
+    const payload = { text: 'held' };
+    const frameBytes = Buffer.byteLength(
+      JSON.stringify({
+        kind: 'event',
+        eventId: 'e:0',
+        event: 'note',
+        payload,
+      }),
+      'utf8',
+    );
+    const h = sessionHarness({
+      maxQueuedEvents: 2,
+      maxQueuedEventBytes: 1_000_000,
+    });
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+
+    expect(h.layer.health().eventBacklog).toEqual({
+      connections: 0,
+      frames: 0,
+      bytes: 0,
+      dropped: 0,
+    });
+
+    const held = h.transport.holdSends('c1');
+    h.controlled.emit(sessionEvent('e:0', payload));
+    h.controlled.emit(sessionEvent('e:1', payload));
+    h.controlled.emit(sessionEvent('e:2', payload));
+    await held.entered;
+
+    // e:0 is in c1's connection queue (one writing frame), e:1 and e:2 are
+    // still in the Session's own queue: the Session contributes frames and
+    // bytes but cannot make a connection's queue look non-empty.
+    expect(h.layer.health().eventBacklog).toEqual({
+      connections: 1,
+      frames: 3,
+      bytes: frameBytes * 3,
+      dropped: 0,
+    });
+
+    h.controlled.emit(sessionEvent('e:3', payload));
+    expect(h.layer.health().eventBacklog).toEqual({
+      connections: 1,
+      frames: 3,
+      bytes: frameBytes * 3,
+      dropped: 1,
+    });
+
+    // A target that is simply gone is not backpressure: it must not move the
+    // overflow counter a probe watches.
+    h.controlled.emit({
+      eventId: 'e:lost',
+      target: { kind: 'connection', connectionId: 'nobody' },
+      event: 'note',
+      payload,
+    });
+    expect(h.layer.health().eventBacklog.dropped).toBe(1);
+
+    held.release();
+    await tick();
+    await tick();
+    await tick();
+    expect(h.layer.health().eventBacklog).toEqual({
+      connections: 0,
+      frames: 0,
+      bytes: 0,
+      dropped: 1,
+    });
+  });
+
+  test('keeps counting a queue whose connection was already removed', async () => {
+    const h = sessionHarness();
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+
+    const held = h.transport.holdSends('c1');
+    h.controlled.emit(connectionEvent('e:0'));
+    await held.entered;
+    await h.transport.disconnect('c1');
+
+    // The connection is gone from the admission table, but a frame it accepted
+    // is still in flight: dropping it from the total would under-report the
+    // memory the layer still holds.
+    expect(h.layer.health().eventBacklog).toMatchObject({
+      connections: 1,
+      frames: 1,
+      dropped: 0,
+    });
+
+    held.release();
+    await tick();
+    await tick();
+    expect(h.layer.health().eventBacklog).toEqual({
+      connections: 0,
+      frames: 0,
+      bytes: 0,
+      dropped: 0,
+    });
+  });
+
+  test('reports one discard summary at shutdown and keeps it out of dropped', async () => {
+    const payload = { text: 'held' };
+    const frameBytes = Buffer.byteLength(
+      JSON.stringify({ kind: 'event', eventId: 'e:1', event: 'note', payload }),
+      'utf8',
+    );
+    const h = sessionHarness({ maxQueuedEvents: 100 });
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+
+    // e:0 is being written, e:1 waits in the Session queue and e:2 waits in
+    // c1's connection queue: two of the three buffers hold unwritten frames.
+    const held = h.transport.holdSends('c1');
+    h.controlled.emit(sessionEvent('e:0', payload));
+    h.controlled.emit(sessionEvent('e:1', payload));
+    h.controlled.emit(connectionEvent('e:2', payload));
+    await held.entered;
+
+    await h.layer.stop();
+
+    const summary = h
+      .logs()
+      .filter((line) => line.code === 'EVENT_BACKLOG_DISCARDED');
+    expect(summary).toHaveLength(1);
+    expect(summary[0]).toMatchObject({
+      reason: 'shutdown',
+      count: 2,
+      connections: 1,
+      frames: 2,
+      bytes: frameBytes * 2,
+    });
+    expect(dropLines(h.logs())).toEqual([]);
+    // A rolling restart must not look like runtime backpressure to a probe.
+    expect(h.layer.health().eventBacklog.dropped).toBe(0);
+
+    held.release();
+    await tick();
+    await tick();
+    expect(h.layer.health().eventBacklog).toEqual({
+      connections: 0,
+      frames: 0,
+      bytes: 0,
+      dropped: 0,
+    });
+  });
+
+  test('a frame dropped on disconnect does not reach the shutdown summary', async () => {
+    const h = sessionHarness({ maxQueuedEvents: 100 });
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+
+    // e:0 is on the wire; e:1 is still queued when the client leaves. The
+    // queued frame is a disconnect drop, so by the time the layer stops there
+    // is nothing left for the shutdown discard to report: one frame is
+    // accounted for exactly once.
+    const held = h.transport.holdSends('c1');
+    h.controlled.emit(connectionEvent('e:0'));
+    h.controlled.emit(connectionEvent('e:1'));
+    await held.entered;
+    await h.transport.disconnect('c1');
+    await tick();
+
+    expect(dropLines(h.logs()).map((line) => line.eventId)).toEqual(['e:1']);
+
+    await h.layer.stop();
+
+    expect(
+      h.logs().filter((line) => line.code === 'EVENT_BACKLOG_DISCARDED'),
+    ).toEqual([]);
+    // A disconnect drop is not backpressure either.
+    expect(h.layer.health().eventBacklog.dropped).toBe(0);
+
+    held.release();
+    await tick();
+    await tick();
+  });
+
+  test('drops a queued connection event when its connection closes before the write', async () => {
+    const h = sessionHarness();
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+
+    // e:0 is handed to the transport; e:1 waits behind it in the queue.
+    const held = h.transport.holdSends('c1');
+    h.controlled.emit(connectionEvent('e:0'));
+    h.controlled.emit(connectionEvent('e:1'));
+    await held.entered;
+
+    await h.transport.disconnect('c1');
+    held.release();
+    await tick();
+    await tick();
+
+    // The queued frame targets a closed connection, so it is a drop, exactly
+    // as for a Session target; only the frame already on the wire can fail as
+    // a transport failure.
+    expect(
+      h.logs().filter((line) => line.code === 'TRANSPORT_SEND_FAILED'),
+    ).toEqual([]);
+    const drops = dropLines(h.logs());
+    expect(drops).toHaveLength(1);
+    expect(drops[0]).toMatchObject({
+      eventId: 'e:1',
+      event: 'note',
+      targetKind: 'connection',
+      connectionId: 'c1',
+      reason: 'the target connection closed before the event was written',
+    });
+  });
+
+  test('ignores executor dispatch that arrives after stop has unsubscribed', async () => {
+    const h = sessionHarness();
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+    const before = h.layer.health().eventBacklog;
+
+    const stopping = h.layer.stop();
+    // `doStop` unsubscribes before its first await, so a dispatch that lands
+    // afterwards never reaches the layer. This case covers that unsubscribe
+    // path only; the `acceptingEvents` guard for a delivery already in progress
+    // is not observed here.
+    expect(() => h.controlled.emit(connectionEvent('e:late'))).not.toThrow();
+    expect(() => h.controlled.emit(sessionEvent('e:late', 'x'))).not.toThrow();
+    await stopping;
+    await tick();
+    await tick();
+
+    // The transport cannot be read once stopped, so the frame count and the
+    // absence of diagnostics are the observable evidence: nothing was written
+    // and nothing was reported.
+    expect(h.layer.health().eventBacklog).toEqual(before);
+    expect(h.logs().filter((line) => line.code === 'EVENT_DROPPED')).toEqual(
+      [],
+    );
+    expect(
+      h.logs().filter((line) => line.code === 'TRANSPORT_SEND_FAILED'),
+    ).toEqual([]);
+  });
+
+  test('applies the documented defaults when no bound is passed', async () => {
+    const h = sessionHarness();
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+
+    // Observed through the overflow log, not a private field: the first frame
+    // is held on the wire and the next 1023 fill the queue to 1024, so the
+    // 1025th event is the one refused.
+    const held = h.transport.holdSends('c1');
+    h.controlled.emit(connectionEvent('e:0'));
+    for (let i = 1; i <= 1023; i += 1) {
+      h.controlled.emit(connectionEvent(`e:${i}`));
+    }
+    await held.entered;
+    expect(dropLines(h.logs())).toEqual([]);
+
+    h.controlled.emit(connectionEvent('e:1024'));
+    const drops = dropLines(h.logs());
+    expect(drops.map((line) => line.eventId)).toEqual(['e:1024']);
+    expect(drops[0]).toMatchObject({
+      reason: 'backlog',
+      queuedEvents: 1024,
+      maxQueuedEvents: 1024,
+      maxQueuedEventBytes: 4 * 1024 * 1024,
+    });
+
+    held.release();
+    await tick();
+  });
+
+  test('counts a redelivered Session event once and clears it after settlement', async () => {
+    const h = sessionHarness();
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"1","method":"bind"}');
+
+    // A hanging request occupies c1's writer, so the Session event that follows
+    // stays queued and has not started writing.
+    const hanging = h.transport.receive('c1', '{"id":"2","method":"hang"}');
+    await sleep(0);
+    h.controlled.emit(sessionEvent('e:0', 'first'));
+    await tick();
+
+    const accepted = h.layer.health().eventBacklog;
+    expect(accepted.frames).toBe(1);
+    expect(accepted.connections).toBe(1);
+    // Nothing was written: the frame is queued, not in flight.
+    expect(
+      h.transport
+        .sentTo('c1')
+        .map(parseFrame)
+        .filter((frame) => frame.kind === 'event'),
+    ).toEqual([]);
+
+    // c2 takes the Session over while e:0 still waits in c1's queue. The frame
+    // moves between buffers, so the totals must not grow.
+    h.transport.connect('c2');
+    await h.transport.receive('c2', '{"id":"3","method":"bind"}');
+    const afterTakeover = h.layer.health().eventBacklog;
+    expect(afterTakeover.frames).toBe(accepted.frames);
+    expect(afterTakeover.bytes).toBe(accepted.bytes);
+
+    // Releasing the request lets the queued frame's turn arrive: it re-resolves
+    // the holder, sees c2, and is redelivered there rather than written to c1.
+    h.controlled.release();
+    await hanging;
+    await tick();
+    await tick();
+    await tick();
+
+    expect(
+      h.transport
+        .sentTo('c2')
+        .map(parseFrame)
+        .filter((frame) => frame.kind === 'event')
+        .map((frame) => frame.payload),
+    ).toEqual(['first']);
+    expect(
+      h.transport
+        .sentTo('c1')
+        .map(parseFrame)
+        .filter((frame) => frame.kind === 'event'),
+    ).toEqual([]);
+    expect(dropLines(h.logs())).toEqual([]);
+    expect(h.layer.health().eventBacklog).toEqual({
+      connections: 0,
+      frames: 0,
+      bytes: 0,
+      dropped: 0,
+    });
+  });
+});

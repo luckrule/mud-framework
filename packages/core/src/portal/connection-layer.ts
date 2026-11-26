@@ -16,21 +16,27 @@ import type {
 import type { ConnectionState } from './connection-admission.ts';
 import {
   DEFAULT_MAX_CONNECTIONS,
+  DEFAULT_MAX_QUEUED_EVENTS,
+  DEFAULT_MAX_QUEUED_EVENT_BYTES,
   DEFAULT_MAX_QUEUED_PER_CONNECTION,
-  appendToChain,
   onConnect as admitConnection,
   onDisconnect as disconnectConnection,
 } from './connection-admission.ts';
-import type { EventDeliveryHost } from './connection-events.ts';
+import type {
+  EventDeliveryHost,
+  SessionEventQueue,
+} from './connection-events.ts';
 import {
   DEFAULT_EVENT_SEND_TIMEOUT_MS,
   deliverServerEvent,
+  discardSessionQueues,
 } from './connection-events.ts';
 import type { RequestHost } from './connection-request.ts';
 import {
   cancelQuietly,
   onMessage as receiveMessage,
 } from './connection-request.ts';
+import { EventBacklog } from './event-backlog.ts';
 import type { ConnectionHealth, ConnectionLayerStatus } from './health.ts';
 import { connectionHealthSnapshot, readExecutorHealth } from './health.ts';
 import { SessionRouter } from './session-router.ts';
@@ -77,6 +83,19 @@ export interface ConnectionLayerOptions {
    */
   maxQueuedPerConnection?: number;
   /**
+   * Server events allowed to wait in one event buffer (SPEC 3.8). The bound
+   * applies to each connection's event queue and to each Session's pending
+   * queue separately, not to a per-connection total. Defaults to
+   * `DEFAULT_MAX_QUEUED_EVENTS`. Must be a positive integer.
+   */
+  maxQueuedEvents?: number;
+  /**
+   * The same bound in encoded frame bytes (SPEC 3.8), with the same per-queue
+   * scope. Defaults to `DEFAULT_MAX_QUEUED_EVENT_BYTES`. Must be a positive
+   * integer.
+   */
+  maxQueuedEventBytes?: number;
+  /**
    * Ceiling on each shutdown wait: draining in-flight requests, closing the
    * executor and stopping the transport (SPEC 6.3). Defaults to
    * `DEFAULT_STOP_TIMEOUT_MS`. Must be a finite number of at least 1.
@@ -115,10 +134,10 @@ export interface ConnectionLayerOptions {
  * Wires a transport to an executor. It owns only what sits between the two:
  * decode, per-connection ordering, Session routing, error mapping and encode
  * (SPEC 5.2). The routing table and its ordering gate live in `SessionRouter`;
- * this layer applies the gate at the head of the connection's chain and carries
- * no business state, which belongs to the business process (SPEC 6.1). Replay
- * is `IpcExecutor`'s (SPEC 6.4) and input buffering is the `queued` counter
- * itself (SPEC 3.5).
+ * this layer applies the gate at the head of the connection's request queue and
+ * carries no business state, which belongs to the business process (SPEC 6.1).
+ * Replay is `IpcExecutor`'s (SPEC 6.4) and input buffering is the `queued`
+ * counter itself (SPEC 3.5).
  */
 export class ConnectionLayer implements TransportHandlers {
   private readonly transport: Transport;
@@ -127,12 +146,16 @@ export class ConnectionLayer implements TransportHandlers {
   private readonly logger: Logger;
   private readonly createRequestId: () => string;
   private readonly maxQueuedPerConnection: number;
+  private readonly maxQueuedEvents: number;
+  private readonly maxQueuedEventBytes: number;
   private readonly maxConnections: number;
   private readonly shutdownTimeoutMs: number;
   private readonly eventSendTimeoutMs: number;
   private readonly connections = new Map<string, ConnectionState>();
-  /** Per-Session serialization of Server events (ADR-0008); empty when idle. */
-  private readonly sessionTails = new Map<string, Promise<void>>();
+  /** Per-Session serialization and bounds for Server events (ADR-0008). */
+  private readonly sessionQueues = new Map<string, SessionEventQueue>();
+  /** Every event buffer reports here, so health sees detached queues too. */
+  private readonly backlog = new EventBacklog();
   /** Which connection holds which Session, and the reconnect gate (SPEC 3.2). */
   private readonly router: SessionRouter;
   /** The narrow view the admission, request and reply modules work through. */
@@ -141,6 +164,8 @@ export class ConnectionLayer implements TransportHandlers {
   private readonly eventHost: EventDeliveryHost;
   /** Set while the layer is subscribed to the executor's event stream. */
   private unsubscribeEvents: (() => void) | undefined;
+  /** False from the first instant of shutdown; no event is accepted after it. */
+  private eventsOpen = true;
   private status: ConnectionLayerStatus = 'idle';
   private executorStart: Promise<void> | undefined;
   private transportStart: Promise<void> | undefined;
@@ -157,6 +182,12 @@ export class ConnectionLayer implements TransportHandlers {
     const maxQueuedPerConnection =
       options.maxQueuedPerConnection ?? DEFAULT_MAX_QUEUED_PER_CONNECTION;
     assertPositiveInteger(maxQueuedPerConnection, 'maxQueuedPerConnection');
+    const maxQueuedEvents =
+      options.maxQueuedEvents ?? DEFAULT_MAX_QUEUED_EVENTS;
+    assertPositiveInteger(maxQueuedEvents, 'maxQueuedEvents');
+    const maxQueuedEventBytes =
+      options.maxQueuedEventBytes ?? DEFAULT_MAX_QUEUED_EVENT_BYTES;
+    assertPositiveInteger(maxQueuedEventBytes, 'maxQueuedEventBytes');
     const shutdownTimeoutMs =
       options.shutdownTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
     assertFiniteAtLeastOne(shutdownTimeoutMs, 'shutdownTimeoutMs');
@@ -170,6 +201,8 @@ export class ConnectionLayer implements TransportHandlers {
     );
     this.createRequestId = options.createRequestId ?? randomUUID;
     this.maxQueuedPerConnection = maxQueuedPerConnection;
+    this.maxQueuedEvents = maxQueuedEvents;
+    this.maxQueuedEventBytes = maxQueuedEventBytes;
     this.maxConnections = maxConnections;
     this.shutdownTimeoutMs = shutdownTimeoutMs;
     this.eventSendTimeoutMs = eventSendTimeoutMs;
@@ -180,18 +213,26 @@ export class ConnectionLayer implements TransportHandlers {
       connections: this.connections,
       maxConnections,
       maxQueuedPerConnection,
+      maxQueuedEvents,
+      maxQueuedEventBytes,
+      backlog: this.backlog,
       createRequestId: this.createRequestId,
       router: this.router,
       executor: this.executor,
-      enqueue: (state, work) => this.enqueue(state, work),
+      enqueue: (state, work) => state.writer.submit(work),
     };
     this.eventHost = {
       codec: this.codec,
       logger: this.logger,
       connections: this.connections,
       router: this.router,
-      enqueue: (state, work) => this.enqueue(state, work),
-      sessionTails: this.sessionTails,
+      queueEvent: (state, write) => state.writer.enqueue(write),
+      cancelEvent: (state, write) => state.writer.cancel(write),
+      acceptingEvents: () => this.eventsOpen,
+      maxQueuedEvents: this.maxQueuedEvents,
+      maxQueuedEventBytes: this.maxQueuedEventBytes,
+      backlog: this.backlog,
+      sessionQueues: this.sessionQueues,
       sendTimeoutMs: this.eventSendTimeoutMs,
     };
   }
@@ -208,8 +249,8 @@ export class ConnectionLayer implements TransportHandlers {
       // commit an event that arrives before the sink exists. Best-effort:
       // delivery failures are the delivery module's to log (ADR-0008).
       this.unsubscribeEvents = this.executor.onEvent((event) => {
-        // The chain already swallows its own failures; this keeps an
-        // unexpected rejection out of the process's unhandled-rejection path.
+        // Delivery already contains its own failures; this keeps an unexpected
+        // rejection out of the process's unhandled-rejection path.
         void deliverServerEvent(this.eventHost, event).catch(() => undefined);
       });
       await this.executorStart;
@@ -292,8 +333,26 @@ export class ConnectionLayer implements TransportHandlers {
     // Events are additional, not owed (ADR-0008): once the layer stops, an
     // event that would be delivered mid-shutdown is dropped by the executor
     // instead of racing the transport close.
+    this.eventsOpen = false;
     this.unsubscribeEvents?.();
     this.unsubscribeEvents = undefined;
+    // Queued frames cannot be written any more, and shutdown does not wait for
+    // the unreliable event path to drain (SPEC 3.8). A frame already handed to
+    // the transport is left to its own send bound.
+    const discarded = this.discardEventBacklogs();
+    if (discarded.count > 0) {
+      this.logger.warn(
+        {
+          code: 'EVENT_BACKLOG_DISCARDED',
+          reason: 'shutdown',
+          count: discarded.count,
+          connections: discarded.connections,
+          frames: discarded.frames,
+          bytes: discarded.bytes,
+        },
+        'server event backlog discarded at shutdown',
+      );
+    }
     const timeoutMs = this.shutdownTimeoutMs;
     // Waiting requests may fail during shutdown, never bypass their barrier.
     for (const state of this.connections.values()) {
@@ -301,11 +360,15 @@ export class ConnectionLayer implements TransportHandlers {
     }
 
     // SPEC 6.3 step 2: drain what was already accepted. New input is refused,
-    // so the chains can only shrink. Bounded because a handler that never
-    // returns would otherwise keep the process alive forever, which is worse
-    // than the leak the wait is meant to avoid.
+    // so the accepted request work can only shrink. Bounded because a handler
+    // that never returns would otherwise keep the process alive forever, which
+    // is worse than the leak the wait is meant to avoid.
     const drained = await settleWithin(
-      Promise.all([...this.connections.values()].map((state) => state.chain)),
+      Promise.all(
+        [...this.connections.values()].map(
+          (state) => state.writer.requestsSettled,
+        ),
+      ),
       timeoutMs,
     );
     if (drained.status === 'timeout') {
@@ -324,11 +387,11 @@ export class ConnectionLayer implements TransportHandlers {
     this.connections.clear();
     // SPEC 6.1: routes outlive neither their connections nor the layer. Leaving
     // them behind would make a restarted layer route a reconnect to a
-    // connection id that no longer exists. The Session event tails are cleared
-    // with them: a delivery still parked on a dropped chain can never write,
-    // and keeping its promise would retain one entry per Session addressed.
+    // connection id that no longer exists. The Session event queues are cleared
+    // with them: a delivery still parked on a dropped queue can never write,
+    // and keeping the entry would retain one per Session addressed.
     this.router.clear();
-    this.sessionTails.clear();
+    this.sessionQueues.clear();
 
     // SPEC 6.3 step 3: close the executor (and with it the Server and storage)
     // before the transport, so no write can land after the connection that
@@ -402,6 +465,37 @@ export class ConnectionLayer implements TransportHandlers {
   }
 
   /**
+   * Drops every accepted event that has not started writing (SPEC 3.8). Frames
+   * already handed to the transport are left alone; their send bound ends them.
+   * The totals describe what was discarded, so shutdown can report it once.
+   */
+  private discardEventBacklogs(): {
+    count: number;
+    connections: number;
+    frames: number;
+    bytes: number;
+  } {
+    let connections = 0;
+    let frames = 0;
+    let bytes = 0;
+    for (const buffer of this.backlog.connectionBuffers) {
+      const discarded = buffer.discardQueued();
+      if (discarded.frames === 0) {
+        continue;
+      }
+      connections += 1;
+      frames += discarded.frames;
+      bytes += discarded.bytes;
+    }
+    const sessions = discardSessionQueues(this.sessionQueues, this.backlog);
+    frames += sessions.frames;
+    bytes += sessions.bytes;
+    // One event is one frame, so the count and the frame total coincide today;
+    // both are reported because the log contract names both.
+    return { count: frames, connections, frames, bytes };
+  }
+
+  /**
    * Synchronous snapshot for deployment probes (SPEC 6.6). It has no side
    * effects: it reads the layer's status and admission count and asks the
    * executor once, turning a failing self-report into `unknown` rather than
@@ -412,18 +506,8 @@ export class ConnectionLayer implements TransportHandlers {
       this.status,
       this.connections.size,
       readExecutorHealth(this.executor),
+      this.backlog.snapshot(),
     );
-  }
-
-  /**
-   * Appends work to the connection's ordered chain; the chain itself lives with
-   * `ConnectionState` so every module appends through one implementation.
-   */
-  private enqueue(
-    state: ConnectionState,
-    work: () => Promise<void>,
-  ): Promise<void> {
-    return appendToChain(state, work);
   }
 }
 

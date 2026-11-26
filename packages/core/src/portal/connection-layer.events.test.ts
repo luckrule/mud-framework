@@ -1,13 +1,17 @@
 import { describe, expect, test } from 'bun:test';
 
+import { withDeadline } from 'mud-framework-test-support';
+
 import { createJsonLogger } from '../logging/json-logger.ts';
 import { JsonCodec } from '../shared/codec.ts';
 import type { ServerEvent } from '../shared/events.ts';
 import { parseFrame, sleep, tick } from '../testing/common.ts';
 import { sessionHarness } from '../testing/connection-layer.ts';
 import type { ConnectionState } from './connection-admission.ts';
-import { deliverServerEvent } from './connection-events.ts';
+import { EventWrite, deliverServerEvent } from './connection-events.ts';
 import type { EventDeliveryHost } from './connection-events.ts';
+import { ConnectionWriter } from './connection-writer.ts';
+import { EventBacklog } from './event-backlog.ts';
 import { SessionRouter } from './session-router.ts';
 
 function event(overrides: Partial<ServerEvent> = {}): ServerEvent {
@@ -57,12 +61,12 @@ function sendFailures(
 }
 
 /**
- * Reads the layer's private Session tail table. The map is an implementation
- * detail (it exists so ordering state is per layer), so the test borrows the
- * live object rather than exposing it on the public surface.
+ * Reads the layer's private Session queue table. The map is an implementation
+ * detail (it exists so ordering and bound state is per layer), so the test
+ * borrows the live object rather than exposing it on the public surface.
  */
-function sessionTailsOf(layer: unknown): Map<string, Promise<void>> {
-  return (layer as { sessionTails: Map<string, Promise<void>> }).sessionTails;
+function sessionQueuesOf(layer: unknown): Map<string, unknown> {
+  return (layer as { sessionQueues: Map<string, unknown> }).sessionQueues;
 }
 
 describe('ConnectionLayer server events', () => {
@@ -592,10 +596,13 @@ describe('ConnectionLayer server events', () => {
     await h.layer.start();
     h.transport.connect('c1');
 
+    // The frame must already be handed to the transport for this to be a send
+    // failure: a frame still queued when its connection closes is a drop
+    // (SPEC 3.8), not a transport failure.
+    const write = h.transport.holdSends('c1');
     h.controlled.emit(event());
-    // The frame is queued on the connection's chain; closing the connection
-    // before that chain runs makes the write itself fail.
-    await h.transport.disconnect('c1');
+    await write.entered;
+    write.fail(new Error('socket closed mid-write'));
     await tick();
 
     const failed = h
@@ -606,7 +613,11 @@ describe('ConnectionLayer server events', () => {
       connectionId: 'c1',
       eventId: 'req-1:0',
       stage: 'send',
+      reason: 'socket closed mid-write',
     });
+    expect(h.logs().filter((line) => line.code === 'EVENT_DROPPED')).toEqual(
+      [],
+    );
   });
 
   test('registers with the executor at start and releases at stop', async () => {
@@ -619,37 +630,147 @@ describe('ConnectionLayer server events', () => {
     expect(h.controlled.listenerCount()).toBe(0);
   });
 
-  test('clears the session tails on stop, so a restarted layer holds no stale entry', async () => {
+  test('clears the session queues on stop, so a restarted layer holds no stale entry', async () => {
     const h = sessionHarness({ shutdownTimeoutMs: 20 });
     await h.layer.start();
     h.transport.connect('c1');
     await h.transport.receive('c1', '{"id":"1","method":"bind"}');
 
-    // Hold the write: the delivery cannot finish, so its tail stays in the map
-    // until the layer drops it. Without an explicit clear the drain timeout
-    // leaves the entry behind for the life of the object.
+    // Hold the write: the delivery cannot finish, so its Session queue stays in
+    // the map until the layer drops it. Without an explicit clear the entry
+    // would outlive the layer.
     const write = h.transport.holdSends('c1');
     h.controlled.emit(sessionEvent('req-1:0', 'stuck'));
     await write.entered;
 
-    const tails = sessionTailsOf(h.layer);
-    expect(tails.size).toBe(1);
+    const queues = sessionQueuesOf(h.layer);
+    expect(queues.size).toBe(1);
 
     await h.layer.stop();
 
-    expect(tails.size).toBe(0);
+    expect(queues.size).toBe(0);
     write.release();
+  });
+});
+
+/** Correlates the frames written to one connection: reply id or event id. */
+function frameLabels(source: FrameSource, connectionId: string): string[] {
+  return source
+    .sentTo(connectionId)
+    .map(parseFrame)
+    .map((frame) => {
+      if (typeof frame.id === 'string') {
+        return frame.id;
+      }
+      return String(frame.eventId);
+    });
+}
+
+describe('ConnectionLayer event write scheduling', () => {
+  test('a request result overtakes an event still waiting and the event follows', async () => {
+    const h = sessionHarness();
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+
+    // The first event is handed to the transport and held there; the second
+    // stays in the connection's event queue.
+    const held = h.transport.holdSends('c1');
+    h.controlled.emit(event({ eventId: 'e:0' }));
+    h.controlled.emit(event({ eventId: 'e:1' }));
+    await held.entered;
+
+    const request = h.transport.receive('c1', '{"id":"r1","method":"work"}');
+    await tick();
+    // A frame already handed to the transport cannot be preempted, and the
+    // result must not wait for the event that is still queued.
+    expect(frameLabels(h.transport, 'c1')).toEqual(['bind', 'e:0']);
+
+    held.release();
+    await request;
+    await tick();
+
+    expect(frameLabels(h.transport, 'c1')).toEqual([
+      'bind',
+      'e:0',
+      'r1',
+      'e:1',
+    ]);
+  });
+
+  test('writes one queued event after every completed request', async () => {
+    const h = sessionHarness();
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+
+    const held = h.transport.holdSends('c1');
+    h.controlled.emit(event({ eventId: 'e:0' }));
+    h.controlled.emit(event({ eventId: 'e:1' }));
+    await held.entered;
+
+    const first = h.transport.receive('c1', '{"id":"r1","method":"work"}');
+    const second = h.transport.receive('c1', '{"id":"r2","method":"work"}');
+    await tick();
+
+    held.release();
+    await Promise.all([first, second]);
+    await tick();
+
+    // Request work wins whenever both are ready, but each completion hands the
+    // queue head one turn, so a request stream cannot starve the event.
+    expect(frameLabels(h.transport, 'c1')).toEqual([
+      'bind',
+      'e:0',
+      'r1',
+      'e:1',
+      'r2',
+    ]);
+  });
+
+  test('stop discards a queued event instead of waiting for the transport', async () => {
+    // A budget far beyond the test deadline: only an implementation that
+    // drained events at shutdown could take this long.
+    const h = sessionHarness({ shutdownTimeoutMs: 60_000 });
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+
+    const held = h.transport.holdSends('c1');
+    h.controlled.emit(event({ eventId: 'e:0' }));
+    h.controlled.emit(event({ eventId: 'e:1' }));
+    await held.entered;
+    // The transport cannot be read once stopped, so the frames written so far
+    // are captured here: e:0 is on the wire, e:1 is still in the queue.
+    expect(frameLabels(h.transport, 'c1')).toEqual(['bind', 'e:0']);
+
+    await withDeadline(
+      h.layer.stop(),
+      1000,
+      'stop with an event write in flight',
+    );
+
+    held.release();
+    await tick();
+    await tick();
+
+    // e:1 was still queued and must not be attempted after the layer stopped.
+    // Attempting it would fail inside the stopped transport and leave a
+    // send-failure line behind.
+    expect(
+      h.logs().filter((line) => line.code === 'TRANSPORT_SEND_FAILED'),
+    ).toEqual([]);
   });
 });
 
 interface QueuedWrite {
   readonly state: ConnectionState;
-  readonly work: () => Promise<void>;
+  readonly write: EventWrite;
 }
 
 /**
- * A host whose `enqueue` records work instead of running it, so a test can move
- * the Session between two queued writes deterministically.
+ * A host whose event queue records frames instead of running them, so a test
+ * can move the Session between two queued writes deterministically.
  */
 function deferredDeliveryHost(
   options: {
@@ -664,6 +785,7 @@ function deferredDeliveryHost(
     },
   });
   const router = new SessionRouter({ logger });
+  const backlog = new EventBacklog();
   const connections = new Map<string, ConnectionState>();
   const sent = new Map<string, (string | Uint8Array)[]>();
   for (const id of ['c1', 'c2']) {
@@ -681,7 +803,12 @@ function deferredDeliveryHost(
         },
         close: () => Promise.resolve(),
       },
-      chain: Promise.resolve(),
+      writer: new ConnectionWriter({
+        maxQueuedEvents: 1024,
+        maxQueuedEventBytes: 4 * 1024 * 1024,
+        backlog,
+        logger,
+      }),
       queued: 0,
       inFlight: new Set(),
       closed: new AbortController(),
@@ -693,11 +820,22 @@ function deferredDeliveryHost(
     logger,
     connections,
     router,
-    sessionTails: new Map(),
+    sessionQueues: new Map(),
     sendTimeoutMs: 1000,
-    enqueue: (state, work) => {
-      queue.push({ state, work });
-      return Promise.resolve();
+    acceptingEvents: () => true,
+    maxQueuedEvents: 1024,
+    maxQueuedEventBytes: 4 * 1024 * 1024,
+    backlog,
+    queueEvent: (state, write) => {
+      queue.push({ state, write });
+      return { accepted: true };
+    },
+    cancelEvent: (_state, write) => {
+      if (write.started || write.settled) {
+        return false;
+      }
+      write.settle('aborted');
+      return true;
     },
   };
   return { host, router, queue, sent, logs: () => lines.map(parseFrame) };
@@ -716,7 +854,7 @@ describe('deliverServerEvent session re-resolution', () => {
     expect(h.queue.map((entry) => entry.state.connection.id)).toEqual(['c1']);
 
     h.router.bind('c2', 's1', Promise.resolve());
-    await h.queue[0].work();
+    await h.queue[0].write.run();
     await tick();
     expect(h.sent.get('c1')).toEqual([]);
     expect(h.queue.map((entry) => entry.state.connection.id)).toEqual([
@@ -727,7 +865,7 @@ describe('deliverServerEvent session re-resolution', () => {
     // Back to c1 before the redelivered write runs: chasing again would let two
     // connections hand the event back and forth, so the retry is bounded.
     h.router.bind('c1', 's1', Promise.resolve());
-    await h.queue[1].work();
+    await h.queue[1].write.run();
     await tick();
 
     expect(h.sent.get('c1')).toEqual([]);
@@ -745,7 +883,7 @@ describe('deliverServerEvent session re-resolution', () => {
     await delivery;
   });
 
-  test('writes one session event at a time and clears the tail when idle', async () => {
+  test('writes one session event at a time and clears the queue when idle', async () => {
     const h = deferredDeliveryHost();
     h.router.bind('c1', 's1', Promise.resolve());
 
@@ -770,19 +908,19 @@ describe('deliverServerEvent session re-resolution', () => {
     // c1 is free, but the second event must wait for the first to finish.
     expect(h.queue).toHaveLength(1);
 
-    await h.queue[0].work();
+    await h.queue[0].write.run();
     await tick();
     expect(h.queue).toHaveLength(2);
     expect(h.sent.get('c1')).toHaveLength(1);
 
-    await h.queue[1].work();
+    await h.queue[1].write.run();
     await Promise.all([first, second]);
     await tick();
 
     expect(
       (h.sent.get('c1') ?? []).map(parseFrame).map((frame) => frame.payload),
     ).toEqual(['first', 'second']);
-    expect(h.host.sessionTails.size).toBe(0);
+    expect(h.host.sessionQueues.size).toBe(0);
   });
 
   test('drops a queued event whose holder left before the write ran', async () => {
@@ -798,7 +936,7 @@ describe('deliverServerEvent session re-resolution', () => {
     // An unbind removes the route while the event waits; the write-time
     // resolution must see the missing holder rather than write to c1.
     h.router.release('c1');
-    await h.queue[0].work();
+    await h.queue[0].write.run();
     await delivery;
 
     expect(h.sent.get('c1')).toEqual([]);
@@ -812,7 +950,7 @@ describe('deliverServerEvent session re-resolution', () => {
     });
   });
 
-  test('clears the tail after a failed write', async () => {
+  test('clears the queue after a failed write', async () => {
     const h = deferredDeliveryHost({ failSends: new Set(['c1']) });
     h.router.bind('c1', 's1', Promise.resolve());
 
@@ -821,17 +959,17 @@ describe('deliverServerEvent session re-resolution', () => {
       event({ target: { kind: 'session', sessionId: 's1' } }),
     );
     await tick();
-    await h.queue[0].work();
+    await h.queue[0].write.run();
     await delivery;
     await tick();
 
     expect(
       h.logs().filter((line) => line.code === 'TRANSPORT_SEND_FAILED'),
     ).toHaveLength(1);
-    expect(h.host.sessionTails.size).toBe(0);
+    expect(h.host.sessionQueues.size).toBe(0);
   });
 
-  test('clears the tail after a dropped event', async () => {
+  test('clears the queue after a dropped event', async () => {
     const h = deferredDeliveryHost();
     h.router.bind('c1', 's1', Promise.resolve());
 
@@ -841,17 +979,17 @@ describe('deliverServerEvent session re-resolution', () => {
     );
     await tick();
     h.router.release('c1');
-    await h.queue[0].work();
+    await h.queue[0].write.run();
     await delivery;
     await tick();
 
     expect(
       h.logs().filter((line) => line.code === 'EVENT_DROPPED'),
     ).toHaveLength(1);
-    expect(h.host.sessionTails.size).toBe(0);
+    expect(h.host.sessionQueues.size).toBe(0);
   });
 
-  test('one session tail does not hold up another session', async () => {
+  test('one session queue does not hold up another session', async () => {
     const h = deferredDeliveryHost();
     h.router.bind('c1', 's1', Promise.resolve());
     h.router.bind('c2', 's2', Promise.resolve());
@@ -877,18 +1015,18 @@ describe('deliverServerEvent session re-resolution', () => {
       'c1',
       'c2',
     ]);
-    await h.queue[1].work();
+    await h.queue[1].write.run();
     await other;
     await tick();
 
     expect(h.sent.get('c2')).toHaveLength(1);
-    expect(h.host.sessionTails.size).toBe(1);
+    expect(h.host.sessionQueues.size).toBe(1);
 
-    await h.queue[0].work();
+    await h.queue[0].write.run();
     await blocked;
     await tick();
 
     expect(h.sent.get('c1')).toHaveLength(1);
-    expect(h.host.sessionTails.size).toBe(0);
+    expect(h.host.sessionQueues.size).toBe(0);
   });
 });

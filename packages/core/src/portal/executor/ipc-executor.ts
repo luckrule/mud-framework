@@ -55,8 +55,8 @@ export type { IpcExecutorOptions };
  * until the replay budget runs out.
  *
  * `execute` never throws and always settles by the request deadline, because
- * the connection layer advances a connection's ordered chain on settlement and
- * a hanging promise would stall every later request on that connection.
+ * the connection layer serializes request work per connection and a hanging
+ * promise would stall every later request on that connection.
  *
  * The process lifecycle lives in `ServerSupervisor`; this class owns the
  * admission and settlement surface those processes serve.
