@@ -44,21 +44,21 @@ bun run bench          # logger + game 微基准
 
 `bench:switch` 在真实 Portal + Server + WebSocket 上执行一次热升级（`IpcExecutor.switchTo`），测的是客户端请求在切换期间实际等了多久，而不是只验证连接不断。
 
-实现拆在 `benchmarks/game/switch/`：`portal.ts` 是基准 Portal，装配与 `examples/game-slice/src/portal.ts` 相同（`WsTransport` + `IpcExecutor` + `ConnectionLayer`），额外起一个只监听 `127.0.0.1`、端口由系统分配的 `POST /switch` 控制端点；同一时刻只接受一个切换，响应带服务端测得的 `switchTo` 耗时。`index.ts` 是负载、触发、分相统计与报告，`support.ts` 放配置、分相分类、Portal 生命周期与清理。Server 入口复用 `examples/game-slice/src/server.ts`，两个进程世代共用同一个临时 `GAME_SLICE_DATA_DIR`，替换顺序由框架保证旧写者退出后才激活新进程。
+实现拆在 `benchmarks/game/switch/`：`portal.ts` 是基准 Portal，装配与 `examples/game-slice/src/portal.ts` 相同（`WsTransport` + `IpcExecutor` + `ConnectionLayer`），额外起一个只监听 `127.0.0.1`、端口由系统分配的 `POST /switch` 控制端点；同一时刻只接受一个切换，响应带服务端测得的 `switchTo` 耗时。`index.ts` 是负载、触发、分相统计与报告，`support.ts` 放配置、分相分类、Portal 生命周期与清理，`budget.ts` 按 ADR-0004 推导外部停止预算。Server 入口复用 `examples/game-slice/src/server.ts`，两个进程世代共用同一个临时 `GAME_SLICE_DATA_DIR`，替换顺序由框架保证旧写者退出后才激活新进程。
 
 时间线：
 
 - 客户端先登录，再按固定 start-to-start 间隔发 `game.look`（每个客户端同一时刻一个在途请求）。
 - warmup 段不计入样本；随后先跑一段基线，再通过控制端点触发一次 `switchTo`。
 - 切换窗口 = 触发 → `switchTo` resolve → 固定余量。请求按时间区间归类：在触发前完成的是基线，与窗口有重叠的是窗口（包括触发时已在途、切换结束后才返回的请求），窗口结束后开始的是恢复段。
-- 报告服务端测得的切换耗时、`POST /switch` 往返时间、窗口跨度，以及基线/窗口/恢复三段的 p50/p95/p99/max、失败数、超时数、连接关闭数与错误 code 分布。
+- 报告服务端测得的切换耗时、`POST /switch` 往返时间、窗口跨度，以及基线/窗口/恢复三段的 p50/p95/p99/max、失败数、超时数、连接关闭数与错误 code 分布。超时单列：`timeout` 是客户端 `CLIENT_TIMEOUT` 与 Portal/Server 返回的 `FRAMEWORK_TIMEOUT` 之和，输出与摘要都在括号内分列 `client`/`framework`；`failed` 只统计两类超时之外的错误（业务错误、`INTERNAL_ERROR`、连接关闭等），框架超时既不会落入普通失败，也不会被 `timeout 0` 掩盖。
 - 从 Portal 日志统计 `request replayed`、`request timed out` 与 `server switch completed`；报告所有 Server pid、当前 pid 和已退役 pid 是否已消失。
 - 默认附带一个两客户端的 `say` 探针（`SWITCH_EVENTS=0` 关闭）：发送方的序号只在 `game.say` 被接受后推进，失败尝试复用同一序号。接收方按到达阶段统计 within-epoch 序号缺口与 duplicate。duplicate 可能来自“超时但已提交的 say 被重试”，与真实重复投递无法区分，不能当丢包；缺口只说明成功 say 的事件没有按序号到达。
 - 所有 look 客户端也在 square，会收到探针的 `room.say`，但它们注册空监听器排空事件，不参与事件统计。
 
 环境变量（默认值见 `benchmarks/game/switch/support.ts` 顶部常量）：`SWITCH_CLIENTS`、`SWITCH_INTERVAL_MS`、`SWITCH_DURATION_SEC`（客户端运行总时长，含 warmup）、`SWITCH_WARMUP_SEC`、`SWITCH_DATA_DIR`、`SWITCH_KEEP=1`、`SWITCH_EVENTS=0`、`REQUEST_TIMEOUT_MS`。同时设 `SWITCH_URL` 与 `SWITCH_CONTROL_URL` 可复用外部 Portal：跳过 spawn、Server pid 检查与数据目录清理，控制端点由外部 Portal 自己提供。
 
-清理：关闭客户端、SIGTERM Portal、在有界时间内确认 Portal 与所有已见 Server pid 消失，必要时 SIGKILL；只有 Portal 优雅停止、退出已观测、没有幸存 Server pid 且运行没有失败时才删除临时目录。失败、`SWITCH_KEEP=1` 或 `SWITCH_DATA_DIR` 指定的用户目录都会保留现场并打印路径。只有装配、连接、切换被拒绝、cleanup 或“窗口/基线没有样本”才非零退出；请求失败、超时、掉线与事件缺口只报告，不设阈值。
+清理：关闭客户端、SIGTERM Portal、按 ADR-0004 的完整外部停止上界 `C + max(C, E + S) + C` 加 1000 ms 诊断余量等待 Portal 退出（当前装配 `C=5000`、`E=23250`、`S=1000`，即 34250 + 1000 = 35250 ms），超时才 SIGKILL；随后在有界时间内确认所有已见 Server pid 消失，必要时 SIGKILL。只有 Portal 优雅停止、退出已观测、没有幸存 Server pid 且运行没有失败时才删除临时目录。失败、`SWITCH_KEEP=1` 或 `SWITCH_DATA_DIR` 指定的用户目录都会保留现场并打印路径。只有装配、连接、切换被拒绝、cleanup 或“窗口/基线没有样本”才非零退出；请求失败、超时、掉线与事件缺口只报告，不设阈值。
 
 限制：所有进程同机，切换耗时受本机进程启动、文件系统与调度影响；默认数据目录通常是 tmpfs，SQLite 与 Server 启动会比真实磁盘快；look 客户端与协调器同进程，客户端侧 JSON 解析与事件循环调度也算进请求延迟；结果是单机近似，跨机器没有可比性。结果不写入仓库文档。
 

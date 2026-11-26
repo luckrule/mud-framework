@@ -480,7 +480,7 @@ function report(
     `summary: switch ${(result.reply.durationNs / 1e6).toFixed(1)} ms; ` +
     `window ${integerText(window.requests)} requests, ${phaseText(window)}; ` +
     `baseline ${phaseText(baseline)}; ` +
-    `failures ${integerText(window.failed)} timeout ${integerText(window.timeouts)} disconnected ${integerText(window.disconnected)} in window, ${integerText(disconnected)} look clients detached; ` +
+    `failures ${integerText(window.failed)} timeout ${integerText(window.timeouts)} (client ${integerText(window.clientTimeouts)}, framework ${integerText(window.frameworkTimeouts)}) disconnected ${integerText(window.disconnected)} in window, ${integerText(disconnected)} look clients detached; ` +
     `${eventSummary}; ` +
     'numbers are observations, not assertions';
   write(`\n${summary}`);

@@ -15,6 +15,7 @@ import {
   writeError,
 } from '../support.ts';
 import type { LatencyStats, PortalStopResult } from '../support.ts';
+import { PORTAL_STOP_BUDGET_MS } from './budget.ts';
 
 /**
  * Configuration, phase statistics, Portal lifecycle and cleanup for
@@ -32,7 +33,6 @@ export const BASELINE_MS = 2000;
 export const WINDOW_MARGIN_MS = 1000;
 const CONTROL_TIMEOUT_MS = 60_000;
 const PORTAL_READY_TIMEOUT_MS = 15_000;
-const PORTAL_EXIT_TIMEOUT_MS = 10_000;
 const FORCE_EXIT_TIMEOUT_MS = 5000;
 const SERVER_EXIT_TIMEOUT_MS = 5000;
 const POLL_INTERVAL_MS = 25;
@@ -163,7 +163,13 @@ export function phaseOfSample(
 export interface PhaseSummary {
   readonly requests: number;
   readonly ok: number;
+  /** Failures that are neither client-side nor framework timeouts. */
   readonly failed: number;
+  /** Client-side deadline (`CLIENT_TIMEOUT`). */
+  readonly clientTimeouts: number;
+  /** Portal/Server deadline (`FRAMEWORK_TIMEOUT`). */
+  readonly frameworkTimeouts: number;
+  /** Both timeout kinds; broken out above, never folded into `failed`. */
   readonly timeouts: number;
   readonly disconnected: number;
   readonly latency: LatencyStats | undefined;
@@ -177,7 +183,8 @@ export function summarizePhase(
   let requests = 0;
   let ok = 0;
   let failed = 0;
-  let timeouts = 0;
+  let clientTimeouts = 0;
+  let frameworkTimeouts = 0;
   let disconnected = 0;
   const latencies: number[] = [];
   for (const sample of samples) {
@@ -191,7 +198,11 @@ export function summarizePhase(
       continue;
     }
     if (sample.code === 'CLIENT_TIMEOUT') {
-      timeouts += 1;
+      clientTimeouts += 1;
+      continue;
+    }
+    if (sample.code === 'FRAMEWORK_TIMEOUT') {
+      frameworkTimeouts += 1;
       continue;
     }
     failed += 1;
@@ -206,7 +217,9 @@ export function summarizePhase(
     requests,
     ok,
     failed,
-    timeouts,
+    clientTimeouts,
+    frameworkTimeouts,
+    timeouts: clientTimeouts + frameworkTimeouts,
     disconnected,
     latency: latencies.length === 0 ? undefined : latencyStats(latencies),
   };
@@ -217,7 +230,7 @@ export function phaseLine(label: string, summary: PhaseSummary): string {
     summary.latency === undefined
       ? 'latency: no successful samples'
       : `latency ms: ${latencyText(summary.latency)}`;
-  return `${label.padEnd(9)} requests ${integerText(summary.requests).padStart(7)}  ok ${integerText(summary.ok).padStart(7)}  failed ${integerText(summary.failed).padStart(5)}  timeout ${integerText(summary.timeouts).padStart(5)}  closed ${integerText(summary.disconnected).padStart(4)}  ${latency}`;
+  return `${label.padEnd(9)} requests ${integerText(summary.requests).padStart(7)}  ok ${integerText(summary.ok).padStart(7)}  failed ${integerText(summary.failed).padStart(5)}  timeout ${integerText(summary.timeouts).padStart(5)} (client ${integerText(summary.clientTimeouts)}, framework ${integerText(summary.frameworkTimeouts)})  closed ${integerText(summary.disconnected).padStart(4)}  ${latency}`;
 }
 
 export interface SwitchReply {
@@ -418,7 +431,9 @@ export async function startSwitchPortal(options: {
   const stop = (): Promise<PortalStopResult> => {
     stopped ??= (async () => {
       child.kill('SIGTERM');
-      let exitCode = await waitForExit(child, PORTAL_EXIT_TIMEOUT_MS);
+      // ADR-0004's complete external stop bound plus a diagnostic margin, not a
+      // fixed guess: a legal but slow drain/exit confirmation must finish.
+      let exitCode = await waitForExit(child, PORTAL_STOP_BUDGET_MS);
       let forced = false;
       if (exitCode === undefined) {
         forced = true;

@@ -7,6 +7,8 @@ import {
   spawnBunServer,
 } from 'mud-framework-core';
 
+import { PORTAL_SHUTDOWN_TIMEOUT_MS } from './budget.ts';
+
 /**
  * The benchmark Portal: the same assembly as `examples/game-slice/src/portal.ts`
  * plus a loopback-only control endpoint. The endpoint is what lets the
@@ -63,6 +65,7 @@ async function main(): Promise<void> {
       }),
     timeoutMs: 5000,
     startTimeoutMs: 10_000,
+    shutdownTimeoutMs: PORTAL_SHUTDOWN_TIMEOUT_MS,
   });
   const transport = new WsTransport({
     port: portalPort,
@@ -71,7 +74,7 @@ async function main(): Promise<void> {
   const layer = new ConnectionLayer({
     transport,
     executor,
-    shutdownTimeoutMs: 5000,
+    shutdownTimeoutMs: PORTAL_SHUTDOWN_TIMEOUT_MS,
   });
 
   // One switch at a time: the coordinator only sends one, but a second caller
