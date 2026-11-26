@@ -1,7 +1,12 @@
 import { describe, expect, test } from 'bun:test';
 
 import {
+  closeBudget,
+  DEFAULT_SHUTDOWN_TIMEOUT_MS,
+} from '../../../packages/core/src/shared/budget.ts';
+import {
   PORTAL_EXECUTOR_CLOSE_BUDGET_MS,
+  PORTAL_SHUTDOWN_TIMEOUT_MS,
   PORTAL_STOP_BUDGET_MS,
   STOP_DIAGNOSTIC_MARGIN_MS,
   deriveExternalStopBudget,
@@ -77,6 +82,16 @@ describe('external stop budget (ADR-0004)', () => {
 });
 
 describe('executor close budget from the Portal (drift guard)', () => {
+  test('the snapshot matches the core close budget', () => {
+    // The Portal reports its live budget; this copy is the fallback, so it has
+    // to be re-derived here. Asserting against the same constant would stay
+    // green after core changed its formula.
+    expect(PORTAL_EXECUTOR_CLOSE_BUDGET_MS).toBe(
+      closeBudget(DEFAULT_SHUTDOWN_TIMEOUT_MS),
+    );
+    expect(PORTAL_SHUTDOWN_TIMEOUT_MS).toBe(DEFAULT_SHUTDOWN_TIMEOUT_MS);
+  });
+
   test('reads the live budget the Portal prints', () => {
     expect(
       parsePortalCloseBudgetMs('portal: executor close budget 23250 ms'),

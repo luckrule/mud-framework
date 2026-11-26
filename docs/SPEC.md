@@ -174,7 +174,7 @@ Handler 可以为一个请求声明要发送的事件（ADR-0008）。`ctx.emit(
 
 - 目标 Connection 不存在或已关闭、目标 Session 当前没有 holder 时，事件 MUST 被丢弃并记录 warn（`EVENT_DROPPED`）；编码失败或传输写失败时同样丢弃并记录 `TRANSPORT_SEND_FAILED`。MUST NOT 因失败而缓冲或重试，也不得让请求失败。
 - Session 目标的收件人按实际写出时的当前 holder 解析：排队期间 takeover 会改投新 holder，至多重投递一次，再次变化即丢弃。
-- 同一 Session 的 session 目标事件 MUST 按发射序串行投递：后一条必须等前一条写出或丢弃后才开始，因此 takeover 不改变同一收件 Connection 上这些事件之间的顺序。投递分两段，只有第一段可取消：**queued**（尚未开始写出）时旧连接被移除或 abort，该事件丢弃（`EVENT_DROPPED`，reason 指明写出前连接已关闭）并立即释放串行位；**writing**（已开始写出）时 abort MUST NOT 提前释放串行位，必须等实际写结果（成功或传输失败）结算后再释放，写失败记 `TRANSPORT_SEND_FAILED` 而不是 `EVENT_DROPPED`，因为帧可能已写出。写出本身必须有界：传输发送受其 `sendTimeoutMs` 约束，底层发送 Promise 不保证 settle 时以发送超时为上界，不得用 abort 信号代替。这个写出上界优先取传输声明的单帧发送上界（§5.2），其次取连接层配置，最后取默认值；传输声明不可用（例如 `Infinity`）时按未声明处理，回退到默认值。
+- 同一 Session 的 session 目标事件 MUST 按发射序串行投递：后一条必须等前一条写出或丢弃后才开始，因此 takeover 不改变同一收件 Connection 上这些事件之间的顺序。投递分两段，只有第一段可取消：**queued**（尚未开始写出）时旧连接被移除或 abort，该事件丢弃（`EVENT_DROPPED`，reason 指明写出前连接已关闭）并立即释放串行位；**writing**（已开始写出）时 abort MUST NOT 提前释放串行位，必须等实际写结果（成功或传输失败）结算后再释放，写失败记 `TRANSPORT_SEND_FAILED` 而不是 `EVENT_DROPPED`，因为帧可能已写出。写出本身必须有界：传输发送受其 `sendTimeoutMs` 约束，底层发送 Promise 不保证 settle 时以发送超时为上界，不得用 abort 信号代替。这个写出上界优先取连接层的显式 `eventSendTimeoutMs` 配置，其次取传输声明的单帧发送上界（§5.2），最后取默认值；传输声明不可用（例如 `Infinity`）时按未声明处理，回退到默认值。
 - 结果发送失败时，该请求的全部事件 MUST 跳过并记录；请求的成功状态不变。
 - 同一 Connection 上，结果帧与事件帧、事件帧之间的写顺序由连接层的有序链与传输发送队列保证；session 目标的事件另由按 Session 的串行队列保证发射序；connection 目标与 session 目标之间、不同 Connection 之间不承诺发射序。
 - 事件是附加通道：MUST NOT 改变请求的终态、超时、取消、重放、Session 屏障或关闭语义。
