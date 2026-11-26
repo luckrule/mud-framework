@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 
 import {
   FrameworkTimeoutError,
@@ -7,12 +7,73 @@ import {
 import { rejectionOf, sleep } from '../testing/common.ts';
 import {
   BusyCommitBackend,
+  HookedCommitBackend,
   deferred,
   parseLines,
   quietDispatcher,
 } from '../testing/dispatcher.ts';
 import { MemoryStorageBackend } from '../testing/memory-backend.ts';
 import { Dispatcher } from './dispatcher.ts';
+import type { DispatchResult } from './dispatcher.ts';
+
+const DEADLINE_START_MS = 1_000;
+const DEADLINE_TIMEOUT_MS = 1_000;
+
+/**
+ * Dispatches a committing handler whose transaction settles `offsetMs` after
+ * the dispatcher recorded `startedAt`.
+ *
+ * The dispatcher reads `performance.now()` for `startedAt`, `deadlineAt` and
+ * `committedAt`, so a stubbed clock pins all three and makes the boundary
+ * reachable exactly. Real time never advances, so the deadline timer cannot
+ * fire: only the post-race `committedAt >= deadlineAt` check can time the
+ * request out.
+ */
+async function dispatchAt(committedAtOffsetMs: number): Promise<{
+  result: DispatchResult | undefined;
+  error: Error | undefined;
+  stats: { committed: number; rolledBack: number };
+  lostCommits: number;
+}> {
+  const clock = { now: DEADLINE_START_MS };
+  const backend = new HookedCommitBackend(() => {
+    clock.now = DEADLINE_START_MS + committedAtOffsetMs;
+  });
+  const lines: string[] = [];
+  const spy = spyOn(performance, 'now').mockImplementation(() => clock.now);
+  try {
+    const { dispatcher } = quietDispatcher(
+      { backend, timeoutMs: DEADLINE_TIMEOUT_MS },
+      lines,
+    );
+    dispatcher.register(
+      'commit-at',
+      async (ctx) => {
+        ctx.bindSession('session-1');
+        ctx.emit('committed', { ok: true });
+        return 'done';
+      },
+      { access: 'public', mayChangeSession: true },
+    );
+    let result: DispatchResult | undefined;
+    let error: Error | undefined;
+    try {
+      result = await dispatcher.dispatch('commit-at', null);
+    } catch (caught) {
+      error = caught instanceof Error ? caught : new Error(String(caught));
+    }
+    return {
+      result,
+      error,
+      stats: backend.stats(),
+      lostCommits: parseLines(lines).filter(
+        (entry) => entry.code === 'CANCEL_LOST_TO_COMMIT',
+      ).length,
+    };
+  } finally {
+    spy.mockRestore();
+  }
+}
 
 describe('Dispatcher.timeout', () => {
   test('fails the request at the timeout and invalidates later writes', async () => {
@@ -280,6 +341,39 @@ describe('Dispatcher.timeout', () => {
         (entry) => entry.code === 'CANCEL_LOST_TO_COMMIT',
       ),
     ).toHaveLength(0);
+  });
+
+  describe('commit settlement against the deadline', () => {
+    test('settling exactly at the deadline is a timeout', async () => {
+      const { result, error, stats, lostCommits } = await dispatchAt(1_000);
+
+      // `>=`, not `>`: a settlement the dispatcher only sees at the deadline is
+      // treated as late. The commit is durable, so it must be logged as lost,
+      // and no result, session change or event may reach the caller.
+      expect(result).toBeUndefined();
+      expect(error).toBeInstanceOf(FrameworkTimeoutError);
+      expect(stats).toEqual({ committed: 1, rolledBack: 0 });
+      expect(lostCommits).toBe(1);
+    });
+
+    test('settling one millisecond before the deadline succeeds', async () => {
+      const { result, error, stats, lostCommits } = await dispatchAt(999);
+
+      expect(error).toBeUndefined();
+      expect(result).toEqual({
+        result: 'done',
+        sessionChange: { type: 'bind', sessionId: 'session-1' },
+        events: [
+          {
+            target: { kind: 'connection', connectionId: '' },
+            event: 'committed',
+            payload: { ok: true },
+          },
+        ],
+      });
+      expect(stats).toEqual({ committed: 1, rolledBack: 0 });
+      expect(lostCommits).toBe(0);
+    });
   });
 
   test('uses the smaller of the configured timeout and the backend ceiling', async () => {

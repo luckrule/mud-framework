@@ -1,9 +1,12 @@
 import { describe, expect, test } from 'bun:test';
 
 import {
+  PORTAL_EXECUTOR_CLOSE_BUDGET_MS,
   PORTAL_STOP_BUDGET_MS,
   STOP_DIAGNOSTIC_MARGIN_MS,
   deriveExternalStopBudget,
+  parsePortalCloseBudgetMs,
+  resolveExecutorCloseBudget,
 } from './budget.ts';
 import { phaseLine, summarizePhase } from './support.ts';
 import type { RequestSample, SwitchMarkers } from './support.ts';
@@ -70,6 +73,62 @@ describe('external stop budget (ADR-0004)', () => {
     expect(
       deriveExternalStopBudget({ ...PORTAL_BUDGET, diagnosticMarginMs: 2500 }),
     ).toBe(bound + 2500);
+  });
+});
+
+describe('executor close budget from the Portal (drift guard)', () => {
+  test('reads the live budget the Portal prints', () => {
+    expect(
+      parsePortalCloseBudgetMs('portal: executor close budget 23250 ms'),
+    ).toBe(23_250);
+    // A changed core budget must win over the snapshot, whatever its value.
+    expect(
+      parsePortalCloseBudgetMs('portal: executor close budget 31000 ms'),
+    ).toBe(31_000);
+  });
+
+  test('ignores every other stdout line', () => {
+    const lines = [
+      'portal: listening on ws://127.0.0.1:1234/',
+      'portal: control on http://127.0.0.1:1235/switch',
+      '{"level":"info","msg":"server ready","pid":42}',
+      'portal: executor close budget 23250ms',
+      'portal: executor close budget  23250 ms',
+      'portal: executor close budget 0 ms',
+      'portal: executor close budget 23250.5 ms',
+      'portal: executor close budget abc ms',
+      '',
+    ];
+    for (const line of lines) {
+      expect(parsePortalCloseBudgetMs(line)).toBeUndefined();
+    }
+  });
+
+  test('uses the reported budget and only falls back when none arrived', () => {
+    expect(resolveExecutorCloseBudget(23_250)).toEqual({
+      closeBudgetMs: 23_250,
+      reported: true,
+    });
+    expect(resolveExecutorCloseBudget(31_000)).toEqual({
+      closeBudgetMs: 31_000,
+      reported: true,
+    });
+    expect(resolveExecutorCloseBudget(undefined)).toEqual({
+      closeBudgetMs: PORTAL_EXECUTOR_CLOSE_BUDGET_MS,
+      reported: false,
+    });
+  });
+
+  test('a reported budget drives the stop budget, not the snapshot', () => {
+    const reported = resolveExecutorCloseBudget(31_000);
+    expect(
+      deriveExternalStopBudget({
+        connectionShutdownMs: 5000,
+        executorCloseBudgetMs: reported.closeBudgetMs,
+        executorCloseSlackMs: 1000,
+        diagnosticMarginMs: 0,
+      }),
+    ).toBe(5000 + 32_000 + 5000);
   });
 });
 

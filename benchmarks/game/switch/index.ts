@@ -550,6 +550,9 @@ async function main(): Promise<void> {
       write(
         `portal: spawned pid ${portal.pid}, listening on ${url}, control ${controlUrl}`,
       );
+      write(
+        `portal: executor close budget ${portal.executorCloseBudgetMs} ms (${portal.closeBudgetReported ? 'reported by the Portal' : 'snapshot fallback'})`,
+      );
     }
 
     const result = await runScenario(url, controlUrl, config);

@@ -44,7 +44,7 @@ bun run bench          # logger + game 微基准
 
 `bench:switch` 在真实 Portal + Server + WebSocket 上执行一次热升级（`IpcExecutor.switchTo`），测的是客户端请求在切换期间实际等了多久，而不是只验证连接不断。
 
-实现拆在 `benchmarks/game/switch/`：`portal.ts` 是基准 Portal，装配与 `examples/game-slice/src/portal.ts` 相同（`WsTransport` + `IpcExecutor` + `ConnectionLayer`），额外起一个只监听 `127.0.0.1`、端口由系统分配的 `POST /switch` 控制端点；同一时刻只接受一个切换，响应带服务端测得的 `switchTo` 耗时。`index.ts` 是负载、触发、分相统计与报告，`support.ts` 放配置、分相分类、Portal 生命周期与清理，`budget.ts` 按 ADR-0004 推导外部停止预算。Server 入口复用 `examples/game-slice/src/server.ts`，两个进程世代共用同一个临时 `GAME_SLICE_DATA_DIR`，替换顺序由框架保证旧写者退出后才激活新进程。
+实现拆在 `benchmarks/game/switch/`：`portal.ts` 是基准 Portal，装配与 `examples/game-slice/src/portal.ts` 相同（`WsTransport` + `IpcExecutor` + `ConnectionLayer`），额外起一个只监听 `127.0.0.1`、端口由系统分配的 `POST /switch` 控制端点；同一时刻只接受一个切换，响应带服务端测得的 `switchTo` 耗时。`index.ts` 是负载、触发、分相统计与报告，`support.ts` 放配置、分相分类、Portal 生命周期与清理，`budget.ts` 按 ADR-0004 推导外部停止预算并从 Portal stdout 读取 `executor.closeBudgetMs`（读不到才回退常量）。Server 入口复用 `examples/game-slice/src/server.ts`，两个进程世代共用同一个临时 `GAME_SLICE_DATA_DIR`，替换顺序由框架保证旧写者退出后才激活新进程。
 
 时间线：
 
@@ -58,9 +58,9 @@ bun run bench          # logger + game 微基准
 
 环境变量（默认值见 `benchmarks/game/switch/support.ts` 顶部常量）：`SWITCH_CLIENTS`、`SWITCH_INTERVAL_MS`、`SWITCH_DURATION_SEC`（客户端运行总时长，含 warmup）、`SWITCH_WARMUP_SEC`、`SWITCH_DATA_DIR`、`SWITCH_KEEP=1`、`SWITCH_EVENTS=0`、`REQUEST_TIMEOUT_MS`。同时设 `SWITCH_URL` 与 `SWITCH_CONTROL_URL` 可复用外部 Portal：跳过 spawn、Server pid 检查与数据目录清理，控制端点由外部 Portal 自己提供。
 
-清理：关闭客户端、SIGTERM Portal、按 ADR-0004 的完整外部停止上界 `C + max(C, E + S) + C` 加 1000 ms 诊断余量等待 Portal 退出（当前装配 `C=5000`、`E=23250`、`S=1000`，即 34250 + 1000 = 35250 ms），超时才 SIGKILL；随后在有界时间内确认所有已见 Server pid 消失，必要时 SIGKILL。只有 Portal 优雅停止、退出已观测、没有幸存 Server pid 且运行没有失败时才删除临时目录。失败、`SWITCH_KEEP=1` 或 `SWITCH_DATA_DIR` 指定的用户目录都会保留现场并打印路径。只有装配、连接、切换被拒绝、cleanup 或“窗口/基线没有样本”才非零退出；请求失败、超时、掉线与事件缺口只报告，不设阈值。
+清理：关闭客户端、SIGTERM Portal、按 ADR-0004 的完整外部停止上界 `C + max(C, E + S) + C` 加 1000 ms 诊断余量等待 Portal 退出，超时才 SIGKILL。`C` 与 `S` 是基准中的常量（`C` 就是 Portal 的 `shutdownTimeoutMs`），`E` 不是：Portal 启动时把 `IpcExecutor.closeBudgetMs` 打印成 `portal: executor close budget <n> ms`，协调器从 Portal stdout 解析该值再推导停止预算，因此 core 关闭预算变化会直接反映到等待时长，不会出现“基准和测试一起绿、预算却已漂移”；运行输出也会打印解析到的预算与来源。只有解析不到该行时才回退到 `budget.ts` 的快照常量，并在 stderr 打印 warn，写明回退值与最终预算。随后在有界时间内确认所有已见 Server pid 消失，必要时 SIGKILL。只有 Portal 优雅停止、退出已观测、没有幸存 Server pid 且运行没有失败时才删除临时目录。失败、`SWITCH_KEEP=1` 或 `SWITCH_DATA_DIR` 指定的用户目录都会保留现场并打印路径。只有装配、连接、切换被拒绝、cleanup 或“窗口/基线没有样本”才非零退出；请求失败、超时、掉线与事件缺口只报告，不设阈值。
 
-限制：所有进程同机，切换耗时受本机进程启动、文件系统与调度影响；默认数据目录通常是 tmpfs，SQLite 与 Server 启动会比真实磁盘快；look 客户端与协调器同进程，客户端侧 JSON 解析与事件循环调度也算进请求延迟；结果是单机近似，跨机器没有可比性。结果不写入仓库文档。
+限制：所有进程同机，切换耗时受本机进程启动、文件系统与调度影响；默认数据目录通常是 tmpfs，SQLite 与 Server 启动会比真实磁盘快；look 客户端与协调器同进程，客户端侧 JSON 解析与事件循环调度也算进请求延迟；结果是单机近似，跨机器没有可比性。基准 Portal 沿用 `WsTransport` 默认的消息上限与发送队列容量，`maxQueuedBytes` 不得小于 `maxMessageBytes` 的启动期校验因此不会触发；复用外部 Portal（`SWITCH_URL`）时，该 Portal 自己的装配若把队列设得小于单帧上限，会在启动时报 `RangeError`，基准侧只看到连接失败。结果不写入仓库文档。
 
 ## 玩家级负载基准
 

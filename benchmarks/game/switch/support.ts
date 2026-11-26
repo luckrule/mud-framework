@@ -15,7 +15,13 @@ import {
   writeError,
 } from '../support.ts';
 import type { LatencyStats, PortalStopResult } from '../support.ts';
-import { PORTAL_STOP_BUDGET_MS } from './budget.ts';
+import {
+  PORTAL_EXECUTOR_CLOSE_SLACK_MS,
+  PORTAL_SHUTDOWN_TIMEOUT_MS,
+  deriveExternalStopBudget,
+  parsePortalCloseBudgetMs,
+  resolveExecutorCloseBudget,
+} from './budget.ts';
 
 /**
  * Configuration, phase statistics, Portal lifecycle and cleanup for
@@ -276,6 +282,10 @@ export interface SwitchPortal {
   readonly url: string;
   readonly controlUrl: string;
   readonly pid: number;
+  /** `IpcExecutor.closeBudgetMs` as the Portal reported it, else the snapshot. */
+  readonly executorCloseBudgetMs: number;
+  /** False when the Portal never printed its budget and the snapshot was used. */
+  readonly closeBudgetReported: boolean;
   serverPids(): readonly number[];
   liveServerPid(): number | undefined;
   logCount(msg: string): number;
@@ -371,6 +381,7 @@ export async function startSwitchPortal(options: {
 
   const serverPids = new Set<number>();
   let newestServerPid: number | undefined;
+  let reportedCloseBudgetMs: number | undefined;
   const logCounts = new Map<string, number>();
   const listening = Promise.withResolvers<string>();
   const control = Promise.withResolvers<string>();
@@ -379,6 +390,10 @@ export async function startSwitchPortal(options: {
     if (pid !== undefined) {
       serverPids.add(pid);
       newestServerPid = pid;
+    }
+    const closeBudgetMs = parsePortalCloseBudgetMs(line);
+    if (closeBudgetMs !== undefined) {
+      reportedCloseBudgetMs = closeBudgetMs;
     }
     const msg = logMessageOf(line);
     if (msg !== undefined) {
@@ -427,13 +442,25 @@ export async function startSwitchPortal(options: {
       ? newestServerPid
       : undefined;
 
+  const resolved = resolveExecutorCloseBudget(reportedCloseBudgetMs);
+  const stopBudgetMs = deriveExternalStopBudget({
+    connectionShutdownMs: PORTAL_SHUTDOWN_TIMEOUT_MS,
+    executorCloseBudgetMs: resolved.closeBudgetMs,
+    executorCloseSlackMs: PORTAL_EXECUTOR_CLOSE_SLACK_MS,
+  });
+  if (!resolved.reported) {
+    writeError(
+      `switch benchmark warning: the Portal did not report its executor close budget; falling back to the ${resolved.closeBudgetMs} ms snapshot (stop budget ${stopBudgetMs} ms)`,
+    );
+  }
+
   let stopped: Promise<PortalStopResult> | undefined;
   const stop = (): Promise<PortalStopResult> => {
     stopped ??= (async () => {
       child.kill('SIGTERM');
       // ADR-0004's complete external stop bound plus a diagnostic margin, not a
       // fixed guess: a legal but slow drain/exit confirmation must finish.
-      let exitCode = await waitForExit(child, PORTAL_STOP_BUDGET_MS);
+      let exitCode = await waitForExit(child, stopBudgetMs);
       let forced = false;
       if (exitCode === undefined) {
         forced = true;
@@ -465,6 +492,8 @@ export async function startSwitchPortal(options: {
     url,
     controlUrl,
     pid: child.pid,
+    executorCloseBudgetMs: resolved.closeBudgetMs,
+    closeBudgetReported: resolved.reported,
     serverPids: () => [...serverPids],
     liveServerPid,
     logCount: (msg) => logCounts.get(msg) ?? 0,

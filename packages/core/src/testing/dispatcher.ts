@@ -112,6 +112,55 @@ export class SlowCommitBackend implements StorageBackend {
 }
 
 /**
+ * A backend that runs `beforeCommit` after the transaction callback settled but
+ * before it counts the commit, so a test can place the settlement at an exact
+ * instant on its own clock. `BusyCommitBackend` blocks real time; this one does
+ * not block at all, which keeps a test that pins `performance.now()` from
+ * waiting for a timer it cannot reach.
+ */
+export class HookedCommitBackend implements StorageBackend {
+  private committed = 0;
+  private rolledBack = 0;
+
+  constructor(private readonly beforeCommit: () => void) {}
+
+  capabilities(): StorageCapabilities {
+    return {
+      transactions: 'full',
+      concurrency: 'pooled',
+      snapshotRead: true,
+      uniqueConstraint: false,
+      maxTransactionDurationMs: Number.POSITIVE_INFINITY,
+    };
+  }
+
+  async transaction<T>(fn: (tx: StorageTransaction) => Promise<T>): Promise<T> {
+    const tx: StorageTransaction = {
+      query: <R>(): Promise<R[]> => Promise.resolve([]),
+      execute: (): Promise<void> => Promise.resolve(),
+    };
+    let result: T;
+    try {
+      result = await fn(tx);
+    } catch (error) {
+      this.rolledBack += 1;
+      throw error;
+    }
+    this.beforeCommit();
+    this.committed += 1;
+    return result;
+  }
+
+  close(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  stats(): { committed: number; rolledBack: number } {
+    return { committed: this.committed, rolledBack: this.rolledBack };
+  }
+}
+
+/**
  * A backend whose COMMIT blocks the event loop synchronously once the
  * transaction callback resolves, like a driver flushing its log on the calling
  * thread. `SlowCommitBackend` yields a macrotask instead, which lets the

@@ -67,6 +67,9 @@ async function main(): Promise<void> {
     startTimeoutMs: 10_000,
     shutdownTimeoutMs: PORTAL_SHUTDOWN_TIMEOUT_MS,
   });
+  // The coordinator derives its stop budget from this line, so the benchmark
+  // never waits on a stale copy of core's close budget.
+  write(`portal: executor close budget ${executor.closeBudgetMs} ms`);
   const transport = new WsTransport({
     port: portalPort,
     hostname: '127.0.0.1',
