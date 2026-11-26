@@ -7,6 +7,26 @@ interface RequestWork {
   readonly run: () => Promise<void>;
   readonly done: () => void;
   readonly fail: (error: unknown) => void;
+  readonly queued: QueuedRequest | undefined;
+}
+
+/**
+ * What a request work tells shutdown about itself. A dropped request must undo
+ * the accounting its submitter did for the seat it held, and a decoded request
+ * must be named in the log — a frame that could not be decoded is not a
+ * Request and has no identity to report.
+ */
+export interface QueuedRequest {
+  readonly identity?: QueuedRequestIdentity;
+  /** Undoes the caller's accounting for the queued seat this work held. */
+  readonly onDropped: () => void;
+}
+
+export interface QueuedRequestIdentity {
+  readonly requestId: string;
+  readonly method: string;
+  /** The client's correlation id (SPEC 7.3), omitted when there is none. */
+  readonly clientRequestId?: string;
 }
 
 /**
@@ -70,12 +90,13 @@ export class ConnectionWriter {
     return this.requestTail;
   }
 
-  submit(work: () => Promise<void>): Promise<void> {
+  submit(work: () => Promise<void>, queued?: QueuedRequest): Promise<void> {
     const { promise, resolve, reject } = Promise.withResolvers<void>();
     this.requests.push({
       run: work,
       done: () => resolve(),
       fail: (error: unknown) => reject(error),
+      queued,
     });
     this.requestTail = promise.then(
       () => undefined,
@@ -83,6 +104,30 @@ export class ConnectionWriter {
     );
     this.start();
     return promise;
+  }
+
+  /**
+   * Drops every request that has not started, for shutdown (SPEC 6.3). Work
+   * already shifted out of the queue keeps running: it may have committed, and
+   * interrupting it is not what a bounded drain is allowed to do.
+   *
+   * Returning the identities rather than logging here keeps the shutdown
+   * policy in the layer. `onDropped` releases the caller's accounting for the
+   * seat and `done` settles `requestsSettled`, so a dropped request leaves no
+   * count and no hanging barrier behind.
+   */
+  discardQueuedRequests(): QueuedRequestIdentity[] {
+    const identities: QueuedRequestIdentity[] = [];
+    for (const work of this.requests) {
+      work.queued?.onDropped();
+      const identity = work.queued?.identity;
+      if (identity !== undefined) {
+        identities.push(identity);
+      }
+      work.done();
+    }
+    this.requests.length = 0;
+    return identities;
   }
 
   /**

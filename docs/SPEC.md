@@ -257,7 +257,7 @@ Extension 对存储能力的依赖 MUST 显式声明。启动时若后端能力�
 
 Transport 只负责四件事：接受连接、交付入站数据、写出发站数据、关闭。MUST NOT 承担：Session 路由、输入缓冲、重放、访问检查。理由：这些职责依赖 Session 与 Request 语义，属于框架契约；下沉到传输会让每个传输实现各自重写一遍，且无法保证跨传输一致。
 
-Transport MUST 对每个连接的发站缓冲设上限。缓冲耗尽时 MUST 显式失败并终止该连接，不得让未写出的数据无界积压，也不得静默丢弃。单条发送的超时只约束“已接受的帧迟迟写不出去”，MUST NOT 用它代替容量上限：慢客户端可以在超时前持续制造积压。
+Transport MUST 对每个连接的发站缓冲设上限。缓冲耗尽时 MUST 显式失败并终止该连接，不得让未写出的数据无界积压，也不得静默丢弃。单条发送的超时只约束“已接受的帧迟迟写不出去”，MUST NOT 用它代替容量上限：慢客户端可以在超时前持续制造积压。传输实现 MAY 在出站缓冲耗尽时以 close code `1013`（Try Again Later）关闭该连接；这与 §6.1 的准入拒绝使用同一码值，但触发条件不同（已准入连接的服务不可用，而非准入拒绝），传输实现可以映射为本协议的等价语义。
 
 Transport MAY 暴露自己的单帧发送上界（`Transport.sendTimeoutMs`）。暴露时框架用它给 Server 事件的写出设界，保证同一 Session 的串行位不会早于传输自身失败而释放（§3.8）。该字段可选，未暴露或值不可用（例如 `Infinity`）时框架按自己的配置与默认值处理。
 
@@ -297,7 +297,7 @@ TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：
 
 分离的理由不是架构美观，而是崩溃恢复：业务进程崩溃后可以重启并重放，连接层保住玩家不断线。Session 的业务状态归业务进程，连接层只保存路由信息与未确认输入；连接层重启会断开连接，但不会丢失已提交的业务状态。
 
-连接层对同时活跃的连接数设准入上限（见 `ConnectionLayerOptions.maxConnections`）。达到上限时，新连接 MUST 被关闭且不进入请求处理；连接断开后空出的名额 MUST 可供后续连接使用。该上限只约束准入，不是业务 Session 的生命周期限制。理由：绑定在 Handler 成功后才声明，连接层无法在执行前预检 Session 容量；活跃连接数是唯一能在副作用前拒绝的位置，而路由表大小不会超过连接数。
+连接层对同时活跃的连接数设准入上限（见 `ConnectionLayerOptions.maxConnections`）。达到上限时，新连接 MUST 被关闭且不进入请求处理；关闭时传给传输的关闭码 MUST 为 `1013`（Try Again Later），非 WebSocket 传输可以忽略该值。连接断开后空出的名额 MUST 可供后续连接使用。该上限只约束准入，不是业务 Session 的生命周期限制。理由：绑定在 Handler 成功后才声明，连接层无法在执行前预检 Session 容量；活跃连接数是唯一能在副作用前拒绝的位置，而路由表大小不会超过连接数。
 
 ### 6.2 启动顺序
 
@@ -318,7 +318,7 @@ TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：
 ### 6.3 关闭顺序
 
 1. 连接层停止接受新输入。
-2. 排空已接受输入，受连接层关闭预算约束；仍在 Session 屏障前、尚未调用 executor 的请求以 `FRAMEWORK_SHUTDOWN` 结束，不绕过屏障继续执行。
+2. 排空已接受输入，受连接层关闭预算约束。已经开始执行的请求按原路径结算并回执；排空结束后仍未开始的请求 MUST 被显式丢弃，逐条记录 `REQUEST_DROPPED_AT_SHUTDOWN`（字段见 §7.1），不再执行也不回执——连接随即关闭，回执无处可送。请求 MUST NOT 绕过 Session 屏障继续执行。丢弃只发生在排空之后：排空预算内能开始的请求仍正常执行，不因关闭而被提前丢弃。
 3. 执行器等待已接受工作，并关闭 Server 与存储，所有等待有界；超时或失败必须可观测，不得当作已确认资源释放。
 4. 尽力关闭传输并传播其失败，即使执行器关闭已经失败也不得跳过。
 
@@ -372,6 +372,8 @@ Server 事件的诊断日志（ADR-0008）分逐事件与批量两类。逐事�
 
 关闭时丢弃未写出事件的汇总日志为 `EVENT_BACKLOG_DISCARDED`，`reason` 取 `'shutdown'`，字段含 `count`、`connections`、`frames`、`bytes`（§3.8）。
 
+关闭时丢弃尚未开始的请求为逐条日志 `REQUEST_DROPPED_AT_SHUTDOWN`（§6.3 第 2 步），`reason` 指明排空预算内未开始，字段含 `requestId`、`method`、`clientRequestId`（无则省略）、`connectionId`。该 `code` 与该路径互斥于 `TRANSPORT_CLOSED`：后者只表示连接已不在，不再用于关闭预算耗尽。
+
 ### 7.2 错误码
 
 错误码 MUST 可枚举。发布前错误码可删除或改名，按破坏性变更处理；发布后只增不删。语义变更 MUST 分配新码，不得复用旧码表示新含义。
@@ -398,7 +400,7 @@ Server 事件的诊断日志（ADR-0008）分逐事件与批量两类。逐事�
 
 `TRANSPORT_SEND_FAILED` 的触发条件是“写不出去”，因此它结构上不可能送达客户端，只能作为日志字段被观察到。`TRANSPORT_CLOSED` 只作为请求终态的原因出现：请求因断线结束时连接已不在，没有可回写的通道，因此不承诺送达。两码仍是契约——它们回答“请求为什么结束”，删掉会让终态失去可枚举的说法。
 
-**仅日志诊断字段** 出现在日志的 `code` 字段里，用于定位，不发给客户端，也不构成 wire 契约：`CANCEL_LOST_TO_COMMIT`、`IPC_CHANNEL_CLOSED`、`SERVER_STARTUP_FAILED`、`DUPLICATE_REQUEST`、`INVALID_IPC_MESSAGE`、`EVENT_DROPPED`、`EVENT_SEND_FAILED`、`EVENTS_DROPPED`、`EVENT_LISTENER_FAILED`、`EVENT_BACKLOG_DISCARDED` 等。日志里的 `code` 只是一个字段名，取值不受本节约束。`EVENT_DROPPED` 与 `EVENT_BACKLOG_DISCARDED` 的 `reason` 与字段见 §7.1。
+**仅日志诊断字段** 出现在日志的 `code` 字段里，用于定位，不发给客户端，也不构成 wire 契约：`CANCEL_LOST_TO_COMMIT`、`IPC_CHANNEL_CLOSED`、`SERVER_STARTUP_FAILED`、`DUPLICATE_REQUEST`、`INVALID_IPC_MESSAGE`、`EVENT_DROPPED`、`EVENT_SEND_FAILED`、`EVENTS_DROPPED`、`EVENT_LISTENER_FAILED`、`EVENT_BACKLOG_DISCARDED`、`REQUEST_DROPPED_AT_SHUTDOWN` 等。日志里的 `code` 只是一个字段名，取值不受本节约束。`EVENT_DROPPED`、`EVENT_BACKLOG_DISCARDED` 与 `REQUEST_DROPPED_AT_SHUTDOWN` 的 `reason` 与字段见 §7.1。
 
 `FRAMEWORK_` 前缀是示例惯例，不是强制格式。`INVALID_ENVELOPE`、`UNKNOWN_METHOD`、`INTERNAL_ERROR`、`TRANSPORT_SEND_FAILED` 没有该前缀；发布后错误码只增不删；改名等于换码，所以这些名字保持不变。
 
@@ -406,7 +408,7 @@ Server 事件的诊断日志（ADR-0008）分逐事件与批量两类。逐事�
 
 ### 7.3 请求标识与关联
 
-每个 Request 在进入框架时分配请求标识，并在整个生命周期内保持不变——包括跨进程投递与重放。理由：一次重放会产生多条日志，分布在两个进程；若重放时换新标识，就无法回答“这条日志对应玩家哪一次输入”。重放时 SHOULD 额外记录重放次数与原始接收时间，用于识别“同一个请求反复失败”的情况。
+每个 Request 在进入框架时分配请求标识，并在整个生命周期内保持不变——包括跨进程投递与重放。理由：一次重放会产生多条日志，分布在两个进程；若重放时换新标识，就无法回答“这条日志对应玩家哪一次输入”。重放时 SHOULD 额外记录重放次数与原始接收时间（绝对时间戳），用于识别“同一个请求反复失败”的情况，并让分布在两个进程的日志能按原始接收时刻对齐。
 
 ## 8. 变更规则
 

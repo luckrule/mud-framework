@@ -763,6 +763,63 @@ describe('ConnectionLayer event write scheduling', () => {
       h.logs().filter((line) => line.code === 'TRANSPORT_SEND_FAILED'),
     ).toEqual([]);
   });
+
+  test('stop during a takeover redelivery does not queue the event on the new holder', async () => {
+    const h = sessionHarness({ shutdownTimeoutMs: 30 });
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"1","method":"bind"}');
+    const hanging = h.transport.receive('c1', '{"id":"2","method":"hang"}');
+    await sleep(0);
+
+    // E1 is queued for s1 on c1, behind the hanging request.
+    h.controlled.emit(sessionEvent('e:0', 'first'));
+    await tick();
+
+    // c2 takes s1 over while E1 waits, so E1's write will observe a moved
+    // holder and earn exactly one redelivery.
+    h.transport.connect('c2');
+    await h.transport.receive('c2', '{"id":"3","method":"bind"}');
+    await sleep(0);
+
+    h.controlled.release();
+    // Wait until the moved frame has left every buffer: it was released from
+    // c1's queue and the redelivery has not queued it again yet. Polling a
+    // public health count ties the test to observable state rather than to the
+    // number of promise hops the implementation happens to use.
+    let hops = 0;
+    while (h.layer.health().eventBacklog.frames !== 0 && hops < 50) {
+      await Promise.resolve();
+      hops += 1;
+    }
+    expect(h.layer.health().eventBacklog.frames).toBe(0);
+    const c2Frames = h.transport.sentTo('c2').map(parseFrame);
+
+    const stopping = h.layer.stop();
+    await Promise.all([hanging, stopping]);
+    await tick();
+    await tick();
+
+    // The redelivery must not join c2's queue after shutdown started: the only
+    // guard is the accepting-events check at the head of the redelivery loop.
+    // Without it the frame is queued, immediately aborted by the shutdown and
+    // reported as an EVENT_DROPPED, which the shutdown contract forbids.
+    expect(c2Frames).toEqual([{ id: '3', ok: true, result: 'bind' }]);
+    expect(h.logs().filter((line) => line.code === 'EVENT_DROPPED')).toEqual(
+      [],
+    );
+    expect(
+      h.logs().filter((line) => line.code === 'TRANSPORT_SEND_FAILED'),
+    ).toEqual([]);
+    // Nothing is left counted: the frame left the Session queue, was never
+    // re-queued, and no overflow drop was recorded.
+    expect(h.layer.health().eventBacklog).toEqual({
+      connections: 0,
+      frames: 0,
+      bytes: 0,
+      dropped: 0,
+    });
+  });
 });
 
 interface QueuedWrite {

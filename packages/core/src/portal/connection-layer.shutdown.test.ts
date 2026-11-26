@@ -1,14 +1,25 @@
 import { describe, expect, test } from 'bun:test';
 
 import { createJsonLogger } from '../logging/json-logger.ts';
+import type { ServerEvent } from '../shared/events.ts';
 import type { RequestExecutor } from '../shared/executor.ts';
 import { parseFrame, rejectionOf, sleep } from '../testing/common.ts';
 import {
   fakeConnection,
   scriptedExecutor,
   scriptedTransport,
+  sessionHarness,
 } from '../testing/connection-layer.ts';
 import { ConnectionLayer } from './connection-layer.ts';
+
+function connectionEvent(eventId: string, connectionId = 'c1'): ServerEvent {
+  return {
+    eventId,
+    target: { kind: 'connection', connectionId },
+    event: 'note',
+    payload: 'x',
+  };
+}
 
 describe('ConnectionLayer shutdown (SPEC 6.3)', () => {
   test('still closes the executor when transport.stop throws, and a retry is idempotent (2b)', async () => {
@@ -475,5 +486,165 @@ describe('ConnectionLayer shutdown (SPEC 6.3)', () => {
 
     expect(closeCalls()).toBe(1);
     expect(scripted.stopCalls()).toBe(1);
+  });
+});
+
+describe('ConnectionLayer shutdown drops requests that never started (SPEC 3.8, 6.3)', () => {
+  test('drops a request queued behind an unfinished event frame, once and by name', async () => {
+    const h = sessionHarness({
+      shutdownTimeoutMs: 20,
+      createRequestId: () => 'req-1',
+    });
+    await h.layer.start();
+    h.transport.connect('c1');
+
+    // One event frame is on the wire and never settles: the writer is inside
+    // the frame's write, so the request behind it cannot start.
+    const held = h.transport.holdSends('c1');
+    h.controlled.emit(connectionEvent('e:0'));
+    await held.entered;
+    const request = h.transport.receive('c1', '{"id":"r1","method":"work"}');
+    await sleep(0);
+    // Read before `stop()`: a stopped transport cannot be inspected, and the
+    // held frame is the only one on the wire at this point.
+    const beforeStop = h.transport.sentTo('c1').map(parseFrame);
+
+    const stopping = h.layer.stop();
+    await sleep(40);
+    // The request was dropped, not left waiting on the writer; releasing the
+    // frame lets the transport's own stop finish.
+    held.release();
+    await stopping;
+    await request;
+    await sleep(0);
+
+    const dropped = h
+      .logs()
+      .filter((entry) => entry.code === 'REQUEST_DROPPED_AT_SHUTDOWN');
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]).toMatchObject({
+      level: 'warn',
+      requestId: 'req-1',
+      method: 'work',
+      clientRequestId: 'r1',
+      connectionId: 'c1',
+      reason: expect.stringContaining('drain budget'),
+    });
+    // It never ran, so nothing was written and no late path reported it.
+    expect(h.controlled.started).not.toContain('work');
+    expect(beforeStop).toEqual([
+      {
+        kind: 'event',
+        eventId: 'e:0',
+        event: 'note',
+        payload: 'x',
+      },
+    ]);
+    expect(
+      h.logs().filter((entry) => entry.msg === 'request dropped before start'),
+    ).toEqual([]);
+    expect(
+      h.logs().filter((entry) => entry.code === 'TRANSPORT_CLOSED'),
+    ).toEqual([]);
+    // Exactly one line: the drop is reported by the shutdown path and nowhere
+    // else, so the two paths cannot both claim the same request.
+    expect(
+      h.logs().filter((entry) => entry.msg === 'request dropped at shutdown'),
+    ).toHaveLength(1);
+    // Nothing is left counted after the close.
+    expect(h.layer.health().connections).toBe(0);
+    expect(h.layer.health().eventBacklog).toEqual({
+      connections: 0,
+      frames: 0,
+      bytes: 0,
+      dropped: 0,
+    });
+  });
+
+  test('lets a started request finish with its receipt while a waiting one is dropped', async () => {
+    const h = sessionHarness({
+      shutdownTimeoutMs: 20,
+      createRequestId: (() => {
+        let next = 0;
+        return () => `req-${(next += 1)}`;
+      })(),
+    });
+    await h.layer.start();
+    h.transport.connect('c1');
+    h.transport.connect('c2');
+
+    // c1's request is already running and finishes inside the drain budget.
+    const started = h.transport.receive('c1', '{"id":"a1","method":"work"}');
+    // c2's request waits behind a frame that never settles, so its turn never
+    // comes: the drain budget runs out with it still queued.
+    const held = h.transport.holdSends('c2');
+    h.controlled.emit(connectionEvent('e:0', 'c2'));
+    await held.entered;
+    const waiting = h.transport.receive('c2', '{"id":"b1","method":"work"}');
+    await sleep(0);
+
+    const stopping = h.layer.stop();
+    await started;
+    const c1Frames = h.transport.sentTo('c1').map(parseFrame);
+    await sleep(40);
+    held.release();
+    await stopping;
+    await waiting;
+    await sleep(0);
+
+    // The started request ran to completion and was answered; it is not a
+    // shutdown casualty (SPEC 6.3 step 2).
+    expect(h.controlled.started).toContain('work');
+    expect(c1Frames).toEqual([{ id: 'a1', ok: true, result: 'work' }]);
+    expect(h.controlled.finished).toContain('work');
+
+    const dropped = h
+      .logs()
+      .filter((entry) => entry.code === 'REQUEST_DROPPED_AT_SHUTDOWN');
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]).toMatchObject({
+      requestId: 'req-2',
+      method: 'work',
+      clientRequestId: 'b1',
+      connectionId: 'c2',
+    });
+  });
+
+  test('a graceful shutdown still runs and answers a request that was only queued', async () => {
+    const h = sessionHarness({ shutdownTimeoutMs: 5000 });
+    await h.layer.start();
+    h.transport.connect('c1');
+
+    // One request is running, one waits behind it. Neither is stuck on a frame,
+    // so the drain budget covers both: this is the normal close, and dropping
+    // the waiting one would turn a graceful shutdown into an abrupt one.
+    const running = h.transport.receive('c1', '{"id":"a1","method":"hang"}');
+    await sleep(0);
+    const queued = h.transport.receive('c1', '{"id":"b1","method":"work"}');
+    await sleep(0);
+    expect(h.controlled.started).toEqual(['hang']);
+
+    const stopping = h.layer.stop();
+    await sleep(0);
+    h.controlled.release();
+    await Promise.all([running, queued]);
+    // Behaviour first: a premature drop shows up here rather than as a read on
+    // a transport that already stopped.
+    expect(h.controlled.started).toEqual(['hang', 'work']);
+    expect(h.controlled.finished).toEqual(['hang', 'work']);
+    expect(
+      h.logs().filter((entry) => entry.code === 'REQUEST_DROPPED_AT_SHUTDOWN'),
+    ).toEqual([]);
+    expect(
+      h.logs().filter((entry) => entry.msg === 'request dropped before start'),
+    ).toEqual([]);
+    // Read while the transport is still running: `stop()` has not resolved yet.
+    const frames = h.transport.sentTo('c1').map(parseFrame);
+    await stopping;
+
+    expect(frames).toEqual([
+      { id: 'a1', ok: true, result: 'hang' },
+      { id: 'b1', ok: true, result: 'work' },
+    ]);
   });
 });

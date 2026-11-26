@@ -219,7 +219,7 @@ export class ConnectionLayer implements TransportHandlers {
       createRequestId: this.createRequestId,
       router: this.router,
       executor: this.executor,
-      enqueue: (state, work) => state.writer.submit(work),
+      enqueue: (state, work, queued) => state.writer.submit(work, queued),
     };
     this.eventHost = {
       codec: this.codec,
@@ -384,6 +384,12 @@ export class ConnectionLayer implements TransportHandlers {
         'in-flight requests did not settle before the shutdown timeout',
       );
     }
+    // Requests still waiting for their turn cannot start within what is left of
+    // the drain budget: a started event frame can occupy the writer for its own
+    // send bound, which exceeds the shutdown budget (SPEC 3.8). Dropping them
+    // here, by name, replaces the silent drop that `connections.clear()` used to
+    // cause when they woke up on a gone connection. Started work is untouched.
+    this.discardQueuedRequests();
     this.connections.clear();
     // SPEC 6.1: routes outlive neither their connections nor the layer. Leaving
     // them behind would make a restarted layer route a reconnect to a
@@ -461,6 +467,34 @@ export class ConnectionLayer implements TransportHandlers {
     }
     if (executorFailure !== undefined) {
       throw executorFailure;
+    }
+  }
+
+  /**
+   * Drops every accepted request that never started, one warn line each
+   * (SPEC 3.8, 6.3). Without this the request would wake up on a cleared table
+   * and be reported as `TRANSPORT_CLOSED` — the wrong reason, since the client
+   * is still connected and it was shutdown that ended it. Work that already
+   * started keeps the existing drain and timeout path.
+   */
+  private discardQueuedRequests(): void {
+    for (const [connectionId, state] of this.connections) {
+      for (const identity of state.writer.discardQueuedRequests()) {
+        this.logger.warn(
+          {
+            requestId: identity.requestId,
+            method: identity.method,
+            ...(identity.clientRequestId === undefined
+              ? {}
+              : { clientRequestId: identity.clientRequestId }),
+            connectionId,
+            code: 'REQUEST_DROPPED_AT_SHUTDOWN',
+            reason:
+              'the request did not start within the shutdown drain budget',
+          },
+          'request dropped at shutdown',
+        );
+      }
     }
   }
 

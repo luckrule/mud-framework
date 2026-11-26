@@ -12,6 +12,7 @@ import {
 } from './connection-admission.ts';
 import { isExecutorOutcome, toFailure } from './connection-outcome-guards.ts';
 import { rawLengthOf, rejectEnvelope, reply } from './connection-reply.ts';
+import type { QueuedRequest } from './connection-writer.ts';
 import type { ConnectionLayerStatus } from './health.ts';
 import type { SessionRouter } from './session-router.ts';
 
@@ -27,6 +28,7 @@ export interface RequestHost extends AdmissionHost {
   readonly enqueue: (
     state: ConnectionState,
     work: () => Promise<void>,
+    queued: QueuedRequest,
   ) => Promise<void>;
 }
 
@@ -59,10 +61,16 @@ export function onMessage(
     const rawLength = rawLengthOf(payload);
     const reason = messageOf(error);
     state.queued += 1;
-    return host.enqueue(state, async () => {
-      state.queued -= 1;
-      await rejectEnvelope(host, connection, rawLength, reason);
-    });
+    return host.enqueue(
+      state,
+      async () => {
+        state.queued -= 1;
+        await rejectEnvelope(host, connection, rawLength, reason);
+      },
+      // A frame that could not be decoded never became a Request, so it has no
+      // identity to report; only its seat has to be released.
+      { onDropped: () => (state.queued -= 1) },
+    );
   }
   // Assigned when the decoded request enters the framework, before the queue
   // cap decides whether it gets a seat: a refusal is still a Request whose log
@@ -73,8 +81,19 @@ export function onMessage(
     return refuseQueue(host, state, envelope.id, envelope.method, requestId);
   }
   state.queued += 1;
-  return host.enqueue(state, () =>
-    startAfterGate(host, state, envelope, requestId),
+  return host.enqueue(
+    state,
+    () => startAfterGate(host, state, envelope, requestId),
+    {
+      identity: {
+        requestId,
+        method: envelope.method,
+        ...(envelope.id === '' ? {} : { clientRequestId: envelope.id }),
+      },
+      // Shutdown drops the work before it starts, so the decrement that would
+      // have happened inside `startAfterGate` never runs.
+      onDropped: () => (state.queued -= 1),
+    },
   );
 }
 

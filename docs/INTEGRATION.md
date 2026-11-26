@@ -137,7 +137,7 @@ core 只提供同步快照，不提供 HTTP 端点（SPEC 6.6）。应用在自�
 
 **子进程必须是 Bun 进程。** `spawnBunServer` 使用 `Bun.spawn` 的 `ipc` 选项，其序列化格式只与其他 Bun 进程兼容。用 `node` 启动 Server 不会报错：`process.send` 存在，消息被写入，但 Portal 收不到 IPC 回调，表现为启动一直等到 `startTimeoutMs` 才失败。`command` 的第一个元素按 `PATH` 解析，部署环境里 `bun` 必须在 `PATH` 上。
 
-**子进程不得往 stdout 写。** `spawnBunServer` 让子进程的 stdout/stderr 继承 Portal 的对应流（stdin 被忽略），IPC 走独立通道。往 stdout 写不会破坏消息，但会把裸行混进 Portal 的输出流；若下游按行解析结构化日志，混入的裸行会让解析失败。框架自身的 Server 日志默认写 stdout，生产装配要么给 `runServerProcess` 传一个 `sink` 写 stderr 的 logger，要么保证下游不假设每行都合法。诊断信息用 `console.error`。
+**子进程的 stdout 默认混入框架日志。** `spawnBunServer` 让子进程的 stdout/stderr 继承 Portal 的对应流（stdin 被忽略），IPC 走独立通道。往 stdout 写不会破坏消息，但会把裸行混进 Portal 的输出流；若下游按行解析结构化日志，混入的裸行会让解析失败。框架自身的 Server 日志默认写 stdout，因此**生产装配 MUST 给 `runServerProcess` 传一个 `sink` 写 stderr 的 logger，或保证下游不假设每行都合法**；应用自己的诊断信息用 `console.error`。
 
 **一个进程只能有一个 `runServerProcess`。** `process.send` 与 `message`/`disconnect` 事件是进程级的，一个进程只有一条到父进程的 IPC 链路。第二次调用会同步抛出 `a process channel already exists`，而不是让两个实例把同一条消息处理两遍——那等于两个存储写者（INV-002）。需要多个 Server 就启动多个 OS 进程，每个 Portal 只拉起一个。
 
