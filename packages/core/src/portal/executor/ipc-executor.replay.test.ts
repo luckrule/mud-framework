@@ -162,7 +162,7 @@ describe('IpcExecutor replay', () => {
   });
 
   test('logs the original receive time with the replay count', async () => {
-    const h = harness({ timeoutMs: 5000 });
+    const h = harness({ timeoutMs: 5000, maxReplays: 2 });
     const before = Date.now();
     const first = await started(h);
 
@@ -171,27 +171,45 @@ describe('IpcExecutor replay', () => {
     );
 
     first.crash();
-    await flushTicks();
+    await waitFor(() => h.servers.length === 2);
     const second = serverAt(h, 1);
     second.send(readyMessage());
     await flushTicks();
 
-    const replayed = h.logs().find((line) => line.msg === 'request replayed');
-    expect(replayed?.replayCount).toBe(1);
-    expect(typeof replayed?.durationMs).toBe('number');
+    // Crash again so the same request is replayed a second time: two replay
+    // lines for one request is the only way to tell "stamped once at receipt"
+    // from "stamped at each replay", which a single line cannot distinguish.
+    await waitFor(() =>
+      h.logs().some((line) => line.msg === 'request replayed'),
+    );
+    second.crash();
+    await waitFor(() => h.servers.length === 3);
+    const third = serverAt(h, 2);
+    third.send(readyMessage());
+    await flushTicks();
+
+    const replays = h.logs().filter((line) => line.msg === 'request replayed');
+    expect(replays.map((line) => line.replayCount)).toEqual([1, 2]);
 
     // Absolute epoch milliseconds, not the relative `durationMs`: it falls in
     // the window the request was accepted in, which is what lets the two
     // processes align their logs on the original receipt (SPEC 7.3).
-    const receivedAt = replayed?.receivedAt;
-    if (typeof receivedAt !== 'number') {
-      throw new Error('expected the replay log to carry a numeric receivedAt');
+    const receivedAt = replays.map((line) => line.receivedAt);
+    for (const stamp of receivedAt) {
+      if (typeof stamp !== 'number') {
+        throw new Error(
+          'expected the replay log to carry a numeric receivedAt',
+        );
+      }
+      expect(stamp).toBeGreaterThan(1_000_000_000_000);
+      expect(stamp).toBeGreaterThanOrEqual(before);
+      expect(stamp).toBeLessThanOrEqual(Date.now());
     }
-    expect(receivedAt).toBeGreaterThan(1_000_000_000_000);
-    expect(receivedAt).toBeGreaterThanOrEqual(before);
-    expect(receivedAt).toBeLessThanOrEqual(Date.now());
+    // The same request, stamped once: a value re-read at each replay would
+    // drift forward with the restarts and break cross-process alignment.
+    expect(receivedAt[0]).toBe(receivedAt[1]);
 
-    second.send(successMessage('req-1', 'after restart'));
+    third.send(successMessage('req-1', 'after restart'));
     expect(await outcomePromise).toEqual({
       ok: true,
       result: 'after restart',
