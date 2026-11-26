@@ -187,7 +187,7 @@ Handler 可以为一个请求声明要发送的事件（ADR-0008）。`ctx.emit(
 - 每个 Connection 的写出由该连接内的单一调度器串行执行；不同 Connection 之间仍并发写出，不共享调度器。请求工作指从输入准入到结果写出的整段（读输入 → 准入 gate → 执行 → 写结果），是一个调度单元，不是仅写结果帧；MUST NOT 把请求执行留在原链、只把结果帧交给新队列，那会产生两个写者，违背单写者前提。队列中存在就绪的请求工作时，MUST 先处理该请求工作；没有就绪请求工作时才写事件。因此结果帧 MAY 越过尚未写出的事件帧，事件帧之间仍保持发射序（范围见本节“投递语义”）。准入拒绝与关闭拒绝的响应帧不经过该调度器：它们不是请求工作，也不承载事件（§5.4 允许这类帧越过已接受输入）。这是方向性变更：原规则是结果帧与事件帧按 FIFO 顺序写出，新规则是请求工作优先，不是措辞澄清。
 - 请求优先 MUST NOT 使事件无限期饥饿：事件的等待 MUST 被有界数量的请求工作限制。放行间隔是实现常量，不构成契约；请求优先只决定两者同时就绪时的顺序，公平规则只承诺有界等待，不承诺固定的请求与事件比例。
 - 残余边界：已经交给传输的那一帧事件无法被后续结果抢占；慢客户端上正在写的事件帧会让下一个结果多等一帧的写出时间。这是单写者的固有代价，不是保证。
-- 连接层开始关闭后 MUST 停止接收新事件；每一处事件缓冲内尚未写出的事件 MUST 丢弃并记录一条汇总日志（`EVENT_BACKLOG_DISCARDED`，`reason: 'shutdown'`，字段见 §7.1）。关闭只排空请求工作，不为事件消耗关闭预算。已经开始写出的事件帧不属于队列内待写项，MUST NOT 被抢占；它仍受写出上界约束，排在其后的请求最多等待该帧的写出上界。汇总日志的 `count`、`frames`、`bytes` 是被丢弃的帧数与字节数，`connections` 是持有被丢弃帧的 Connection 事件队列数；Session 待投递队列不计入 `connections`。依据：事件是 best-effort，关闭不为不可靠通道延迟资源释放。
+- 连接层开始关闭后 MUST 停止接收新事件；每一处事件缓冲内尚未写出的事件，以及 Session 泵已取出、尚未交给任何连接队列的在手帧，MUST 丢弃并记录一条汇总日志（`EVENT_BACKLOG_DISCARDED`，`reason: 'shutdown'`，字段见 §7.1）。在手帧只存在于 takeover 重投递的交接窗口，平时不构成额外缓冲。关闭只排空请求工作，不为事件消耗关闭预算。已经开始写出的事件帧不属于队列内待写项，MUST NOT 被抢占；它仍受写出上界约束，排在其后的请求最多等待该帧的写出上界。汇总日志的 `count`、`frames`、`bytes` 是被丢弃的帧数与字节数，`connections` 是持有被丢弃帧的 Connection 事件队列数；Session 待投递队列与在手帧不计入 `connections`。依据：事件是 best-effort，关闭不为不可靠通道延迟资源释放。
 
 安全边界：框架不对事件做授权。Handler 可以向任意 Session 声明事件；房间成员资格、可见性与内容过滤属于业务。
 
@@ -377,7 +377,7 @@ Server 事件的诊断日志（ADR-0008）分逐事件与批量两类。逐事�
 
 关闭时丢弃未写出事件的汇总日志为 `EVENT_BACKLOG_DISCARDED`，`reason` 取 `'shutdown'`，字段含 `count`、`connections`、`frames`、`bytes`（§3.8）。
 
-关闭时丢弃尚未开始的请求为逐条日志 `REQUEST_DROPPED_AT_SHUTDOWN`（§6.3 第 2 步），`reason` 指明排空预算内未开始，字段含 `requestId`、`method`、`clientRequestId`（无则省略）、`connectionId`。该 `code` 用于「从未从调度器队列取出的请求」；已取出但在 Session 屏障前被 abort 的请求走 `FRAMEWORK_SHUTDOWN`（§6.3 第 2 步、§7.2）。`TRANSPORT_CLOSED` 只表示连接已不在，不用于关闭预算耗尽。
+关闭时丢弃尚未开始的请求为逐条日志 `REQUEST_DROPPED_AT_SHUTDOWN`（§6.3 第 2 步），`reason` 指明排空预算内未开始，字段含 `requestId`、`method`、`clientRequestId`（无则省略）、`connectionId`。该 `code` 用于「从未从调度器队列取出的请求」；已取出但在 Session 屏障前被 abort 的请求走 `FRAMEWORK_SHUTDOWN`（§6.3 第 2 步、§7.2）。`TRANSPORT_CLOSED` 表示连接已不在，不用于关闭预算耗尽。边界：排空等待超时后 `doStop` 才清空连接表，此时仍停在 Session 屏障前的请求会看到连接不匹配，落 `TRANSPORT_CLOSED` 而不是 `FRAMEWORK_SHUTDOWN`；它同样不执行。
 
 ### 7.2 错误码
 

@@ -128,8 +128,8 @@ describe('ConnectionLayer server events', () => {
     );
     await tick();
 
-    // c2 takes s1 over while c1's chain is still blocked. Its next request
-    // waits on the Session barrier, so it occupies c2's chain ahead of the
+    // c2 takes s1 over while c1's request queue is still blocked. Its next request
+    // waits on the Session barrier, so it occupies c2's request queue ahead of the
     // re-addressed event.
     h.transport.connect('c2');
     await h.transport.receive('c2', '{"id":"3","method":"bind"}');
@@ -172,7 +172,7 @@ describe('ConnectionLayer server events', () => {
     const hanging = h.transport.receive('c1', '{"id":"2","method":"hang"}');
     await sleep(0);
 
-    // The first event waits behind c1's hung chain. The second arrives after
+    // The first event waits behind c1's hung request queue. The second arrives after
     // c2 took the Session over; it must still wait for the first one, or c2
     // would see the events in reverse emission order.
     h.controlled.emit(
@@ -228,7 +228,7 @@ describe('ConnectionLayer server events', () => {
     );
     await tick();
 
-    // c1's chain never reaches the queued event: dropping it on abort is what
+    // c1's request queue never reaches the queued event: dropping it on abort is what
     // releases the Session queue so a later event can still be delivered.
     await h.transport.disconnect('c1');
     await tick();
@@ -815,10 +815,10 @@ describe('ConnectionLayer event write scheduling', () => {
       h.logs().filter((line) => line.code === 'TRANSPORT_SEND_FAILED'),
     ).toEqual([]);
     // The frame was between buffers when shutdown ran: out of the Session
-    // queue, not yet in c2's connection queue. SPEC 3.8 requires every
-    // unwritten frame to be discarded and reported, so the in-hand frame must
-    // appear in the one summary line. It is not a connection queue's frame, so
-    // `connections` stays 0 (SPEC 3.8 names Session queues as excluded).
+    // queue, not yet in c2's connection queue. SPEC 3.8 names in-hand frames
+    // explicitly, so this one must appear in the single summary line. It is not
+    // a connection queue's frame, so `connections` stays 0 (SPEC 3.8 excludes
+    // Session queues and in-hand frames from that count).
     const summary = h
       .logs()
       .filter((line) => line.code === 'EVENT_BACKLOG_DISCARDED');
