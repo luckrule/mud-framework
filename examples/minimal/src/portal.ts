@@ -7,6 +7,8 @@ import {
   spawnBunServer,
 } from 'mud-framework-core';
 
+import { shutdownPortal } from './shutdown.ts';
+
 const DEFAULT_PORTAL_PORT = 8080;
 const DEFAULT_HEALTH_PORT = 8081;
 const SHUTDOWN_SIGNALS = ['SIGINT', 'SIGTERM'] as const;
@@ -83,12 +85,18 @@ async function main(): Promise<void> {
     stopping = true;
     write(`portal: shutting down (${signal})`);
     try {
-      await layer.stop();
-      await health.stop(true);
-      process.exitCode = 0;
-    } catch (error) {
-      writeError(`portal: shutdown failed: ${messageOf(error)}`);
-      process.exitCode = 1;
+      // Both stops always run: the health listener is what keeps the process
+      // alive if the layer's stop rejects.
+      const outcome = await shutdownPortal({
+        stopLayer: () => layer.stop(),
+        stopHealth: () => health.stop(true),
+      });
+      for (const failure of outcome.failures) {
+        writeError(
+          `portal: ${failure.target} shutdown failed: ${messageOf(failure.error)}`,
+        );
+      }
+      process.exitCode = outcome.exitCode;
     } finally {
       lifetime.resolve();
     }
