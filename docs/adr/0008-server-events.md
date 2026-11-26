@@ -19,7 +19,7 @@
 - `ctx.emit(event, payload)`：发给当前请求的 Connection。
 - `ctx.emitToSession(sessionId, event, payload)`：发给该 Session 当前的 holder。
 
-`emit` 的地址是请求入口的 Connection，不是 Session：一个请求在入口无 Session 时也可以发事件。`emitToSession` 存的是 Session id，Portal 在真正写出前才用路由表解析当前 holder。收件人因此是“写出时”的 holder，而不是 handler 运行或事件入队时的连接：排队期间 takeover 会把事件改投新 holder，至多重投递一次，二次变化即丢弃；没有 holder 就丢弃，不排队等它上线。事件随重连跟随 Session，但只跟随一次写出前的变化，不是对所有后续 takeover 的保证。
+`emit` 的地址是请求入口的 Connection，不是 Session：一个请求在入口无 Session 时也可以发事件。`emitToSession` 存的是 Session id，Portal 在真正写出前才用路由表解析当前 holder。收件人因此是“写出时”的 holder，而不是 handler 运行或事件入队时的连接：排队期间 takeover 会把事件改投新 holder，至多重投递一次，二次变化即丢弃；没有 holder 就丢弃，不排队等它上线。事件随重连跟随 Session，但只跟随一次写出前的变化，不是对所有后续 takeover 的保证。同一 Session 的事件按到达顺序串行：后一条等前一条写出或丢弃后才投递，因此 takeover 不改变同一收件 Connection 上的事件顺序。
 
 事件名与 payload 对框架不透明，框架只校验事件名非空、`emitToSession` 的 Session id 非空。事件名是业务契约的一部分，框架不维护枚举。
 
@@ -55,7 +55,8 @@ Server → Portal 使用独立消息：
 
 - Portal 收到事件消息后，`connection` 目标查连接表，`session` 目标在实际写出前重新解析当前 holder。目标不存在、连接已关闭、没有 holder、编码失败或传输写失败时，记一条 warn 并丢弃。不因失败缓冲或重试，不让任何请求失败。
 - `session` 目标排队期间发生 takeover 时改投新 holder，至多重投递一次；再次变化即丢弃（`EVENT_DROPPED`）。
-- 同一 Connection 上的写顺序由该连接的有序链与传输发送队列保证。不同 Connection 之间不承诺全局顺序。
+- `session` 目标按 Session 串行：同一 Session 的事件按到达顺序逐条处理，后一条在前一条写出或丢弃后才开始投递。旧连接在事件等待其有序链期间关闭时，该事件丢弃（`EVENT_DROPPED`）并释放串行位，后续事件继续，不会因旧链不再前进而永久阻塞。串行只保证顺序，不改变 best-effort 语义：事件仍可能被丢弃。
+- 同一 Connection 上的写顺序由该连接的有序链与传输发送队列保证；同一 Session 的事件另由串行队列保证到达顺序。不同 Connection 之间不承诺全局顺序。
 - 结果发送失败时，Server 跳过该请求的全部事件并记录；请求本身的成功状态不变。
 - Portal 开始关闭后不再向事件通道注册/派发；关闭期间及之后到达的事件按 best-effort 丢弃。
 
@@ -73,6 +74,6 @@ Server → Portal 使用独立消息：
 
 - 事件可能丢失：目标不在线、连接正在关闭、编码失败、传输写失败都只留下 warn。业务不能把事件当作可靠投递。
 - 事件可能重复：重放会以相同 `eventId` 再发一次；客户端去重只是可选优化，不是框架保证。
-- 事件的全局顺序不承诺，只有同一 Connection 的写顺序有保证。
+- 事件的全局顺序不承诺；同一 Connection 的写顺序有保证，同一 Session 的事件还按到达顺序串行。跨 Connection 的顺序仍不承诺。
 - `eventId` 的稳定性依赖“同一请求的发射顺序稳定”。handler 若按外部时间或随机分支决定发射顺序，重放会产生不同 id；业务需要自行接受这一点。
 - 不做通用 pub/sub、房间/频道抽象与离线事件。需要广播时，业务自行维护成员列表并逐个 `emitToSession`，或由客户端读取状态。这条边界是有意的：引入主题模型就必然要把授权与生命周期也搬进框架。

@@ -5,6 +5,7 @@ import { JsonCodec } from '../shared/codec.ts';
 import type { ServerEvent } from '../shared/events.ts';
 import { parseFrame, sleep, tick } from '../testing/common.ts';
 import { sessionHarness } from '../testing/connection-layer.ts';
+import type { FakeTransport } from '../testing/fake-transport.ts';
 import type { ConnectionState } from './connection-admission.ts';
 import { deliverServerEvent } from './connection-events.ts';
 import type { EventDeliveryHost } from './connection-events.ts';
@@ -18,6 +19,17 @@ function event(overrides: Partial<ServerEvent> = {}): ServerEvent {
     payload: { text: 'a cave' },
     ...overrides,
   };
+}
+
+/** Event frames written to `connectionId`, in write order. */
+function eventFrames(
+  transport: FakeTransport,
+  connectionId: string,
+): Record<string, unknown>[] {
+  return transport
+    .sentTo(connectionId)
+    .map(parseFrame)
+    .filter((frame) => frame.kind === 'event');
 }
 
 describe('ConnectionLayer server events', () => {
@@ -122,6 +134,156 @@ describe('ConnectionLayer server events', () => {
     ).toHaveLength(0);
   });
 
+  test('a takeover does not reorder two events addressed to the same session', async () => {
+    const h = sessionHarness();
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"1","method":"bind"}');
+    const hanging = h.transport.receive('c1', '{"id":"2","method":"hang"}');
+    await sleep(0);
+
+    // The first event waits behind c1's hung chain. The second arrives after
+    // c2 took the Session over; it must still wait for the first one, or c2
+    // would see the events in reverse emission order.
+    h.controlled.emit(
+      event({
+        eventId: 'req-1:0',
+        target: { kind: 'session', sessionId: 's1' },
+        payload: 'first',
+      }),
+    );
+    await tick();
+
+    h.transport.connect('c2');
+    await h.transport.receive('c2', '{"id":"3","method":"bind"}');
+    h.controlled.emit(
+      event({
+        eventId: 'req-2:0',
+        target: { kind: 'session', sessionId: 's1' },
+        payload: 'second',
+      }),
+    );
+    await tick();
+
+    // c2 is idle, but writing the second event now would overtake the first.
+    expect(eventFrames(h.transport, 'c2')).toEqual([]);
+
+    h.controlled.release();
+    await hanging;
+    await tick();
+
+    expect(eventFrames(h.transport, 'c1')).toEqual([]);
+    expect(
+      eventFrames(h.transport, 'c2').map((frame) => frame.payload),
+    ).toEqual(['first', 'second']);
+    expect(h.logs().filter((line) => line.code === 'EVENT_DROPPED')).toEqual(
+      [],
+    );
+  });
+
+  test('drops an event waiting on a disconnected holder and delivers the next one', async () => {
+    const h = sessionHarness();
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"1","method":"bind"}');
+    const hanging = h.transport.receive('c1', '{"id":"2","method":"hang"}');
+    await sleep(0);
+
+    h.controlled.emit(
+      event({
+        eventId: 'req-1:0',
+        target: { kind: 'session', sessionId: 's1' },
+        payload: 'lost',
+      }),
+    );
+    await tick();
+
+    // c1's chain never reaches the queued event: dropping it on abort is what
+    // releases the Session queue so a later event can still be delivered.
+    await h.transport.disconnect('c1');
+    await tick();
+    const dropped = h.logs().filter((line) => line.code === 'EVENT_DROPPED');
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]).toMatchObject({
+      eventId: 'req-1:0',
+      event: 'room.description',
+      targetKind: 'session',
+      sessionId: 's1',
+      connectionId: 'c1',
+      reason: 'the target connection closed while the event waited',
+    });
+
+    h.transport.connect('c2');
+    await h.transport.receive('c2', '{"id":"3","method":"bind"}');
+    h.controlled.emit(
+      event({
+        eventId: 'req-2:0',
+        target: { kind: 'session', sessionId: 's1' },
+        payload: 'next',
+      }),
+    );
+    await tick();
+
+    expect(
+      eventFrames(h.transport, 'c2').map((frame) => frame.payload),
+    ).toEqual(['next']);
+
+    h.controlled.release();
+    await hanging;
+    await tick();
+    expect(eventFrames(h.transport, 'c1')).toEqual([]);
+  });
+
+  test('a blocked session queue does not hold up other sessions or connection targets', async () => {
+    const h = sessionHarness({
+      sessionOf: (method) =>
+        method === 'bind1' ? 's1' : method === 'bind2' ? 's2' : undefined,
+    });
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"1","method":"bind1"}');
+    const hanging = h.transport.receive('c1', '{"id":"2","method":"hang"}');
+    await sleep(0);
+
+    h.controlled.emit(
+      event({
+        eventId: 'req-1:0',
+        target: { kind: 'session', sessionId: 's1' },
+        payload: 'blocked',
+      }),
+    );
+    await tick();
+
+    h.transport.connect('c2');
+    await h.transport.receive('c2', '{"id":"3","method":"bind2"}');
+    h.controlled.emit(
+      event({
+        eventId: 'req-2:0',
+        target: { kind: 'session', sessionId: 's2' },
+        payload: 'other session',
+      }),
+    );
+    h.controlled.emit(
+      event({
+        eventId: 'req-3:0',
+        target: { kind: 'connection', connectionId: 'c2' },
+        payload: 'pinned',
+      }),
+    );
+    await tick();
+
+    expect(
+      eventFrames(h.transport, 'c2').map((frame) => frame.payload),
+    ).toEqual(['other session', 'pinned']);
+
+    h.controlled.release();
+    await hanging;
+    await tick();
+    expect(
+      eventFrames(h.transport, 'c1').map((frame) => frame.payload),
+    ).toEqual(['blocked']);
+  });
+
   test('drops a queued session event when its holder leaves before the write', async () => {
     const h = sessionHarness();
     await h.layer.start();
@@ -153,7 +315,7 @@ describe('ConnectionLayer server events', () => {
       event: 'room.description',
       targetKind: 'session',
       sessionId: 's1',
-      reason: 'no connection holds the session',
+      reason: 'the target connection closed while the event waited',
     });
   });
 
@@ -294,6 +456,7 @@ function deferredDeliveryHost() {
     logger,
     connections,
     router,
+    sessionTails: new Map(),
     enqueue: (state, work) => {
       queue.push({ state, work });
       return Promise.resolve();
@@ -311,10 +474,12 @@ describe('deliverServerEvent session re-resolution', () => {
       h.host,
       event({ target: { kind: 'session', sessionId: 's1' } }),
     );
+    await tick();
     expect(h.queue.map((entry) => entry.state.connection.id)).toEqual(['c1']);
 
     h.router.bind('c2', 's1', Promise.resolve());
     await h.queue[0].work();
+    await tick();
     expect(h.sent.get('c1')).toEqual([]);
     expect(h.queue.map((entry) => entry.state.connection.id)).toEqual([
       'c1',
@@ -325,6 +490,7 @@ describe('deliverServerEvent session re-resolution', () => {
     // connections hand the event back and forth, so the retry is bounded.
     h.router.bind('c1', 's1', Promise.resolve());
     await h.queue[1].work();
+    await tick();
 
     expect(h.sent.get('c1')).toEqual([]);
     expect(h.sent.get('c2')).toEqual([]);
@@ -339,5 +505,72 @@ describe('deliverServerEvent session re-resolution', () => {
       reason: 'the session holder changed again while redelivering',
     });
     await delivery;
+  });
+
+  test('writes one session event at a time and clears the tail when idle', async () => {
+    const h = deferredDeliveryHost();
+    h.router.bind('c1', 's1', Promise.resolve());
+
+    const first = deliverServerEvent(
+      h.host,
+      event({
+        eventId: 'req-1:0',
+        target: { kind: 'session', sessionId: 's1' },
+        payload: 'first',
+      }),
+    );
+    const second = deliverServerEvent(
+      h.host,
+      event({
+        eventId: 'req-2:0',
+        target: { kind: 'session', sessionId: 's1' },
+        payload: 'second',
+      }),
+    );
+    await tick();
+
+    // c1 is free, but the second event must wait for the first to finish.
+    expect(h.queue).toHaveLength(1);
+
+    await h.queue[0].work();
+    await tick();
+    expect(h.queue).toHaveLength(2);
+    expect(h.sent.get('c1')).toHaveLength(1);
+
+    await h.queue[1].work();
+    await Promise.all([first, second]);
+    await tick();
+
+    expect(
+      (h.sent.get('c1') ?? []).map(parseFrame).map((frame) => frame.payload),
+    ).toEqual(['first', 'second']);
+    expect(h.host.sessionTails.size).toBe(0);
+  });
+
+  test('drops a queued event whose holder left before the write ran', async () => {
+    const h = deferredDeliveryHost();
+    h.router.bind('c1', 's1', Promise.resolve());
+    const delivery = deliverServerEvent(
+      h.host,
+      event({ target: { kind: 'session', sessionId: 's1' } }),
+    );
+    await tick();
+    expect(h.queue).toHaveLength(1);
+
+    // An unbind removes the route while the event waits; the write-time
+    // resolution must see the missing holder rather than write to c1.
+    h.router.release('c1');
+    await h.queue[0].work();
+    await delivery;
+
+    expect(h.sent.get('c1')).toEqual([]);
+    const dropped = h.logs().filter((line) => line.code === 'EVENT_DROPPED');
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]).toMatchObject({
+      eventId: 'req-1:0',
+      targetKind: 'session',
+      sessionId: 's1',
+      reason: 'no connection holds the session',
+    });
   });
 });

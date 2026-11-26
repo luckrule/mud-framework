@@ -174,8 +174,9 @@ Handler 可以为一个请求声明要发送的事件（ADR-0008）。`ctx.emit(
 
 - 目标 Connection 不存在或已关闭、目标 Session 当前没有 holder 时，事件 MUST 被丢弃并记录 warn（`EVENT_DROPPED`）；编码失败或传输写失败时同样丢弃并记录 `TRANSPORT_SEND_FAILED`。MUST NOT 因失败而缓冲或重试，也不得让请求失败。
 - Session 目标的收件人按实际写出时的当前 holder 解析：排队期间 takeover 会改投新 holder，至多重投递一次，再次变化即丢弃。
+- 同一 Session 的事件 MUST 按到达顺序串行投递：后一条必须等前一条写出或丢弃后才开始，因此 takeover 不改变同一收件 Connection 上这些事件之间的顺序。事件在等待旧 holder 的有序链期间旧连接被移除或 abort 时，该事件丢弃（`EVENT_DROPPED`）并释放串行位，后续事件继续，不得永久阻塞。
 - 结果发送失败时，该请求的全部事件 MUST 跳过并记录；请求的成功状态不变。
-- 同一 Connection 上，结果帧与事件帧、事件帧之间的写顺序由连接层的有序链与传输发送队列保证；不同 Connection 之间不承诺全局顺序。
+- 同一 Connection 上，结果帧与事件帧、事件帧之间的写顺序由连接层的有序链与传输发送队列保证；Session 目标的事件另由按 Session 的串行队列保证到达顺序；不同 Connection 之间不承诺全局顺序。
 - 事件是附加通道：MUST NOT 改变请求的终态、超时、取消、重放、Session 屏障或关闭语义。
 
 安全边界：框架不对事件做授权。Handler 可以向任意 Session 声明事件；房间成员资格、可见性与内容过滤属于业务。

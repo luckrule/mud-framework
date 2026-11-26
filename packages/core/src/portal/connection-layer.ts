@@ -113,6 +113,8 @@ export class ConnectionLayer implements TransportHandlers {
   private readonly maxConnections: number;
   private readonly shutdownTimeoutMs: number;
   private readonly connections = new Map<string, ConnectionState>();
+  /** Per-Session serialization of Server events (ADR-0008); empty when idle. */
+  private readonly sessionTails = new Map<string, Promise<void>>();
   /** Which connection holds which Session, and the reconnect gate (SPEC 3.2). */
   private readonly router: SessionRouter;
   /** The narrow view the admission, request and reply modules work through. */
@@ -169,6 +171,7 @@ export class ConnectionLayer implements TransportHandlers {
       connections: this.connections,
       router: this.router,
       enqueue: (state, work) => this.enqueue(state, work),
+      sessionTails: this.sessionTails,
     };
   }
 

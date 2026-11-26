@@ -8,8 +8,9 @@ import type { SessionRouter } from './session-router.ts';
 
 /**
  * What delivery needs from the connection layer: the two lookup tables (which
- * connection exists, which Session it holds), the wire format and the
- * per-connection ordered chain the frame must join.
+ * connection exists, which Session it holds), the wire format, the
+ * per-connection ordered chain the frame must join, and the per-Session queue
+ * prefix that keeps Session-addressed events in arrival order.
  */
 export interface EventDeliveryHost {
   readonly codec: Codec;
@@ -20,6 +21,13 @@ export interface EventDeliveryHost {
     state: ConnectionState,
     work: () => Promise<void>,
   ) => Promise<void>;
+  /**
+   * Tail of each Session's event queue. Owned by the connection layer rather
+   * than the module, so ordering state is per layer (and per test) instead of
+   * process-global. An entry exists only while that Session has unfinished
+   * delivery work.
+   */
+  readonly sessionTails: Map<string, Promise<void>>;
 }
 
 /**
@@ -60,59 +68,158 @@ export function deliverServerEvent(
     // when the Session that used to live there moves on.
     return host.enqueue(state, () => writeEvent(host, state, event));
   }
-  // The Session id is the address, not the holder. Resolving here only picks
-  // the chain to join; `deliverToSession` resolves again before the write.
-  const state = holderState(host, target.sessionId, event);
-  if (state === undefined) {
-    return Promise.resolve();
-  }
-  return host.enqueue(state, () =>
-    deliverToSession(host, target.sessionId, state, event, 0),
-  );
+  // The Session id is the address, not the holder: each event resolves the
+  // holder when its turn starts and again right before the write. The Session
+  // queue serializes events across a takeover: the holder may change, but the
+  // emission order must not.
+  return enqueueSessionEvent(host, target.sessionId, event);
 }
 
 /**
- * Writes a Session-addressed event to the holder current at write time, not the
- * one that held the Session when the event was queued. A frame can wait behind
- * the old connection's chain long enough for a reconnect to move the Session,
- * and writing it to the old connection would address a player who no longer
- * owns it (SPEC 3.8). A missing holder is the expected case for a player who
- * left, not an error.
+ * Queues a Session-addressed event behind the previous one for the same
+ * Session. Two events for one Session are processed one at a time and in
+ * arrival order; the later one waits until the earlier finished writing or was
+ * dropped. Without this, a takeover would let a later event overtake an
+ * earlier one still waiting on the old holder's chain, and the new holder would
+ * receive them out of order (SPEC 3.8).
  */
-async function deliverToSession(
+function enqueueSessionEvent(
+  host: EventDeliveryHost,
+  sessionId: string,
+  event: ServerEvent,
+): Promise<void> {
+  const previous = host.sessionTails.get(sessionId);
+  // With no queued event for this Session, start now rather than in a
+  // continuation: an event that follows synchronously (for another Session or a
+  // pinned connection) must not overtake it on a shared connection chain.
+  const delivery =
+    previous === undefined
+      ? deliverSessionEvent(host, sessionId, event)
+      : previous.then(() => deliverSessionEvent(host, sessionId, event));
+  // Mirrors the connection chain: one failed delivery must not poison every
+  // later event for the Session.
+  const tail = delivery.then(
+    () => undefined,
+    () => undefined,
+  );
+  host.sessionTails.set(sessionId, tail);
+  // Drop the entry once this is the last delivery for the Session; otherwise
+  // the map would retain one resolved promise per Session ever addressed.
+  void tail.then(() => {
+    if (host.sessionTails.get(sessionId) === tail) {
+      host.sessionTails.delete(sessionId);
+    }
+    return undefined;
+  });
+  return delivery;
+}
+
+type DeliveryOutcome = 'written' | 'dropped' | 'moved' | 'aborted';
+
+/**
+ * Delivers one Session event while holding that Session's serial slot. The
+ * holder is resolved twice: once to pick the chain to join, again inside that
+ * chain right before the write, because a takeover may land while the event
+ * waits. A moved holder earns one redelivery (the existing bound); a second
+ * change is dropped.
+ */
+async function deliverSessionEvent(
+  host: EventDeliveryHost,
+  sessionId: string,
+  event: ServerEvent,
+): Promise<void> {
+  let redeliveries = 0;
+  while (true) {
+    const state = holderState(host, sessionId, event);
+    if (state === undefined) {
+      return;
+    }
+    // oxlint-disable-next-line eslint/no-await-in-loop -- a redelivery must observe the previous attempt before re-resolving the holder
+    const outcome = await deliverOnChain(host, sessionId, state, event);
+    if (outcome === 'written' || outcome === 'dropped') {
+      return;
+    }
+    if (outcome === 'aborted') {
+      // The connection whose chain this event joined closed while the event
+      // still waited behind earlier work. The chain does not settle on
+      // disconnect, so waiting for the queued callback could pin the Session's
+      // serial slot forever; drop the event and let the next one proceed.
+      warnDropped(
+        host,
+        event,
+        {
+          targetKind: 'session',
+          sessionId,
+          connectionId: state.connection.id,
+        },
+        'the target connection closed while the event waited',
+      );
+      return;
+    }
+    if (redeliveries >= MAX_SESSION_REDELIVERIES) {
+      warnDropped(
+        host,
+        event,
+        { targetKind: 'session', sessionId },
+        'the session holder changed again while redelivering',
+      );
+      return;
+    }
+    redeliveries += 1;
+  }
+}
+
+/**
+ * Joins the current holder's ordered chain and reports what its turn observed.
+ * The write re-resolves the holder, so a takeover between queueing and
+ * execution is handled here rather than by pinning the old connection. The
+ * abort race is what keeps a Session queue from waiting forever on a chain that
+ * was removed: `appendToChain` still runs queued work after a disconnect, but
+ * only once its predecessor settles, which may never happen.
+ */
+async function deliverOnChain(
   host: EventDeliveryHost,
   sessionId: string,
   queuedFor: ConnectionState,
   event: ServerEvent,
-  redeliveries: number,
-): Promise<void> {
-  const state = holderState(host, sessionId, event);
-  if (state === undefined) {
-    return;
+): Promise<DeliveryOutcome> {
+  const signal = queuedFor.closed.signal;
+  if (signal.aborted) {
+    return 'aborted';
   }
-  // `queuedFor` only identifies the chain this delivery was queued on; it is
-  // never the write target. Equality means the holder did not move.
-  if (state === queuedFor) {
-    await writeEvent(host, state, event);
-    return;
+  const result = Promise.withResolvers<DeliveryOutcome>();
+  let cancelled = false;
+  const onAbort = (): void => {
+    cancelled = true;
+    result.resolve('aborted');
+  };
+  signal.addEventListener('abort', onAbort, { once: true });
+  try {
+    const queued = host.enqueue(queuedFor, async () => {
+      // The abort race already reported this event; writing now would only
+      // target a connection that is gone.
+      if (cancelled) {
+        return;
+      }
+      const current = holderState(host, sessionId, event);
+      if (current === undefined) {
+        result.resolve('dropped');
+        return;
+      }
+      if (current !== queuedFor) {
+        result.resolve('moved');
+        return;
+      }
+      await writeEvent(host, current, event);
+      result.resolve('written');
+    });
+    // A rejected chain link must not strand the Session queue. The connection
+    // chain itself already catches, so this is defensive.
+    void queued.catch(() => result.resolve('dropped'));
+    return await result.promise;
+  } finally {
+    signal.removeEventListener('abort', onAbort);
   }
-  if (redeliveries >= MAX_SESSION_REDELIVERIES) {
-    warnDropped(
-      host,
-      event,
-      { targetKind: 'session', sessionId },
-      'the session holder changed again while redelivering',
-    );
-    return;
-  }
-  // Joining the new holder's chain keeps that connection's own order. The
-  // requeue is not awaited: the old connection's chain must not wait on another
-  // connection's work, which could close a cycle through the Session barrier.
-  void host
-    .enqueue(state, () =>
-      deliverToSession(host, sessionId, state, event, redeliveries + 1),
-    )
-    .catch(() => undefined);
 }
 
 /** The tracked connection holding `sessionId`, or a logged drop. */
