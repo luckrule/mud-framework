@@ -18,6 +18,16 @@ import {
   until,
 } from './ws-transport.support.ts';
 
+/**
+ * The flood reaches tens of megabytes. Timeout and disconnect tests need it
+ * to sit unsent, so they raise the capacity that would otherwise overflow
+ * first; capacity behavior has its own tests below.
+ */
+const FLOOD_CAPACITY = {
+  maxQueuedFrames: 256,
+  maxQueuedBytes: 64 * 1024 * 1024,
+} as const;
+
 describe('WsTransport sends', () => {
   test('sends text and binary payloads the client receives', async () => {
     const { transport, recorded, url } = await startTransport();
@@ -71,6 +81,7 @@ describe('WsTransport sends', () => {
   test('holds the send of a client that never reads, then drops it on timeout', async () => {
     const { transport, recorded } = await startTransport({
       sendTimeoutMs: 250,
+      ...FLOOD_CAPACITY,
     });
     const port = transport.port;
     if (port === undefined) {
@@ -111,6 +122,7 @@ describe('WsTransport sends', () => {
     const { transport, recorded } = await startTransport({
       sendTimeoutMs: 250,
       logger,
+      ...FLOOD_CAPACITY,
     });
     const port = transport.port;
     if (port === undefined) {
@@ -142,9 +154,123 @@ describe('WsTransport sends', () => {
     }
   });
 
+  test('closes a connection once when the send queue exceeds its byte limit', async () => {
+    const { logger, entries } = captureLogger();
+    const { transport, recorded, url } = await startTransport({
+      maxQueuedBytes: 1,
+      logger,
+    });
+    const client = await openClient(url);
+    try {
+      await until(() => recorded.connected.length === 1, 'onConnect');
+      const connection = first(recorded.connected);
+      const closed = new Promise<number>((resolve) => {
+        client.addEventListener(
+          'close',
+          (event) => {
+            resolve(event.code);
+          },
+          { once: true },
+        );
+      });
+
+      const send = tracked(connection.send('ab'));
+      await until(() => send.state() === 'rejected', 'the overflow rejection');
+      expect(send.error()?.message).toMatch(/send queue overflow/);
+
+      expect(await closed).toBe(1013);
+      await until(() => recorded.disconnected.length === 1, 'onDisconnect');
+
+      const warnings = entries().filter(
+        (entry) => entry.msg === 'send queue overflow; closing connection',
+      );
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toMatchObject({
+        level: 'warn',
+        transport: 'ws',
+        connectionId: connection.id,
+        limit: 'maxQueuedBytes',
+        queuedFrames: 0,
+        queuedBytes: 0,
+        maxQueuedBytes: 1,
+        incomingBytes: 2,
+      });
+
+      const after = await rejectionOf(connection.send('later'));
+      expect(after.message).toMatch(/not open|overflow|closed/);
+      expect(
+        entries().filter(
+          (entry) => entry.msg === 'send queue overflow; closing connection',
+        ),
+      ).toHaveLength(1);
+    } finally {
+      client.close();
+      await safeStop(transport);
+    }
+  });
+
+  test('drops a paused client whose unread frames exceed the queue', async () => {
+    const { logger, entries } = captureLogger();
+    const { transport, recorded } = await startTransport({
+      maxQueuedFrames: 1,
+      sendTimeoutMs: 10_000,
+      logger,
+    });
+    const port = transport.port;
+    if (port === undefined) {
+      throw new Error('expected the transport to bind a port');
+    }
+    const socket = await rawClient(port);
+    try {
+      await until(() => recorded.connected.length === 1, 'onConnect');
+      const connection = first(recorded.connected);
+      const filler = new Uint8Array(900_000);
+      const flood = [
+        ...floodConnection(connection),
+        ...floodConnection(connection),
+        // One blocked frame plus one more frame is enough to overflow; these
+        // two guarantee a send follows the first `-1` whatever index it lands.
+        tracked(connection.send(filler)),
+        tracked(connection.send(filler)),
+      ];
+      await until(
+        () =>
+          flood.some((entry) =>
+            (entry.error()?.message ?? '').includes('send queue overflow'),
+          ),
+        'the overflow rejection',
+      );
+      await until(
+        () => flood.every((entry) => entry.state() !== 'pending'),
+        'the whole queue to settle',
+      );
+
+      const warnings = entries().filter(
+        (entry) => entry.msg === 'send queue overflow; closing connection',
+      );
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toMatchObject({
+        level: 'warn',
+        transport: 'ws',
+        connectionId: connection.id,
+        limit: 'maxQueuedFrames',
+        maxQueuedFrames: 1,
+      });
+      expect(typeof warnings[0]?.queuedFrames).toBe('number');
+      expect(typeof warnings[0]?.queuedBytes).toBe('number');
+
+      const after = await rejectionOf(connection.send('later'));
+      expect(after.message).toMatch(/not open|overflow|closed/);
+    } finally {
+      socket.destroy();
+      await safeStop(transport);
+    }
+  });
+
   test('rejects queued sends when the client disconnects', async () => {
     const { transport, recorded } = await startTransport({
       sendTimeoutMs: 10_000,
+      ...FLOOD_CAPACITY,
     });
     const port = transport.port;
     if (port === undefined) {

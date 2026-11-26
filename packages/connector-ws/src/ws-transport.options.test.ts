@@ -86,6 +86,36 @@ describe('WsTransport option validation', () => {
     expect(() => createTransport({ sendTimeoutMs: 1 })).not.toThrow();
   });
 
+  test('rejects maxQueuedFrames and maxQueuedBytes that are not positive integers', () => {
+    const invalid: readonly [unknown, typeof RangeError | typeof TypeError][] =
+      [
+        [0, RangeError],
+        [-1, RangeError],
+        [1.5, RangeError],
+        [Number.NaN, RangeError],
+        [Number.POSITIVE_INFINITY, RangeError],
+        [Number.NEGATIVE_INFINITY, RangeError],
+        ['1', TypeError],
+      ];
+    for (const name of ['maxQueuedFrames', 'maxQueuedBytes'] as const) {
+      for (const [value, Expected] of invalid) {
+        const options =
+          name === 'maxQueuedFrames'
+            ? { maxQueuedFrames: value as number }
+            : { maxQueuedBytes: value as number };
+        const call = () => createTransport(options);
+        expect(call).toThrow(Expected);
+        expect(call).toThrow(new RegExp(name));
+        expect(call).toThrow(new RegExp(String(value)));
+      }
+      const options =
+        name === 'maxQueuedFrames'
+          ? { maxQueuedFrames: 1 }
+          : { maxQueuedBytes: 1 };
+      expect(() => createTransport(options)).not.toThrow();
+    }
+  });
+
   test('rejects an empty hostname or path, and a path without a leading slash', () => {
     expect(() => createTransport({ hostname: '' })).toThrow(RangeError);
     expect(() => createTransport({ hostname: '' })).toThrow(/hostname/);

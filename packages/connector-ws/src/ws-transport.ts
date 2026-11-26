@@ -9,7 +9,12 @@ import type {
   TransportHandlers,
 } from 'mud-framework-core';
 
-import { SendQueue } from './send-queue.ts';
+import {
+  SendQueue,
+  assertPositiveInteger,
+  payloadBytes,
+} from './send-queue.ts';
+import type { SendQueueOverflow } from './send-queue.ts';
 
 export interface WsTransportOptions {
   /**
@@ -38,6 +43,17 @@ export interface WsTransportOptions {
    */
   sendTimeoutMs?: number;
   /**
+   * Frames that may wait unsettled in one connection's outbound queue before
+   * it is failed. Must be a positive integer; defaults to 1024.
+   */
+  maxQueuedFrames?: number;
+  /**
+   * Unsettled outbound bytes per connection before it is failed. Must be a
+   * positive integer; defaults to 4 MiB, raised to `maxMessageBytes` when that
+   * is larger so a single maximum-size frame always fits.
+   */
+  maxQueuedBytes?: number;
+  /**
    * Optional: this package depends on core's types and the stateless
    * `safeLogger` wrapper only, never on a logger implementation; the caller
    * supplies the implementation. Without it nothing is logged.
@@ -64,6 +80,18 @@ type Status = 'idle' | 'started' | 'stopped';
 const DEFAULT_MAX_MESSAGE_BYTES = 1024 * 1024;
 const DEFAULT_IDLE_TIMEOUT_SECONDS = 30;
 const DEFAULT_SEND_TIMEOUT_MS = 30_000;
+/**
+ * The input queue bounds a connection at 1000 waiting requests, so one
+ * response per request must fit. 1024 lets a refusal storm finish without
+ * letting a client that never reads pin memory without bound.
+ */
+const DEFAULT_MAX_QUEUED_FRAMES = 1024;
+/**
+ * 4 MiB holds an ordinary burst (1000 refusal frames are ~80 KB) and several
+ * maximum-size frames. The effective default is raised to `maxMessageBytes`
+ * when a caller allows larger single frames.
+ */
+const DEFAULT_MAX_QUEUED_BYTES = 4 * 1024 * 1024;
 
 /**
  * WebSocket carries binary frames, fragments, ordered delivery and protocol
@@ -80,6 +108,8 @@ export class WsTransport implements Transport {
     readonly maxMessageBytes: number;
     readonly idleTimeoutSeconds: number;
     readonly sendTimeoutMs: number;
+    readonly maxQueuedFrames: number;
+    readonly maxQueuedBytes: number;
   };
   private readonly connections = new Map<string, ConnectionState>();
   private readonly pending = new Set<Promise<void>>();
@@ -99,6 +129,13 @@ export class WsTransport implements Transport {
     assertNonNegativeInteger(idleTimeoutSeconds, 'idleTimeoutSeconds');
     const sendTimeoutMs = options.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS;
     assertSendTimeout(sendTimeoutMs, 'sendTimeoutMs');
+    const maxQueuedFrames =
+      options.maxQueuedFrames ?? DEFAULT_MAX_QUEUED_FRAMES;
+    assertPositiveInteger(maxQueuedFrames, 'maxQueuedFrames');
+    const maxQueuedBytes =
+      options.maxQueuedBytes ??
+      Math.max(DEFAULT_MAX_QUEUED_BYTES, maxMessageBytes);
+    assertPositiveInteger(maxQueuedBytes, 'maxQueuedBytes');
     const hostname = options.hostname ?? '127.0.0.1';
     assertNonEmptyString(hostname, 'hostname');
     const path = options.path ?? '/';
@@ -110,6 +147,8 @@ export class WsTransport implements Transport {
       maxMessageBytes,
       idleTimeoutSeconds,
       sendTimeoutMs,
+      maxQueuedFrames,
+      maxQueuedBytes,
     };
     this.logger =
       options.logger === undefined
@@ -186,19 +225,30 @@ export class WsTransport implements Transport {
     }
     const id = randomUUID();
     const connectionLogger = this.logger?.child({ connectionId: id });
-    const queue = new SendQueue(id, this.settings.sendTimeoutMs, {
-      // The socket only exists after the upgrade, so look it up per write.
-      write: (payload) => {
-        const target = this.connections.get(id)?.ws;
-        if (target === undefined) {
-          throw new Error(`connection "${id}" has no socket`);
-        }
-        return target.send(payload);
+    const queue = new SendQueue(
+      id,
+      this.settings.sendTimeoutMs,
+      {
+        maxQueuedFrames: this.settings.maxQueuedFrames,
+        maxQueuedBytes: this.settings.maxQueuedBytes,
       },
-      abandon: (error) => {
-        this.abandon(id, error);
+      {
+        // The socket only exists after the upgrade, so look it up per write.
+        write: (payload) => {
+          const target = this.connections.get(id)?.ws;
+          if (target === undefined) {
+            throw new Error(`connection "${id}" has no socket`);
+          }
+          return target.send(payload);
+        },
+        abandon: (error) => {
+          this.abandon(id, error);
+        },
+        overflow: (info) => {
+          this.overflow(id, info);
+        },
       },
-    });
+    );
     const state: ConnectionState = {
       connection: this.createConnection(id, queue),
       queue,
@@ -306,6 +356,36 @@ export class WsTransport implements Transport {
     state.ws?.terminate();
   }
 
+  /**
+   * Drops a connection whose outbound queue hit its capacity. A graceful
+   * close is enough here: the overflowing frame was rejected before it was
+   * written, so only the already-accepted head can precede the 1013 frame.
+   * 1013 (Try Again Later) tells the client the connection is temporarily
+   * unable to serve it, rather than that one message was malformed.
+   */
+  private overflow(id: string, info: SendQueueOverflow): void {
+    const state = this.connections.get(id);
+    if (state === undefined) {
+      return;
+    }
+    state.open = false;
+    // warn: one connection is dropped, the transport keeps serving others,
+    // which is a degradation rather than a request failure (SPEC 7.1).
+    state.logger?.warn(
+      {
+        limit: info.limit,
+        queuedFrames: info.queuedFrames,
+        queuedBytes: info.queuedBytes,
+        maxQueuedFrames: info.maxQueuedFrames,
+        maxQueuedBytes: info.maxQueuedBytes,
+        incomingBytes: info.incomingBytes,
+        reason: info.error.message,
+      },
+      'send queue overflow; closing connection',
+    );
+    closeQuietly(state.ws, 1013, 'send queue full');
+  }
+
   private handleError(error: Error, ws: Bun.ServerWebSocket<WsData>): void {
     const state = this.connections.get(ws.data.id);
     const logger =
@@ -386,7 +466,7 @@ export class WsTransport implements Transport {
         // May stay pending for a long time: the socket buffer is full and only
         // `drain` (or `sendTimeoutMs`) settles it. Awaiting is the point —
         // that is how the transport pushes back on the writer.
-        await queue.send(payload, bytes);
+        await queue.send(payload);
       },
       close: async (code, reason) => {
         if (this.status !== 'started') {
@@ -512,19 +592,6 @@ function assertNonNegativeInteger(value: unknown, name: string): void {
   }
 }
 
-function assertPositiveInteger(value: unknown, name: string): void {
-  if (typeof value !== 'number') {
-    throw new TypeError(
-      `${name} must be a positive integer, got ${String(value)}`,
-    );
-  }
-  if (!Number.isInteger(value) || value < 1) {
-    throw new RangeError(
-      `${name} must be a positive integer, got ${String(value)}`,
-    );
-  }
-}
-
 function normalizePayload(
   message: string | Buffer<ArrayBuffer>,
 ): string | Uint8Array {
@@ -534,12 +601,6 @@ function normalizePayload(
   // Buffer is a Uint8Array subclass backed by a pooled ArrayBuffer; copy so a
   // handler never sees neighbouring bytes or a later mutation of the pool.
   return new Uint8Array(message);
-}
-
-function payloadBytes(payload: string | Uint8Array): number {
-  return typeof payload === 'string'
-    ? Buffer.byteLength(payload)
-    : payload.byteLength;
 }
 
 function describeClose(code: number, reason: string): string {

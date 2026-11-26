@@ -1,10 +1,35 @@
+import { Buffer } from 'node:buffer';
+
 /** Bun's `send` result: `> 0` accepted, `0` dropped, `< 0` accepted but full. */
 export type WriteStatus = number;
+
+/** Hard capacity of one connection's outbound queue; both must be positive. */
+export interface SendQueueLimits {
+  readonly maxQueuedFrames: number;
+  readonly maxQueuedBytes: number;
+}
+
+/** Which capacity the frame that failed the queue would have exceeded. */
+export type SendQueueLimit = 'maxQueuedFrames' | 'maxQueuedBytes';
+
+/** Snapshot of the queue at the moment a frame no longer fits. */
+export interface SendQueueOverflow {
+  readonly error: Error;
+  readonly limit: SendQueueLimit;
+  /** Bytes of the frame that would have exceeded the capacity. */
+  readonly incomingBytes: number;
+  readonly queuedFrames: number;
+  readonly queuedBytes: number;
+  readonly maxQueuedFrames: number;
+  readonly maxQueuedBytes: number;
+}
 
 export interface SendQueueSink {
   write(payload: string | Uint8Array): WriteStatus;
   /** Drops the connection once a payload sat unsent past the timeout. */
   abandon(error: Error): void;
+  /** Drops the connection once the queue can hold no more payloads. */
+  overflow(info: SendQueueOverflow): void;
 }
 
 interface Entry {
@@ -25,22 +50,36 @@ interface Entry {
  * reads (SPEC 3.5 bounded queue).
  *
  * Payloads behind a blocked head are not written at all, so this queue is the
- * buffer and its depth is the backpressure the caller feels.
+ * buffer and its depth is the backpressure the caller feels. Capacity is a
+ * hard bound: once a frame no longer fits, the whole queue fails and the
+ * connection is dropped instead of letting refusals pile up in memory.
  */
 export class SendQueue {
   private readonly id: string;
   private readonly timeoutMs: number;
+  private readonly maxQueuedFrames: number;
+  private readonly maxQueuedBytes: number;
   private readonly sink: SendQueueSink;
   private readonly entries: Entry[] = [];
+  private unsettledBytes = 0;
   private closed: Error | undefined;
   private blocked = false;
   private flushing = false;
   /** Set when `drain` lands while `flush` is already running. */
   private rerun = false;
 
-  constructor(id: string, timeoutMs: number, sink: SendQueueSink) {
+  constructor(
+    id: string,
+    timeoutMs: number,
+    limits: SendQueueLimits,
+    sink: SendQueueSink,
+  ) {
+    assertPositiveInteger(limits.maxQueuedFrames, 'maxQueuedFrames');
+    assertPositiveInteger(limits.maxQueuedBytes, 'maxQueuedBytes');
     this.id = id;
     this.timeoutMs = timeoutMs;
+    this.maxQueuedFrames = limits.maxQueuedFrames;
+    this.maxQueuedBytes = limits.maxQueuedBytes;
     this.sink = sink;
   }
 
@@ -49,15 +88,28 @@ export class SendQueue {
     return this.entries.length;
   }
 
+  /** Bytes of the unsettled payloads; released as frames settle. */
+  get queuedBytes(): number {
+    return this.unsettledBytes;
+  }
+
   /**
    * Resolves once the frame is on a socket with room to spare. Under
    * backpressure it stays pending — neither resolved nor rejected — until
-   * `drain` or the timeout, which is what slows the writer down.
+   * `drain` or the timeout, which is what slows the writer down. A frame that
+   * would exceed either capacity fails the queue and rejects at once.
    */
-  send(payload: string | Uint8Array, bytes: number): Promise<void> {
+  send(payload: string | Uint8Array): Promise<void> {
     const closed = this.closed;
     if (closed !== undefined) {
       return Promise.reject(closed);
+    }
+    const bytes = payloadBytes(payload);
+    if (this.entries.length + 1 > this.maxQueuedFrames) {
+      return this.overflow('maxQueuedFrames', bytes);
+    }
+    if (this.unsettledBytes + bytes > this.maxQueuedBytes) {
+      return this.overflow('maxQueuedBytes', bytes);
     }
     return new Promise<void>((resolve, reject) => {
       const entry: Entry = {
@@ -74,6 +126,7 @@ export class SendQueue {
         }, this.timeoutMs);
       }
       this.entries.push(entry);
+      this.unsettledBytes += bytes;
       this.pump();
     });
   }
@@ -86,12 +139,45 @@ export class SendQueue {
 
   /** Rejects everything outstanding; later sends reject with the same error. */
   fail(error: Error): void {
+    this.closeWith(error);
+  }
+
+  /**
+   * Fails the queue once when the next frame no longer fits. The caller is
+   * told synchronously, exactly once, after every pending promise has been
+   * rejected, so the transport can close the connection without racing a
+   * second overflow.
+   */
+  private overflow(
+    limit: SendQueueLimit,
+    incomingBytes: number,
+  ): Promise<never> {
+    const queuedFrames = this.entries.length;
+    const queuedBytes = this.unsettledBytes;
+    const error = new Error(
+      `connection "${this.id}" send queue overflow (${limit}): ${queuedFrames}/${this.maxQueuedFrames} frames and ${queuedBytes}/${this.maxQueuedBytes} bytes queued; next frame is ${incomingBytes} bytes`,
+    );
+    this.closeWith(error);
+    this.sink.overflow({
+      error,
+      limit,
+      incomingBytes,
+      queuedFrames,
+      queuedBytes,
+      maxQueuedFrames: this.maxQueuedFrames,
+      maxQueuedBytes: this.maxQueuedBytes,
+    });
+    return Promise.reject(error);
+  }
+
+  private closeWith(error: Error): void {
     if (this.closed !== undefined) {
       return;
     }
     this.closed = error;
     this.blocked = false;
     const outstanding = this.entries.splice(0);
+    this.unsettledBytes = 0;
     for (const entry of outstanding) {
       this.clearTimer(entry);
       entry.reject(error);
@@ -193,6 +279,7 @@ export class SendQueue {
       return false;
     }
     this.entries.splice(index, 1);
+    this.unsettledBytes -= entry.bytes;
     this.clearTimer(entry);
     return true;
   }
@@ -202,6 +289,27 @@ export class SendQueue {
       clearTimeout(entry.timer);
       entry.timer = undefined;
     }
+  }
+}
+
+export function payloadBytes(payload: string | Uint8Array): number {
+  // UTF-8 size for strings: WebSocket text frames are UTF-8 on the wire, so a
+  // byte cap must not count UTF-16 code units.
+  return typeof payload === 'string'
+    ? Buffer.byteLength(payload)
+    : payload.byteLength;
+}
+
+export function assertPositiveInteger(value: unknown, name: string): void {
+  if (typeof value !== 'number') {
+    throw new TypeError(
+      `${name} must be a positive integer, got ${String(value)}`,
+    );
+  }
+  if (!Number.isInteger(value) || value < 1) {
+    throw new RangeError(
+      `${name} must be a positive integer, got ${String(value)}`,
+    );
   }
 }
 
