@@ -918,6 +918,24 @@ function deferredDeliveryHost() {
   return { host, router, queue, sent, logs: () => lines.map(parseFrame) };
 }
 
+/**
+ * A layer whose successful `unbind` request removes the route. `hang` is a
+ * request still running when the event arrives: it declares the unbind, so the
+ * route is gone by the time the queued event's write turn comes, while the
+ * connection itself stays open (a disconnect would abort the frame instead and
+ * take the `'aborted'` path).
+ */
+function unbindingHarness() {
+  return sessionHarness({
+    changeOf: (method) =>
+      method === 'bind'
+        ? { type: 'bind', sessionId: 's1' }
+        : method === 'hang'
+          ? { type: 'unbind' }
+          : undefined,
+  });
+}
+
 describe('deliverServerEvent session re-resolution', () => {
   test('drops after one redelivery instead of following a second takeover', async () => {
     const h = deferredDeliveryHost();
@@ -996,23 +1014,30 @@ describe('deliverServerEvent session re-resolution', () => {
   });
 
   test('drops a queued event whose holder left before the write ran', async () => {
-    const h = deferredDeliveryHost();
-    h.router.bind('c1', 's1', Promise.resolve());
-    const delivery = deliverServerEvent(
-      h.host,
-      event({ target: { kind: 'session', sessionId: 's1' } }),
-    );
+    const h = unbindingHarness();
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"1","method":"bind"}');
+
+    // The running request holds c1's writer, so the event cannot write yet: its
+    // frame waits in c1's connection queue and the Session's serial slot stays
+    // held.
+    const unbind = h.transport.receive('c1', '{"id":"2","method":"hang"}');
     await tick();
-    expect(h.queue).toHaveLength(1);
+    h.controlled.emit(sessionEvent('req-1:0', 'lost'));
+    await tick();
+    expect(sessionQueuesOf(h.layer).size).toBe(1);
 
-    // An unbind removes the route while the event waits; the write-time
-    // resolution must see the missing holder rather than write to c1.
-    h.router.release('c1');
-    await h.queue[0].write.run();
-    await delivery;
+    // The request succeeds and declares the unbind, removing the route while
+    // the event waits. The write-time resolution must see the missing holder
+    // rather than write to the connection that queued it.
+    h.controlled.release();
+    await unbind;
+    await tick();
+    await tick();
 
-    expect(h.sent.get('c1')).toEqual([]);
-    const dropped = h.logs().filter((line) => line.code === 'EVENT_DROPPED');
+    expect(eventFrames(h.transport, 'c1')).toEqual([]);
+    const dropped = dropLines(h.logs());
     expect(dropped).toHaveLength(1);
     expect(dropped[0]).toMatchObject({
       eventId: 'req-1:0',
@@ -1043,23 +1068,28 @@ describe('deliverServerEvent session re-resolution', () => {
   });
 
   test('clears the queue after a dropped event', async () => {
-    const h = deferredDeliveryHost();
-    h.router.bind('c1', 's1', Promise.resolve());
+    const h = unbindingHarness();
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"1","method":"bind"}');
 
-    const delivery = deliverServerEvent(
-      h.host,
-      event({ target: { kind: 'session', sessionId: 's1' } }),
-    );
+    // Same construction as the drop above: the event waits while the running
+    // request removes the route, so its write turn finds no holder.
+    const unbind = h.transport.receive('c1', '{"id":"2","method":"hang"}');
     await tick();
-    h.router.release('c1');
-    await h.queue[0].write.run();
-    await delivery;
+    h.controlled.emit(sessionEvent('req-1:0', 'lost'));
+    await tick();
+    expect(sessionQueuesOf(h.layer).size).toBe(1);
+
+    h.controlled.release();
+    await unbind;
+    await tick();
     await tick();
 
-    expect(
-      h.logs().filter((line) => line.code === 'EVENT_DROPPED'),
-    ).toHaveLength(1);
-    expect(h.host.sessionQueues.size).toBe(0);
+    expect(dropLines(h.logs())).toHaveLength(1);
+    // The drop must release the Session's serial slot, or every later event
+    // for that Session would wait behind it forever.
+    expect(sessionQueuesOf(h.layer).size).toBe(0);
   });
 
   test('one session queue does not hold up another session', async () => {
