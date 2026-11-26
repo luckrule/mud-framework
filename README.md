@@ -27,6 +27,7 @@ bash scripts/ci.sh --skip-install # 完整门禁
 - `docs/SPEC.md`：对外契约，含五条承诺、执行模型、存储契约、传输契约与生命周期。
 - `docs/INVARIANTS.md`：产品承诺的不变量清单，违反即为 bug。
 - `docs/INTEGRATION.md`：双进程装配指南，含最小可运行代码、硬约束与部署检查清单。操作文档，不是契约。
+- `docs/RESPONSIBILITY.md`：框架、消费方与部署/运维的职责边界；与契约冲突时以 SPEC/INVARIANTS 为准。
 - `docs/CONTRIBUTING.md`：协作流程，含开发环境、门禁命令、测试分层、提交规范与 PR 流程。
 
 ## 许可证
