@@ -4,7 +4,11 @@ import { createJsonLogger } from '../logging/json-logger.ts';
 import type { Logger } from '../logging/types.ts';
 import type { ExecutorRequest, RequestExecutor } from '../shared/executor.ts';
 import { parseFrame, sleep } from '../testing/common.ts';
-import { harness } from '../testing/connection-layer.ts';
+import {
+  fakeConnection,
+  harness,
+  sessionHarness,
+} from '../testing/connection-layer.ts';
 import { FakeTransport } from '../testing/fake-transport.ts';
 import { ConnectionLayer } from './connection-layer.ts';
 
@@ -354,6 +358,77 @@ describe('ConnectionLayer disconnect', () => {
     await inFlight;
 
     expect(transport.sentTo('c1')).toHaveLength(0);
+  });
+
+  test('does not run a request queued on a closed connection against a same-id replacement', async () => {
+    const { transport, layer, controlled, logs } = sessionHarness();
+    await layer.start();
+    transport.connect('c1');
+
+    const first = transport.receive('c1', '{"id":"r1","method":"hang"}');
+    await sleep(0);
+    const queued = transport.receive('c1', '{"id":"r2","method":"bind"}');
+    await sleep(0);
+    expect(controlled.started).toEqual(['hang']);
+
+    await transport.disconnect('c1', 'client left');
+    // The transport mints a new connection that reuses the id. The queued
+    // request must keep acting for the ConnectionState it entered with, not
+    // for whatever the id resolves to now.
+    const replacement = fakeConnection('c1');
+    await layer.onConnect(replacement.connection);
+
+    controlled.release();
+    await Promise.all([first, queued]);
+    await sleep(5);
+
+    // The old login never reached a handler and left no route behind.
+    expect(controlled.started).not.toContain('bind');
+    expect(
+      logs().filter((entry) => entry.msg === 'session bound'),
+    ).toHaveLength(0);
+    expect(
+      logs().filter((entry) => entry.msg === 'request dropped before start'),
+    ).toHaveLength(1);
+
+    // The replacement is still tracked and its request runs unbound.
+    await layer.onMessage(
+      replacement.connection,
+      '{"id":"r3","method":"probe"}',
+    );
+    expect(controlled.started).toContain('probe');
+    expect(
+      controlled.requests.find((request) => request.method === 'probe')
+        ?.sessionId,
+    ).toBeUndefined();
+    expect(replacement.sent.map(parseFrame)).toMatchObject([
+      { id: 'r3', ok: true, result: 'probe' },
+    ]);
+    await layer.stop();
+  });
+
+  test('a disconnect for a previous connection does not remove a same-id replacement', async () => {
+    const { layer, controlled } = sessionHarness();
+    await layer.start();
+    const previous = fakeConnection('c1');
+    const replacement = fakeConnection('c1');
+
+    await layer.onConnect(previous.connection);
+    await layer.onConnect(replacement.connection);
+    // Stale disconnect: the id is the same, but this event belongs to the
+    // connection the replacement already displaced.
+    await layer.onDisconnect(previous.connection);
+
+    expect(layer.health().connections).toBe(1);
+    await layer.onMessage(
+      replacement.connection,
+      '{"id":"r1","method":"probe"}',
+    );
+    expect(controlled.started).toEqual(['probe']);
+    expect(replacement.sent.map(parseFrame)).toMatchObject([
+      { id: 'r1', ok: true, result: 'probe' },
+    ]);
+    await layer.stop();
   });
 
   test('ignores messages for a connection it does not track', async () => {

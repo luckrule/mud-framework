@@ -143,18 +143,18 @@ describe('runServerProcess requests', () => {
         result: 'hi',
       },
     ]);
-    // `DispatcherExecutor` omits the key entirely for an unbound success, and both
-    // JSON and structured clone keep that shape, so "absent" is literally what
-    // "unbound" looks like on the wire (SPEC 2). `toBeUndefined` would also
-    // pass on a present-but-undefined key, i.e. on the shape this asserts
-    // against, so the assertion is on the key's presence.
+    // `DispatcherExecutor` omits the key entirely for an unbound success, so
+    // "absent" is literally what "unbound" looks like in the result (SPEC 2).
+    // `toBeUndefined` would also pass on a present-but-undefined key, i.e. on
+    // the shape this asserts against, so the assertion is on the key's
+    // presence.
     const raw = harness.messages.find(
       (message) => isRecord(message) && message.type === 'result',
     );
     if (!isRecord(raw)) {
       throw new Error('expected a raw result message');
     }
-    expect(raw).not.toHaveProperty('sessionId');
+    expect(raw).not.toHaveProperty('sessionChange');
     await harness.stop();
   });
 

@@ -208,11 +208,12 @@ export class Dispatcher {
     // Both the timer and `cancel` settle this, and only the first settles it:
     // a request has exactly one terminal state (SPEC 2).
     const terminal = Promise.withResolvers<never>();
+    const startedAt = performance.now();
     const entry: InFlight = {
       expiry,
       storageScope,
       logger,
-      startedAt: performance.now(),
+      startedAt,
       fail: (error) => terminal.reject(error),
     };
     // Registered before the handler can run so a cancel in the same batch finds
@@ -221,7 +222,14 @@ export class Dispatcher {
     // overwrite would mean the caller broke that contract.
     this.inFlight.set(requestId, entry);
 
-    const timer = setTimeout(() => {
+    // The flag alone is not enough: synchronous handler work holds the event
+    // loop, so the timer cannot fire while the deadline passes. Both paths go
+    // through `expire`, which settles the request exactly once.
+    const deadlineAt = startedAt + effectiveTimeoutMs;
+    const expire = (): void => {
+      if (expiry.expired) {
+        return;
+      }
       // Same guard as `finally`: a second dispatch of the same id overwrote the
       // map entry, and deleting it here would make that running request
       // uncancellable.
@@ -241,7 +249,21 @@ export class Dispatcher {
         'request timed out',
       );
       terminal.reject(new FrameworkTimeoutError(requestId, effectiveTimeoutMs));
-    }, effectiveTimeoutMs);
+    };
+    const timer = setTimeout(expire, effectiveTimeoutMs);
+
+    // Ends the transaction callback (so the backend rolls back) whenever the
+    // request is already terminal or outlived its deadline. A request that
+    // waited for the backend's slot past its deadline must not start its
+    // handler at all; one that blocked the timer must not commit its result.
+    const assertNotExpired = (): void => {
+      if (!expiry.expired && performance.now() >= deadlineAt) {
+        expire();
+      }
+      if (expiry.expired) {
+        throw new Error(EXPIRED_MESSAGE);
+      }
+    };
 
     // Recorded, not applied: the change is committed only when the handler
     // succeeds, so a failed request leaves the route untouched (SPEC 2). A
@@ -271,6 +293,10 @@ export class Dispatcher {
         );
       }
       const work = this.backend.transaction(async (tx) => {
+        // Waiting for the backend's slot can outlast the deadline (a 'single'
+        // backend queues the callback). Starting the handler now would run
+        // framework-external side effects for a request already settled.
+        assertNotExpired();
         const context: RequestContext = {
           requestId,
           connectionId,
@@ -322,10 +348,10 @@ export class Dispatcher {
           const result = await registered.handler(context, payload);
           // The handler outlived its terminal state: force the backend to roll
           // back instead of committing effects nobody is waiting for
-          // (SPEC 3.3, 3.4).
-          if (expiry.expired) {
-            throw new Error(EXPIRED_MESSAGE);
-          }
+          // (SPEC 3.3, 3.4). Checked before this callback returns, so the
+          // backend has not started its COMMIT yet; a synchronous handler that
+          // blocked the timer is caught here as well.
+          assertNotExpired();
           return result;
         } finally {
           storageScope.active = false;
@@ -341,7 +367,11 @@ export class Dispatcher {
           expiry.expired ? logLostCommit(logger, entry.startedAt) : undefined,
         () => undefined,
       );
-      const result = await Promise.race([work, terminal.promise]);
+      // The terminal promise is listed first: when a pre-handler expiry and the
+      // transaction rejection settle in the same turn, the request's timeout
+      // (or cancel) must be the reported outcome, not the internal rollback
+      // signal.
+      const result = await Promise.race([terminal.promise, work]);
       const sessionChange = change.value;
       const events =
         eventBuffer.events.length === 0 ? undefined : eventBuffer.events;

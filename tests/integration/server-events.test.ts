@@ -254,18 +254,40 @@ describe('Server events over a real WebSocket and IPC', () => {
         timeoutMs: REQUEST_TIMEOUT_MS,
       });
       try {
-        const failed = await call(socket, {
-          id: 'fail',
-          method: 'event.fail',
-        });
+        // The reader is attached before the request, so it sees every frame the
+        // failed request produces — including one arriving right behind the
+        // reply. `call` installs a one-shot listener, which would miss an event
+        // between two calls and let the fault escape the test.
+        const frames = frameReader(socket);
+        socket.send(
+          JSON.stringify({
+            id: 'fail',
+            method: 'event.fail',
+          }),
+        );
+        const failed = await withDeadline(
+          frames.next(),
+          REQUEST_TIMEOUT_MS,
+          'reply to fail',
+        );
         expect(failed).toMatchObject({
           id: 'fail',
           ok: false,
           error: { code: 'INTERNAL_ERROR' },
         });
 
-        // The next frame on this socket must be the next response. A buffered
-        // event from the failed request would arrive first and make this fail.
+        // A failed request emits no event. The connection is otherwise idle, so
+        // the short silence window after the failure reply must hold no frame
+        // at all — any frame here would be the dropped event leaking out.
+        let stray: Record<string, unknown> | undefined;
+        try {
+          stray = await withDeadline(frames.next(), 100, 'stray event frame');
+        } catch {
+          // No frame within the window: nothing was emitted.
+        }
+        expect(stray).toBeUndefined();
+
+        // The connection still serves the next request.
         const echo = await call(socket, {
           id: 'after-fail',
           method: 'echo',

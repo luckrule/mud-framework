@@ -5,7 +5,10 @@ import type {
   RequestMessage,
 } from '../ipc/protocol.ts';
 import type { LogFields, Logger } from '../logging/types.ts';
-import type { BufferedServerEvent } from '../shared/events.ts';
+import type {
+  BufferedServerEvent,
+  ServerEventTarget,
+} from '../shared/events.ts';
 import type { ExecutorOutcome } from '../shared/executor.ts';
 import { messageOf } from '../shared/guards.ts';
 import { requestLogFields } from '../shared/identity.ts';
@@ -325,12 +328,16 @@ export class RequestRunner {
         !outcome.ok &&
         outcome.error.code === entry.cancelledCode
       ) {
-        // `dispatcher.cancel` invalidated the transaction and rolled it back,
-        // and Portal settled this id when it sent the cancel. A result now
-        // would be a late answer nobody can match, so it is dropped; the
-        // rollback is the visible outcome (SPEC 3.3, 3.6). The outcome code is
-        // checked, not just the flag: a cancel that lost the race to the commit
-        // left a real success behind, and suppressing that would hide it.
+        // Cancelling invalidates the transaction context: the transaction
+        // rolls back on the handler's return only when it never entered (or
+        // never finished) COMMIT, and only to the extent the backend declares
+        // (SPEC 3.4, 4.3). A COMMIT that already started may still commit, so
+        // the outcome is not proof that nothing was written. Portal settled
+        // this id when it sent the cancel, so a result now would be a late
+        // answer nobody can match and is dropped; the rollback is the visible
+        // outcome (SPEC 3.3, 3.6). The outcome code is checked, not just the
+        // flag: a cancel that lost the race to the commit left a real success
+        // behind, and suppressing that would hide it.
         this.deps.logger.warn(
           {
             ...this.requestFields(message),
@@ -446,13 +453,36 @@ export class RequestRunner {
     for (const [index, event] of events.entries()) {
       const eventId = `${message.requestId}:${index}`;
       if (!this.deps.send(eventMessage(eventId, event), 'event')) {
+        // The entry identity's `sessionId` names the Session the request
+        // entered with, not the event's delivery target; the target fields
+        // carry a `target` prefix so the two cannot be read as the same thing
+        // (SPEC 7.1).
         this.deps.logger.warn(
-          { ...fields, code: 'EVENT_SEND_FAILED', eventId, event: event.event },
+          {
+            ...fields,
+            code: 'EVENT_SEND_FAILED',
+            eventId,
+            event: event.event,
+            ...eventTargetFields(event.target),
+            reason: 'event could not be sent',
+          },
           'event could not be sent',
         );
       }
     }
   }
+}
+
+/**
+ * The delivery target of one event as log fields (SPEC 7.1). `EVENT_SEND_FAILED`
+ * lines also carry the request's entry identity, whose `sessionId` is the
+ * Session the request entered with; the `target` prefix keeps that field from
+ * being read as the delivery target.
+ */
+function eventTargetFields(target: ServerEventTarget): LogFields {
+  return target.kind === 'connection'
+    ? { targetKind: 'connection', targetConnectionId: target.connectionId }
+    : { targetKind: 'session', targetSessionId: target.sessionId };
 }
 
 /**

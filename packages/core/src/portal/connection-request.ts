@@ -89,14 +89,7 @@ async function startAfterGate(
     state.closed.signal,
     async (sessionId, terminal) => {
       state.queued -= 1;
-      await handle(
-        host,
-        state.connection,
-        envelope,
-        sessionId,
-        terminal,
-        requestId,
-      );
+      await handle(host, state, envelope, sessionId, terminal, requestId);
     },
   );
   if (!ran) {
@@ -104,18 +97,47 @@ async function startAfterGate(
     // Shutdown can stop waiting, but cannot start overlapping Session work.
     if (host.connections.get(state.connection.id) === state) {
       await refuseWithId(host, state.connection, envelope.id, requestId);
+      return;
     }
+    // The wait ended because this connection closed before the request could
+    // start, or because a shutdown whose drain wait timed out had already
+    // cleared the table; either way nobody can read a reply on it.
+    logDroppedBeforeStart(host, state, envelope, requestId);
   }
+}
+
+/** A queued request that must not start because its connection is gone. */
+function logDroppedBeforeStart(
+  host: RequestHost,
+  state: ConnectionState,
+  envelope: Envelope,
+  requestId: string,
+): void {
+  host.logger
+    .child({
+      requestId,
+      connectionId: state.connection.id,
+      clientRequestId: envelope.id,
+    })
+    .warn(
+      {
+        method: envelope.method,
+        code: TRANSPORT_CLOSED,
+        reason: 'connection closed',
+      },
+      'request dropped before start',
+    );
 }
 
 async function handle(
   host: RequestHost,
-  connection: TransportConnection,
+  state: ConnectionState,
   envelope: Envelope,
   sessionId: string | undefined,
   terminal: Promise<void>,
   requestId: string,
 ): Promise<void> {
+  const connection = state.connection;
   const method = envelope.method;
   const clientRequestId = envelope.id;
   const requestPayload = envelope.payload;
@@ -126,7 +148,6 @@ async function handle(
   // runs: a request that binds a Session still runs as unbound, and the binding
   // it declares is applied only after it succeeds. Every request line carries
   // it (SPEC 7.1), which is why the logger is built after this lookup.
-  const state = host.connections.get(connection.id);
   const logger = host.logger.child({
     requestId,
     connectionId: connection.id,
@@ -135,11 +156,19 @@ async function handle(
   });
   const startedAt = performance.now();
 
-  // A request queued behind another one can reach this point after its
-  // connection closed. Executing it would commit writes for a player who is
-  // gone, which is the same defect as running a cancelled request (SPEC 3.6),
-  // so it is ended here instead — before it acquires a transaction.
-  if (state === undefined) {
+  // The ConnectionState captured when the request took its queue seat is the
+  // only identity it may act under: looking the id up again would let a request
+  // that waited behind another one run as the replacement that reused the id
+  // after this connection closed (SPEC 5.2). Executing it would commit writes
+  // for a player who is gone — the same defect as running a cancelled request
+  // (SPEC 3.6) — so it ends here, before it acquires a transaction. Shutdown
+  // keeps its states tracked while it drains accepted work (SPEC 6.3), so this
+  // check rejects only the disconnect/replacement case. Boundary: when the
+  // drain wait times out, `doStop` clears the table, so a request still parked
+  // behind the Session barrier at that point sees the same mismatch and is
+  // logged as TRANSPORT_CLOSED instead of FRAMEWORK_SHUTDOWN; it still does not
+  // run.
+  if (host.connections.get(connection.id) !== state) {
     logger.warn(
       { method, code: TRANSPORT_CLOSED, reason: 'connection closed' },
       'request dropped before start',
@@ -222,11 +251,11 @@ async function handle(
     );
     return;
   }
-  // An untracked connection means `onDisconnect` already ran: the request ended
-  // because the client left, which is expected, and nobody can read a reply.
-  // Writing one would only add a TRANSPORT_SEND_FAILED error on top of the
-  // cancel the executor already logged (SPEC 7.1).
-  if (!host.connections.has(connection.id)) {
+  // An untracked (or replaced) connection means `onDisconnect` already ran: the
+  // request ended because the client left, which is expected, and nobody can
+  // read a reply. Writing one would only add a TRANSPORT_SEND_FAILED error on
+  // top of the cancel the executor already logged (SPEC 7.1).
+  if (host.connections.get(connection.id) !== state) {
     logger.debug(
       {
         method,

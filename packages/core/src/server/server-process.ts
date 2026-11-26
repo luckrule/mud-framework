@@ -72,9 +72,11 @@ type Phase =
  * The returned promise is the exit signal, since a library must not call
  * `process.exit` and a caller needs something observable to map to an exit code:
  *
- * - resolves after an orderly `shutdown` (the last message is `closed`, the
- *   backend is closed and the link is closed): exit 0. A `shutdown` before
- *   activation resolves without ever opening storage;
+ * - resolves after an orderly `shutdown`: the bounded close flow has been
+ *   attempted (`closed` was sent and the link is closed), reported as exit 0.
+ *   Resolution does not guarantee the backend was closed or that the process
+ *   has exited; a failure or timeout inside the close flow is only logged. A
+ *   `shutdown` before activation resolves without ever opening storage;
  * - rejects with `ServerStartupError` when activation never reached `ready`, and
  *   with `ServerChannelClosedError` when the link died without `shutdown`: exit
  *   non-zero so the Portal restart policy sees a failure.

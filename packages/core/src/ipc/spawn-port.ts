@@ -13,9 +13,10 @@ export interface ServerExitInfo {
 }
 
 /**
- * One Server process plus the channel that talks to it. `exited` and the
- * channel's close both mean "this process is gone"; they race, so a ServerState
- * is the identity used to make crash handling happen at most once per process.
+ * One Server process plus the channel that talks to it. A channel close does
+ * not mean the process is gone: only `exited` resolving with `observed: true`
+ * releases the writer barrier, and the two race, so a ServerState is the
+ * identity used to make crash handling happen at most once per process.
  *
  * This is the port the executor depends on, not an implementation detail of it:
  * a spawn can come from `Bun.spawn`, `child_process`, a container or a remote

@@ -243,6 +243,8 @@ Extension 对存储能力的依赖 MUST 显式声明。启动时若后端能力�
 
 Transport 只负责四件事：接受连接、交付入站数据、写出发站数据、关闭。MUST NOT 承担：Session 路由、输入缓冲、重放、访问检查。理由：这些职责依赖 Session 与 Request 语义，属于框架契约；下沉到传输会让每个传输实现各自重写一遍，且无法保证跨传输一致。
 
+`TransportConnection.id` 在连接层实例的生命周期内 MUST 唯一：连接断开后，同一 id MUST NOT 被新连接复用。连接层以该 id 维护活跃连接、Session 路由、请求入口查找与事件投递；复用会让迟到入站消息落到替换连接，或让本应发给旧连接的事件误投到替换连接。需要重连语义时，传输 MUST 铸造新 id（默认 WS 传输的 UUID 满足此约束）。连接层按连接对象身份忽略迟到的旧断线事件，但按 id 投递的事件无法区分新旧，因此唯一性由传输保证。
+
 职责拆分：Session 路由、输入缓冲与重放在连接层进程（§6.1）；访问检查点与拒绝语义（`AUTH_REQUIRED` / `FORBIDDEN`、检查顺序）在 core 的 Dispatcher 内，随 Handler 在业务进程执行（§3.7）；认证与授权策略、登录流程属于消费方。
 
 TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：core 不终止 TLS，也不承载 TLS 配置，只处理传输已经解出的 payload。部署方 MUST 在不可信网络前终止 TLS——由反向代理前置终止，或由具体传输实现自行终止；框架不承诺明文监听可以安全地暴露在不可信网络上。TLS 终止不替代消费方的认证与授权策略（§3.7），也不改变 §5.4 的 Envelope 线格式。
@@ -344,7 +346,7 @@ TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：
 
 结果/完成类日志（`request completed`、`result received`、失败日志）的 `sessionId` 表示请求入口 Session（与 `RequestIdentity` 同义），不会因 Handler 绑定而被改写；入口无 Session 时不写。成功请求声明了 Session 变更时写 `sessionChange`，值为 `SessionChange` 对象（`{type:'bind',sessionId}` 或 `{type:'unbind'}`）；没有变更不写。字段名与语义都是契约。路由事件行（`session bound`、`session rebound to a new connection`）的 `sessionId` 表示本次被建立或接管的路由 id，与请求入口 Session 无关。
 
-Server 事件的诊断日志（ADR-0008）带 `eventId`、`event`，以及目标字段（`connectionId` 或 `sessionId`）与 `reason`。`code` 取值：`EVENT_DROPPED`（目标缺失、连接已关闭，或没有事件监听者）、`EVENT_SEND_FAILED`（Server 侧单条事件 IPC 发送失败）、`EVENTS_DROPPED`（结果未发出，该请求的全部事件被跳过）、`EVENT_LISTENER_FAILED`（事件监听者抛错）；Portal 侧编码或传输写失败记录 `TRANSPORT_SEND_FAILED`，并以 `stage` 区分 `encode` 与 `send`。这些是仅在日志中出现的诊断字段，不发往客户端；事件投递失败 MUST NOT 改变请求的日志结论或终态。
+Server 事件的诊断日志（ADR-0008）分逐事件与批量两类。逐事件日志（`EVENT_SEND_FAILED`）带 `eventId`、`event`、`reason` 与目标字段。Server 侧的 `EVENT_SEND_FAILED` 与请求入口身份写在同一行，目标字段用 `target` 前缀与入口身份区分：`targetKind` 取 `'connection'` 或 `'session'`，并相应带 `targetConnectionId` 或 `targetSessionId`；入口身份字段（`requestId`、`connectionId`、`clientRequestId`、`sessionId`）语义不变，`sessionId` 始终是请求入口 Session，不是投递目标。批量日志 `EVENTS_DROPPED` 是该请求的全部事件随未发出的结果一起被跳过时的单行记录，只有 `count`、`reason` 与请求入口身份，没有单一的 `eventId` 或目标字段。Portal 侧的 `EVENT_DROPPED`、`EVENT_LISTENER_FAILED` 是事件级日志，目标字段沿用目标自身的 `connectionId` 或 `sessionId`，并同样带 `targetKind`。`code` 取值：`EVENT_DROPPED`（目标缺失、连接已关闭，或没有事件监听者）、`EVENT_SEND_FAILED`（Server 侧单条事件 IPC 发送失败）、`EVENTS_DROPPED`（结果未发出，该请求的全部事件被跳过）、`EVENT_LISTENER_FAILED`（事件监听者抛错）；Portal 侧编码或传输写失败记录 `TRANSPORT_SEND_FAILED`，并以 `stage` 区分 `encode` 与 `send`。这些是仅在日志中出现的诊断字段，不发往客户端；事件投递失败 MUST NOT 改变请求的日志结论或终态。
 
 ### 7.2 错误码
 

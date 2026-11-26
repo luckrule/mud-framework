@@ -51,6 +51,8 @@ describe('IpcExecutor server events', () => {
     expect(dropped[0]).toMatchObject({
       eventId: 'req-1:0',
       event: 'room.description',
+      targetKind: 'connection',
+      connectionId: 'c1',
       reason: 'no event listener',
     });
   });
@@ -87,7 +89,11 @@ describe('IpcExecutor server events', () => {
       .logs()
       .filter((line) => line.code === 'EVENT_LISTENER_FAILED');
     expect(failed).toHaveLength(1);
-    expect(failed[0]).toMatchObject({ reason: 'listener exploded' });
+    expect(failed[0]).toMatchObject({
+      targetKind: 'connection',
+      connectionId: 'c1',
+      reason: 'listener exploded',
+    });
   });
 
   test('ignores a subscription registered after close', async () => {

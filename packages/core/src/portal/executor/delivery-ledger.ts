@@ -106,6 +106,14 @@ export class DeliveryLedger {
     if (this.buffer.get(pending.request.requestId) !== pending) {
       return true;
     }
+    // A deadline that has already passed is terminal. Rounding it up to the
+    // protocol's 1ms floor would deliver work whose result nobody can accept
+    // (SPEC 3.4, INV-007); settle it here instead, exactly like the timer.
+    const remaining = pending.deadlineAt - Date.now();
+    if (remaining <= 0) {
+      this.expire(pending);
+      return true;
+    }
     const isReplay = pending.sentOn !== undefined;
     // The count is only committed after a successful send: a send that dies on
     // a closing channel did not reach any Server and must not burn budget.
@@ -132,11 +140,7 @@ export class DeliveryLedger {
     }
     try {
       server.channel.send(
-        requestMessage(
-          pending.request,
-          Math.max(1, pending.deadlineAt - Date.now()),
-          replayCount,
-        ),
+        requestMessage(pending.request, remaining, replayCount),
       );
     } catch (error) {
       this.onServerLost(server, null, null, `send failed: ${messageOf(error)}`);
@@ -214,7 +218,16 @@ export class DeliveryLedger {
     if (this.buffer.get(pending.request.requestId) !== pending) {
       return;
     }
-    pending.timer = undefined;
+    this.expire(pending);
+  }
+
+  /**
+   * Settles `pending` as a timeout: one log line, a best-effort cancel to the
+   * Server that holds it, and the terminal outcome. Shared by the deadline
+   * timer and delivery, so a deadline discovered to be already past produces
+   * exactly the same observable result as one that fired on time.
+   */
+  private expire(pending: PendingRequest): void {
     // warn, not error: the connection layer records the failed outcome at error
     // level, and one request failure should not produce two error lines.
     this.logger.warn(

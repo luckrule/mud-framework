@@ -68,6 +68,7 @@ describe('ConnectionLayer server events', () => {
     expect(dropped).toHaveLength(1);
     expect(dropped[0]).toMatchObject({
       eventId: 'req-1:0',
+      targetKind: 'session',
       sessionId: 'nobody',
       reason: 'no connection holds the session',
     });
@@ -87,6 +88,7 @@ describe('ConnectionLayer server events', () => {
     const dropped = h.logs().filter((line) => line.code === 'EVENT_DROPPED');
     expect(dropped).toHaveLength(1);
     expect(dropped[0]).toMatchObject({
+      targetKind: 'connection',
       connectionId: 'c1',
       reason: 'target connection is not available',
     });

@@ -57,7 +57,9 @@ export interface StartupDeps {
  * delivers immediately after `ready` (the contract SPEC 6.2 gives it) would lose
  * them.
  *
- * Throws `ServerStartupError` and leaves no backend open when any step fails.
+ * Throws `ServerStartupError` when any step fails, after attempting to close
+ * whatever was opened; a close failure is logged as `STORAGE_CLOSE_FAILED` and
+ * is not a promise that the backend was released.
  */
 export async function startServer(deps: StartupDeps): Promise<StartupResult> {
   const { options, logger } = deps;

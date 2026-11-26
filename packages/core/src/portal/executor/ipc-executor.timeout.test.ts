@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 
+import { sleep } from '../../testing/common.ts';
 import {
   failureOf,
   flushTicks,
@@ -145,6 +146,33 @@ describe('IpcExecutor timeout', () => {
 
     second.send(successMessage('req-1', null));
     expect((await outcomePromise).ok).toBe(true);
+    await h.executor.close();
+  });
+
+  test('does not deliver a buffered request whose deadline a shorter ceiling moved into the past', async () => {
+    const h = harness({ timeoutMs: 5000 });
+    const startPromise = h.executor.start();
+    const server = serverAt(h, 0);
+
+    const outcomePromise = h.executor.execute(request({ requestId: 'req-1' }));
+    // Long enough that the 10ms ceiling below is already in the past.
+    await sleep(60);
+
+    // The Server declares a ceiling far below the time this request already
+    // spent buffered, so tightening the deadline leaves nothing to send.
+    server.send(readyMessage(10));
+    await startPromise;
+    // Even a result arriving in the same turn must not turn the expiry into a
+    // successful request.
+    server.send(successMessage('req-1', 'done'));
+
+    const outcome = await outcomePromise;
+
+    expect(failureOf(outcome).code).toBe('FRAMEWORK_TIMEOUT');
+    expect(requestMessages(server)).toHaveLength(0);
+    expect(
+      h.logs().filter((line) => line.msg === 'request timed out'),
+    ).toHaveLength(1);
     await h.executor.close();
   });
 

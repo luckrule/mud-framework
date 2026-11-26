@@ -157,4 +157,75 @@ describe('RequestRunner server events', () => {
       event: 'first',
     });
   });
+
+  test('names the session target and the reason when an event send fails', async () => {
+    // Every event send fails, the result send succeeds: the request itself stays
+    // successful and only the event diagnostic line carries the failure.
+    const harness = startRunner(1000, () => true, {
+      send: (_message, what) => what !== 'event',
+    });
+    harness.register(
+      'tell',
+      (ctx) => {
+        ctx.emitToSession('s2', 'chat.message', 'hi');
+        return Promise.resolve('ok');
+      },
+      { access: 'public' },
+    );
+
+    harness.runner.accept(
+      requestMessage({ requestId: 'req-7', method: 'tell', sessionId: 's1' }),
+    );
+    await tick();
+
+    const failed = harness
+      .logs()
+      .filter((line) => line.code === 'EVENT_SEND_FAILED');
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({
+      requestId: 'req-7',
+      sessionId: 's1',
+      eventId: 'req-7:0',
+      event: 'chat.message',
+      targetKind: 'session',
+      targetSessionId: 's2',
+      reason: expect.any(String),
+    });
+    // The entry Session is the request's own and must not be read as the target.
+    expect(failed[0]?.targetSessionId).not.toBe(failed[0]?.sessionId);
+  });
+
+  test('names the connection target when an event send fails', async () => {
+    const harness = startRunner(1000, () => true, {
+      send: (_message, what) => what !== 'event',
+    });
+    harness.register(
+      'look',
+      (ctx) => {
+        ctx.emit('room.description', { text: 'a cave' });
+        return Promise.resolve('ok');
+      },
+      { access: 'public' },
+    );
+
+    harness.runner.accept(
+      requestMessage({ requestId: 'req-8', method: 'look', sessionId: 's1' }),
+    );
+    await tick();
+
+    const failed = harness
+      .logs()
+      .filter((line) => line.code === 'EVENT_SEND_FAILED');
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({
+      requestId: 'req-8',
+      sessionId: 's1',
+      eventId: 'req-8:0',
+      event: 'room.description',
+      targetKind: 'connection',
+      targetConnectionId: 'c1',
+      reason: expect.any(String),
+    });
+    expect(failed[0]).not.toHaveProperty('targetSessionId');
+  });
 });

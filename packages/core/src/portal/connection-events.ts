@@ -61,6 +61,7 @@ function resolveTarget(
         {
           eventId: event.eventId,
           event: event.event,
+          targetKind: 'connection',
           connectionId: target.connectionId,
           code: 'EVENT_DROPPED',
           reason: 'target connection is not available',
@@ -77,6 +78,7 @@ function resolveTarget(
       {
         eventId: event.eventId,
         event: event.event,
+        targetKind: 'session',
         sessionId: target.sessionId,
         code: 'EVENT_DROPPED',
         reason: 'no connection holds the session',
@@ -93,6 +95,7 @@ function resolveTarget(
       {
         eventId: event.eventId,
         event: event.event,
+        targetKind: 'session',
         sessionId: target.sessionId,
         connectionId,
         code: 'EVENT_DROPPED',

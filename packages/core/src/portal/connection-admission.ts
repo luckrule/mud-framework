@@ -207,10 +207,15 @@ export async function onDisconnect(
   hooks: DisconnectHooks,
 ): Promise<void> {
   const state = host.connections.get(connection.id);
-  host.connections.delete(connection.id);
-  if (state === undefined) {
+  // The id is the map key, but the connection object is the identity: a stale
+  // disconnect that arrives after a replacement reused the id must not delete
+  // the new state or cancel its requests. The contract is that transport ids
+  // are unique for the life of the layer (SPEC 5.2); this guard keeps a
+  // violating transport from corrupting the replacement's routing.
+  if (state === undefined || state.connection !== connection) {
     return;
   }
+  host.connections.delete(connection.id);
   hooks.releaseRoute(connection.id);
   // Only this connection's wait is released; other holders still wait for its
   // framework request completion, even when cancellation settles later.

@@ -396,6 +396,7 @@ export class IpcExecutor implements RequestExecutor, SwitchDeps {
         {
           eventId: event.eventId,
           event: event.event,
+          ...eventTargetFields(event.target),
           code: 'EVENT_DROPPED',
           reason: 'no event listener',
         },
@@ -414,6 +415,7 @@ export class IpcExecutor implements RequestExecutor, SwitchDeps {
           {
             eventId: event.eventId,
             event: event.event,
+            ...eventTargetFields(event.target),
             code: 'EVENT_LISTENER_FAILED',
             reason: messageOf(error),
           },
@@ -541,4 +543,18 @@ export class IpcExecutor implements RequestExecutor, SwitchDeps {
       listPendingExits: () => this.slot.pendingExits,
     };
   }
+}
+
+/**
+ * The event's target as log fields (SPEC 7.1). Portal-side event logs have no
+ * request entry identity to collide with, so the target id keeps its own name;
+ * `targetKind` is the same discriminator the Server side logs, so both sides
+ * can be filtered the same way.
+ */
+function eventTargetFields(
+  target: ServerEvent['target'],
+): Record<string, unknown> {
+  return target.kind === 'connection'
+    ? { targetKind: 'connection', connectionId: target.connectionId }
+    : { targetKind: 'session', sessionId: target.sessionId };
 }
