@@ -366,6 +366,100 @@ describe('ConnectionLayer shutdown (SPEC 6.3)', () => {
     expect(scripted.stopCalls()).toBe(1);
   });
 
+  test('rejects stop when transport stop never settles, calls it once, and repeats the same rejection', async () => {
+    const never = Promise.withResolvers<void>();
+    let stops = 0;
+    const order: string[] = [];
+    const { executor } = scriptedExecutor(order);
+    const lines: string[] = [];
+    const layer = new ConnectionLayer({
+      transport: {
+        start: () => Promise.resolve(),
+        stop: () => {
+          stops += 1;
+          return never.promise;
+        },
+      },
+      executor,
+      shutdownTimeoutMs: 5,
+      logger: createJsonLogger({ sink: (line) => lines.push(line) }),
+    });
+    await layer.start();
+
+    const failure = await rejectionOf(layer.stop());
+    expect(failure.message).toMatch(/transport stop.*shutdown timeout/);
+    expect(stops).toBe(1);
+    // The state still reflects the sequence reaching its end, but the caller
+    // is told the transport close was never confirmed.
+    expect(layer.health().state).toBe('stopped');
+    expect(
+      lines
+        .map(parseFrame)
+        .find(
+          (entry) =>
+            entry.msg ===
+            'transport stop did not settle before the shutdown timeout',
+        ),
+    ).toMatchObject({ level: 'error', timeoutMs: 5 });
+
+    expect(await rejectionOf(layer.stop())).toBe(failure);
+    expect(stops).toBe(1);
+    never.resolve();
+  });
+
+  test('preserves executor close failure and transport timeout together in a stable order', async () => {
+    const executorFailure = new Error('server refused to die');
+    const never = Promise.withResolvers<void>();
+    let stops = 0;
+    const executor: RequestExecutor = {
+      start: () => Promise.resolve(),
+      onEvent: () => () => undefined,
+      execute: () => Promise.resolve({ ok: true, result: null }),
+      cancel: () => Promise.resolve(),
+      close: () => Promise.reject(executorFailure),
+      health: () => ({ state: 'ready', ready: true }),
+    };
+    const layer = new ConnectionLayer({
+      transport: {
+        start: () => Promise.resolve(),
+        stop: () => {
+          stops += 1;
+          return never.promise;
+        },
+      },
+      executor,
+      shutdownTimeoutMs: 5,
+      logger: createJsonLogger({ sink: () => undefined }),
+    });
+    await layer.start();
+
+    const failure = await rejectionOf(layer.stop());
+    expect(failure).toBeInstanceOf(AggregateError);
+    const errors = (failure as AggregateError).errors;
+    expect(errors).toHaveLength(2);
+    expect(errors[0]).toBe(executorFailure);
+    expect(errors[1]?.message).toMatch(/transport stop.*shutdown timeout/);
+    expect(stops).toBe(1);
+    expect(await rejectionOf(layer.stop())).toBe(failure);
+    never.resolve();
+  });
+
+  test('resolves stop when the transport stops within the budget', async () => {
+    const order: string[] = [];
+    const { executor } = scriptedExecutor(order);
+    const scripted = scriptedTransport(order);
+    const layer = new ConnectionLayer({
+      transport: scripted.transport,
+      executor,
+      shutdownTimeoutMs: 5,
+    });
+    await layer.start();
+
+    await layer.stop();
+
+    expect(scripted.stopCalls()).toBe(1);
+  });
+
   test('runs the shutdown once for concurrent and repeated calls', async () => {
     const order: string[] = [];
     const { executor, closeCalls } = scriptedExecutor(order);

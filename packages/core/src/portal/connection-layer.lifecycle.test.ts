@@ -46,12 +46,17 @@ describe('ConnectionLayer lifecycle', () => {
     await entered.promise;
 
     try {
-      await layer.stop();
+      // The transport start is still pending, so the layer cannot confirm the
+      // close within the budget: that is a failed stop, not a silent success.
+      const stopError = await rejectionOf(layer.stop());
+      expect(stopError.message).toMatch(/transport stop.*shutdown timeout/);
       release.resolve();
       const startError = await starting;
       expect(() => listener.connect('late')).toThrow(/stopped/);
       expect(startError).toBeInstanceOf(Error);
-      await layer.stop();
+      // The late start still releases the listener once, but the memoised stop
+      // keeps reporting the same unconfirmed close.
+      expect(await rejectionOf(layer.stop())).toBe(stopError);
       expect(stops).toBe(1);
     } finally {
       release.resolve();
@@ -154,11 +159,14 @@ describe('ConnectionLayer lifecycle', () => {
     await entered.promise;
     const concurrent = await rejectionOf(layer.start());
     expect(concurrent.message).toMatch(/cannot start while starting/);
-    await layer.stop();
+    // The transport start is still pending at the deadline, so stop() reports
+    // the unconfirmed close instead of resolving.
+    const stopError = await rejectionOf(layer.stop());
+    expect(stopError.message).toMatch(/transport stop.*shutdown timeout/);
     release.resolve();
 
     expect(await rejected).toBe(failure);
-    await layer.stop();
+    expect(await rejectionOf(layer.stop())).toBe(stopError);
     expect(closeCalls()).toBe(1);
     expect(stops).toBe(0);
   });

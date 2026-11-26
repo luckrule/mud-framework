@@ -339,25 +339,33 @@ export class ConnectionLayer implements TransportHandlers {
       );
     }
 
+    let transportFailure: Error | undefined;
     const stopped = await settleWithin(this.stopTransport(), timeoutMs);
     this.status = 'stopped';
     if (stopped.status === 'timeout') {
+      // SPEC 6.3: an unconfirmed transport close is a failed close, not a
+      // logged footnote. Reporting success would tell the caller the listener
+      // was released when it may still be running.
+      transportFailure = new Error(
+        'transport stop did not settle before the shutdown timeout',
+      );
       this.logger.error(
         { timeoutMs },
         'transport stop did not settle before the shutdown timeout',
       );
+    } else if (stopped.status === 'rejected') {
+      transportFailure = toError(stopped.error);
     }
-    if (stopped.status === 'rejected') {
-      if (executorFailure !== undefined) {
-        throw new AggregateError(
-          [executorFailure, toError(stopped.error)],
-          'executor and transport failed to close',
-        );
-      }
-      // The sequence is complete, but the transport never confirmed it closed:
-      // that is the caller's to handle, so it is rethrown rather than logged
-      // away.
-      throw toError(stopped.error);
+    if (executorFailure !== undefined && transportFailure !== undefined) {
+      throw new AggregateError(
+        [executorFailure, transportFailure],
+        'executor and transport failed to close',
+      );
+    }
+    // The sequence is complete, but the transport never confirmed it closed:
+    // that is the caller's to handle, so it is thrown rather than logged away.
+    if (transportFailure !== undefined) {
+      throw transportFailure;
     }
     if (executorFailure !== undefined) {
       throw executorFailure;
