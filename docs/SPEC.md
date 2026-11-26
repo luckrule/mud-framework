@@ -135,6 +135,8 @@ COMMIT 完成时刻晚于 deadline 时，请求仍以超时终态结束：不返
 
 `FRAMEWORK_QUEUE_FULL` 同时表示 Portal 的未确认缓冲达到上限（`IpcExecutor.maxPending`）。两层队列的拒绝语义一致：以同一稳定错误码立即失败，不静默丢弃。
 
+事件缓冲的上界见 §3.8。它与本节 Input Queue 的上界是两个独立的界：分别计量、分别执行各自的溢出策略，不合并为一个总上限。
+
 ### 3.6 取消与断线
 
 Connection 在 Request 处理中关闭时，该 Request MUST 进入终态，不得无限期挂起。
@@ -176,8 +178,16 @@ Handler 可以为一个请求声明要发送的事件（ADR-0008）。`ctx.emit(
 - Session 目标的收件人按实际写出时的当前 holder 解析：排队期间 takeover 会改投新 holder，至多重投递一次，再次变化即丢弃。
 - 同一 Session 的 session 目标事件 MUST 按发射序串行投递：后一条必须等前一条写出或丢弃后才开始，因此 takeover 不改变同一收件 Connection 上这些事件之间的顺序。投递分两段，只有第一段可取消：**queued**（尚未开始写出）时旧连接被移除或 abort，该事件丢弃（`EVENT_DROPPED`，reason 指明写出前连接已关闭）并立即释放串行位；**writing**（已开始写出）时 abort MUST NOT 提前释放串行位，必须等实际写结果（成功或传输失败）结算后再释放，写失败记 `TRANSPORT_SEND_FAILED` 而不是 `EVENT_DROPPED`，因为帧可能已写出。写出本身必须有界：传输发送受其 `sendTimeoutMs` 约束，底层发送 Promise 不保证 settle 时以发送超时为上界，不得用 abort 信号代替。这个写出上界优先取连接层的显式 `eventSendTimeoutMs` 配置，其次取传输声明的单帧发送上界（§5.2），最后取默认值；传输声明不可用（例如 `Infinity`）时按未声明处理，回退到默认值。
 - 结果发送失败时，该请求的全部事件 MUST 跳过并记录；请求的成功状态不变。
-- 同一 Connection 上，结果帧与事件帧、事件帧之间的写顺序由连接层的有序链与传输发送队列保证；session 目标的事件另由按 Session 的串行队列保证发射序；connection 目标与 session 目标之间、不同 Connection 之间不承诺发射序。
+- 事件帧之间的发射序按投递路径界定：同一 Session 的 session 目标事件由按 Session 的串行队列保证，同一 Connection 上的 connection 目标事件按发射序写出；connection 目标与 session 目标之间、不同 Connection 之间不承诺发射序。结果帧与事件帧之间的相对顺序见本节“写出调度与有界缓冲”。
 - 事件是附加通道：MUST NOT 改变请求的终态、超时、取消、重放、Session 屏障或关闭语义。
+
+写出调度与有界缓冲：
+
+- 连接层持有的每一处事件缓冲（每 Connection 的事件队列、每 Session 的待投递队列）MUST 有界：已接收、尚未写出的事件帧数与字节数都不得越过上限，上限由连接层选项 `maxQueuedEvents` 与 `maxQueuedEventBytes` 定义，默认值见选项定义。上限是每个队列实例的上界，不是每 Connection 汇总的上界。达到任一上限时 MUST 丢弃新事件并记录（`EVENT_DROPPED`，`reason: 'backlog'`，字段见 §7.1），MUST NOT 静默丢弃，MUST NOT 因此改变请求终态或让请求失败。
+- 每个 Connection 的写出由该连接内的单一调度器串行执行；不同 Connection 之间仍并发写出，不共享调度器。请求工作指从输入准入到结果写出的整段（读输入 → 准入 gate → 执行 → 写结果），是一个调度单元，不是仅写结果帧；MUST NOT 把请求执行留在原链、只把结果帧交给新队列，那会产生两个写者，违背单写者前提。队列中存在就绪的请求工作时，MUST 先处理该请求工作；没有就绪请求工作时才写事件。因此结果帧 MAY 越过尚未写出的事件帧，事件帧之间仍保持发射序（范围见本节“投递语义”）。这是方向性变更：原规则是结果帧与事件帧按 FIFO 顺序写出，新规则是请求工作优先，不是措辞澄清。
+- 请求优先 MUST NOT 使事件无限期饥饿：该 Connection 每完成一个请求工作，若其事件队列非空，MUST 取出队首事件写出。请求优先只决定两者同时就绪时的顺序，公平规则给出事件等待的有界性，两者并存。
+- 残余边界：已经交给传输的那一帧事件无法被后续结果抢占；慢客户端上正在写的事件帧会让下一个结果多等一帧的写出时间。这是单写者的固有代价，不是保证。
+- 连接层开始关闭后 MUST 停止接收新事件；每一处事件缓冲内尚未写出的事件 MUST 丢弃并记录一条汇总日志（`EVENT_BACKLOG_DISCARDED`，`reason: 'shutdown'`，字段见 §7.1）。关闭只排空请求工作，不为事件消耗关闭预算。依据：事件是 best-effort，关闭不为不可靠通道延迟资源释放。
 
 安全边界：框架不对事件做授权。Handler 可以向任意 Session 声明事件；房间成员资格、可见性与内容过滤属于业务。
 
@@ -338,6 +348,8 @@ TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：
 
 快照是建议性的，可能在返回后立即过期，MUST NOT 作为每个请求的准入 gate——请求仍受 §3.5 队列上限、§6.2 启动顺序与各自 deadline 约束。包内不提供传输层健康端点：如何把快照映射为 HTTP 探针由应用决定（见 INTEGRATION.md）。
 
+快照包含聚合字段 `eventBacklog: { connections, frames, bytes, dropped }`：`connections` 只统计事件队列非空的 Connection；Session 待投递队列在事件解析出 holder 之前不归属于任何 Connection，只体现在 `frames` 与 `bytes` 中。`frames` 与 `bytes` 是当前全部事件缓冲（每 Connection 的事件队列与每 Session 的待投递队列）的在途总量；`dropped` 只统计因达到上界而溢出丢弃的事件，是自进程启动以来的累计值（不是瞬时值），不含关闭时的批量丢弃——后者走 `EVENT_BACKLOG_DISCARDED` 汇总日志，不进入该计数。理由：探针读 `dropped` 是为了判断运行期是否在持续丢事件（背压或滥用）；把关闭期的正常丢弃混进来，会让每次滚动重启都出现一次计数跳变，形成误报。快照不提供 per-connection 深度，单连接诊断走日志（§7.1）。
+
 ## 7. 可观测性
 
 ### 7.1 结构化日志
@@ -354,7 +366,11 @@ TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：
 
 结果/完成类日志（`request completed`、`result received`、失败日志）的 `sessionId` 表示请求入口 Session（与 `RequestIdentity` 同义），不会因 Handler 绑定而被改写；入口无 Session 时不写。成功请求声明了 Session 变更时写 `sessionChange`，值为 `SessionChange` 对象（`{type:'bind',sessionId}` 或 `{type:'unbind'}`）；没有变更不写。字段名与语义都是契约。路由事件行（`session bound`、`session rebound to a new connection`）的 `sessionId` 表示本次被建立或接管的路由 id，与请求入口 Session 无关。
 
-Server 事件的诊断日志（ADR-0008）分逐事件与批量两类。逐事件日志（`EVENT_SEND_FAILED`）带 `eventId`、`event`、`reason` 与目标字段。Server 侧的 `EVENT_SEND_FAILED` 与请求入口身份写在同一行，目标字段用 `target` 前缀与入口身份区分：`targetKind` 取 `'connection'` 或 `'session'`，并相应带 `targetConnectionId` 或 `targetSessionId`；入口身份字段（`requestId`、`connectionId`、`clientRequestId`、`sessionId`）语义不变，`sessionId` 始终是请求入口 Session，不是投递目标。批量日志 `EVENTS_DROPPED` 是该请求的全部事件随未发出的结果一起被跳过时的单行记录，只有 `count`、`reason` 与请求入口身份，没有单一的 `eventId` 或目标字段。Portal 侧的 `EVENT_DROPPED`、`EVENT_LISTENER_FAILED` 是事件级日志，目标字段沿用目标自身的 `connectionId` 或 `sessionId`，并同样带 `targetKind`。`code` 取值：`EVENT_DROPPED`（目标缺失、连接已关闭，或没有事件监听者）、`EVENT_SEND_FAILED`（Server 侧单条事件 IPC 发送失败）、`EVENTS_DROPPED`（结果未发出，该请求的全部事件被跳过）、`EVENT_LISTENER_FAILED`（事件监听者抛错）；Portal 侧编码或传输写失败记录 `TRANSPORT_SEND_FAILED`，并以 `stage` 区分 `encode` 与 `send`。这些是仅在日志中出现的诊断字段，不发往客户端；事件投递失败 MUST NOT 改变请求的日志结论或终态。
+Server 事件的诊断日志（ADR-0008）分逐事件与批量两类。逐事件日志（`EVENT_SEND_FAILED`）带 `eventId`、`event`、`reason` 与目标字段。Server 侧的 `EVENT_SEND_FAILED` 与请求入口身份写在同一行，目标字段用 `target` 前缀与入口身份区分：`targetKind` 取 `'connection'` 或 `'session'`，并相应带 `targetConnectionId` 或 `targetSessionId`；入口身份字段（`requestId`、`connectionId`、`clientRequestId`、`sessionId`）语义不变，`sessionId` 始终是请求入口 Session，不是投递目标。批量日志 `EVENTS_DROPPED` 是该请求的全部事件随未发出的结果一起被跳过时的单行记录，只有 `count`、`reason` 与请求入口身份，没有单一的 `eventId` 或目标字段。Portal 侧的 `EVENT_DROPPED`、`EVENT_LISTENER_FAILED` 是事件级日志，目标字段沿用目标自身的 `connectionId` 或 `sessionId`，并同样带 `targetKind`。`code` 取值：`EVENT_DROPPED`（目标缺失、连接已关闭、任一处事件缓冲积压达到上界，或没有事件监听者）、`EVENT_SEND_FAILED`（Server 侧单条事件 IPC 发送失败）、`EVENTS_DROPPED`（结果未发出，该请求的全部事件被跳过）、`EVENT_LISTENER_FAILED`（事件监听者抛错）、`EVENT_BACKLOG_DISCARDED`（关闭时丢弃未写出的事件，单行汇总）；Portal 侧编码或传输写失败记录 `TRANSPORT_SEND_FAILED`，并以 `stage` 区分 `encode` 与 `send`。这些是仅在日志中出现的诊断字段，不发往客户端；事件投递失败 MUST NOT 改变请求的日志结论或终态。
+
+事件积压达到任一处事件缓冲的上界时，`EVENT_DROPPED` 的 `reason` 取 `'backlog'`，并带 `queuedEvents`、`queuedEventBytes`、`maxQueuedEvents`、`maxQueuedEventBytes`；Connection 事件队列溢出带 `connectionId`，Session 待投递队列溢出带 `sessionId` 与 `targetKind: 'session'`（§3.8）。
+
+关闭时丢弃未写出事件的汇总日志为 `EVENT_BACKLOG_DISCARDED`，`reason` 取 `'shutdown'`，字段含 `count`、`connections`、`frames`、`bytes`（§3.8）。
 
 ### 7.2 错误码
 
@@ -382,7 +398,7 @@ Server 事件的诊断日志（ADR-0008）分逐事件与批量两类。逐事�
 
 `TRANSPORT_SEND_FAILED` 的触发条件是“写不出去”，因此它结构上不可能送达客户端，只能作为日志字段被观察到。`TRANSPORT_CLOSED` 只作为请求终态的原因出现：请求因断线结束时连接已不在，没有可回写的通道，因此不承诺送达。两码仍是契约——它们回答“请求为什么结束”，删掉会让终态失去可枚举的说法。
 
-**仅日志诊断字段** 出现在日志的 `code` 字段里，用于定位，不发给客户端，也不构成 wire 契约：`CANCEL_LOST_TO_COMMIT`、`IPC_CHANNEL_CLOSED`、`SERVER_STARTUP_FAILED`、`DUPLICATE_REQUEST`、`INVALID_IPC_MESSAGE`、`EVENT_DROPPED`、`EVENT_SEND_FAILED`、`EVENTS_DROPPED`、`EVENT_LISTENER_FAILED` 等。日志里的 `code` 只是一个字段名，取值不受本节约束。
+**仅日志诊断字段** 出现在日志的 `code` 字段里，用于定位，不发给客户端，也不构成 wire 契约：`CANCEL_LOST_TO_COMMIT`、`IPC_CHANNEL_CLOSED`、`SERVER_STARTUP_FAILED`、`DUPLICATE_REQUEST`、`INVALID_IPC_MESSAGE`、`EVENT_DROPPED`、`EVENT_SEND_FAILED`、`EVENTS_DROPPED`、`EVENT_LISTENER_FAILED`、`EVENT_BACKLOG_DISCARDED` 等。日志里的 `code` 只是一个字段名，取值不受本节约束。`EVENT_DROPPED` 与 `EVENT_BACKLOG_DISCARDED` 的 `reason` 与字段见 §7.1。
 
 `FRAMEWORK_` 前缀是示例惯例，不是强制格式。`INVALID_ENVELOPE`、`UNKNOWN_METHOD`、`INTERNAL_ERROR`、`TRANSPORT_SEND_FAILED` 没有该前缀；发布后错误码只增不删；改名等于换码，所以这些名字保持不变。
 
