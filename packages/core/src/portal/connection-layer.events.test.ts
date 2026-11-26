@@ -3,17 +3,9 @@ import { Buffer } from 'node:buffer';
 
 import { withDeadline } from 'mud-framework-test-support';
 
-import { createJsonLogger } from '../logging/json-logger.ts';
-import { JsonCodec } from '../shared/codec.ts';
 import type { ServerEvent } from '../shared/events.ts';
 import { parseFrame, sleep, tick } from '../testing/common.ts';
 import { sessionHarness } from '../testing/connection-layer.ts';
-import type { ConnectionState } from './connection-admission.ts';
-import { EventWrite, deliverServerEvent } from './connection-events.ts';
-import type { EventDeliveryHost } from './connection-events.ts';
-import { ConnectionWriter } from './connection-writer.ts';
-import { EventBacklog } from './event-backlog.ts';
-import { SessionRouter } from './session-router.ts';
 
 function event(overrides: Partial<ServerEvent> = {}): ServerEvent {
   return {
@@ -848,76 +840,6 @@ describe('ConnectionLayer event write scheduling', () => {
   });
 });
 
-interface QueuedWrite {
-  readonly state: ConnectionState;
-  readonly write: EventWrite;
-}
-
-/**
- * A host whose event queue records frames instead of running them, so a test
- * can move the Session between two queued writes deterministically.
- */
-function deferredDeliveryHost() {
-  const lines: string[] = [];
-  const logger = createJsonLogger({
-    sink: (line) => {
-      lines.push(line);
-    },
-  });
-  const router = new SessionRouter({ logger });
-  const backlog = new EventBacklog();
-  const connections = new Map<string, ConnectionState>();
-  const sent = new Map<string, (string | Uint8Array)[]>();
-  for (const id of ['c1', 'c2']) {
-    const frames: (string | Uint8Array)[] = [];
-    sent.set(id, frames);
-    connections.set(id, {
-      connection: {
-        id,
-        send: (frame) => {
-          frames.push(frame);
-          return Promise.resolve();
-        },
-        close: () => Promise.resolve(),
-      },
-      writer: new ConnectionWriter({
-        maxQueuedEvents: 1024,
-        maxQueuedEventBytes: 4 * 1024 * 1024,
-        backlog,
-        logger,
-      }),
-      queued: 0,
-      inFlight: new Set(),
-      closed: new AbortController(),
-    });
-  }
-  const queue: QueuedWrite[] = [];
-  const host: EventDeliveryHost = {
-    codec: new JsonCodec(),
-    logger,
-    connections,
-    router,
-    sessionQueues: new Map(),
-    sendTimeoutMs: 1000,
-    acceptingEvents: () => true,
-    maxQueuedEvents: 1024,
-    maxQueuedEventBytes: 4 * 1024 * 1024,
-    backlog,
-    queueEvent: (state, write) => {
-      queue.push({ state, write });
-      return { accepted: true };
-    },
-    cancelEvent: (_state, write) => {
-      if (write.started || write.settled) {
-        return false;
-      }
-      write.settle('aborted');
-      return true;
-    },
-  };
-  return { host, router, queue, sent, logs: () => lines.map(parseFrame) };
-}
-
 /**
  * A layer whose successful `unbind` request removes the route. `hang` is a
  * request still running when the event arrives: it declares the unbind, so the
@@ -938,35 +860,69 @@ function unbindingHarness() {
 
 describe('deliverServerEvent session re-resolution', () => {
   test('drops after one redelivery instead of following a second takeover', async () => {
-    const h = deferredDeliveryHost();
-    h.router.bind('c1', 's1', Promise.resolve());
+    const h = sessionHarness();
+    await h.layer.start();
+    h.transport.connect('c1');
 
-    const delivery = deliverServerEvent(
-      h.host,
-      event({ target: { kind: 'session', sessionId: 's1' } }),
-    );
+    // c1's writer is held by the bind reply, so the Session event that follows
+    // is accepted into c1's connection queue without running. Holding the reply
+    // is how the test catches the "queued, not started" window a real writer
+    // closes on its next microtask.
+    const heldC1 = h.transport.holdSends('c1');
+    const bindingC1 = h.transport.receive('c1', '{"id":"1","method":"bind"}');
+    await heldC1.entered;
+    h.controlled.emit(sessionEvent('req-1:0', 'chase'));
     await tick();
-    expect(h.queue.map((entry) => entry.state.connection.id)).toEqual(['c1']);
+    expect(h.layer.health().eventBacklog).toMatchObject({
+      connections: 1,
+      frames: 1,
+    });
 
-    h.router.bind('c2', 's1', Promise.resolve());
-    await h.queue[0].write.run();
+    // c2 takes the Session over, and its writer is held the same way: the
+    // redelivered frame will stop in c2's queue instead of running.
+    h.transport.connect('c2');
+    const heldC2 = h.transport.holdSends('c2');
+    const bindingC2 = h.transport.receive('c2', '{"id":"2","method":"bind"}');
+    await heldC2.entered;
+
+    // Releasing c1 lets the queued frame's turn arrive: it re-resolves the
+    // holder, sees c2, and is redelivered rather than written to c1.
+    heldC1.release();
+    await bindingC1;
     await tick();
-    expect(h.sent.get('c1')).toEqual([]);
-    expect(h.queue.map((entry) => entry.state.connection.id)).toEqual([
-      'c1',
-      'c2',
-    ]);
+    expect(eventFrames(h.transport, 'c1')).toEqual([]);
+    expect(dropLines(h.logs())).toEqual([]);
+    // Exactly one frame is outstanding and only c2's buffer can hold it: c1's
+    // write already ran and re-resolved. That is the single redelivery, seen
+    // through public health rather than a private queue.
+    expect(h.layer.health().eventBacklog).toMatchObject({
+      connections: 1,
+      frames: 1,
+    });
 
     // Back to c1 before the redelivered write runs: chasing again would let two
-    // connections hand the event back and forth, so the retry is bounded.
-    h.router.bind('c1', 's1', Promise.resolve());
-    await h.queue[1].write.run();
-    await tick();
+    // connections hand the event back and forth, so the retry is bounded. c1's
+    // writer is idle now, so a third attempt would write the frame there and be
+    // caught by the empty frame list below.
+    await h.transport.receive('c1', '{"id":"3","method":"bind"}');
+    heldC2.release();
+    await bindingC2;
+    // Wait for the bounded delivery to finish by its observable outcome instead
+    // of counting promise hops: the drop is logged, the Session queue is gone and
+    // no buffer still holds the frame.
+    const settled = (): boolean =>
+      dropLines(h.logs()).length > 0 &&
+      sessionQueuesOf(h.layer).size === 0 &&
+      h.layer.health().eventBacklog.frames === 0;
+    let hops = 0;
+    while (!settled() && hops < 50) {
+      await Promise.resolve();
+      hops += 1;
+    }
 
-    expect(h.sent.get('c1')).toEqual([]);
-    expect(h.sent.get('c2')).toEqual([]);
-    expect(h.queue).toHaveLength(2);
-    const dropped = h.logs().filter((line) => line.code === 'EVENT_DROPPED');
+    expect(eventFrames(h.transport, 'c1')).toEqual([]);
+    expect(eventFrames(h.transport, 'c2')).toEqual([]);
+    const dropped = dropLines(h.logs());
     expect(dropped).toHaveLength(1);
     expect(dropped[0]).toMatchObject({
       eventId: 'req-1:0',
@@ -975,7 +931,14 @@ describe('deliverServerEvent session re-resolution', () => {
       sessionId: 's1',
       reason: 'the session holder changed again while redelivering',
     });
-    await delivery;
+    // The drop released the Session's serial slot, leaving no queue behind.
+    expect(sessionQueuesOf(h.layer).size).toBe(0);
+    expect(h.layer.health().eventBacklog).toEqual({
+      connections: 0,
+      frames: 0,
+      bytes: 0,
+      dropped: 0,
+    });
   });
 
   test('writes one session event at a time and clears the queue when idle', async () => {
