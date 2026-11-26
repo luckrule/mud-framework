@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { GameClient } from '../../examples/game-slice/src/client-lib.ts';
 import type { GameEvent } from '../../examples/game-slice/src/client-lib.ts';
 
+import { portalStopFailed, shouldRemoveDataDir } from './cleanup.ts';
 import {
   envInt,
   envIntList,
@@ -380,9 +381,12 @@ async function runRestart(portal: PortalHandle, url: string, config: Config) {
 async function cleanup(
   portal: PortalHandle | undefined,
   dataDirectory: string | undefined,
-  removeDataDirectory: boolean,
   config: Config,
 ): Promise<void> {
+  // A spawn path that never produced a Portal cannot confirm any exit; an
+  // external URL has no `dataDirectory` and never reaches the removal below.
+  let stopFailed = portal === undefined && dataDirectory !== undefined;
+  let survivors: readonly number[] = [];
   if (portal !== undefined) {
     try {
       const result = await portal.stop();
@@ -401,17 +405,18 @@ async function cleanup(
       write(
         `cleanup: portal exited (${exit}${result.forced ? ', forced' : ''}); Server pid(s) ${pids}: ${state}`,
       );
-      const badExit =
-        result.exitCode !== undefined &&
-        result.exitCode !== null &&
-        result.exitCode !== 0;
-      if (result.survivors.length > 0 || badExit) {
+      survivors = result.survivors;
+      stopFailed = portalStopFailed(result);
+      if (stopFailed) {
+        const exitNote =
+          result.exitCode === undefined ? ' (exit not confirmed)' : '';
         writeError(
-          `game benchmark cleanup failed: ${state}; portal exit ${exit}`,
+          `game benchmark cleanup failed: ${state}; portal exit ${exit}${exitNote}`,
         );
         process.exitCode = 1;
       }
     } catch (error) {
+      stopFailed = true;
       writeError(
         `game benchmark cleanup failed: could not stop the Portal: ${messageOf(error)}`,
       );
@@ -422,9 +427,16 @@ async function cleanup(
   if (dataDirectory === undefined) {
     return;
   }
-  if (!removeDataDirectory) {
+  const keep = config.dataDirectory !== undefined || config.keep;
+  if (!shouldRemoveDataDir({ stopFailed, survivors, keep })) {
     const why =
-      config.dataDirectory !== undefined ? 'BENCH_DATA_DIR' : 'BENCH_KEEP=1';
+      config.dataDirectory !== undefined
+        ? 'BENCH_DATA_DIR'
+        : config.keep
+          ? 'BENCH_KEEP=1'
+          : stopFailed
+            ? 'Portal stop was not graceful or not confirmed'
+            : `Server pid(s) still alive: ${survivors.join(', ')}`;
     write(`cleanup: kept data dir ${dataDirectory} (${why})`);
     return;
   }
@@ -449,7 +461,6 @@ async function main(): Promise<void> {
   );
 
   let dataDirectory: string | undefined;
-  let removeDataDirectory = false;
   let portal: PortalHandle | undefined;
   let summary: string | undefined;
   try {
@@ -463,7 +474,6 @@ async function main(): Promise<void> {
     } else {
       dataDirectory =
         config.dataDirectory ?? mkdtempSync(join(tmpdir(), 'mud-bench-game-'));
-      removeDataDirectory = config.dataDirectory === undefined && !config.keep;
       const kept =
         config.dataDirectory !== undefined
           ? ' (BENCH_DATA_DIR; never removed by the benchmark)'
@@ -520,7 +530,7 @@ async function main(): Promise<void> {
     ];
     summary = `summary: ${parts.join('; ')}; numbers are observations, not assertions`;
   } finally {
-    await cleanup(portal, dataDirectory, removeDataDirectory, config);
+    await cleanup(portal, dataDirectory, config);
   }
 
   if (summary !== undefined) {

@@ -23,7 +23,9 @@ export interface AggregateCommand {
 }
 
 export interface AggregateEvents {
+  saysAttempted: number;
   saysSent: number;
+  saysFailed: number;
   received: number;
   gaps: number;
   duplicates: number;
@@ -54,7 +56,9 @@ export function aggregateResults(
     say: { count: 0, errors: 0, histogram: new Histogram() },
   };
   const events: AggregateEvents = {
+    saysAttempted: 0,
     saysSent: 0,
+    saysFailed: 0,
     received: 0,
     gaps: 0,
     duplicates: 0,
@@ -92,7 +96,9 @@ export function aggregateResults(
       bucket.histogram.mergeJson(part.histogram);
     }
     const partEvents = result.events;
+    events.saysAttempted += partEvents.saysAttempted;
     events.saysSent += partEvents.saysSent;
+    events.saysFailed += partEvents.saysFailed;
     events.received += partEvents.received;
     events.gaps += partEvents.gaps;
     events.duplicates += partEvents.duplicates;
@@ -174,12 +180,15 @@ export function printAggregate(aggregate: Aggregate, config: MainConfig): void {
 
   const events = aggregate.events;
   const eventSummary = events.histogram.summary();
+  // Successful responses are the confirmable broadcast set, so they are the
+  // delivery denominator; a timed-out attempt may also have been broadcast, so
+  // deliveries/say can exceed 1.
   const perSay =
     events.saysSent === 0
       ? 'n/a'
       : (events.received / events.saysSent).toFixed(1);
   write(
-    `  room.say  says ${integerText(events.saysSent)}  received ${integerText(events.received)}  deliveries/say ${perSay}  latency ms: ${latencyText(
+    `  room.say  attempted ${integerText(events.saysAttempted)}  sent ${integerText(events.saysSent)}  failed ${integerText(events.saysFailed)}  received ${integerText(events.received)}  deliveries/say ${perSay}  latency ms: ${latencyText(
       {
         minNs: eventSummary.minNs,
         p50Ns: eventSummary.p50Ns,
@@ -190,7 +199,7 @@ export function printAggregate(aggregate: Aggregate, config: MainConfig): void {
     )}${eventSummary.overflow === 0 ? '' : `  overflow ${integerText(eventSummary.overflow)}`}`,
   );
   write(
-    `  event checks: within-epoch gaps ${integerText(events.gaps)}, duplicates ${integerText(events.duplicates)}, receiver-moved ${integerText(events.staleRoom)}, late-epoch ${integerText(events.lateEpoch)}, unparsed ${integerText(events.unparsed)}`,
+    `  event checks: within-epoch gaps ${integerText(events.gaps)}, duplicates ${integerText(events.duplicates)} (a retried timed-out say, ambiguous with double delivery, not loss), receiver-moved ${integerText(events.staleRoom)}, late-epoch ${integerText(events.lateEpoch)}, unparsed ${integerText(events.unparsed)}`,
   );
 
   const queueFull = aggregate.errors.FRAMEWORK_QUEUE_FULL ?? 0;

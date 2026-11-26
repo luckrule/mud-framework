@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { cpus, release, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { shouldRemoveDataDir } from '../cleanup.ts';
 import { integerText, messageOf, write, writeError } from '../support.ts';
 import type { PortalHandle } from '../support.ts';
 import {
@@ -15,6 +16,7 @@ import {
   waitForReady,
 } from './orchestrator.ts';
 import type { GeneratorHandle } from './orchestrator.ts';
+import type { PortalStopSummary } from './orchestrator.ts';
 import {
   aggregateResults,
   buildSummary,
@@ -85,14 +87,32 @@ function prepareDirectories(config: MainConfig): Directories {
   return { scratchDir, dataDir, resultsDir, userDataDir: false };
 }
 
-function cleanupDirectories(dirs: Directories, keep: boolean): void {
+function cleanupDirectories(
+  dirs: Directories,
+  stop: PortalStopSummary,
+  keep: boolean,
+): void {
   if (dirs.userDataDir && dirs.dataDir !== undefined) {
     write(
       `cleanup: kept data dir ${dirs.dataDir} (LOAD_DATA_DIR is user-owned)`,
     );
   }
-  if (keep) {
-    write(`cleanup: kept ${dirs.scratchDir} (LOAD_KEEP=1)`);
+  // Results and the scratch data directory stay together: removing them while
+  // a Portal or Server may still be alive hides the failure scene and can
+  // unlink a SQLite file a live writer still has open.
+  if (
+    !shouldRemoveDataDir({
+      stopFailed: stop.stopFailed,
+      survivors: stop.survivors,
+      keep,
+    })
+  ) {
+    const why = keep
+      ? 'LOAD_KEEP=1'
+      : stop.stopFailed
+        ? 'Portal stop was not graceful or not confirmed'
+        : `Server pid(s) still alive: ${stop.survivors.join(', ')}`;
+    write(`cleanup: kept ${dirs.scratchDir} (${why})`);
     return;
   }
   try {
@@ -170,9 +190,12 @@ async function main(): Promise<void> {
     // the exit path.
     const resources = sampler?.stop();
     await stopGenerators(generators);
-    await stopPortal(portal, config.shared.externalUrl !== undefined);
+    const portalStop = await stopPortal(
+      portal,
+      config.shared.externalUrl !== undefined,
+    );
     if (dirs !== undefined) {
-      cleanupDirectories(dirs, config.keep);
+      cleanupDirectories(dirs, portalStop, config.keep);
     }
     if (resources !== undefined) {
       printResources(resources);

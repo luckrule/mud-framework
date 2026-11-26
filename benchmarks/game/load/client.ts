@@ -15,6 +15,12 @@ import {
   writeError,
 } from '../support.ts';
 import {
+  beginSaySequence,
+  commitSaySequence,
+  observeArrival,
+} from './sequence.ts';
+import type { SaySequence, SenderArrivals } from './sequence.ts';
+import {
   Histogram,
   effectiveThinkMs,
   envIntegerRequired,
@@ -90,9 +96,10 @@ interface ClientRuntime {
   room: string;
   /** Incremented on every room change; part of the say token. */
   epoch: number;
-  saySeq: number;
+  /** Next say seq; advances only when the Server accepts the say. */
+  readonly saySequence: SaySequence;
   /** Last (epoch, seq) seen per sender, for within-epoch gap detection. */
-  readonly seenBySender: Map<string, { epoch: number; lastSeq: number }>;
+  readonly seenBySender: Map<string, SenderArrivals>;
 }
 
 interface CommandAccumulator {
@@ -102,7 +109,9 @@ interface CommandAccumulator {
 }
 
 interface EventAccumulator {
+  saysAttempted: number;
   saysSent: number;
+  saysFailed: number;
   received: number;
   gaps: number;
   duplicates: number;
@@ -240,22 +249,19 @@ function handleEvent(
     return;
   }
 
-  const known = runtime.seenBySender.get(token.sender);
-  if (known === undefined || token.epoch > known.epoch) {
-    runtime.seenBySender.set(token.sender, {
-      epoch: token.epoch,
-      lastSeq: token.seq,
-    });
-  } else if (token.epoch === known.epoch) {
-    if (token.seq > known.lastSeq) {
-      // Sender epoch and receiver room both stayed put, so skipped sequence
-      // numbers are events this receiver never got.
-      stats.events.gaps += token.seq - known.lastSeq - 1;
-      known.lastSeq = token.seq;
-    } else {
-      stats.events.duplicates += 1;
-    }
-  } else {
+  // A successful seq only skips a number when the event itself never arrived;
+  // rejected say attempts never consume a seq, so they cannot fake a gap here.
+  const arrival = observeArrival(
+    runtime.seenBySender,
+    token.sender,
+    token.epoch,
+    token.seq,
+  );
+  stats.events.gaps += arrival.gap;
+  if (arrival.duplicate) {
+    stats.events.duplicates += 1;
+  }
+  if (arrival.lateEpoch) {
     stats.events.lateEpoch += 1;
   }
 }
@@ -344,7 +350,9 @@ function emptyStats(): GeneratorStats {
       say: newCommandAccumulator(),
     },
     events: {
+      saysAttempted: 0,
       saysSent: 0,
+      saysFailed: 0,
       received: 0,
       gaps: 0,
       duplicates: 0,
@@ -400,7 +408,7 @@ async function setupClient(
     name,
     room: '',
     epoch: 0,
-    saySeq: 0,
+    saySequence: { nextSeq: 0 },
     seenBySender: new Map(),
   };
   client.onEvent((event) => {
@@ -464,13 +472,18 @@ async function executeCommand(
       }
       case 'say': {
         const sentAtMs = Date.now();
-        const seq = runtime.saySeq;
-        runtime.saySeq += 1;
+        // Reserve without advancing: a rejected attempt must leave no seq hole
+        // for the receiver, which only sees the accepted (broadcast) says.
+        const seq = beginSaySequence(runtime.saySequence);
         if (measured) {
-          stats.events.saysSent += 1;
+          stats.events.saysAttempted += 1;
         }
         const text = `${TOKEN_PREFIX}|${shared.runTag}|${runtime.name}|${runtime.epoch}|${seq}|${sentAtMs}|${runtime.room}`;
         await runtime.client.call('game.say', { text });
+        commitSaySequence(runtime.saySequence, seq);
+        if (measured) {
+          stats.events.saysSent += 1;
+        }
         break;
       }
       default: {
@@ -485,6 +498,9 @@ async function executeCommand(
   } catch (error) {
     if (measured) {
       recordError(stats, command, error);
+      if (command === 'say') {
+        stats.events.saysFailed += 1;
+      }
     }
     return isClosedError(error) ? 'closed' : 'ok';
   }
@@ -564,7 +580,9 @@ function commandJson(accumulator: CommandAccumulator): CommandResultJson {
 
 function eventJson(accumulator: EventAccumulator): EventResultJson {
   return {
+    saysAttempted: accumulator.saysAttempted,
     saysSent: accumulator.saysSent,
+    saysFailed: accumulator.saysFailed,
     received: accumulator.received,
     gaps: accumulator.gaps,
     duplicates: accumulator.duplicates,

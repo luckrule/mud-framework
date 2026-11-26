@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { portalStopFailed } from '../cleanup.ts';
 import {
   messageOf,
   pumpLines,
@@ -328,15 +329,23 @@ export async function stopGenerators(
   );
 }
 
+export interface PortalStopSummary {
+  /** The stop path did not confirm a clean exit (throw, non-zero, no exit). */
+  readonly stopFailed: boolean;
+  /** Server pids still alive after the bounded stop wait. */
+  readonly survivors: readonly number[];
+}
+
 export async function stopPortal(
   portal: PortalHandle | undefined,
   externalUrl: boolean,
-): Promise<void> {
+): Promise<PortalStopSummary> {
   if (portal === undefined) {
     write(
       `cleanup: portal not spawned${externalUrl ? ' (LOAD_URL reuses an external Portal)' : ''}`,
     );
-    return;
+    // A spawn path that never produced a Portal cannot confirm any exit.
+    return { stopFailed: !externalUrl, survivors: [] };
   }
   try {
     const result = await portal.stop();
@@ -355,20 +364,21 @@ export async function stopPortal(
     write(
       `cleanup: portal exited (${exit}${result.forced ? ', forced' : ''}); Server pid(s) ${pids}: ${state}`,
     );
-    const badExit =
-      result.exitCode !== undefined &&
-      result.exitCode !== null &&
-      result.exitCode !== 0;
-    if (result.survivors.length > 0 || badExit) {
+    const stopFailed = portalStopFailed(result);
+    if (stopFailed) {
+      const exitNote =
+        result.exitCode === undefined ? ' (exit not confirmed)' : '';
       writeError(
-        `load benchmark cleanup failed: ${state}; portal exit ${exit}`,
+        `load benchmark cleanup failed: ${state}; portal exit ${exit}${exitNote}`,
       );
       process.exitCode = 1;
     }
+    return { stopFailed, survivors: result.survivors };
   } catch (error) {
     writeError(
       `load benchmark cleanup failed: could not stop the Portal: ${messageOf(error)}`,
     );
     process.exitCode = 1;
+    return { stopFailed: true, survivors: [] };
   }
 }

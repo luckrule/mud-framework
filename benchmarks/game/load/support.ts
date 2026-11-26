@@ -474,12 +474,20 @@ export interface CommandResultJson {
 
 /**
  * Every `say` carries a token. `epoch` increments when the sender changes
- * rooms and `seq` is the sender's monotonic say counter, so a receiver can
- * count missing sequence numbers inside one (sender, epoch) pair as lost
- * events without mistaking a room change for a gap.
+ * rooms and `seq` is the sender's next successful-say counter. Failed say
+ * attempts do not consume a seq, so a receiver can count missing sequence
+ * numbers inside one (sender, epoch) pair as lost events without mistaking a
+ * rejected attempt or a room change for a gap. A timed-out attempt that was
+ * nevertheless broadcast can repeat its seq on the retry; that shows up as a
+ * duplicate, which is ambiguous with a real double delivery, not as a gap.
  */
 export interface EventResultJson {
+  /** Measured `say` attempts, successful or not. */
+  readonly saysAttempted: number;
+  /** Attempts the Server accepted; also the `deliveries/say` denominator. */
   readonly saysSent: number;
+  /** Measured attempts that ended in an error. */
+  readonly saysFailed: number;
   readonly received: number;
   readonly gaps: number;
   readonly duplicates: number;
@@ -537,7 +545,9 @@ function parseEventResult(value: unknown): EventResultJson {
     throw new Error('events is not an object');
   }
   return {
+    saysAttempted: readIntegerField(value, 'saysAttempted', 'events'),
     saysSent: readIntegerField(value, 'saysSent', 'events'),
+    saysFailed: readIntegerField(value, 'saysFailed', 'events'),
     received: readIntegerField(value, 'received', 'events'),
     gaps: readIntegerField(value, 'gaps', 'events'),
     duplicates: readIntegerField(value, 'duplicates', 'events'),
