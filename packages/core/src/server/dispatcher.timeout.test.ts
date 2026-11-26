@@ -6,6 +6,7 @@ import {
 } from '../shared/wire-codes.ts';
 import { rejectionOf, sleep } from '../testing/common.ts';
 import {
+  BusyCommitBackend,
   deferred,
   parseLines,
   quietDispatcher,
@@ -195,6 +196,90 @@ describe('Dispatcher.timeout', () => {
       method: 'block',
       timeoutMs: 5,
     });
+  });
+
+  test('times out when a synchronous COMMIT outlives the deadline', async () => {
+    const backend = new BusyCommitBackend(35);
+    const { dispatcher, lines } = quietDispatcher({ backend, timeoutMs: 5 });
+    dispatcher.register(
+      'commit-block',
+      async (ctx) => {
+        ctx.bindSession('session-1');
+        ctx.emit('committed', { ok: true });
+        return 'done';
+      },
+      { access: 'public', mayChangeSession: true },
+    );
+
+    const error = await rejectionOf(
+      dispatcher.dispatch('commit-block', null, { requestId: 'r-busy-commit' }),
+    );
+
+    // The COMMIT cannot be aborted, but the request must still end as a
+    // timeout: the deadline passed before the transaction settled.
+    expect(error).toBeInstanceOf(FrameworkTimeoutError);
+    if (error instanceof FrameworkTimeoutError) {
+      expect(error.requestId).toBe('r-busy-commit');
+      expect(error.code).toBe('FRAMEWORK_TIMEOUT');
+      expect(error.timeoutMs).toBe(5);
+    }
+    // The commit is durable, so the log must say so instead of implying a
+    // rollback.
+    expect(backend.stats()).toEqual({ committed: 1, rolledBack: 0 });
+    const entries = parseLines(lines);
+    expect(
+      entries.filter((entry) => entry.msg === 'request timed out'),
+    ).toHaveLength(1);
+    const lost = entries.filter(
+      (entry) => entry.code === 'CANCEL_LOST_TO_COMMIT',
+    );
+    expect(lost).toHaveLength(1);
+    expect(lost[0]).toMatchObject({
+      level: 'warn',
+      requestId: 'r-busy-commit',
+      msg: 'transaction committed after the request reached a terminal state',
+    });
+    // The buffered session change and event belong to the success path; the
+    // timeout outcome must not hand either back.
+    expect(
+      entries.filter((entry) => entry.msg === 'session change recorded'),
+    ).toHaveLength(0);
+    // The request is already terminal, so a later cancel has nothing to accept.
+    expect(dispatcher.cancel('r-busy-commit', 'TRANSPORT_CLOSED')).toBe(false);
+  });
+
+  test('a commit that finishes before the deadline still succeeds', async () => {
+    const backend = new BusyCommitBackend(10);
+    const { dispatcher, lines } = quietDispatcher({ backend, timeoutMs: 250 });
+    dispatcher.register(
+      'commit-ok',
+      async (ctx) => {
+        ctx.bindSession('session-1');
+        ctx.emit('committed', { ok: true });
+        return 'done';
+      },
+      { access: 'public', mayChangeSession: true },
+    );
+
+    expect(
+      await dispatcher.dispatch('commit-ok', null, { connectionId: 'conn-1' }),
+    ).toEqual({
+      result: 'done',
+      sessionChange: { type: 'bind', sessionId: 'session-1' },
+      events: [
+        {
+          target: { kind: 'connection', connectionId: 'conn-1' },
+          event: 'committed',
+          payload: { ok: true },
+        },
+      ],
+    });
+    expect(backend.stats()).toEqual({ committed: 1, rolledBack: 0 });
+    expect(
+      parseLines(lines).filter(
+        (entry) => entry.code === 'CANCEL_LOST_TO_COMMIT',
+      ),
+    ).toHaveLength(0);
   });
 
   test('uses the smaller of the configured timeout and the backend ceiling', async () => {

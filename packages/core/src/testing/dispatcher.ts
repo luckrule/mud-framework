@@ -110,3 +110,55 @@ export class SlowCommitBackend implements StorageBackend {
     return { committed: this.committed, rolledBack: this.rolledBack };
   }
 }
+
+/**
+ * A backend whose COMMIT blocks the event loop synchronously once the
+ * transaction callback resolves, like a driver flushing its log on the calling
+ * thread. `SlowCommitBackend` yields a macrotask instead, which lets the
+ * dispatcher's deadline timer fire; this one hides the deadline from the timer,
+ * so only a clock check can notice it passed during the commit.
+ */
+export class BusyCommitBackend implements StorageBackend {
+  private committed = 0;
+  private rolledBack = 0;
+
+  constructor(private readonly commitBusyMs = 35) {}
+
+  capabilities(): StorageCapabilities {
+    return {
+      transactions: 'full',
+      concurrency: 'pooled',
+      snapshotRead: true,
+      uniqueConstraint: false,
+      maxTransactionDurationMs: Number.POSITIVE_INFINITY,
+    };
+  }
+
+  async transaction<T>(fn: (tx: StorageTransaction) => Promise<T>): Promise<T> {
+    const tx: StorageTransaction = {
+      query: <R>(): Promise<R[]> => Promise.resolve([]),
+      execute: (): Promise<void> => Promise.resolve(),
+    };
+    let result: T;
+    try {
+      result = await fn(tx);
+    } catch (error) {
+      this.rolledBack += 1;
+      throw error;
+    }
+    const busyUntil = performance.now() + this.commitBusyMs;
+    while (performance.now() < busyUntil) {
+      // busy wait: hold the event loop the way a synchronous COMMIT does
+    }
+    this.committed += 1;
+    return result;
+  }
+
+  close(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  stats(): { committed: number; rolledBack: number } {
+    return { committed: this.committed, rolledBack: this.rolledBack };
+  }
+}

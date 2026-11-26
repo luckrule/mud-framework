@@ -362,9 +362,19 @@ export class Dispatcher {
       // side is not silent, though: a backend commits after the handler returns,
       // so a cancel or timeout that landed in that window still commits, and
       // without a line here that outcome is indistinguishable from a rollback.
+      // The settlement time is recorded at the first dispatcher-visible moment:
+      // a synchronous COMMIT can block past the deadline, and the check after
+      // the race must use when the transaction actually settled rather than
+      // when its continuation happened to run.
+      let committedAt: number | undefined;
       void work.then(
-        () =>
-          expiry.expired ? logLostCommit(logger, entry.startedAt) : undefined,
+        () => {
+          committedAt = performance.now();
+          if (expiry.expired) {
+            logLostCommit(logger, entry.startedAt);
+          }
+          return undefined;
+        },
         () => undefined,
       );
       // The terminal promise is listed first: when a pre-handler expiry and the
@@ -372,6 +382,23 @@ export class Dispatcher {
       // (or cancel) must be the reported outcome, not the internal rollback
       // signal.
       const result = await Promise.race([terminal.promise, work]);
+      // The deadline timer is a macrotask, so a synchronous COMMIT after the
+      // transaction callback resolves keeps it from firing; the race above can
+      // then report success for a request that already outlived its deadline.
+      // The COMMIT cannot be aborted, but the request must still terminate as
+      // a timeout: no result, session change or event may reach a caller that
+      // stopped waiting (SPEC 3.4).
+      if (
+        !expiry.expired &&
+        committedAt !== undefined &&
+        committedAt >= deadlineAt
+      ) {
+        expire();
+        // The transaction already committed, so the timeout terminal state must
+        // not be read as a rollback (ADR-0004).
+        logLostCommit(logger, entry.startedAt);
+        throw new FrameworkTimeoutError(requestId, effectiveTimeoutMs);
+      }
       const sessionChange = change.value;
       const events =
         eventBuffer.events.length === 0 ? undefined : eventBuffer.events;
