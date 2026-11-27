@@ -27,6 +27,7 @@ export type EventDeliveryHost = Pick<
   | 'backlog'
   | 'sessionQueues'
   | 'sendTimeoutMs'
+  | 'dropLog'
 > & {
   /** Read-only: delivery resolves holders, it never admits or removes one. */
   readonly connections: ReadonlyMap<string, ConnectionState>;
@@ -635,7 +636,10 @@ function warnDropped(
   target: DropTarget,
   reason: string,
 ): void {
-  host.logger.warn(
+  // Per-drop lines turn a slow reader into a second unbounded stream; the log
+  // aggregates them per reason and target instead (SPEC 7.1). A line keeps the
+  // batch's first event for identification and adds `count`/`droppedTotal`.
+  host.dropLog.record(
     {
       eventId: event.eventId,
       event: event.event,
@@ -643,8 +647,16 @@ function warnDropped(
       code: 'EVENT_DROPPED',
       reason,
     },
-    'server event dropped',
+    reason,
+    dropTargetId(target),
   );
+}
+
+/** The target's id, which is what the aggregation bucket is keyed by. */
+function dropTargetId(target: DropTarget): string {
+  return target.targetKind === 'connection'
+    ? target.connectionId
+    : target.sessionId;
 }
 
 /** One encoded event frame plus the size charged against the byte bound. */
@@ -749,7 +761,11 @@ function logBacklogDrop(
   queued: { readonly queuedEvents: number; readonly queuedEventBytes: number },
 ): void {
   host.backlog.recordDrop();
-  host.logger.warn(
+  // This is the path a slow reader drives at event rate, so it goes through the
+  // same aggregation as any other drop (SPEC 7.1). `droppedTotal` on the line is
+  // the log's running count for this target; `eventBacklog.dropped` above is the
+  // contract's exact total and is never aggregated.
+  host.dropLog.record(
     {
       eventId: event.eventId,
       event: event.event,
@@ -761,7 +777,8 @@ function logBacklogDrop(
       maxQueuedEvents: host.maxQueuedEvents,
       maxQueuedEventBytes: host.maxQueuedEventBytes,
     },
-    'server event dropped',
+    'backlog',
+    dropTargetId(target),
   );
 }
 

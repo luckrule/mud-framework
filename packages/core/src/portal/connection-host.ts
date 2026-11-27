@@ -9,6 +9,7 @@ import type {
 } from './connection-events.ts';
 import type { QueuedRequest } from './connection-writer.ts';
 import type { EventBacklog } from './event-backlog.ts';
+import type { EventDropLog } from './event-drop-log.ts';
 import type { SessionRouter } from './session-router.ts';
 
 /**
@@ -33,6 +34,12 @@ export interface LayerHost {
   readonly maxQueuedEventBytes: number;
   /** Layer-wide event totals every buffer reports to (SPEC 6.6). */
   readonly backlog: EventBacklog;
+  /**
+   * Aggregates repeated `EVENT_DROPPED` lines per reason and target (SPEC 7.1).
+   * A slow reader drops at event rate, so one line per drop would make the
+   * diagnostic channel a second unbounded stream.
+   */
+  readonly dropLog: EventDropLog;
   /** Mints the framework request id at the moment a request enters (SPEC 7.3). */
   readonly createRequestId: () => string;
   readonly router: SessionRouter;

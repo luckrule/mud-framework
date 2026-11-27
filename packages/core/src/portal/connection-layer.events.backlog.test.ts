@@ -534,6 +534,53 @@ describe('ConnectionLayer event backlog bounds', () => {
     await tick();
   });
 
+  test('aggregates a flood of backlog drops while counting every one', async () => {
+    const h = sessionHarness({
+      maxQueuedEvents: 2,
+      maxQueuedEventBytes: 1_000_000,
+    });
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+
+    // A slow reader: the first frame is held on the wire, the next fills the
+    // queue, and every later event is refused. This is the shape SPEC 3.8's
+    // bound exists for, and the shape that used to write one warn per event.
+    const held = h.transport.holdSends('c1');
+    h.controlled.emit(connectionEvent('e:0'));
+    h.controlled.emit(connectionEvent('e:1'));
+    await held.entered;
+    for (let i = 2; i < 200; i += 1) {
+      h.controlled.emit(connectionEvent(`e:${i}`));
+    }
+    await tick();
+
+    const drops = dropLines(h.logs());
+    // 198 drops fold into a line per doubling, not 198 lines.
+    expect(drops.length).toBeLessThan(10);
+    expect(drops.length).toBeGreaterThan(1);
+    // The first line names the event that started the batch, so the dropped
+    // event is still identifiable; the folded lines carry counts instead of
+    // pretending the batch was one event.
+    expect(drops[0]).toMatchObject({
+      eventId: 'e:2',
+      reason: 'backlog',
+      count: 1,
+      droppedTotal: 1,
+      targetKind: 'connection',
+      connectionId: 'c1',
+    });
+    const last = drops.at(-1);
+    expect(last?.count).toBeGreaterThan(1);
+    expect(typeof last?.droppedTotal).toBe('number');
+    // Every drop is still accounted for exactly once in the contract's
+    // counter, which aggregation must not change (SPEC 6.6).
+    expect(h.layer.health().eventBacklog.dropped).toBe(198);
+
+    held.release();
+    await tick();
+  });
+
   test('counts a redelivered Session event once and clears it after settlement', async () => {
     const h = sessionHarness();
     await h.layer.start();

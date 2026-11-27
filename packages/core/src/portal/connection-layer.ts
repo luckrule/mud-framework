@@ -38,6 +38,7 @@ import {
   onMessage as receiveMessage,
 } from './connection-request.ts';
 import { EventBacklog } from './event-backlog.ts';
+import { EventDropLog } from './event-drop-log.ts';
 import type { ConnectionHealth, ConnectionLayerStatus } from './health.ts';
 import { connectionHealthSnapshot, readExecutorHealth } from './health.ts';
 import { SessionRouter } from './session-router.ts';
@@ -178,6 +179,11 @@ export class ConnectionLayer implements TransportHandlers {
   private readonly sessionQueues = new Map<string, SessionEventQueue>();
   /** Every event buffer reports here, so health sees detached queues too. */
   private readonly backlog: EventBacklog;
+  /**
+   * Aggregates `EVENT_DROPPED` lines (SPEC 7.1). Stateless across shutdown: a
+   * restart is a new layer with a fresh log.
+   */
+  private readonly dropLog: EventDropLog;
   /** Which connection holds which Session, and the reconnect gate (SPEC 3.2). */
   private readonly router: SessionRouter;
   /** One host object; each module takes the narrow `Pick` it declares. */
@@ -233,6 +239,7 @@ export class ConnectionLayer implements TransportHandlers {
       liveConnections: () => this.connections.size,
     });
     this.router = new SessionRouter({ logger: this.logger });
+    this.dropLog = new EventDropLog({ logger: this.logger });
     const host: LayerHost = {
       codec: this.codec,
       logger: this.logger,
@@ -242,6 +249,7 @@ export class ConnectionLayer implements TransportHandlers {
       maxQueuedEvents,
       maxQueuedEventBytes,
       backlog: this.backlog,
+      dropLog: this.dropLog,
       createRequestId: this.createRequestId,
       router: this.router,
       executor: this.executor,
