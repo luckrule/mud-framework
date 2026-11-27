@@ -2,15 +2,15 @@ import type { Logger } from '../logging/types.ts';
 import type { Codec } from '../shared/codec.ts';
 import type { RequestExecutor } from '../shared/executor.ts';
 import type { ConnectionState } from './connection-admission.ts';
+import type { QueuedRequest } from './connection-writer.ts';
+import type { EventBacklog } from './event-backlog.ts';
+import type { EventDropLog } from './event-drop-log.ts';
 import type {
   BacklogOverflow,
   EventWrite,
   QueueEventResult,
-  SessionEventQueue,
-} from './connection-events.ts';
-import type { QueuedRequest } from './connection-writer.ts';
-import type { EventBacklog } from './event-backlog.ts';
-import type { EventDropLog } from './event-drop-log.ts';
+} from './event-write.ts';
+import type { SessionEventQueue } from './session-event-queue.ts';
 import type { SessionRouter } from './session-router.ts';
 
 /**

@@ -8,10 +8,10 @@ import {
   FRAMEWORK_SHUTDOWN,
 } from '../shared/wire-codes.ts';
 import type { TransportConnection } from '../transport/types.ts';
-import type { BacklogOverflow } from './connection-events.ts';
 import type { LayerHost } from './connection-host.ts';
 import { reply } from './connection-reply.ts';
 import { ConnectionWriter } from './connection-writer.ts';
+import type { BacklogOverflow } from './event-write.ts';
 import type { ConnectionLayerStatus } from './health.ts';
 
 /**

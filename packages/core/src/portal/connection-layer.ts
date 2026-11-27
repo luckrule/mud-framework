@@ -24,14 +24,7 @@ import {
   onConnect as admitConnection,
   onDisconnect as disconnectConnection,
 } from './connection-admission.ts';
-import type {
-  EventDeliveryHost,
-  SessionEventQueue,
-} from './connection-events.ts';
-import {
-  deliverServerEvent,
-  discardSessionQueues,
-} from './connection-events.ts';
+import { deliverServerEvent } from './connection-events.ts';
 import type { LayerHost } from './connection-host.ts';
 import {
   DEFAULT_STOP_TIMEOUT_MS,
@@ -49,8 +42,11 @@ import {
 } from './connection-request.ts';
 import { EventBacklog } from './event-backlog.ts';
 import { EventDropLog } from './event-drop-log.ts';
+import type { EventDeliveryHost } from './event-frame.ts';
 import type { ConnectionHealth, ConnectionLayerStatus } from './health.ts';
 import { connectionHealthSnapshot, readExecutorHealth } from './health.ts';
+import { discardSessionQueues } from './session-event-queue.ts';
+import type { SessionEventQueue } from './session-event-queue.ts';
 import { SessionRouter } from './session-router.ts';
 
 /**

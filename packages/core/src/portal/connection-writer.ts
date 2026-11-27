@@ -1,7 +1,7 @@
 import type { Logger } from '../logging/types.ts';
 import { messageOf } from '../shared/guards.ts';
-import type { EventWrite, QueueEventResult } from './connection-events.ts';
 import type { EventBacklog } from './event-backlog.ts';
+import type { EventWrite, QueueEventResult } from './event-write.ts';
 
 interface RequestWork {
   readonly run: () => Promise<void>;
