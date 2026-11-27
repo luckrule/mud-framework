@@ -187,8 +187,8 @@ export class ConnectionWriter {
     }
     this.running = true;
     // Deferred: no write starts inside the executor's event-listener stack.
-    // A rejected turn must not leave `running` stuck: that would stop every
-    // later request and event on this connection with no trace.
+    // `drain` resets `running` in its own `finally`, so an escaping rejection
+    // cannot leave every later request and event on this connection stuck.
     void Promise.resolve()
       .then(() => this.drain())
       .catch((error: unknown) => {
@@ -196,36 +196,33 @@ export class ConnectionWriter {
           { reason: messageOf(error) },
           'connection writer stopped unexpectedly',
         );
-        this.running = false;
-        // Only pick the queue up again if something is actually waiting;
-        // restarting an empty queue would spin on the same fault.
-        if (this.requests.length > 0 || this.events.length > 0) {
-          this.start();
-        }
       });
   }
 
   private async drain(): Promise<void> {
-    while (true) {
-      const request = this.requests.shift();
-      if (request !== undefined) {
-        // oxlint-disable-next-line eslint/no-await-in-loop -- this writer is the serialization point; running requests concurrently would defeat it
-        await this.runRequest(request);
-        const fairnessTurn = this.nextEvent();
-        if (fairnessTurn !== undefined) {
-          // oxlint-disable-next-line eslint/no-await-in-loop -- the turn settles before the next choice, which is what keeps the writer serial
-          await this.runEvent(fairnessTurn);
+    try {
+      while (true) {
+        const request = this.requests.shift();
+        if (request !== undefined) {
+          // oxlint-disable-next-line eslint/no-await-in-loop -- this writer is the serialization point; running requests concurrently would defeat it
+          await this.runRequest(request);
+          const fairnessTurn = this.nextEvent();
+          if (fairnessTurn !== undefined) {
+            // oxlint-disable-next-line eslint/no-await-in-loop -- the turn settles before the next choice, which is what keeps the writer serial
+            await this.runEvent(fairnessTurn);
+          }
+          continue;
         }
-        continue;
+        const next = this.nextEvent();
+        if (next !== undefined) {
+          // oxlint-disable-next-line eslint/no-await-in-loop -- one frame at a time is the single-writer contract
+          await this.runEvent(next);
+          continue;
+        }
+        return;
       }
-      const next = this.nextEvent();
-      if (next !== undefined) {
-        // oxlint-disable-next-line eslint/no-await-in-loop -- one frame at a time is the single-writer contract
-        await this.runEvent(next);
-        continue;
-      }
+    } finally {
       this.running = false;
-      return;
     }
   }
 
