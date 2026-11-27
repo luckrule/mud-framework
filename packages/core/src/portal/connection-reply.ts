@@ -1,5 +1,5 @@
 import type { Logger } from '../logging/types.ts';
-import type { Codec, ResponseEnvelope } from '../shared/codec.ts';
+import type { ResponseEnvelope } from '../shared/codec.ts';
 import { messageOf } from '../shared/guards.ts';
 import {
   INTERNAL_ERROR,
@@ -7,12 +7,10 @@ import {
   TRANSPORT_SEND_FAILED,
 } from '../shared/wire-codes.ts';
 import type { TransportConnection } from '../transport/types.ts';
+import type { LayerHost } from './connection-host.ts';
 
 /** The wire format and the sink for failures that must not reach the transport. */
-export interface ReplyHost {
-  readonly codec: Codec;
-  readonly logger: Logger;
-}
+export type ReplyHost = Pick<LayerHost, 'codec' | 'logger'>;
 
 /** Length only: the raw frame may hold client data that must not be logged. */
 export function rawLengthOf(payload: string | Uint8Array): number {

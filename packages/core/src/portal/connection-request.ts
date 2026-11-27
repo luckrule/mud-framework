@@ -1,5 +1,5 @@
 import type { Envelope } from '../shared/codec.ts';
-import type { ExecutorOutcome, RequestExecutor } from '../shared/executor.ts';
+import type { ExecutorOutcome } from '../shared/executor.ts';
 import { messageOf } from '../shared/guards.ts';
 import { elapsedMs } from '../shared/timeout.ts';
 import { TRANSPORT_CLOSED, failureLogLevel } from '../shared/wire-codes.ts';
@@ -10,27 +10,18 @@ import {
   refuseQueue,
   refuseWithId,
 } from './connection-admission.ts';
+import type { LayerHost } from './connection-host.ts';
 import { isExecutorOutcome, toFailure } from './connection-outcome-guards.ts';
 import { rawLengthOf, rejectEnvelope, reply } from './connection-reply.ts';
-import type { QueuedRequest } from './connection-writer.ts';
 import type { ConnectionLayerStatus } from './health.ts';
-import type { SessionRouter } from './session-router.ts';
 
 /**
  * What request handling needs from the layer: the admission view plus the three
- * collaborators a request touches (id minting, Session routing, execution).
- * `enqueue` is passed in so the connection writer's request queue has one owner.
+ * collaborators a request touches (id minting, Session routing, execution) and
+ * the writer hand-off.
  */
-export interface RequestHost extends AdmissionHost {
-  readonly createRequestId: () => string;
-  readonly router: SessionRouter;
-  readonly executor: RequestExecutor;
-  readonly enqueue: (
-    state: ConnectionState,
-    work: () => Promise<void>,
-    queued: QueuedRequest,
-  ) => Promise<void>;
-}
+export type RequestHost = AdmissionHost &
+  Pick<LayerHost, 'createRequestId' | 'router' | 'executor' | 'enqueue'>;
 
 export function onMessage(
   host: RequestHost,

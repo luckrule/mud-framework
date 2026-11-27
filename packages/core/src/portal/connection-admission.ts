@@ -5,10 +5,9 @@ import {
   FRAMEWORK_SHUTDOWN,
 } from '../shared/wire-codes.ts';
 import type { TransportConnection } from '../transport/types.ts';
-import type { ReplyHost } from './connection-reply.ts';
+import type { LayerHost } from './connection-host.ts';
 import { reply } from './connection-reply.ts';
 import { ConnectionWriter } from './connection-writer.ts';
-import type { EventBacklog } from './event-backlog.ts';
 import type { ConnectionLayerStatus } from './health.ts';
 
 /**
@@ -70,19 +69,22 @@ export interface ConnectionState {
 
 /**
  * What admission and the refusal paths need from the layer: fixed limits, the
- * live connection table, and the wire format for answering a refused frame.
- * The status is passed per call, because a refusal must observe it at the
- * moment the transport delivers the connection or message.
+ * live connection table, the wire format for answering a refused frame, and the
+ * backlog a new connection's queue reports to. The status is passed per call,
+ * because a refusal must observe it at the moment the transport delivers the
+ * connection or message.
  */
-export interface AdmissionHost extends ReplyHost {
-  readonly connections: Map<string, ConnectionState>;
-  readonly maxConnections: number;
-  readonly maxQueuedPerConnection: number;
-  readonly maxQueuedEvents: number;
-  readonly maxQueuedEventBytes: number;
-  /** Layer-wide event totals the new connection's queue reports to. */
-  readonly backlog: EventBacklog;
-}
+export type AdmissionHost = Pick<
+  LayerHost,
+  | 'codec'
+  | 'logger'
+  | 'connections'
+  | 'maxConnections'
+  | 'maxQueuedPerConnection'
+  | 'maxQueuedEvents'
+  | 'maxQueuedEventBytes'
+  | 'backlog'
+>;
 
 export function onConnect(
   host: AdmissionHost,

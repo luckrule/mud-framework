@@ -1,14 +1,12 @@
 import { Buffer } from 'node:buffer';
 
-import type { Logger } from '../logging/types.ts';
-import type { Codec } from '../shared/codec.ts';
 import type { ServerEvent } from '../shared/events.ts';
 import { messageOf } from '../shared/guards.ts';
 import { settleWithin } from '../shared/timeout.ts';
 import { TRANSPORT_SEND_FAILED } from '../shared/wire-codes.ts';
 import type { ConnectionState } from './connection-admission.ts';
+import type { LayerHost } from './connection-host.ts';
 import type { EventBacklog } from './event-backlog.ts';
-import type { SessionRouter } from './session-router.ts';
 
 /**
  * What delivery needs from the connection layer: the two lookup tables (which
@@ -16,51 +14,23 @@ import type { SessionRouter } from './session-router.ts';
  * connection's single writer, and the per-Session pending queues that keep
  * Session-addressed events in arrival order.
  */
-export interface EventDeliveryHost {
-  readonly codec: Codec;
-  readonly logger: Logger;
+export type EventDeliveryHost = Pick<
+  LayerHost,
+  | 'codec'
+  | 'logger'
+  | 'router'
+  | 'queueEvent'
+  | 'cancelEvent'
+  | 'acceptingEvents'
+  | 'maxQueuedEvents'
+  | 'maxQueuedEventBytes'
+  | 'backlog'
+  | 'sessionQueues'
+  | 'sendTimeoutMs'
+> & {
+  /** Read-only: delivery resolves holders, it never admits or removes one. */
   readonly connections: ReadonlyMap<string, ConnectionState>;
-  readonly router: SessionRouter;
-  /**
-   * Queues one encoded frame on the target connection's event queue. The
-   * queue belongs to the connection's single writer, so the frame is written
-   * after any request work already waiting (SPEC 3.8).
-   */
-  readonly queueEvent: (
-    state: ConnectionState,
-    write: EventWrite,
-  ) => QueueEventResult;
-  /**
-   * Cancels a frame that has not started writing. False once it did: the
-   * write's own bound decides when the serial slot is released.
-   */
-  readonly cancelEvent: (state: ConnectionState, write: EventWrite) => boolean;
-  /**
-   * False once the layer started stopping. Events are best-effort and the
-   * buffers are discarded at that point, so a late event is not accepted
-   * (SPEC 3.8).
-   */
-  readonly acceptingEvents: () => boolean;
-  /** Frame bound of each event buffer (SPEC 3.8). */
-  readonly maxQueuedEvents: number;
-  /** Byte bound of each event buffer (SPEC 3.8). */
-  readonly maxQueuedEventBytes: number;
-  /** Layer-wide totals the buffers report to (SPEC 6.6). */
-  readonly backlog: EventBacklog;
-  /**
-   * Pending queues of the Sessions the layer addresses, owned by the layer so
-   * ordering and bound state is per layer (and per test) rather than
-   * process-global. An entry exists while that Session has unfinished delivery
-   * work, which is also when its serial slot is held.
-   */
-  readonly sessionQueues: Map<string, SessionEventQueue>;
-  /**
-   * Upper bound on one event write. A transport bounds its own sends, but the
-   * layer cannot assume every implementation does: without this bound a send
-   * that never settles would pin the Session's serial slot forever (SPEC 3.8).
-   */
-  readonly sendTimeoutMs: number;
-}
+};
 
 /** How one queued event frame's write turn ended. */
 export type EventOutcome =

@@ -31,6 +31,7 @@ import {
   deliverServerEvent,
   discardSessionQueues,
 } from './connection-events.ts';
+import type { LayerHost } from './connection-host.ts';
 import type { RequestHost } from './connection-request.ts';
 import {
   cancelQuietly,
@@ -145,10 +146,6 @@ export class ConnectionLayer implements TransportHandlers {
   private readonly codec: Codec;
   private readonly logger: Logger;
   private readonly createRequestId: () => string;
-  private readonly maxQueuedPerConnection: number;
-  private readonly maxQueuedEvents: number;
-  private readonly maxQueuedEventBytes: number;
-  private readonly maxConnections: number;
   private readonly shutdownTimeoutMs: number;
   private readonly eventSendTimeoutMs: number;
   private readonly connections = new Map<string, ConnectionState>();
@@ -158,9 +155,9 @@ export class ConnectionLayer implements TransportHandlers {
   private readonly backlog = new EventBacklog();
   /** Which connection holds which Session, and the reconnect gate (SPEC 3.2). */
   private readonly router: SessionRouter;
-  /** The narrow view the admission, request and reply modules work through. */
+  /** One host object; each module takes the narrow `Pick` it declares. */
   private readonly requestHost: RequestHost;
-  /** The narrow view Server-event delivery works through (ADR-0008). */
+  /** The same host, viewed through delivery's narrower `Pick` (ADR-0008). */
   private readonly eventHost: EventDeliveryHost;
   /** Set while the layer is subscribed to the executor's event stream. */
   private unsubscribeEvents: (() => void) | undefined;
@@ -200,14 +197,10 @@ export class ConnectionLayer implements TransportHandlers {
         createJsonLogger({ bindings: { component: 'connection-layer' } }),
     );
     this.createRequestId = options.createRequestId ?? randomUUID;
-    this.maxQueuedPerConnection = maxQueuedPerConnection;
-    this.maxQueuedEvents = maxQueuedEvents;
-    this.maxQueuedEventBytes = maxQueuedEventBytes;
-    this.maxConnections = maxConnections;
     this.shutdownTimeoutMs = shutdownTimeoutMs;
     this.eventSendTimeoutMs = eventSendTimeoutMs;
     this.router = new SessionRouter({ logger: this.logger });
-    this.requestHost = {
+    const host: LayerHost = {
       codec: this.codec,
       logger: this.logger,
       connections: this.connections,
@@ -220,21 +213,14 @@ export class ConnectionLayer implements TransportHandlers {
       router: this.router,
       executor: this.executor,
       enqueue: (state, work, queued) => state.writer.submit(work, queued),
-    };
-    this.eventHost = {
-      codec: this.codec,
-      logger: this.logger,
-      connections: this.connections,
-      router: this.router,
       queueEvent: (state, write) => state.writer.enqueue(write),
       cancelEvent: (state, write) => state.writer.cancel(write),
       acceptingEvents: () => this.eventsOpen,
-      maxQueuedEvents: this.maxQueuedEvents,
-      maxQueuedEventBytes: this.maxQueuedEventBytes,
-      backlog: this.backlog,
       sessionQueues: this.sessionQueues,
       sendTimeoutMs: this.eventSendTimeoutMs,
     };
+    this.requestHost = host;
+    this.eventHost = host;
   }
 
   async start(): Promise<void> {
