@@ -338,6 +338,8 @@ TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：
 
 恢复受唯一写者屏障约束：只有 `SpawnedServer` 报告退出 `observed: true` 才能解除旧写者屏障。退出 Promise 仍 pending 而等待超时时，框架 MUST 保留引用，迟到的确认可在执行器仍可恢复时继续一次恢复；`close()` 或其它终态之后 MUST NOT 被迟到事件重新启动。若一次性退出结果是 `observed: false`，框架无法据此确认进程释放了存储，MUST 保持屏障，不承诺自动恢复；有界关闭仍无法确认退出时 MUST 失败。恢复可用性不能优先于 INV-002，请求仍受各自 deadline 约束。关闭未能确认退出时，健康态 MUST 保持 `blocked`（§6.6）。
 
+子进程诊断：`ServerExitInfo` 有一个可选字段 `stderrTail`，携带 spawn 被要求捕获时子进程 stderr 的末尾若干行。默认的 spawn 不捕获（stderr 继承 Portal 的对应流），因此该字段通常缺失；它是诊断信息，不参与退出判定——`observed` 仍是解除屏障的唯一依据，尾部是否为空或缺失不影响任何恢复、关闭或切换语义。切换失败时框架 MUST 在有诊断可用时把它带进 rejection，使消费方能读到“Server 为什么起不来”，而不是只能从 Portal 控制台看到。
+
 语义是 at-least-once：同一个 Request 可能被执行多次。框架 MUST NOT 声称 exactly-once。幂等由业务负责：需要“只生效一次”的效果（扣钱、发物品、唯一命名），MUST 由 Extension 用业务幂等键实现，不能依赖框架。理由：at-least-once 是“连接保活”承诺的直接代价——只要允许重放，重复执行就无法在框架层排除。
 
 ### 6.5 重放的顺序约束

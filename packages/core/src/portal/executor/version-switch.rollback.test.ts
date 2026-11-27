@@ -304,6 +304,41 @@ describe('IpcExecutor switchTo', () => {
     await h.executor.close();
   });
 
+  test('carries the replacement stderr tail into the rejection', async () => {
+    // A Server that dies before the handshake is the case the tail exists for:
+    // the real cause (a syntax error, a missing module) is on the child's
+    // stderr, and a caller must be able to read it from the rejection instead
+    // of from the Portal's console.
+    const h = switchable({ startTimeoutMs: 500 });
+    const old = await started(h);
+
+    const error = await rejectionOf(
+      h.executor.switchTo({
+        spawn: () => {
+          const handle = labelledServer(h, 'new', {
+            silentOnHello: true,
+            stderrTail: ['error: Unexpected ;', '    at bad.ts:1:19'],
+          });
+          const spawned = h.servers.at(-1);
+          setTimeout(() => {
+            spawned?.crash(1);
+          }, 0);
+          return handle;
+        },
+      }),
+    );
+
+    expect(error.message).toMatch(/replacement server (lost|exited before)/);
+    expect(error.message).toContain('error: Unexpected ;');
+    expect(error.message).toContain('at bad.ts:1:19');
+
+    // Diagnostics must not change the failure semantics: the old process still
+    // serves, exactly as without a tail.
+    expect(messagesTo(old)).toEqual(['hello', 'activate']);
+    expect(old.killCount).toBe(0);
+    await h.executor.close();
+  });
+
   test('rolls back to the previous version when the old server dies mid-switch', async () => {
     const h = switchable({ startTimeoutMs: 5000, restartBackoffMs: 5 });
     const old = await started(h);

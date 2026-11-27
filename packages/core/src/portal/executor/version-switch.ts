@@ -22,6 +22,13 @@ export interface SwitchBarrier {
 }
 
 /**
+ * How long a failed switch waits for a replacement that already died to report
+ * its exit. Bounded because the exit is evidence for INV-002 but the stderr tail
+ * is only a diagnostic: an unobservable exit must not delay the rejection.
+ */
+const SWITCH_STDERR_GRACE_MS = 250;
+
+/**
  * One `switchTo` in flight. It owns the staged process and the previous one,
  * the barriers it waits for, and the abort signal `close()` uses to interrupt
  * the sequence at any await.
@@ -314,8 +321,27 @@ export class VersionSwitch {
     } catch (error) {
       op.failure ??= toError(error);
     } finally {
+      await this.awaitLostExit(op);
       this.finishSwitch(op);
     }
+  }
+
+  /**
+   * Gives a replacement that died on its own a bounded moment to report its
+   * exit, so the rejection can carry its stderr tail.
+   *
+   * The channel can close before the exit is recorded, and the loss is what
+   * wakes the switch: without this the tail is read one turn too early and is
+   * empty exactly when the diagnostic matters. Only the self-death case waits —
+   * a timed-out barrier leaves a process that is still alive, and a switch must
+   * not sit on its rejection for that.
+   */
+  private async awaitLostExit(op: SwitchOperation): Promise<void> {
+    const staged = op.staged;
+    if (staged === undefined || op.stagedLost === undefined || staged.exited) {
+      return;
+    }
+    await settleWithin(staged.exitPromise, SWITCH_STDERR_GRACE_MS);
   }
 
   /**
@@ -610,10 +636,13 @@ export class VersionSwitch {
         // restart with the promoted spawn), so no rollback runs here — the
         // switch only refuses to call this a success.
         op.reject(
-          op.abortError ??
-            op.stagedLost ??
-            op.failure ??
-            new Error('the promoted replacement server was lost'),
+          withStderrTail(
+            op.abortError ??
+              op.stagedLost ??
+              op.failure ??
+              new Error('the promoted replacement server was lost'),
+            op.staged,
+          ),
         );
       } else {
         op.resolve();
@@ -622,9 +651,12 @@ export class VersionSwitch {
       return;
     }
     op.reject(
-      op.abortError ??
-        op.failure ??
-        new Error('ipc executor switch ended unexpectedly'),
+      withStderrTail(
+        op.abortError ??
+          op.failure ??
+          new Error('ipc executor switch ended unexpectedly'),
+        abandoned ?? op.staged,
+      ),
     );
     if (op.previous !== undefined && !op.previousGone) {
       // The previous Server can still serve; it is still the current one, so it
@@ -737,4 +769,36 @@ function newBarrier(): SwitchBarrier {
     resolve: deferred.resolve,
     seen: false,
   };
+}
+
+/** Caps the stderr text one rejection message carries. */
+const STDERR_TAIL_MESSAGE_LIMIT = 4000;
+
+/**
+ * Attaches the failed process's captured stderr to a switch rejection.
+ *
+ * Only the failure path calls this. Without it the real cause of a Server that
+ * dies before the handshake — a syntax error, a missing module — exists only on
+ * the Portal's console: the message says nothing about it and a caller has no
+ * programmatic view. The error object is reused so the failure type and the
+ * existing message text stay exactly as they were; only the message grows, and
+ * only when a spawn actually captured a tail. It is bounded because that text
+ * ends up in a `reason` log field.
+ */
+function withStderrTail(error: Error, server: ServerState | undefined): Error {
+  const tail = server?.lastExit()?.stderrTail;
+  if (tail === undefined || tail.length === 0) {
+    return error;
+  }
+  const kept: string[] = [];
+  let size = 0;
+  for (const line of tail.toReversed()) {
+    if (kept.length > 0 && size + line.length > STDERR_TAIL_MESSAGE_LIMIT) {
+      break;
+    }
+    kept.unshift(line);
+    size += line.length + 1;
+  }
+  error.message = `${error.message}\nserver stderr (last ${String(kept.length)} lines):\n${kept.join('\n')}`;
+  return error;
 }

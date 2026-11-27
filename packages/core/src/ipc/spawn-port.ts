@@ -10,6 +10,13 @@ export interface ServerExitInfo {
   readonly code: number | null;
   readonly signal: string | null;
   readonly observed: boolean;
+  /**
+   * The last stderr lines, when the spawn was asked to capture them. Absent
+   * under the default `inherit` mode, which is why this is optional: a startup
+   * failure's real cause (a syntax error, a missing module) otherwise exists
+   * only on the Portal's console and cannot reach a caller programmatically.
+   */
+  readonly stderrTail?: readonly string[];
 }
 
 /**

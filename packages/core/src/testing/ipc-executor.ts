@@ -194,6 +194,11 @@ export interface FakeServerOptions {
   readyOnActivate?: boolean;
   /** Reported in `prepared`/`ready`; defaults to 4242. */
   pid?: number;
+  /**
+   * stderr tail this process's exit reports, modelling a spawn that captured
+   * its child's stderr. Absent by default, like the real `inherit` mode.
+   */
+  stderrTail?: readonly string[];
   /** Shared event log for cross-process ordering assertions. */
   timeline?: string[];
   /** Prefix for this process's timeline entries. */
@@ -224,6 +229,7 @@ export class FakeServerProcess {
   private readonly silentOnHello: boolean;
   private readonly readyOnActivate: boolean;
   private readonly pid: number;
+  private readonly stderrTail: readonly string[] | undefined;
   private readonly timeline: string[] | undefined;
   private readonly label: string;
   private readonly holdRequests: boolean;
@@ -246,6 +252,7 @@ export class FakeServerProcess {
     this.silentOnHello = options.silentOnHello ?? false;
     this.readyOnActivate = options.readyOnActivate ?? false;
     this.pid = options.pid ?? 4242;
+    this.stderrTail = options.stderrTail;
     this.timeline = options.timeline;
     this.label = options.label ?? `server-${String(this.pid)}`;
     this.holdRequests = options.holdRequests ?? false;
@@ -383,7 +390,10 @@ export class FakeServerProcess {
       return;
     }
     this.exitRecorded = true;
-    this.exitInfo = info;
+    this.exitInfo =
+      this.stderrTail === undefined
+        ? info
+        : { ...info, stderrTail: this.stderrTail };
     this.mark('exit');
     if (this.closeChannelOnExit) {
       // Mirrors `spawnBunServer`: `markClosed` runs before `exit.resolve`, so
@@ -391,7 +401,7 @@ export class FakeServerProcess {
       // continuation has not run yet.
       this.channel.close('server process exited');
     }
-    this.exit.resolve(info);
+    this.exit.resolve(this.exitInfo);
   }
 }
 

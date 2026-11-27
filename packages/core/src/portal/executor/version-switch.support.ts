@@ -57,6 +57,7 @@ export function labelledServer(
     killExits?: boolean;
     pid?: number;
     crashOnActivate?: boolean;
+    stderrTail?: readonly string[];
   } = {},
 ): SpawnedServer {
   return h.makeServer({
@@ -72,6 +73,7 @@ export function labelledServer(
       ? {}
       : { killExits: overrides.killExits }),
     crashOnActivate: overrides.crashOnActivate,
+    stderrTail: overrides.stderrTail,
     timeline: h.timeline,
   });
 }

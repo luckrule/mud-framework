@@ -139,6 +139,8 @@ core 只提供同步快照，不提供 HTTP 端点（SPEC 6.6）。应用在自�
 
 **子进程的 stdout 默认混入框架日志。** `spawnBunServer` 让子进程的 stdout/stderr 继承 Portal 的对应流（stdin 被忽略），IPC 走独立通道。往 stdout 写不会破坏消息，但会把裸行混进 Portal 的输出流；若下游按行解析结构化日志，混入的裸行会让解析失败。框架自身的 Server 日志默认写 stdout，因此**生产装配 MUST 给 `runServerProcess` 传一个 `sink` 写 stderr 的 logger，或保证下游不假设每行都合法**；应用自己的诊断信息用 `console.error`。
 
+**启动失败时想从代码里拿到子进程的诊断，给 spawn 传 `stderrTailLines`。** 默认不捕获：stderr 直接继承，Server 因语法错误或模块缺失起不来时，真正的原因只在 Portal 控制台上，`switchTo` 只能 reject 一句没有细节的消息。传 `stderrTailLines: 20` 后 `spawnBunServer` 改为 pipe stderr，保留末尾 20 行并通过 `ServerExitInfo.stderrTail` 暴露；`switchTo` 的失败消息会附带这段文本。为了不改变运维的可见性，捕获模式会把每一块 stderr 原样转发回 Portal 的 stderr（不是经 logger，因此不会被日志级别或自定义 sink 吞掉），所以两种模式在控制台上看到的内容一致。代价是多一条管道与一次最多 250ms 的退出前排空等待；尾部只是诊断，不参与退出判定。
+
 **一个进程只能有一个 `runServerProcess`。** `process.send` 与 `message`/`disconnect` 事件是进程级的，一个进程只有一条到父进程的 IPC 链路。第二次调用会同步抛出 `a process channel already exists`，而不是让两个实例把同一条消息处理两遍——那等于两个存储写者（INV-002）。需要多个 Server 就启动多个 OS 进程，每个 Portal 只拉起一个。
 
 **Portal 的 `timeoutMs` 是权威。** Portal 侧 `IpcExecutor` 的 `timeoutMs` 决定请求何时在 Portal 结算；发给 Server 的 `timeoutMs` 是“从发送那一刻起还剩多少预算”，Server 只会在自身配置与后端声明之上再收紧，不会放宽。Server 侧配得比 Portal 大没有意义，配得小则先于 Portal 生效；部署时应让 Server 的 `timeoutMs` 不小于 Portal 的。
