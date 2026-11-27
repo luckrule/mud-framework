@@ -609,8 +609,13 @@ function holderState(
   }
   const state = host.connections.get(connectionId);
   if (state === undefined) {
-    // The router and the connection table are updated together, so this is a
-    // defensive branch: treat a stale route like a missing holder.
+    // No path in this layer reaches this: a route is only created for a
+    // connection that is in the table (`connection-request.ts` checks it before
+    // binding), and every removal either releases the route in the same
+    // synchronous turn (`onDisconnect`) or clears both tables together
+    // (`doStop`). Kept as a drop rather than an assertion because the two maps
+    // are separate objects, and a future refactor that opens a window should
+    // fail one event, not the process.
     warnDropped(
       host,
       event,
