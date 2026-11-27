@@ -255,8 +255,10 @@ export class FakeTransport implements Transport {
           }
           this.closes.set(id, { code, reason: closeReason });
           if (current.deferReport === true) {
-            // The socket is closed, but the report arrives later; the layer must
-            // already treat the connection as gone.
+            // The socket is gone the moment close returns — later writes fail —
+            // but the disconnect report arrives later. That split is the window
+            // this hook exists to expose.
+            current.open = false;
             current.pendingReport = closeReason;
             return Promise.resolve();
           }
