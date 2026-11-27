@@ -4,8 +4,13 @@ import { messageOf } from '../shared/guards.ts';
 import { elapsedMs } from '../shared/timeout.ts';
 import { TRANSPORT_CLOSED, failureLogLevel } from '../shared/wire-codes.ts';
 import type { TransportConnection } from '../transport/types.ts';
-import type { AdmissionHost, ConnectionState } from './connection-admission.ts';
+import type {
+  AdmissionHost,
+  ConnectionState,
+  RequestSeat,
+} from './connection-admission.ts';
 import {
+  acquireSeat,
   refuseAfterShutdown,
   refuseQueue,
   refuseWithId,
@@ -51,16 +56,16 @@ export function onMessage(
     }
     const rawLength = rawLengthOf(payload);
     const reason = messageOf(error);
-    state.queued += 1;
+    const seat = acquireSeat(state);
     return host.enqueue(
       state,
       async () => {
-        state.queued -= 1;
+        seat.release();
         await rejectEnvelope(host, connection, rawLength, reason);
       },
       // A frame that could not be decoded never became a Request, so it has no
       // identity to report; only its seat has to be released.
-      { onDropped: () => (state.queued -= 1) },
+      { onDropped: () => seat.release() },
     );
   }
   // Assigned when the decoded request enters the framework, before the queue
@@ -71,19 +76,19 @@ export function onMessage(
   if (state.queued >= host.maxQueuedPerConnection) {
     return refuseQueue(host, state, envelope.id, envelope.method, requestId);
   }
-  state.queued += 1;
+  const seat = acquireSeat(state);
   return host.enqueue(
     state,
-    () => startAfterGate(host, state, envelope, requestId),
+    () => startAfterGate(host, state, envelope, requestId, seat),
     {
       identity: {
         requestId,
         method: envelope.method,
         ...(envelope.id === '' ? {} : { clientRequestId: envelope.id }),
       },
-      // Shutdown drops the work before it starts, so the decrement that would
+      // Shutdown drops the work before it starts, so the release that would
       // have happened inside `startAfterGate` never runs.
-      onDropped: () => (state.queued -= 1),
+      onDropped: () => seat.release(),
     },
   );
 }
@@ -93,17 +98,18 @@ async function startAfterGate(
   state: ConnectionState,
   envelope: Envelope,
   requestId: string,
+  seat: RequestSeat,
 ): Promise<void> {
   const ran = await host.router.run(
     state.connection.id,
     state.closed.signal,
     async (sessionId, terminal) => {
-      state.queued -= 1;
+      seat.release();
       await handle(host, state, envelope, sessionId, terminal, requestId);
     },
   );
   if (!ran) {
-    state.queued -= 1;
+    seat.release();
     // Shutdown can stop waiting, but cannot start overlapping Session work.
     if (host.connections.get(state.connection.id) === state) {
       await refuseWithId(host, state.connection, envelope.id, requestId);

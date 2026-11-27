@@ -315,4 +315,122 @@ describe('ConnectionLayer bounded input queue (SPEC 3.5)', () => {
       logs().filter((entry) => entry.code === 'FRAMEWORK_QUEUE_FULL'),
     ).toHaveLength(2);
   });
+
+  test('a malformed frame releases its seat after the rejection is written', async () => {
+    // The malformed path takes a seat without minting an identity, so its
+    // release has no request to hang it on. If the seat leaked, the cap would
+    // tighten by one on every bad frame and a healthy connection would start
+    // refusing real requests.
+    const { transport, dispatcher, layer } = await harness({
+      maxQueuedPerConnection: 1,
+      timeoutMs: 5000,
+    });
+    dispatcher.register('work', async () => null, { access: 'public' });
+    transport.connect('c1');
+
+    for (let index = 0; index < 5; index += 1) {
+      await transport.receive('c1', 'not json');
+    }
+    // The seat is free again, so one request may still wait behind the running
+    // one instead of being refused at a cap that leaked down to zero.
+    const gate = Promise.withResolvers<void>();
+    dispatcher.register(
+      'hold',
+      async () => {
+        await gate.promise;
+        return null;
+      },
+      { access: 'public' },
+    );
+    const running = transport.receive('c1', '{"id":"a","method":"hold"}');
+    await sleep(0);
+    const waiting = transport.receive('c1', '{"id":"b","method":"work"}');
+    gate.resolve();
+    await Promise.all([running, waiting]);
+
+    const frames = transport.sentTo('c1').map(parseFrame);
+    expect(
+      frames.filter(
+        (frame) =>
+          isRecord(frame.error) && frame.error.code === 'FRAMEWORK_QUEUE_FULL',
+      ),
+    ).toEqual([]);
+    await layer.stop();
+  });
+
+  test('a dropped malformed frame releases its seat at shutdown', async () => {
+    // Shutdown discards queued work without running it, so the seat is released
+    // by the drop hook instead of the work itself. A double release here would
+    // make the counter negative and silently widen the bound.
+    const h = sessionHarness({ shutdownTimeoutMs: 20 });
+    await h.layer.start();
+    h.transport.connect('c1');
+    const state = (
+      h.layer as unknown as {
+        connections: Map<string, { queued: number }>;
+      }
+    ).connections.get('c1');
+
+    const held = h.transport.holdSends('c1');
+    h.controlled.emit({
+      eventId: 'e:0',
+      event: 'note',
+      payload: 'x',
+      target: { kind: 'connection', connectionId: 'c1' },
+    });
+    await held.entered;
+    const bad = h.transport.receive('c1', 'not json');
+    await sleep(0);
+    expect(state?.queued).toBe(1);
+
+    const stopping = h.layer.stop();
+    await sleep(40);
+    expect(state?.queued).toBe(0);
+    held.release();
+    await stopping;
+    await bad;
+
+    // Released once, not twice: the count is back to its starting value.
+    expect(state?.queued).toBe(0);
+    expect(
+      h.logs().filter((entry) => entry.code === 'REQUEST_DROPPED_AT_SHUTDOWN'),
+    ).toEqual([]);
+  });
+
+  test('a request abandoned at the Session barrier releases its seat', async () => {
+    // The wait can end without the work running: the connection closes while
+    // its request is parked behind another connection's unfinished Session
+    // work. The seat is released on that path instead of inside the work.
+    const h = sessionHarness({});
+    await h.layer.start();
+    h.transport.connect('c1');
+    h.transport.connect('c2');
+    const c2 = (
+      h.layer as unknown as {
+        connections: Map<string, { queued: number }>;
+      }
+    ).connections.get('c2');
+
+    // c1 binds s1 and holds its barrier with a request that never finishes.
+    await h.transport.receive('c1', '{"id":"1","method":"bind"}');
+    const holding = h.transport.receive('c1', '{"id":"2","method":"hang"}');
+    await sleep(0);
+    // c2 takes s1 over; its next request must wait for c1's unfinished work.
+    await h.transport.receive('c2', '{"id":"3","method":"bind"}');
+    const waiting = h.transport.receive('c2', '{"id":"4","method":"next"}');
+    await sleep(0);
+    expect(c2?.queued).toBe(1);
+
+    await h.transport.disconnect('c2', 'client left');
+    h.controlled.release();
+    await Promise.all([holding, waiting]);
+    await sleep(0);
+
+    expect(c2?.queued).toBe(0);
+    expect(h.controlled.started).not.toContain('next');
+    expect(
+      h.logs().filter((entry) => entry.msg === 'request dropped before start'),
+    ).toHaveLength(1);
+    await h.layer.stop();
+  });
 });

@@ -67,6 +67,8 @@ export interface ConnectionState {
    * Requests accepted on this connection that are waiting for their turn,
    * excluding the one executing. The SPEC 3.5 cap is about this backlog: a
    * client that keeps writing while the handler lags is the case it exists for.
+   *
+   * Written only through `acquireSeat`, so a seat cannot be released twice.
    */
   queued: number;
   /**
@@ -77,6 +79,33 @@ export interface ConnectionState {
   readonly inFlight: Set<string>;
   /** Aborts only waiting work; an unfinished Session barrier survives it. */
   readonly closed: AbortController;
+}
+
+/**
+ * One request's claim on a connection's bounded backlog (SPEC 3.5).
+ *
+ * A seat is acquired when the frame is admitted and released on exactly one of
+ * three paths: the work starts, the wait is abandoned (Session barrier or
+ * closed connection), or shutdown drops the seat before the work ever runs. The
+ * three are mutually exclusive today, but the release is idempotent so a future
+ * path cannot decrement the count twice and silently widen the bound.
+ */
+export interface RequestSeat {
+  release(): void;
+}
+
+export function acquireSeat(state: ConnectionState): RequestSeat {
+  state.queued += 1;
+  let released = false;
+  return {
+    release(): void {
+      if (released) {
+        return;
+      }
+      released = true;
+      state.queued -= 1;
+    },
+  };
 }
 
 /**
