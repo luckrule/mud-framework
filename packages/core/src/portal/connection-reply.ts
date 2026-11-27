@@ -35,6 +35,13 @@ export function rawLengthOf(payload: string | Uint8Array): number {
  * caller carries on: SPEC 5.4 promises no response for an unwritable frame, and
  * SPEC 3.8 keeps the request's success unchanged, so a failure here must not
  * become an error the request does not have.
+ *
+ * Failures are warn, not error, for that same reason: an unwritable frame is a
+ * degraded channel, not a failed request, and SPEC 7.1 reserves error for
+ * request failures. `stage` separates an encode failure from a send failure, the
+ * way it does on the event path, and `connectionId` names the connection whose
+ * write was lost — a refusal answered here never went through the request
+ * scheduler, so no other line carries it.
  */
 export async function reply(
   host: ReplyHost,
@@ -48,7 +55,12 @@ export async function reply(
       frame = host.codec.encode(response);
     } catch (error) {
       logger.error(
-        { code: INTERNAL_ERROR, reason: messageOf(error) },
+        {
+          connectionId: connection.id,
+          code: INTERNAL_ERROR,
+          stage: 'encode',
+          reason: messageOf(error),
+        },
         'response could not be encoded',
       );
       frame = host.codec.encode({
@@ -67,22 +79,34 @@ export async function reply(
       host.sendTimeoutMs,
     );
     if (written.status === 'timeout') {
-      logger.error(
+      logger.warn(
         {
+          connectionId: connection.id,
           code: TRANSPORT_SEND_FAILED,
+          stage: 'send',
           reason: `the transport did not settle the write within ${host.sendTimeoutMs}ms`,
         },
         'response could not be sent',
       );
     } else if (written.status === 'rejected') {
-      logger.error(
-        { code: TRANSPORT_SEND_FAILED, reason: messageOf(written.error) },
+      logger.warn(
+        {
+          connectionId: connection.id,
+          code: TRANSPORT_SEND_FAILED,
+          stage: 'send',
+          reason: messageOf(written.error),
+        },
         'response could not be sent',
       );
     }
   } catch (error) {
-    logger.error(
-      { code: TRANSPORT_SEND_FAILED, reason: messageOf(error) },
+    logger.warn(
+      {
+        connectionId: connection.id,
+        code: TRANSPORT_SEND_FAILED,
+        stage: 'send',
+        reason: messageOf(error),
+      },
       'response could not be sent',
     );
   }

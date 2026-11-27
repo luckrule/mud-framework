@@ -306,14 +306,24 @@ export function refuseQueue(
     },
     'request refused: input queue is full',
   );
-  return reply(host, state.connection, {
-    id,
-    ok: false,
-    error: {
-      code: FRAMEWORK_QUEUE_FULL,
-      message: `input queue is full (${host.maxQueuedPerConnection} waiting)`,
+  return reply(
+    host,
+    state.connection,
+    {
+      id,
+      ok: false,
+      error: {
+        code: FRAMEWORK_QUEUE_FULL,
+        message: `input queue is full (${host.maxQueuedPerConnection} waiting)`,
+      },
     },
-  });
+    // A refused frame skips the scheduler, so this is the only place its write
+    // failure can be correlated with the request it answers (SPEC 7.1).
+    host.logger.child({
+      connectionId: state.connection.id,
+      ...(requestId === undefined ? {} : { requestId }),
+    }),
+  );
 }
 
 /** SPEC 6.3 step 2: input arriving after shutdown started gets a stable code. */
@@ -348,14 +358,24 @@ export async function refuseWithId(
     },
     'request refused',
   );
-  await reply(host, connection, {
-    id,
-    ok: false,
-    error: {
-      code: FRAMEWORK_SHUTDOWN,
-      message: 'connection layer is shutting down',
+  await reply(
+    host,
+    connection,
+    {
+      id,
+      ok: false,
+      error: {
+        code: FRAMEWORK_SHUTDOWN,
+        message: 'connection layer is shutting down',
+      },
     },
-  });
+    // Same reason as `refuseQueue`: this frame never entered the scheduler, so
+    // its own log context is the only correlation a failed write gets.
+    host.logger.child({
+      connectionId: connection.id,
+      ...(requestId === undefined ? {} : { requestId }),
+    }),
+  );
 }
 
 export interface DisconnectHooks {

@@ -50,7 +50,11 @@ describe('ConnectionLayer disconnect', () => {
       .map(parseFrame)
       .filter((entry) => entry.code === 'TRANSPORT_SEND_FAILED');
     expect(failures).toHaveLength(1);
-    expect(failures[0]).toMatchObject({ level: 'error', connectionId: 'c1' });
+    expect(failures[0]).toMatchObject({
+      level: 'warn',
+      stage: 'send',
+      connectionId: 'c1',
+    });
     await layer.stop();
   });
 
@@ -96,7 +100,7 @@ describe('ConnectionLayer disconnect', () => {
     expect(typeof ended[0]?.durationMs).toBe('number');
   });
 
-  test('still logs a send failure at error while the connection is tracked', async () => {
+  test('logs a send failure at warn while the connection is tracked', async () => {
     const transport = new FakeTransport();
     const lines: string[] = [];
     const logger: Logger = createJsonLogger({
@@ -119,8 +123,9 @@ describe('ConnectionLayer disconnect', () => {
     const layer = new ConnectionLayer({ transport, executor, logger });
     await layer.start();
     const connection = transport.connect('c1');
-    // The connection is still tracked, but the write itself fails: that is a
-    // real transport fault and must stay an error (SPEC 7.1).
+    // The connection is still tracked, but the write itself fails. The request
+    // already failed on its own; an unwritable reply is a degraded channel, not
+    // a second failure, so it is a warning (SPEC 3.8, 7.1).
     connection.send = () => Promise.reject(new Error('socket is broken'));
 
     await transport.receive('c1', '{"id":"r1","method":"echo"}');
@@ -133,7 +138,12 @@ describe('ConnectionLayer disconnect', () => {
       (entry) => entry.code === 'TRANSPORT_SEND_FAILED',
     );
     expect(failedSend).toHaveLength(1);
-    expect(failedSend[0]).toMatchObject({ level: 'error', connectionId: 'c1' });
+    expect(failedSend[0]).toMatchObject({
+      level: 'warn',
+      stage: 'send',
+      connectionId: 'c1',
+      reason: 'socket is broken',
+    });
     await layer.stop();
   });
 

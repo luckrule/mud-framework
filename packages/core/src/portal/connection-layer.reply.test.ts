@@ -29,8 +29,11 @@ describe('ConnectionLayer response write bound (SPEC 3.8, 5.4)', () => {
       .filter((line) => line.code === 'TRANSPORT_SEND_FAILED');
     expect(failures).toHaveLength(1);
     expect(failures[0]).toMatchObject({
-      level: 'error',
+      // Degraded channel, not a failed request (SPEC 7.1): the request's
+      // success is unchanged, so this is a warning like the event path.
+      level: 'warn',
       connectionId: 'c1',
+      stage: 'send',
       reason: 'the transport did not settle the write within 10ms',
     });
 
@@ -111,9 +114,18 @@ describe('ConnectionLayer response write bound (SPEC 3.8, 5.4)', () => {
     await held.entered;
     await withDeadline(refused, 1000, 'the refusal should be bounded');
 
-    expect(
-      h.logs().filter((line) => line.code === 'TRANSPORT_SEND_FAILED'),
-    ).toHaveLength(1);
+    const failures = h
+      .logs()
+      .filter((line) => line.code === 'TRANSPORT_SEND_FAILED');
+    expect(failures).toHaveLength(1);
+    // The refused frame never entered the scheduler, so this line is the only
+    // one that can name the connection and the request it was answering.
+    expect(failures[0]).toMatchObject({
+      level: 'warn',
+      stage: 'send',
+      connectionId: 'c1',
+      requestId: expect.any(String),
+    });
     expect(
       h.logs().filter((line) => line.code === 'FRAMEWORK_QUEUE_FULL'),
     ).toHaveLength(1);
@@ -141,9 +153,15 @@ describe('ConnectionLayer response write bound (SPEC 3.8, 5.4)', () => {
     await withDeadline(refused, 1000, 'the shutdown refusal should be bounded');
     await withDeadline(stopping, 2000, 'shutdown should finish');
 
-    expect(
-      h.logs().filter((line) => line.code === 'TRANSPORT_SEND_FAILED'),
-    ).toHaveLength(1);
+    const failures = h
+      .logs()
+      .filter((line) => line.code === 'TRANSPORT_SEND_FAILED');
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatchObject({
+      level: 'warn',
+      stage: 'send',
+      connectionId: 'c1',
+    });
     held.release();
   });
 
