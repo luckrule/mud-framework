@@ -29,14 +29,6 @@ export interface QueuedRequestIdentity {
   readonly clientRequestId?: string;
 }
 
-/**
- * How many event frames the writer drains after each completed request.
- * An implementation constant, not a contract (SPEC 3.8 only promises that
- * event waiting is bounded): tuning this changes the bandwidth split without
- * changing the API promise.
- */
-const EVENTS_PER_REQUEST_TURN = 1;
-
 export interface ConnectionWriterOptions {
   /** Frames allowed to wait on this connection before new ones are dropped. */
   readonly maxQueuedEvents: number;
@@ -52,9 +44,9 @@ export interface ConnectionWriterOptions {
  * The single writer of one connection (SPEC 3.8). Request work — input
  * admission through the result write — is one scheduling unit, and a queue of
  * waiting request work runs before queued events. After each completed request
- * the event queue gets a bounded number of release turns, so a busy connection
- * cannot starve its events; the interval is an implementation constant
- * (`EVENTS_PER_REQUEST_TURN`), not part of the contract.
+ * one queued event is released, so a busy connection cannot starve its events.
+ * That is an implementation choice, not part of the contract (SPEC 3.8 only
+ * promises that event waiting is bounded).
  *
  * Separating the queues is what lets a result overtake an event frame that has
  * not started writing. A frame already handed to the transport stays in front;
@@ -219,12 +211,9 @@ export class ConnectionWriter {
       if (request !== undefined) {
         // oxlint-disable-next-line eslint/no-await-in-loop -- this writer is the serialization point; running requests concurrently would defeat it
         await this.runRequest(request);
-        for (let turn = 0; turn < EVENTS_PER_REQUEST_TURN; turn += 1) {
-          const fairnessTurn = this.nextEvent();
-          if (fairnessTurn === undefined) {
-            break;
-          }
-          // oxlint-disable-next-line eslint/no-await-in-loop -- each turn settles before the next choice, which is what keeps the writer serial
+        const fairnessTurn = this.nextEvent();
+        if (fairnessTurn !== undefined) {
+          // oxlint-disable-next-line eslint/no-await-in-loop -- the turn settles before the next choice, which is what keeps the writer serial
           await this.runEvent(fairnessTurn);
         }
         continue;

@@ -712,8 +712,8 @@ describe('ConnectionLayer event write scheduling', () => {
 
     // Request work wins whenever both are ready, and each completion hands the
     // queue head one turn. SPEC 3.8 only promises bounded event waiting, so this
-    // exact interleaving pins the current EVENTS_PER_REQUEST_TURN value rather
-    // than a contract; retuning that constant changes this expectation.
+    // exact interleaving pins the current one-turn-per-request policy rather
+    // than a contract; retuning that policy changes this expectation.
     expect(frameLabels(h.transport, 'c1')).toEqual([
       'bind',
       'e:0',
