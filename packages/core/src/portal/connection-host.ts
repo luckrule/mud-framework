@@ -81,9 +81,11 @@ export interface LayerHost {
    */
   readonly sessionQueues: Map<string, SessionEventQueue>;
   /**
-   * Upper bound on one event write. A transport bounds its own sends, but the
-   * layer cannot assume every implementation does: without this bound a send
-   * that never settles would pin the Session's serial slot forever (SPEC 3.8).
+   * Upper bound on one downlink write: a Server event frame and a response
+   * frame alike (SPEC 3.8). A transport bounds its own sends, but the layer
+   * cannot assume every implementation does: without this bound a send that
+   * never settles would pin the Session's serial slot — or the connection's
+   * single writer, and with it the Session's terminal barrier — forever.
    */
   readonly sendTimeoutMs: number;
 }

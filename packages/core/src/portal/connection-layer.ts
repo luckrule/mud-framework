@@ -166,20 +166,21 @@ export interface ConnectionLayerOptions {
    */
   maxConnections?: number;
   /**
-   * Upper bound on one Server event write. Defaults to the transport's declared
+   * Upper bound on one downlink write: a Server event frame and a response
+   * frame alike (SPEC 3.8). Defaults to the transport's declared
    * `Transport.sendTimeoutMs` plus `EVENT_SEND_SLACK_MS` when that declaration
-   * is a finite number of at least 1, and to
-   * `UNDECLARED_EVENT_SEND_TIMEOUT_MS` otherwise. Deriving the bound from the
-   * transport keeps the Session's serial slot held until the transport itself
-   * would fail the write, so the slot is never released while a frame is still
-   * being written (SPEC 3.8). The slack makes this bound strictly wider than the
-   * transport's, so a stalled write is reported by the transport's own timeout
-   * rather than by this layer's fallback.
+   * is a finite number of at least 1, and to `UNDECLARED_EVENT_SEND_TIMEOUT_MS`
+   * otherwise. Deriving the bound from the transport keeps the Session's serial
+   * slot held until the transport itself would fail the write, so the slot is
+   * never released while a frame is still being written (SPEC 3.8). The slack
+   * makes this bound strictly wider than the transport's, so a stalled write is
+   * reported by the transport's own timeout rather than by this layer's
+   * fallback.
    *
    * An explicit value here is the layer's own bound and wins over the
    * declaration; no slack is added to it, because it replaces the derivation
    * rather than competing with a transport timer it was meant to outlast. Must
-   * be a positive finite number.
+   * be a positive finite number no greater than the largest usable timer delay.
    *
    * It bounds the write, not the disconnect: once a frame is being written an
    * abort does not release the Session's serial slot, because the bytes may
@@ -204,7 +205,8 @@ export class ConnectionLayer implements TransportHandlers {
   private readonly logger: Logger;
   private readonly createRequestId: () => string;
   private readonly shutdownTimeoutMs: number;
-  private readonly eventSendTimeoutMs: number;
+  /** Bound on every downlink write: event frames and response frames (SPEC 3.8). */
+  private readonly sendTimeoutMs: number;
   private readonly connections = new Map<string, ConnectionState>();
   /** Per-Session serialization and bounds for Server events (ADR-0008). */
   private readonly sessionQueues = new Map<string, SessionEventQueue>();
@@ -253,7 +255,7 @@ export class ConnectionLayer implements TransportHandlers {
     const shutdownTimeoutMs =
       options.shutdownTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
     assertFiniteAtLeastOne(shutdownTimeoutMs, 'shutdownTimeoutMs');
-    const eventSendTimeoutMs = resolveEventSendTimeoutMs(options);
+    const sendTimeoutMs = resolveSendTimeoutMs(options);
     this.transport = options.transport;
     this.executor = options.executor;
     this.codec = options.codec ?? new JsonCodec();
@@ -263,7 +265,7 @@ export class ConnectionLayer implements TransportHandlers {
     );
     this.createRequestId = options.createRequestId ?? randomUUID;
     this.shutdownTimeoutMs = shutdownTimeoutMs;
-    this.eventSendTimeoutMs = eventSendTimeoutMs;
+    this.sendTimeoutMs = sendTimeoutMs;
     this.backlog = new EventBacklog({
       logger: this.logger,
       warnBytes: eventBacklogWarnBytes,
@@ -289,7 +291,7 @@ export class ConnectionLayer implements TransportHandlers {
       cancelEvent: (state, write) => state.writer.cancel(write),
       acceptingEvents: () => this.eventsOpen,
       sessionQueues: this.sessionQueues,
-      sendTimeoutMs: this.eventSendTimeoutMs,
+      sendTimeoutMs: this.sendTimeoutMs,
     };
     this.requestHost = host;
     this.eventHost = host;
@@ -604,18 +606,18 @@ export class ConnectionLayer implements TransportHandlers {
 }
 
 /**
- * Resolves the bound on one event write: the layer's explicit option first,
- * then the transport's declaration plus `EVENT_SEND_SLACK_MS`, then this
- * layer's default.
+ * Resolves the bound on one downlink write — an event frame or a response
+ * frame —: the layer's explicit option first, then the transport's declaration
+ * plus `EVENT_SEND_SLACK_MS`, then this layer's default.
  *
  * A transport's value is only taken when it is usable (finite and at least 1).
  * `Infinity` is legal for a transport — `WsTransport` accepts it to disable its
  * own send timeout — but it must not become this bound: an unbounded wait would
- * pin the Session's serial slot forever, the very failure the bound prevents.
- * Such a declaration counts as "no declaration" and falls back to the default.
- * The fallback is a complete bound of its own, so it takes no slack: nothing
- * else bounds the write, and there is no transport timer whose verdict the
- * slack would preserve.
+ * pin the Session's serial slot, or the connection's single writer, forever, the
+ * very failure the bound prevents. Such a declaration counts as "no
+ * declaration" and falls back to the default. The fallback is a complete bound
+ * of its own, so it takes no slack: nothing else bounds the write, and there is
+ * no transport timer whose verdict the slack would preserve.
  *
  * An explicit option is used verbatim. It replaces the derivation rather than
  * standing beside it, so it carries no slack; a caller that wants the
@@ -626,7 +628,7 @@ export class ConnectionLayer implements TransportHandlers {
  * the point where `setTimeout` clamps the delay to 1ms — turning the widest
  * possible bound into the narrowest one.
  */
-function resolveEventSendTimeoutMs(options: ConnectionLayerOptions): number {
+function resolveSendTimeoutMs(options: ConnectionLayerOptions): number {
   if (options.eventSendTimeoutMs !== undefined) {
     assertFiniteAtLeastOne(options.eventSendTimeoutMs, 'eventSendTimeoutMs');
     return options.eventSendTimeoutMs;

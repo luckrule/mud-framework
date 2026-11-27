@@ -21,13 +21,13 @@ function createLayer(
 }
 
 /**
- * Reads the resolved event write bound. The value is private because nothing
- * outside the delivery path may set it, but the resolution rules (explicit
- * option, then transport declaration, then default) are exactly what these
- * tests pin down.
+ * Reads the resolved downlink write bound. The value is private because nothing
+ * outside the delivery and reply paths may set it, but the resolution rules
+ * (explicit option, then transport declaration, then default) are exactly what
+ * these tests pin down.
  */
-function eventSendTimeoutOf(layer: unknown): number {
-  return (layer as { eventSendTimeoutMs: number }).eventSendTimeoutMs;
+function sendTimeoutOf(layer: unknown): number {
+  return (layer as { sendTimeoutMs: number }).sendTimeoutMs;
 }
 
 function layerWithTransport(transport: Transport): ConnectionLayer {
@@ -183,7 +183,7 @@ describe('ConnectionLayer event send bound resolution', () => {
       new FakeTransport({ sendTimeoutMs: 60_000 }),
     );
 
-    const bound = eventSendTimeoutOf(layer);
+    const bound = sendTimeoutOf(layer);
     expect(bound).toBeGreaterThan(60_000);
     expect(bound).toBe(60_000 + EVENT_SEND_SLACK_MS);
   });
@@ -197,7 +197,7 @@ describe('ConnectionLayer event send bound resolution', () => {
       eventSendTimeoutMs: 25,
     });
 
-    expect(eventSendTimeoutOf(layer)).toBe(25);
+    expect(sendTimeoutOf(layer)).toBe(25);
   });
 
   test('ignores an Infinity declaration: an unbounded wait would pin the serial slot', () => {
@@ -208,7 +208,7 @@ describe('ConnectionLayer event send bound resolution', () => {
     // WsTransport accepts Infinity to disable its own send timeout, so the
     // layer must not adopt it as the event bound. The fallback is complete on
     // its own and takes no slack: there is no transport timer to outlast.
-    expect(eventSendTimeoutOf(layer)).toBe(UNDECLARED_EVENT_SEND_TIMEOUT_MS);
+    expect(sendTimeoutOf(layer)).toBe(UNDECLARED_EVENT_SEND_TIMEOUT_MS);
   });
 
   test('ignores an unusable declaration (0, negative, NaN)', () => {
@@ -216,14 +216,12 @@ describe('ConnectionLayer event send bound resolution', () => {
       const layer = layerWithTransport(
         new FakeTransport({ sendTimeoutMs: declared }),
       );
-      expect(eventSendTimeoutOf(layer)).toBe(UNDECLARED_EVENT_SEND_TIMEOUT_MS);
+      expect(sendTimeoutOf(layer)).toBe(UNDECLARED_EVENT_SEND_TIMEOUT_MS);
     }
   });
 
   test('falls back to the undeclared bound when the transport declares nothing', () => {
-    expect(eventSendTimeoutOf(createLayer())).toBe(
-      UNDECLARED_EVENT_SEND_TIMEOUT_MS,
-    );
+    expect(sendTimeoutOf(createLayer())).toBe(UNDECLARED_EVENT_SEND_TIMEOUT_MS);
   });
 
   test('keeps a near-maximum declaration inside the usable timer range', () => {
@@ -234,6 +232,6 @@ describe('ConnectionLayer event send bound resolution', () => {
       new FakeTransport({ sendTimeoutMs: 2_147_483_600 }),
     );
 
-    expect(eventSendTimeoutOf(layer)).toBe(2_147_483_647);
+    expect(sendTimeoutOf(layer)).toBe(2_147_483_647);
   });
 });

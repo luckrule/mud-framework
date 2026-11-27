@@ -125,6 +125,7 @@ export type AdmissionHost = Pick<
   | 'maxQueuedEvents'
   | 'maxQueuedEventBytes'
   | 'backlog'
+  | 'sendTimeoutMs'
 >;
 
 export function onConnect(

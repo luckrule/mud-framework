@@ -1,6 +1,7 @@
 import type { Logger } from '../logging/types.ts';
 import type { ResponseEnvelope } from '../shared/codec.ts';
 import { messageOf } from '../shared/guards.ts';
+import { settleWithin } from '../shared/timeout.ts';
 import {
   INTERNAL_ERROR,
   INVALID_ENVELOPE,
@@ -9,8 +10,11 @@ import {
 import type { TransportConnection } from '../transport/types.ts';
 import type { LayerHost } from './connection-host.ts';
 
-/** The wire format and the sink for failures that must not reach the transport. */
-export type ReplyHost = Pick<LayerHost, 'codec' | 'logger'>;
+/**
+ * The wire format, the sink for failures that must not reach the transport, and
+ * the write bound shared with event delivery.
+ */
+export type ReplyHost = Pick<LayerHost, 'codec' | 'logger' | 'sendTimeoutMs'>;
 
 /** Length only: the raw frame may hold client data that must not be logged. */
 export function rawLengthOf(payload: string | Uint8Array): number {
@@ -22,6 +26,15 @@ export function rawLengthOf(payload: string | Uint8Array): number {
  * produce an answer rather than a stuck request; a write to a closed socket must
  * be recorded instead of thrown, because the transport has no caller to hand it
  * to and no way to answer a request nobody can read.
+ *
+ * The write is bounded by `host.sendTimeoutMs`, the same bound event delivery
+ * uses (SPEC 3.8). Without it a frame the client never reads would hold the
+ * connection's single writer forever, and because the reply is part of the
+ * request work, the Session's terminal barrier with it — other connections
+ * waiting on that Session would never continue. A timeout is recorded and the
+ * caller carries on: SPEC 5.4 promises no response for an unwritable frame, and
+ * SPEC 3.8 keeps the request's success unchanged, so a failure here must not
+ * become an error the request does not have.
  */
 export async function reply(
   host: ReplyHost,
@@ -47,7 +60,26 @@ export async function reply(
         },
       });
     }
-    await connection.send(frame);
+    // `settleWithin` consumes a rejection, so a late failure cannot escape as
+    // an unhandled rejection; a synchronous throw still reaches the catch below.
+    const written = await settleWithin(
+      connection.send(frame),
+      host.sendTimeoutMs,
+    );
+    if (written.status === 'timeout') {
+      logger.error(
+        {
+          code: TRANSPORT_SEND_FAILED,
+          reason: `the transport did not settle the write within ${host.sendTimeoutMs}ms`,
+        },
+        'response could not be sent',
+      );
+    } else if (written.status === 'rejected') {
+      logger.error(
+        { code: TRANSPORT_SEND_FAILED, reason: messageOf(written.error) },
+        'response could not be sent',
+      );
+    }
   } catch (error) {
     logger.error(
       { code: TRANSPORT_SEND_FAILED, reason: messageOf(error) },
