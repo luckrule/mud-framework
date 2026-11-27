@@ -60,6 +60,15 @@ export const DEFAULT_MAX_QUEUED_EVENT_BYTES = 4 * 1024 * 1024;
  */
 export const DEFAULT_EVENT_BACKLOG_WARN_BYTES = 1024 * 1024 * 1024;
 
+/**
+ * Why work that never started was dropped after the layer closed a connection
+ * for an overflowing event buffer (SPEC 3.8, 7.1). Shared by request admission
+ * and event delivery so one phrase covers both, and an operator can tell "the
+ * player left" from "we kicked the player" without reading the code path.
+ */
+export const BACKLOG_CLOSED_REASON =
+  'the connection was closed after an event backlog overflow';
+
 export interface ConnectionState {
   readonly connection: TransportConnection;
   /**
@@ -82,7 +91,15 @@ export interface ConnectionState {
    * could read its result (SPEC 3.6).
    */
   readonly inFlight: Set<string>;
-  /** Aborts only waiting work; an unfinished Session barrier survives it. */
+  /**
+   * Aborts only waiting work; an unfinished Session barrier survives it.
+   *
+   * Aborted by `onDisconnect` and by `closeForBacklog`. The backlog close aborts
+   * it at the decision, not when the transport reports the close: the writer's
+   * drain continuation is a microtask while a transport's close event is a
+   * macrotask, so waiting for the report leaves a window in which a queued
+   * request would still start (SPEC 3.8).
+   */
   readonly closed: AbortController;
   /**
    * Set when this layer closed the connection itself because an event buffer
@@ -90,6 +107,10 @@ export interface ConnectionState {
    * route, but it must not cancel requests already executing: the contract
    * keeps them running so their outcome is settled rather than turned into a
    * cancellation nobody asked for. Their result simply fails to write.
+   *
+   * It is also the fence for work that never started: a request and a queued
+   * event frame both check it, and `closeForBacklog` sets it synchronously, so
+   * nothing new begins on a connection this layer has decided to close.
    */
   backlogClosed: boolean;
 }
@@ -208,6 +229,14 @@ async function closeRefused(
  * leave requests already executing alone, and let their result fail to write
  * (`TRANSPORT_SEND_FAILED`).
  *
+ * `closed` is aborted here, at the decision, rather than waiting for that
+ * report: a transport closes its socket synchronously but reports the close in
+ * a later macrotask, while the writer's next drain turn is a microtask. In that
+ * window the table still holds the state, so a queued request would start and
+ * commit writes for a player this layer has already decided to disconnect.
+ * Aborting releases a waiter on the Session barrier at once and marks the fence
+ * `handle` and `startAfterGate` check (SPEC 3.8).
+ *
  * Best effort like `closeRefused`: a transport failure is logged rather than
  * thrown, because there is no caller to hand it to and the connection is
  * unusable either way.
@@ -226,6 +255,7 @@ export function closeForBacklog(
     return false;
   }
   state.backlogClosed = true;
+  state.closed.abort();
   host.backlog.recordBacklogDisconnect();
   host.logger.warn(
     {

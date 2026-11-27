@@ -12,6 +12,12 @@ interface ConnectionState {
   hold?: HoldState;
   /** Set while a test makes this connection's writes throw; see `throwOnSend`. */
   throwWith?: Error;
+  /**
+   * Set while a test withholds the disconnect a close implies; see
+   * `deferCloseReport`. `pendingReport` remembers the close's reason.
+   */
+  deferReport?: boolean;
+  pendingReport?: string;
 }
 
 interface HoldState {
@@ -158,6 +164,34 @@ export class FakeTransport implements Transport {
     this.lookup(id).throwWith = error;
   }
 
+  /**
+   * Withholds the `onDisconnect` a `close` would cause, so a test can observe
+   * the window between the close call and its report. `reportClose` delivers it.
+   *
+   * This is the real ordering a socket transport has: `ws.close()` returns
+   * immediately, but the `close` event arrives in a later macrotask. Without the
+   * hook the fake collapses both into one call and the window is untestable.
+   */
+  deferCloseReport(id: string): void {
+    this.assertStarted();
+    this.lookup(id).deferReport = true;
+  }
+
+  /** Delivers the report withheld by `deferCloseReport`. */
+  reportClose(id: string): Promise<void> {
+    const state = this.lookup(id);
+    if (state.deferReport !== true || state.pendingReport === undefined) {
+      throw new Error(`connection "${id}" has no deferred close report`);
+    }
+    const reason = state.pendingReport;
+    state.deferReport = false;
+    state.pendingReport = undefined;
+    state.open = false;
+    return this.invoke((handlers) =>
+      handlers.onDisconnect(state.connection, reason),
+    );
+  }
+
   private register(id: string): ConnectionState {
     this.assertStarted();
     if (this.connections.has(id)) {
@@ -203,11 +237,15 @@ export class FakeTransport implements Transport {
           if (current === undefined || !current.open) {
             return Promise.reject(new Error(`connection "${id}" is not open`));
           }
-          this.closes.set(id, {
-            code,
-            reason: reason ?? describeClose(code),
-          });
-          return this.disconnect(id, reason ?? describeClose(code));
+          const closeReason = reason ?? describeClose(code);
+          this.closes.set(id, { code, reason: closeReason });
+          if (current.deferReport === true) {
+            // The socket is closed, but the report arrives later; the layer must
+            // already treat the connection as gone.
+            current.pendingReport = closeReason;
+            return Promise.resolve();
+          }
+          return this.disconnect(id, closeReason);
         },
       },
     };

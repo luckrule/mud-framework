@@ -10,6 +10,7 @@ import type {
   RequestSeat,
 } from './connection-admission.ts';
 import {
+  BACKLOG_CLOSED_REASON,
   acquireSeat,
   refuseAfterShutdown,
   refuseQueue,
@@ -110,6 +111,19 @@ async function startAfterGate(
   );
   if (!ran) {
     seat.release();
+    if (state.backlogClosed) {
+      // The layer closed this connection itself (SPEC 3.8), so no reply is
+      // written: a shutdown refusal would tell the client this layer is
+      // shutting down when it is not, and the socket is on its way out anyway.
+      logDroppedBeforeStart(
+        host,
+        state,
+        envelope,
+        requestId,
+        BACKLOG_CLOSED_REASON,
+      );
+      return;
+    }
     // Shutdown can stop waiting, but cannot start overlapping Session work.
     if (host.connections.get(state.connection.id) === state) {
       await refuseWithId(host, state.connection, envelope.id, requestId);
@@ -128,6 +142,7 @@ function logDroppedBeforeStart(
   state: ConnectionState,
   envelope: Envelope,
   requestId: string,
+  reason = 'connection closed',
 ): void {
   host.logger
     .child({
@@ -139,7 +154,7 @@ function logDroppedBeforeStart(
       {
         method: envelope.method,
         code: TRANSPORT_CLOSED,
-        reason: 'connection closed',
+        reason,
       },
       'request dropped before start',
     );
@@ -184,9 +199,21 @@ async function handle(
   // behind the Session barrier at that point sees the same mismatch and is
   // logged as TRANSPORT_CLOSED instead of FRAMEWORK_SHUTDOWN; it still does not
   // run.
-  if (host.connections.get(connection.id) !== state) {
+  //
+  // `backlogClosed` is the second half of the same fence (SPEC 3.8): the layer
+  // closed this connection itself, and the state stays in the table until the
+  // transport reports the close, so the identity check alone would let a queued
+  // request start in that window. The Session gate is not enough either: with
+  // no unfinished work for the Session it returns without observing the abort.
+  if (host.connections.get(connection.id) !== state || state.backlogClosed) {
     logger.warn(
-      { method, code: TRANSPORT_CLOSED, reason: 'connection closed' },
+      {
+        method,
+        code: TRANSPORT_CLOSED,
+        reason: state.backlogClosed
+          ? BACKLOG_CLOSED_REASON
+          : 'connection closed',
+      },
       'request dropped before start',
     );
     return;

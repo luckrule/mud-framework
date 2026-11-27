@@ -5,6 +5,7 @@ import { EVENT_BACKLOG_CLOSE_CODE } from '../shared/close-codes.ts';
 import type { ServerEvent } from '../shared/events.ts';
 import { parseFrame, sleep, tick } from '../testing/common.ts';
 import { sessionHarness } from '../testing/connection-layer.ts';
+import { BACKLOG_CLOSED_REASON } from './connection-admission.ts';
 
 function connectionEvent(eventId: string, payload: unknown = 'x'): ServerEvent {
   return {
@@ -314,6 +315,64 @@ describe('ConnectionLayer event backlog bounds', () => {
     expect(
       h.logs().filter((line) => line.code === 'TRANSPORT_SEND_FAILED'),
     ).toHaveLength(1);
+  });
+
+  test('does not start a request that was still queued at the overflow', async () => {
+    const h = sessionHarness({
+      maxQueuedEvents: 1,
+      maxQueuedEventBytes: 1_000_000,
+    });
+    await h.layer.start();
+    h.transport.connect('c1');
+
+    // The report of the close is withheld, which is the ordering a socket
+    // transport has: `close()` returns at once, its `close` event lands in a
+    // later macrotask. The writer's next drain turn is a microtask, so without a
+    // fence at the decision the queued request would start in this window.
+    h.transport.deferCloseReport('c1');
+    const hanging = h.transport.receive('c1', '{"id":"a","method":"hang"}');
+    await tick();
+    const queued = h.transport.receive('c1', '{"id":"b","method":"work"}');
+    await tick();
+    expect(h.controlled.started).toEqual(['hang']);
+
+    // One frame fills the queue and the next overflows it: the connection is
+    // closed for backlog while the request still waits behind `hang`.
+    h.controlled.emit(connectionEvent('e:0'));
+    h.controlled.emit(connectionEvent('e:1'));
+    await tick();
+    expect(h.transport.closedWith('c1')).toMatchObject({
+      code: EVENT_BACKLOG_CLOSE_CODE,
+    });
+
+    h.controlled.release();
+    await hanging;
+    await queued;
+    await tick();
+
+    // Only the request that had already started ran; the queued one never
+    // reached the executor, and it was not answered either: a shutdown refusal
+    // would misreport why the layer stopped serving it.
+    expect(h.controlled.started).toEqual(['hang']);
+    expect(h.controlled.finished).toEqual(['hang']);
+    const dropped = h
+      .logs()
+      .filter((line) => line.msg === 'request dropped before start');
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]).toMatchObject({
+      requestId: expect.any(String),
+      connectionId: 'c1',
+      clientRequestId: 'b',
+      method: 'work',
+      code: 'TRANSPORT_CLOSED',
+      reason: BACKLOG_CLOSED_REASON,
+    });
+    expect(
+      h.logs().filter((line) => line.code === 'FRAMEWORK_SHUTDOWN'),
+    ).toEqual([]);
+
+    await h.transport.reportClose('c1');
+    await tick();
   });
 
   test('serves a reconnected client after a backlog close', async () => {
