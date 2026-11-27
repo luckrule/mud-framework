@@ -6,6 +6,7 @@ import type { Transport } from '../transport/types.ts';
 import {
   ConnectionLayer,
   EVENT_SEND_SLACK_MS,
+  MAX_TIMER_DELAY_MS,
   UNDECLARED_EVENT_SEND_TIMEOUT_MS,
 } from './connection-layer.ts';
 import type { ConnectionLayerOptions } from './connection-layer.ts';
@@ -171,6 +172,44 @@ describe('ConnectionLayer option validation', () => {
       expect(call).toThrow(new RegExp(String(value)));
     }
     expect(() => createLayer({ eventSendTimeoutMs: 1 })).not.toThrow();
+  });
+
+  test('rejects shutdownTimeoutMs and eventSendTimeoutMs above the timer ceiling', () => {
+    // Bun clamps a delay above 2^31-1 to 1ms, so an operator who asks for a
+    // 24.8-day wait would get the shortest possible one: every queued request
+    // dropped at shutdown, or a write bound that releases the writer at once.
+    // Rejected rather than capped: the value is the operator's stated intent.
+    const aboveCeiling = 2 ** 31;
+    for (const [name, build] of [
+      [
+        'shutdownTimeoutMs',
+        (value: number) => createLayer({ shutdownTimeoutMs: value }),
+      ],
+      [
+        'eventSendTimeoutMs',
+        (value: number) => createLayer({ eventSendTimeoutMs: value }),
+      ],
+    ] as const) {
+      const call = () => build(aboveCeiling);
+      expect(call).toThrow(RangeError);
+      expect(call).toThrow(new RegExp(name));
+      expect(call).toThrow(new RegExp(String(MAX_TIMER_DELAY_MS)));
+    }
+    // The largest usable delay is still accepted.
+    expect(() =>
+      createLayer({
+        shutdownTimeoutMs: MAX_TIMER_DELAY_MS,
+        eventSendTimeoutMs: MAX_TIMER_DELAY_MS,
+      }),
+    ).not.toThrow();
+    expect(
+      sendTimeoutOf(createLayer({ eventSendTimeoutMs: MAX_TIMER_DELAY_MS })),
+    ).toBe(MAX_TIMER_DELAY_MS);
+  });
+
+  test('a normal delay is unaffected by the ceiling', () => {
+    expect(sendTimeoutOf(createLayer({ eventSendTimeoutMs: 5000 }))).toBe(5000);
+    expect(() => createLayer({ shutdownTimeoutMs: 5000 })).not.toThrow();
   });
 });
 

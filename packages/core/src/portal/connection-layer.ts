@@ -77,9 +77,10 @@ export const EVENT_SEND_SLACK_MS = 250;
 /**
  * Largest delay `setTimeout` accepts. Bun clamps anything above it to 1ms, so a
  * derived bound that overflowed this would release the Session's serial slot
- * almost at once — the opposite of what the bound is for (SPEC 3.8).
+ * almost at once — the opposite of what the bound is for (SPEC 3.8). Exported
+ * so the option tests can name the same ceiling rather than hard-code it.
  */
-const MAX_TIMER_DELAY_MS = 2_147_483_647;
+export const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 /**
  * The bound on one Server event write when neither the caller nor the transport
@@ -149,7 +150,9 @@ export interface ConnectionLayerOptions {
   /**
    * Ceiling on each shutdown wait: draining in-flight requests, closing the
    * executor and stopping the transport (SPEC 6.3). Defaults to
-   * `DEFAULT_STOP_TIMEOUT_MS`. Must be a finite number of at least 1.
+   * `DEFAULT_STOP_TIMEOUT_MS`. Must be a finite number of at least 1, no greater
+   * than the largest usable timer delay; a longer value would be clamped to 1ms
+   * and drop every queued request instead of waiting for it.
    *
    * This is a floor, not the executor's ceiling: when the executor can bound
    * its own `close()` (`RequestExecutor.closeBudgetMs`, which `IpcExecutor`
@@ -180,7 +183,9 @@ export interface ConnectionLayerOptions {
    * An explicit value here is the layer's own bound and wins over the
    * declaration; no slack is added to it, because it replaces the derivation
    * rather than competing with a transport timer it was meant to outlast. Must
-   * be a positive finite number no greater than the largest usable timer delay.
+   * be a positive finite number no greater than the largest usable timer delay;
+   * a longer value would be clamped to 1ms, turning the widest bound into the
+   * narrowest.
    *
    * It bounds the write, not the disconnect: once a frame is being written an
    * abort does not release the Session's serial slot, because the bytes may
@@ -254,7 +259,7 @@ export class ConnectionLayer implements TransportHandlers {
     assertPositiveInteger(eventBacklogWarnBytes, 'eventBacklogWarnBytes');
     const shutdownTimeoutMs =
       options.shutdownTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
-    assertFiniteAtLeastOne(shutdownTimeoutMs, 'shutdownTimeoutMs');
+    assertTimerDelay(shutdownTimeoutMs, 'shutdownTimeoutMs');
     const sendTimeoutMs = resolveSendTimeoutMs(options);
     this.transport = options.transport;
     this.executor = options.executor;
@@ -630,7 +635,7 @@ export class ConnectionLayer implements TransportHandlers {
  */
 function resolveSendTimeoutMs(options: ConnectionLayerOptions): number {
   if (options.eventSendTimeoutMs !== undefined) {
-    assertFiniteAtLeastOne(options.eventSendTimeoutMs, 'eventSendTimeoutMs');
+    assertTimerDelay(options.eventSendTimeoutMs, 'eventSendTimeoutMs');
     return options.eventSendTimeoutMs;
   }
   const declared = options.transport.sendTimeoutMs;
@@ -653,7 +658,10 @@ function assertPositiveInteger(value: unknown, name: string): void {
   }
 }
 
-function assertFiniteAtLeastOne(value: unknown, name: string): void {
+function assertFiniteAtLeastOne(
+  value: unknown,
+  name: string,
+): asserts value is number {
   if (typeof value !== 'number') {
     throw new TypeError(
       `${name} must be a finite number of at least 1, got ${describeValue(value)}`,
@@ -662,6 +670,29 @@ function assertFiniteAtLeastOne(value: unknown, name: string): void {
   if (!Number.isFinite(value) || value < 1) {
     throw new RangeError(
       `${name} must be a finite number of at least 1, got ${String(value)}`,
+    );
+  }
+}
+
+/**
+ * A configured delay must also fit `setTimeout`. Above `MAX_TIMER_DELAY_MS` Bun
+ * clamps the delay to 1ms, so the longest wait an operator can ask for becomes
+ * the shortest: shutdown would drop every queued request, and a send bound would
+ * release the writer while the frame may still be on the wire. Rejected rather
+ * than capped because the value is the operator's stated intent; silently
+ * shortening it is the same inversion, and a delay this far out of range is a
+ * configuration error worth reporting rather than quietly repairing.
+ *
+ * Every caller of this is a timer delay, so the ceiling applies to all of them.
+ */
+function assertTimerDelay(
+  value: unknown,
+  name: string,
+): asserts value is number {
+  assertFiniteAtLeastOne(value, name);
+  if (value > MAX_TIMER_DELAY_MS) {
+    throw new RangeError(
+      `${name} must not exceed ${MAX_TIMER_DELAY_MS}ms (the largest setTimeout delay), got ${String(value)}`,
     );
   }
 }
