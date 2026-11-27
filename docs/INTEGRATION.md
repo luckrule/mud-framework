@@ -154,6 +154,8 @@ core 只提供同步快照，不提供 HTTP 端点（SPEC 6.6）。应用在自�
 - **`maxPending`**：Portal 未确认缓冲的硬上限（默认值见 `IpcExecutorOptions`），超出后请求以 `FRAMEWORK_QUEUE_FULL` 拒绝。deadline 在 Server 未就绪或不可用时仍会结算请求，只限制单条请求的驻留时间；总数上限控制同时在途的数量，不能用来延长 deadline。
 - **`maxConnections`**：连接层同时接纳的活跃连接上限（默认值见 `ConnectionLayerOptions`）。达到上限后，新连接以 WebSocket close code `1013`（Try Again Later）关闭，不进入请求处理；连接断开才释放名额。它是准入上限，不是业务 Session 的生命周期限制。
 - **`eventSendTimeoutMs`**：单条 Server 事件写出的上界（默认值见 `ConnectionLayerOptions`）。优先级是：该选项，其次传输暴露的 `Transport.sendTimeoutMs`（SPEC 5.2），最后默认值。传输声明可用时以它为准，串行位不会早于传输自身失败而释放；声明为 `Infinity` 等不可用值时按未声明处理，回退默认值，避免串行位无界等待。它约束的是写出，不是断线：帧已开始写出后，断线不会提前释放串行位，因为字节可能已经写出（SPEC 3.8）。
+- **`maxQueuedEvents` / `maxQueuedEventBytes`**：每一处事件缓冲的上界（帧数与编码后的字节数，默认值见 `ConnectionLayerOptions`），分别作用于每个 Connection 的事件队列和每个 Session 的待投递队列，不是每 Connection 汇总的上界。超出后丢弃新事件并记 `EVENT_DROPPED`（`reason: 'backlog'`），不影响请求终态（SPEC 3.8）。
+- **事件内存包络**：框架只保证每处缓冲各自有界，进程总量要部署方自己算。上界约为 `内存上界 ≈ maxConnections × maxQueuedEventBytes × 2`。乘 2 是因为每份上限有两处可以同时攒满：该 Connection 的事件队列一份，它那个 Session 的待投递队列一份；两处装的是不同的帧，同一帧不会被重复计数。Session 待投递队列的数量不超过连接数，没有 holder 的队列在投递时即被丢弃，所以这个乘积是量级估算而非严格上界。按默认值（10000 连接 × 4 MiB）该乘积是 80 GiB，远超常见机器；部署时必须按实际连接数与容器内存下调这两个选项之一，不能假设默认值安全。
 - **出站队列有界**：传输实现必须限制每个连接的出站缓冲；慢客户端积压到上限时会被关闭，而不是无限占用 Portal 内存（SPEC 5.2）。
 
 ### TLS 终止配置要点
