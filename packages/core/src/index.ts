@@ -136,5 +136,6 @@ export type { IpcChannel } from './ipc/channel.ts';
 export { IpcChannelClosedError } from './ipc/channel.ts';
 export type { IpcMessage, IpcParseResult } from './ipc/protocol.ts';
 export { parseIpcMessage } from './ipc/protocol.ts';
+export type { BunServerSpawnOptions } from './ipc/bun-spawn.ts';
 export { spawnBunServer } from './ipc/bun-spawn.ts';
 export { createProcessChannel } from './ipc/bun-child.ts';
