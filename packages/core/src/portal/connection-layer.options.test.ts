@@ -4,12 +4,12 @@ import { scriptedExecutor } from '../testing/connection-layer.ts';
 import { FakeTransport } from '../testing/fake-transport.ts';
 import type { Transport } from '../transport/types.ts';
 import {
-  ConnectionLayer,
   EVENT_SEND_SLACK_MS,
   MAX_TIMER_DELAY_MS,
   UNDECLARED_EVENT_SEND_TIMEOUT_MS,
-} from './connection-layer.ts';
-import type { ConnectionLayerOptions } from './connection-layer.ts';
+} from './connection-layer-options.ts';
+import type { ConnectionLayerOptions } from './connection-layer-options.ts';
+import { ConnectionLayer } from './connection-layer.ts';
 
 function createLayer(
   options: Partial<ConnectionLayerOptions> = {},

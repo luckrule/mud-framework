@@ -12,7 +12,8 @@ import type {
   TransportConnection,
   TransportHandlers,
 } from '../transport/types.ts';
-import { ConnectionLayer, EVENT_SEND_SLACK_MS } from './connection-layer.ts';
+import { EVENT_SEND_SLACK_MS } from './connection-layer-options.ts';
+import { ConnectionLayer } from './connection-layer.ts';
 
 function event(overrides: Partial<ServerEvent> = {}): ServerEvent {
   return {

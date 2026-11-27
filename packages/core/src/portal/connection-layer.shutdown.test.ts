@@ -11,7 +11,8 @@ import {
   scriptedTransport,
   sessionHarness,
 } from '../testing/connection-layer.ts';
-import { ConnectionLayer, MAX_TIMER_DELAY_MS } from './connection-layer.ts';
+import { MAX_TIMER_DELAY_MS } from './connection-layer-options.ts';
+import { ConnectionLayer } from './connection-layer.ts';
 
 function connectionEvent(eventId: string, connectionId = 'c1'): ServerEvent {
   return {

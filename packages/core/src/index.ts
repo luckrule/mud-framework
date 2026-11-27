@@ -108,7 +108,7 @@ export {
   failureLogLevel,
   isFrameworkCode,
 } from './shared/wire-codes.ts';
-export type { ConnectionLayerOptions } from './portal/connection-layer.ts';
+export type { ConnectionLayerOptions } from './portal/connection-layer-options.ts';
 export type {
   ConnectionHealth,
   ConnectionHealthState,

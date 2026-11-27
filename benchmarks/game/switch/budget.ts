@@ -23,7 +23,7 @@ export const PORTAL_SHUTDOWN_TIMEOUT_MS = 5000;
  */
 export const PORTAL_EXECUTOR_CLOSE_BUDGET_MS = 23_250;
 
-/** `EXECUTOR_CLOSE_SLACK_MS` in `packages/core/src/portal/connection-layer.ts`. */
+/** `EXECUTOR_CLOSE_SLACK_MS` in `packages/core/src/portal/connection-layer-options.ts`. */
 export const PORTAL_EXECUTOR_CLOSE_SLACK_MS = 1000;
 
 /** Headroom above the legal bound, so a slow stop is not read as a hang. */
