@@ -5,6 +5,7 @@ import { messageOf } from '../shared/guards.ts';
 import { settleWithin } from '../shared/timeout.ts';
 import { TRANSPORT_SEND_FAILED } from '../shared/wire-codes.ts';
 import type { ConnectionState } from './connection-admission.ts';
+import { BACKLOG_CLOSED_REASON } from './connection-admission.ts';
 import type { LayerHost } from './connection-host.ts';
 import type { EventBacklog } from './event-backlog.ts';
 
@@ -201,7 +202,7 @@ export function deliverServerEvent(
         host,
         event,
         { targetKind: 'connection', connectionId: target.connectionId },
-        'the target connection closed before the event was written',
+        closedReason(state),
       );
       return Promise.resolve();
     }
@@ -227,7 +228,7 @@ export function deliverServerEvent(
           host,
           event,
           { targetKind: 'connection', connectionId: target.connectionId },
-          'the target connection closed before the event was written',
+          BACKLOG_CLOSED_REASON,
         );
       }
       return Promise.resolve();
@@ -409,7 +410,7 @@ function enqueueSessionEvent(
           host,
           event,
           { targetKind: 'session', sessionId },
-          'the target connection closed before the event was written',
+          BACKLOG_CLOSED_REASON,
         );
       }
     }
@@ -607,7 +608,7 @@ async function deliverToHolder(
           sessionId,
           connectionId: queuedFor.connection.id,
         },
-        'the target connection closed before the event was written',
+        BACKLOG_CLOSED_REASON,
       );
     }
     return 'dropped';
@@ -625,6 +626,11 @@ async function deliverToHolder(
  * that has not started writing is dropped with `EVENT_DROPPED`, while one
  * already handed to the transport waits for its own result and a failure there
  * stays a `TRANSPORT_SEND_FAILED`.
+ *
+ * The abort has two causes and they get different reasons (see `closedReason`).
+ * Both are drops, but an operator sorting through a flood of `EVENT_DROPPED` has
+ * to be able to tell "the player went away" from "we disconnected the player",
+ * and the frames still queued behind an overflow are the second case.
  */
 async function watchQueuedWrite(
   host: EventDeliveryHost,
@@ -651,13 +657,27 @@ async function watchQueuedWrite(
         host,
         event,
         { ...target, connectionId: queuedFor.connection.id },
-        'the target connection closed before the event was written',
+        queuedFor.backlogClosed
+          ? BACKLOG_CLOSED_REASON
+          : 'the target connection closed before the event was written',
       );
     }
     return outcome;
   } finally {
     signal.removeEventListener('abort', onAbort);
   }
+}
+
+/**
+ * Why a closed connection can no longer take a frame (SPEC 3.8). A backlog
+ * close is this layer's decision, so it is named as such: otherwise its drops
+ * would be indistinguishable from a client that disconnected on its own, and
+ * the two need different responses from whoever reads the log.
+ */
+function closedReason(state: ConnectionState): string {
+  return state.backlogClosed
+    ? BACKLOG_CLOSED_REASON
+    : 'the target connection closed before the event was written';
 }
 
 /** The tracked connection holding `sessionId`, or a logged drop. */

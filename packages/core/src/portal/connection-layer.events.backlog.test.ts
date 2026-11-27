@@ -375,6 +375,41 @@ describe('ConnectionLayer event backlog bounds', () => {
     await tick();
   });
 
+  test('drops the frames still queued behind the overflow with a backlog reason', async () => {
+    const h = sessionHarness({
+      maxQueuedEvents: 2,
+      maxQueuedEventBytes: 1_000_000,
+    });
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+
+    // e:0 is held on the wire, e:1 fills the queue, e:2 overflows it. The close
+    // then aborts the queue, so e:1 is dropped unwritten.
+    const held = h.transport.holdSends('c1');
+    h.controlled.emit(connectionEvent('e:0'));
+    h.controlled.emit(connectionEvent('e:1'));
+    await held.entered;
+    h.controlled.emit(connectionEvent('e:2'));
+    await tick();
+
+    const drops = dropLines(h.logs());
+    expect(drops).toHaveLength(1);
+    expect(drops[0]).toMatchObject({
+      eventId: 'e:1',
+      targetKind: 'connection',
+      connectionId: 'c1',
+      // Distinguishable from a client that simply left: this drop is the
+      // layer's own decision, and the two need different follow-up.
+      reason: BACKLOG_CLOSED_REASON,
+    });
+    expect(drops[0]?.droppedTotal).toBe(1);
+
+    held.release();
+    await tick();
+    await tick();
+  });
+
   test('serves a reconnected client after a backlog close', async () => {
     const h = sessionHarness({
       maxQueuedEvents: 1,

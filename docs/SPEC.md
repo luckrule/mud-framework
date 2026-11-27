@@ -385,7 +385,7 @@ Server 事件的诊断日志（ADR-0008）分逐事件与批量两类。逐事�
 
 Portal 侧的 `EVENT_DROPPED` 按（`reason`，目标 id）聚合，同一批的后续丢弃合并进下一行，不是每条丢弃一行。理由：慢读者使每条新事件都成为一次丢弃，逐条记录会把诊断通道变成第二条无界流——正是事件上界要卸掉的压力；注入同步写文件的 logger 时还会直接阻塞事件循环。聚合规则：该组合的首条丢弃立即记录，之后累计计数每翻一倍记一行，静默满 60 秒后的首条也立即记录。由此行数随丢弃数的对数增长，低速率的目标也不会因累计值变大而长期静默。
 
-聚合行 MUST 保留 `code`、`reason`、目标字段（`connectionId` 或 `sessionId` 与 `targetKind`）以及 `count`（本行代表的丢弃条数）与 `droppedTotal`（该组合的累计丢弃数）。`eventId` 与 `event` 取本批首条丢弃的事件，用于回答「丢的是哪条」；聚合行不声称本批只有该事件，`count > 1` 即表示它是首条。积压溢出不走这条聚合：它是一次断开、一行日志（`EVENT_BACKLOG_DISCONNECTED`，§7.1 上段），不会产生逐事件的丢弃流。聚合只影响日志：`eventBacklog.dropped` 按断开计数（§6.6），探针读到的不是聚合值。聚合状态属于本连接层实例，重启即清零；同时活跃的（`reason`，目标 id）组合超过 4096 个时，最久未再丢弃的组合会被淘汰，其累计值随新桶从 1 重新计数——此时仍会立即记录该目标的每条新丢弃，只是 `droppedTotal` 不再是从启动起的累计。
+聚合行 MUST 保留 `code`、`reason`、目标字段（`connectionId` 或 `sessionId` 与 `targetKind`）以及 `count`（本行代表的丢弃条数）与 `droppedTotal`（该组合的累计丢弃数）。`eventId` 与 `event` 取本批首条丢弃的事件，用于回答「丢的是哪条」；聚合行不声称本批只有该事件，`count > 1` 即表示它是首条。`EVENT_BACKLOG_DISCONNECTED` 只描述断开本身：被断开连接上尚未写出的帧仍逐条记 `EVENT_DROPPED`，经本条聚合，所以一次溢出产生一行断开日志，加至多约 log2(队列上限) 行聚合丢弃。这些丢弃的 `reason` 与客户端主动断开不同（`the connection was closed after an event backlog overflow` 对 `the target connection closed before the event was written`），运维据此区分「客户端走了」与「框架断开了它」。聚合只影响日志：`eventBacklog.dropped` 按断开计数（§6.6），探针读到的不是聚合值。聚合状态属于本连接层实例，重启即清零；同时活跃的（`reason`，目标 id）组合超过 4096 个时，最久未再丢弃的组合会被淘汰，其累计值随新桶从 1 重新计数——此时仍会立即记录该目标的每条新丢弃，只是 `droppedTotal` 不再是从启动起的累计。
 
 关闭时丢弃未写出事件的汇总日志为 `EVENT_BACKLOG_DISCARDED`，`reason` 取 `'shutdown'`，字段含 `count`、`connections`、`frames`、`bytes`（§3.8）。
 
