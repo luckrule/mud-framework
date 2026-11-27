@@ -26,8 +26,8 @@ export interface ConnectionHealth {
   readonly connections: number;
   readonly executor: ExecutorHealth;
   /**
-   * Event buffers across every connection and Session (SPEC 6.6). `dropped` is
-   * cumulative and counts overflow only, so a probe can tell sustained
+   * Event buffers across every connection and Session (SPEC 6.6). `dropped`
+   * counts connections closed for backlog, so a probe can tell sustained
    * backpressure from the one-off discard line a shutdown produces.
    */
   readonly eventBacklog: EventBacklogSnapshot;

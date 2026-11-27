@@ -42,12 +42,16 @@ describe('EventDropLog', () => {
     const { logger, lines } = recordingLogger();
     const log = new EventDropLog({ logger });
 
-    log.record({ eventId: 'e:0', reason: 'backlog' }, 'backlog', 'c1');
+    log.record(
+      { eventId: 'e:0', reason: 'no connection holds the session' },
+      'no connection holds the session',
+      'c1',
+    );
 
     expect(lines).toHaveLength(1);
     expect(lines[0]?.fields).toMatchObject({
       eventId: 'e:0',
-      reason: 'backlog',
+      reason: 'no connection holds the session',
       count: 1,
       droppedTotal: 1,
     });
@@ -59,7 +63,11 @@ describe('EventDropLog', () => {
     const log = new EventDropLog({ logger, now: clock.now });
 
     for (let i = 0; i < 1024; i += 1) {
-      log.record({ eventId: `e:${i}` }, 'backlog', 'c1');
+      log.record(
+        { eventId: `e:${i}` },
+        'no connection holds the session',
+        'c1',
+      );
     }
 
     // 1, 2, 4, ..., 1024: log2 growth, not 1024 lines.
@@ -82,9 +90,9 @@ describe('EventDropLog', () => {
     const { logger, lines } = recordingLogger();
     const log = new EventDropLog({ logger });
 
-    log.record({ eventId: 'a' }, 'backlog', 'c1');
-    log.record({ eventId: 'b' }, 'backlog', 'c2');
-    log.record({ eventId: 'c' }, 'no connection holds the session', 'c1');
+    log.record({ eventId: 'a' }, 'no connection holds the session', 'c1');
+    log.record({ eventId: 'b' }, 'no connection holds the session', 'c2');
+    log.record({ eventId: 'c' }, 'target connection is not available', 'c1');
 
     expect(lines).toHaveLength(3);
     expect(lines.map((line) => line.fields.eventId)).toEqual(['a', 'b', 'c']);
@@ -98,12 +106,16 @@ describe('EventDropLog', () => {
     // One line, then a long silence with a high cumulative count: without the
     // quiet reset the doubling rule would stay silent for a very long time.
     for (let i = 0; i < 8; i += 1) {
-      log.record({ eventId: `e:${i}` }, 'backlog', 'c1');
+      log.record(
+        { eventId: `e:${i}` },
+        'no connection holds the session',
+        'c1',
+      );
     }
     expect(lines).toHaveLength(4);
 
     clock.advance(60_000);
-    log.record({ eventId: 'later' }, 'backlog', 'c1');
+    log.record({ eventId: 'later' }, 'no connection holds the session', 'c1');
 
     expect(lines).toHaveLength(5);
     // The quiet drop is reported on its own, not folded into a batch that would
@@ -124,7 +136,11 @@ describe('EventDropLog', () => {
     // still reported once, so the cap costs memory, not diagnosability.
     const targets = 5000;
     for (let i = 0; i < targets; i += 1) {
-      log.record({ eventId: `e:${i}` }, 'backlog', `c${i}`);
+      log.record(
+        { eventId: `e:${i}` },
+        'no connection holds the session',
+        `c${i}`,
+      );
     }
     expect(lines).toHaveLength(targets);
     expect(lines.at(-1)?.fields.eventId).toBe(`e:${targets - 1}`);
@@ -132,7 +148,7 @@ describe('EventDropLog', () => {
     // A target evicted to make room is not silenced: its next drop starts a
     // fresh bucket and is reported at once, exactly as its first drop was.
     clock.advance(60_000);
-    log.record({ eventId: 'again' }, 'backlog', 'c0');
+    log.record({ eventId: 'again' }, 'no connection holds the session', 'c0');
 
     expect(lines).toHaveLength(targets + 1);
     expect(lines.at(-1)?.fields).toMatchObject({

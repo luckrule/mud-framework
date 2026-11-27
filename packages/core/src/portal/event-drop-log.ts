@@ -43,14 +43,14 @@ interface DropBucket {
 /**
  * Aggregates repeated `EVENT_DROPPED` lines per reason and target (SPEC 7.1).
  *
- * A slow reader makes every new event a drop, so one line per drop turns the
- * diagnostic channel into a second unbounded stream — the exact pressure the
- * event bounds exist to relieve. With a synchronous sink it is worse than
- * unbounded output: it blocks the event loop the drops are meant to keep
- * responsive. The first drop of a bucket is therefore written at once, and
- * later ones fold into a line each time the cumulative count doubles: the line
- * count follows log2(drops) while `count` and `droppedTotal` keep every drop
- * visible, so nothing is silent.
+ * A missing target or a closed connection can recur at emission rate when a
+ * room keeps broadcasting to Sessions nobody holds, so one line per drop turns
+ * the diagnostic channel into a second unbounded stream — the exact pressure
+ * the event bounds exist to relieve. With a synchronous sink it is worse than
+ * unbounded output: it blocks the event loop. The first drop of a bucket is
+ * therefore written at once, and later ones fold into a line each time the
+ * cumulative count doubles: the line count follows log2(drops) while `count`
+ * and `droppedTotal` keep every drop visible, so nothing is silent.
  *
  * A folded line keeps the batch's first `eventId` and `event` (the "which event
  * was dropped" answer) and adds `count` — how many drops this line stands for —
@@ -58,8 +58,9 @@ interface DropBucket {
  * fields a folded line would name no event at all; with the last one it would
  * attribute the whole batch to a single event id.
  *
- * Aggregation is logging only. `eventBacklog.dropped` still counts every
- * overflow drop exactly (SPEC 6.6), so a probe never reads an aggregate.
+ * Aggregation is logging only. A backlog overflow is not a drop stream: it
+ * closes one connection and writes one `EVENT_BACKLOG_DISCONNECTED` line
+ * (SPEC 3.8), so it does not go through this log.
  */
 export class EventDropLog {
   private readonly logger: Logger;

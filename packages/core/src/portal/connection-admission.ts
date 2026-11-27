@@ -1,10 +1,14 @@
-import { CONNECTION_LIMIT_CLOSE_CODE } from '../shared/close-codes.ts';
+import {
+  CONNECTION_LIMIT_CLOSE_CODE,
+  EVENT_BACKLOG_CLOSE_CODE,
+} from '../shared/close-codes.ts';
 import { messageOf } from '../shared/guards.ts';
 import {
   FRAMEWORK_QUEUE_FULL,
   FRAMEWORK_SHUTDOWN,
 } from '../shared/wire-codes.ts';
 import type { TransportConnection } from '../transport/types.ts';
+import type { BacklogOverflow } from './connection-events.ts';
 import type { LayerHost } from './connection-host.ts';
 import { reply } from './connection-reply.ts';
 import { ConnectionWriter } from './connection-writer.ts';
@@ -28,11 +32,12 @@ export const DEFAULT_MAX_QUEUED_PER_CONNECTION = 1000;
 export const DEFAULT_MAX_CONNECTIONS = 10_000;
 
 /**
- * SPEC 3.8: events allowed to wait in one buffer before new events are dropped.
- * The same bound applies to each connection's event queue and each Session's
- * pending queue. 1024 covers a burst a healthy transport is still draining while
- * capping the memory one slow reader can pin; events are best-effort, so a
- * deeper backlog is better dropped than buffered.
+ * SPEC 3.8: events allowed to wait in one buffer before the connection owning
+ * it is closed. The same bound applies to each connection's event queue and each
+ * Session's pending queue. 1024 covers a burst a healthy transport is still
+ * draining while capping the memory one slow reader can pin; a deeper backlog
+ * means the client is not reading, so the connection is closed rather than
+ * silently losing events.
  */
 export const DEFAULT_MAX_QUEUED_EVENTS = 1024;
 
@@ -79,6 +84,14 @@ export interface ConnectionState {
   readonly inFlight: Set<string>;
   /** Aborts only waiting work; an unfinished Session barrier survives it. */
   readonly closed: AbortController;
+  /**
+   * Set when this layer closed the connection itself because an event buffer
+   * overflowed (SPEC 3.8). The transport's `onDisconnect` still removes the
+   * route, but it must not cancel requests already executing: the contract
+   * keeps them running so their outcome is settled rather than turned into a
+   * cancellation nobody asked for. Their result simply fails to write.
+   */
+  backlogClosed: boolean;
 }
 
 /**
@@ -160,6 +173,7 @@ export function onConnect(
     queued: 0,
     inFlight: new Set(),
     closed: new AbortController(),
+    backlogClosed: false,
   };
   host.connections.set(connection.id, state);
   return Promise.resolve();
@@ -181,6 +195,66 @@ async function closeRefused(
       'refused connection could not be closed',
     );
   }
+}
+
+/**
+ * Closes the connection that owns an overflowing event buffer (SPEC 3.8).
+ *
+ * `close(1013)` is issued at once instead of waiting for the queue to drain:
+ * the queue is full because the client is not reading, so draining is waiting
+ * for the condition that caused the overflow. The overflow is not a client
+ * disconnect, so `backlogClosed` marks the state before the transport reports
+ * the close: `onDisconnect` must release the route and the queued frames but
+ * leave requests already executing alone, and let their result fail to write
+ * (`TRANSPORT_SEND_FAILED`).
+ *
+ * Best effort like `closeRefused`: a transport failure is logged rather than
+ * thrown, because there is no caller to hand it to and the connection is
+ * unusable either way.
+ *
+ * Returns false when this connection is already being closed for backlog: the
+ * caller then treats the frame as a closed-target drop instead of a second
+ * close, so a frame refused in that window is still reported rather than
+ * silently discarded.
+ */
+export function closeForBacklog(
+  host: AdmissionHost,
+  state: ConnectionState,
+  overflow: BacklogOverflow,
+): boolean {
+  if (state.backlogClosed) {
+    return false;
+  }
+  state.backlogClosed = true;
+  host.backlog.recordBacklogDisconnect();
+  host.logger.warn(
+    {
+      connectionId: state.connection.id,
+      ...(overflow.sessionId === undefined
+        ? {}
+        : { sessionId: overflow.sessionId }),
+      code: 'EVENT_BACKLOG_DISCONNECTED',
+      reason: 'event buffer reached its bound',
+      buffer: overflow.buffer,
+      eventId: overflow.eventId,
+      event: overflow.event,
+      queuedEvents: overflow.queuedEvents,
+      queuedEventBytes: overflow.queuedEventBytes,
+      maxQueuedEvents: overflow.maxQueuedEvents,
+      maxQueuedEventBytes: overflow.maxQueuedEventBytes,
+      closeCode: EVENT_BACKLOG_CLOSE_CODE,
+    },
+    'connection closed: server event backlog reached its bound',
+  );
+  void state.connection
+    .close(EVENT_BACKLOG_CLOSE_CODE, 'server event backlog is full')
+    .catch((error: unknown) => {
+      host.logger.warn(
+        { connectionId: state.connection.id, reason: messageOf(error) },
+        'connection could not be closed after an event backlog overflow',
+      );
+    });
+  return true;
 }
 
 export function refuseQueue(
@@ -280,6 +354,14 @@ export async function onDisconnect(
   // Only this connection's wait is released; other holders still wait for its
   // framework request completion, even when cancellation settles later.
   state.closed.abort();
+  if (state.backlogClosed) {
+    // The layer closed this connection itself (SPEC 3.8): requests already
+    // executing keep running and settle normally, because the contract keeps
+    // their terminal state unchanged. `inFlight` is not cleared here for the
+    // same reason — each request removes its own id when it settles. Queued
+    // event frames are cancelled by the writer's own abort path.
+    return;
+  }
   // SPEC 3.6 default policy: a connection closing mid-request cancels it. The
   // handler may still be running, but nobody can read its result, and letting
   // it commit would leave a state change the player never saw.

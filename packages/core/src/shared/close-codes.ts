@@ -10,3 +10,14 @@
  * the other, so the duplication is intentional.
  */
 export const CONNECTION_LIMIT_CLOSE_CODE = 1013;
+
+/**
+ * Close code passed to a Transport when the layer closes an admitted connection
+ * because one of its event buffers reached its bound (SPEC 3.8).
+ *
+ * The same number as the other two 1013 triggers, for the reason above: an
+ * admission refusal, a transport whose own send buffer is exhausted, and an
+ * event backlog are three separate policies. Naming one for another would let a
+ * change to one silently move the others.
+ */
+export const EVENT_BACKLOG_CLOSE_CODE = 1013;

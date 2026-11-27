@@ -20,6 +20,7 @@ import {
   DEFAULT_MAX_QUEUED_EVENTS,
   DEFAULT_MAX_QUEUED_EVENT_BYTES,
   DEFAULT_MAX_QUEUED_PER_CONNECTION,
+  closeForBacklog,
   onConnect as admitConnection,
   onDisconnect as disconnectConnection,
 } from './connection-admission.ts';
@@ -294,6 +295,8 @@ export class ConnectionLayer implements TransportHandlers {
       enqueue: (state, work, queued) => state.writer.submit(work, queued),
       queueEvent: (state, write) => state.writer.enqueue(write),
       cancelEvent: (state, write) => state.writer.cancel(write),
+      closeForBacklog: (state, overflow) =>
+        closeForBacklog(host, state, overflow),
       acceptingEvents: () => this.eventsOpen,
       sessionQueues: this.sessionQueues,
       sendTimeoutMs: this.sendTimeoutMs,

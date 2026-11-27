@@ -9,7 +9,12 @@ export interface EventBacklogSnapshot {
   readonly frames: number;
   /** Their encoded size, in the same unit as `maxQueuedEventBytes`. */
   readonly bytes: number;
-  /** Overflow drops since the layer started; shutdown discards do not count. */
+  /**
+   * Connections closed because a buffer reached its bound (SPEC 3.8), since the
+   * layer started; shutdown discards do not count. The field name is kept for
+   * the probe contract, but the meaning is a disconnect count, not an event
+   * count: an overflow no longer drops the event and keeps the connection.
+   */
   readonly dropped: number;
 }
 
@@ -36,7 +41,7 @@ export interface EventBacklogOptions {
 export class EventBacklog {
   private frameTotal = 0;
   private byteTotal = 0;
-  private droppedEvents = 0;
+  private backlogDisconnects = 0;
   private readonly buffers = new Set<ConnectionWriter>();
   private readonly logger: Logger;
   private readonly warnBytes: number;
@@ -89,8 +94,12 @@ export class EventBacklog {
     this.checkWarning();
   }
 
-  recordDrop(): void {
-    this.droppedEvents += 1;
+  /**
+   * Records one connection closed because a buffer reached its bound (SPEC
+   * 3.8). The snapshot's `dropped` reports this count.
+   */
+  recordBacklogDisconnect(): void {
+    this.backlogDisconnects += 1;
   }
 
   snapshot(): EventBacklogSnapshot {
@@ -98,7 +107,7 @@ export class EventBacklog {
       connections: this.buffers.size,
       frames: this.frameTotal,
       bytes: this.byteTotal,
-      dropped: this.droppedEvents,
+      dropped: this.backlogDisconnects,
     };
   }
 

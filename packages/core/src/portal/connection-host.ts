@@ -3,6 +3,7 @@ import type { Codec } from '../shared/codec.ts';
 import type { RequestExecutor } from '../shared/executor.ts';
 import type { ConnectionState } from './connection-admission.ts';
 import type {
+  BacklogOverflow,
   EventWrite,
   QueueEventResult,
   SessionEventQueue,
@@ -67,6 +68,17 @@ export interface LayerHost {
    * write's own bound decides when the serial slot is released.
    */
   readonly cancelEvent: (state: ConnectionState, write: EventWrite) => boolean;
+  /**
+   * Closes the connection owning an overflowing event buffer with `1013`
+   * (SPEC 3.8). Passed in rather than implemented here because the close has to
+   * mark the state before the transport reports the disconnect, so `onDisconnect`
+   * can tell a backlog close from a client leaving. Returns false when this
+   * connection is already being closed for backlog.
+   */
+  readonly closeForBacklog: (
+    state: ConnectionState,
+    overflow: BacklogOverflow,
+  ) => boolean;
   /**
    * False once the layer started stopping. Events are best-effort and the
    * buffers are discarded at that point, so a late event is not accepted

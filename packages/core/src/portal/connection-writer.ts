@@ -30,7 +30,7 @@ export interface QueuedRequestIdentity {
 }
 
 export interface ConnectionWriterOptions {
-  /** Frames allowed to wait on this connection before new ones are dropped. */
+  /** Frames allowed to wait on this connection before it is closed (SPEC 3.8). */
   readonly maxQueuedEvents: number;
   /** The same bound in encoded frame bytes. */
   readonly maxQueuedEventBytes: number;
@@ -123,9 +123,9 @@ export class ConnectionWriter {
   }
 
   /**
-   * Queues one encoded event frame behind the request work. Rejected at either
-   * bound instead of growing: the caller logs the drop, because only it knows
-   * which event was refused (SPEC 3.8).
+   * Queues one encoded event frame behind the request work. Refused at either
+   * bound instead of growing: the caller closes the connection, because only it
+   * knows which buffer overflowed and which connection owns it (SPEC 3.8).
    */
   enqueue(event: EventWrite): QueueEventResult {
     if (

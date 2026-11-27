@@ -28,10 +28,32 @@ export type EventDeliveryHost = Pick<
   | 'sessionQueues'
   | 'sendTimeoutMs'
   | 'dropLog'
+  | 'closeForBacklog'
 > & {
   /** Read-only: delivery resolves holders, it never admits or removes one. */
   readonly connections: ReadonlyMap<string, ConnectionState>;
 };
+
+/**
+ * One buffer that reached its bound and refused a frame (SPEC 3.8). The
+ * connection owning the buffer is closed with `1013`, so the observation is
+ * logged with the close rather than as a per-event drop.
+ */
+export interface BacklogOverflow {
+  /** Which buffer refused the frame; the other one is the bound's other scope. */
+  readonly buffer: 'connection' | 'session';
+  /** Frames already waiting in that buffer, including one being written. */
+  readonly queuedEvents: number;
+  /** Their encoded size, matching the bound's unit. */
+  readonly queuedEventBytes: number;
+  readonly maxQueuedEvents: number;
+  readonly maxQueuedEventBytes: number;
+  /** The refused event, kept so the line answers "which event caused this". */
+  readonly eventId: string;
+  readonly event: string;
+  /** The Session whose queue overflowed; absent for a connection queue. */
+  readonly sessionId?: string;
+}
 
 /** How one queued event frame's write turn ended. */
 export type EventOutcome =
@@ -46,7 +68,11 @@ export type EventOutcome =
   /** The layer started stopping while the frame was still queued. */
   | 'discarded';
 
-/** What a buffer did with one offered frame (SPEC 3.8). */
+/**
+ * What a buffer did with one offered frame (SPEC 3.8). A refusal is not a
+ * dropped event: the buffer is full, so the caller disconnects the connection
+ * that owns it instead of silently discarding the frame.
+ */
 export type QueueEventResult =
   | { readonly accepted: true }
   | {
@@ -185,12 +211,25 @@ export function deliverServerEvent(
     });
     const queued = host.queueEvent(state, write);
     if (!queued.accepted) {
-      logBacklogDrop(
-        host,
-        event,
-        { targetKind: 'connection', connectionId: target.connectionId },
-        queued,
-      );
+      const closing = host.closeForBacklog(state, {
+        buffer: 'connection',
+        queuedEvents: queued.queuedEvents,
+        queuedEventBytes: queued.queuedEventBytes,
+        maxQueuedEvents: host.maxQueuedEvents,
+        maxQueuedEventBytes: host.maxQueuedEventBytes,
+        eventId: event.eventId,
+        event: event.event,
+      });
+      if (!closing) {
+        // The connection was already being closed for backlog, so this frame
+        // has nowhere to go: a closed target is a drop (SPEC 3.8).
+        warnDropped(
+          host,
+          event,
+          { targetKind: 'connection', connectionId: target.connectionId },
+          'the target connection closed before the event was written',
+        );
+      }
       return Promise.resolve();
     }
     return watchQueuedWrite(host, state, write, event, {
@@ -350,12 +389,30 @@ function enqueueSessionEvent(
     queuedEvents >= host.maxQueuedEvents ||
     queuedEventBytes + encoded.bytes > host.maxQueuedEventBytes
   ) {
-    logBacklogDrop(
-      host,
-      event,
-      { targetKind: 'session', sessionId },
-      { queuedEvents, queuedEventBytes },
-    );
+    // The Session queue is full, so the Session's current holder is the
+    // connection to disconnect (SPEC 3.8). Without a holder there is no
+    // connection to close, and the event is a target-missing drop.
+    const holder = holderState(host, sessionId, event);
+    if (holder !== undefined) {
+      const closing = host.closeForBacklog(holder, {
+        buffer: 'session',
+        queuedEvents,
+        queuedEventBytes,
+        maxQueuedEvents: host.maxQueuedEvents,
+        maxQueuedEventBytes: host.maxQueuedEventBytes,
+        eventId: event.eventId,
+        event: event.event,
+        sessionId,
+      });
+      if (!closing) {
+        warnDropped(
+          host,
+          event,
+          { targetKind: 'session', sessionId },
+          'the target connection closed before the event was written',
+        );
+      }
+    }
     return Promise.resolve();
   }
   const queue = existing ?? createSessionQueue(sessionId);
@@ -531,16 +588,28 @@ async function deliverToHolder(
   inHand.write = write;
   const queued = host.queueEvent(queuedFor, write);
   if (!queued.accepted) {
-    logBacklogDrop(
-      host,
-      event,
-      {
-        targetKind: 'session',
-        sessionId,
-        connectionId: queuedFor.connection.id,
-      },
-      queued,
-    );
+    const closing = host.closeForBacklog(queuedFor, {
+      buffer: 'connection',
+      queuedEvents: queued.queuedEvents,
+      queuedEventBytes: queued.queuedEventBytes,
+      maxQueuedEvents: host.maxQueuedEvents,
+      maxQueuedEventBytes: host.maxQueuedEventBytes,
+      eventId: event.eventId,
+      event: event.event,
+      sessionId,
+    });
+    if (!closing) {
+      warnDropped(
+        host,
+        event,
+        {
+          targetKind: 'session',
+          sessionId,
+          connectionId: queuedFor.connection.id,
+        },
+        'the target connection closed before the event was written',
+      );
+    }
     return 'dropped';
   }
   return watchQueuedWrite(host, queuedFor, write, event, {
@@ -752,39 +821,6 @@ async function writeEventFrame(
   if (written.status === 'rejected') {
     logSendFailure(host, event, connectionId, messageOf(written.error));
   }
-}
-
-/**
- * An event buffer reached one of its bounds, so this event was not accepted
- * (SPEC 3.8). The request that emitted it is unaffected: events are
- * best-effort, and the line is the only record of the drop.
- */
-function logBacklogDrop(
-  host: EventDeliveryHost,
-  event: ServerEvent,
-  target: DropTarget,
-  queued: { readonly queuedEvents: number; readonly queuedEventBytes: number },
-): void {
-  host.backlog.recordDrop();
-  // This is the path a slow reader drives at event rate, so it goes through the
-  // same aggregation as any other drop (SPEC 7.1). `droppedTotal` on the line is
-  // the log's running count for this target; `eventBacklog.dropped` above is the
-  // contract's exact total and is never aggregated.
-  host.dropLog.record(
-    {
-      eventId: event.eventId,
-      event: event.event,
-      ...target,
-      code: 'EVENT_DROPPED',
-      reason: 'backlog',
-      queuedEvents: queued.queuedEvents,
-      queuedEventBytes: queued.queuedEventBytes,
-      maxQueuedEvents: host.maxQueuedEvents,
-      maxQueuedEventBytes: host.maxQueuedEventBytes,
-    },
-    'backlog',
-    dropTargetId(target),
-  );
 }
 
 function logSendFailure(
