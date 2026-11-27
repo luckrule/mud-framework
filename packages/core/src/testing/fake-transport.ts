@@ -12,6 +12,8 @@ interface ConnectionState {
   hold?: HoldState;
   /** Set while a test makes this connection's writes throw; see `throwOnSend`. */
   throwWith?: Error;
+  /** Set while a test makes this connection's `close` reject; see `failClose`. */
+  closeFailure?: Error;
   /**
    * Set while a test withholds the disconnect a close implies; see
    * `deferCloseReport`. `pendingReport` remembers the close's reason.
@@ -165,6 +167,16 @@ export class FakeTransport implements Transport {
   }
 
   /**
+   * Makes `close` on `id` reject, as a socket that already died would. The
+   * connection stays open: a failed close is the case where the caller has no
+   * report to wait for and must not treat the connection as released.
+   */
+  failClose(id: string, error: Error): void {
+    this.assertStarted();
+    this.lookup(id).closeFailure = error;
+  }
+
+  /**
    * Withholds the `onDisconnect` a `close` would cause, so a test can observe
    * the window between the close call and its report. `reportClose` delivers it.
    *
@@ -238,6 +250,9 @@ export class FakeTransport implements Transport {
             return Promise.reject(new Error(`connection "${id}" is not open`));
           }
           const closeReason = reason ?? describeClose(code);
+          if (current.closeFailure !== undefined) {
+            return Promise.reject(current.closeFailure);
+          }
           this.closes.set(id, { code, reason: closeReason });
           if (current.deferReport === true) {
             // The socket is closed, but the report arrives later; the layer must

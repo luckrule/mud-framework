@@ -438,6 +438,39 @@ describe('ConnectionLayer event backlog bounds', () => {
     expect(h.transport.closedWith('c2')).toBeUndefined();
   });
 
+  test('reports a close that the transport refuses after an overflow', async () => {
+    const h = sessionHarness({
+      maxQueuedEvents: 1,
+      maxQueuedEventBytes: 1_000_000,
+    });
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+    h.transport.failClose('c1', new Error('socket already gone'));
+
+    h.controlled.emit(connectionEvent('e:0'));
+    h.controlled.emit(connectionEvent('e:1'));
+    await tick();
+
+    // The overflow is still recorded, and the failed close is a warning rather
+    // than an escaping rejection: there is no caller to hand it to.
+    expect(disconnectLines(h.logs())).toHaveLength(1);
+    const failed = h
+      .logs()
+      .filter(
+        (line) =>
+          line.msg ===
+          'connection could not be closed after an event backlog overflow',
+      );
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({
+      level: 'warn',
+      connectionId: 'c1',
+      reason: 'socket already gone',
+    });
+    expect(h.layer.health().eventBacklog.dropped).toBe(1);
+  });
+
   test('reports every event buffer and counts only backlog disconnects as dropped', async () => {
     const payload = { text: 'held' };
     const frameBytes = Buffer.byteLength(
