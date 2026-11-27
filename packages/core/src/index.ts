@@ -21,6 +21,11 @@
  * (in this package or another) wraps it the same way, keeping a logging fault
  * out of framework control flow (SPEC 7.1).
  *
+ * `ServerSwitchError` is exported because `IpcExecutor.switchTo` rejects with it:
+ * a caller needs the failure stage and whether the old Server is still serving
+ * to decide whether a retry is safe, and matching on the message text cannot
+ * answer that.
+ *
  * `unmetRequirements` is exported so a caller can pre-check an Extension's
  * storage requirements against backend capabilities without starting a Server
  * (SPEC 4.3), using the same comparison the Server applies at startup. That
@@ -112,6 +117,14 @@ export type { EventBacklogSnapshot } from './portal/event-backlog.ts';
 export { ConnectionLayer } from './portal/connection-layer.ts';
 export type { IpcExecutorOptions } from './portal/executor/ipc-executor-options.ts';
 export { IpcExecutor } from './portal/executor/ipc-executor.ts';
+export type {
+  SwitchFailureDetails,
+  SwitchFailureStage,
+} from './portal/executor/version-switch.ts';
+export {
+  ServerSwitchError,
+  isServerSwitchError,
+} from './portal/executor/version-switch.ts';
 export type { ServerExitInfo, SpawnedServer } from './ipc/spawn-port.ts';
 export type { ServerProcessOptions } from './server/server-process.ts';
 export {

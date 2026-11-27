@@ -44,6 +44,8 @@ Portal 发 `hello`；Server 回 `prepared`（带 `pid`），此时不创建后�
 
 任何失败路径都有界，且在被放弃进程的退出未确认前不会启动新进程。`close()` 在切换期间必须能中止：放弃替换进程后继续关闭原进程，对任何退出未确认的进程执行有界的“等退出 → kill → 再等”；仍无法确认时保留写者屏障并 reject 关闭，不能只记 warn 后宣称成功。等待超时但退出 Promise 仍 pending 时，迟到确认只允许在执行器尚可恢复时解除屏障；一次性 `observed: false` 不提供自动恢复依据。
 
+失败以 `ServerSwitchError` reject，`details` 描述它留下的状态：`stage`（`preparing` / `retiring` / `activating`）、`previousServing`、`rolledBack`、`promoted`、`closeAborted`、`pendingExits`，以及 spawn 捕获到时的 `stderrTail`。这三个阶段与上面的边界一一对应，不是另起的分类；`closeAborted` 时 `previousServing` 与 `rolledBack` 都为 false，因为收尾已交给 `close()`，重试会被拒绝。理由：调用方要判断“能否立刻再切一次”，而文本 message 只说明失败原因，说明不了残留状态。
+
 ### 边界：父进程监控与 `ready`
 
 父进程存活轮询从 `begin()` 起就安装，与 `ready` 无关：一个父进程已被 `SIGKILL` 的 prepared 进程若无人告知，会永久存活。定时器 unref，不单独延长进程寿命。prepare 阶段父进程消失时直接失败退出，不触碰存储：`run()` 停在 `await activation.promise`，必须 reject `activation` 并关闭链路；若父进程在 `starting` 期间消失，由在途的 `startServer` 关闭刚打开的后端，不发送 `ready`。
