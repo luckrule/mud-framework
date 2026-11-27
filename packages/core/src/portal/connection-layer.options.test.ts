@@ -3,8 +3,10 @@ import { describe, expect, test } from 'bun:test';
 import { scriptedExecutor } from '../testing/connection-layer.ts';
 import { FakeTransport } from '../testing/fake-transport.ts';
 import type { Transport } from '../transport/types.ts';
-import { DEFAULT_EVENT_SEND_TIMEOUT_MS } from './connection-events.ts';
-import { ConnectionLayer } from './connection-layer.ts';
+import {
+  ConnectionLayer,
+  UNDECLARED_EVENT_SEND_TIMEOUT_MS,
+} from './connection-layer.ts';
 import type { ConnectionLayerOptions } from './connection-layer.ts';
 
 function createLayer(
@@ -177,7 +179,7 @@ describe('ConnectionLayer event send bound resolution', () => {
 
     // WsTransport accepts Infinity to disable its own send timeout, so the
     // layer must not adopt it as the event bound.
-    expect(eventSendTimeoutOf(layer)).toBe(DEFAULT_EVENT_SEND_TIMEOUT_MS);
+    expect(eventSendTimeoutOf(layer)).toBe(UNDECLARED_EVENT_SEND_TIMEOUT_MS);
   });
 
   test('ignores an unusable declaration (0, negative, NaN)', () => {
@@ -185,13 +187,13 @@ describe('ConnectionLayer event send bound resolution', () => {
       const layer = layerWithTransport(
         new FakeTransport({ sendTimeoutMs: declared }),
       );
-      expect(eventSendTimeoutOf(layer)).toBe(DEFAULT_EVENT_SEND_TIMEOUT_MS);
+      expect(eventSendTimeoutOf(layer)).toBe(UNDECLARED_EVENT_SEND_TIMEOUT_MS);
     }
   });
 
-  test('falls back to the default when the transport declares nothing', () => {
+  test('falls back to the undeclared bound when the transport declares nothing', () => {
     expect(eventSendTimeoutOf(createLayer())).toBe(
-      DEFAULT_EVENT_SEND_TIMEOUT_MS,
+      UNDECLARED_EVENT_SEND_TIMEOUT_MS,
     );
   });
 });

@@ -123,16 +123,6 @@ export class EventWrite {
 const MAX_SESSION_REDELIVERIES = 1;
 
 /**
- * Backstop for one event write, used when the layer has no explicit option and
- * the transport declares no usable send bound (SPEC 3.8). A transport that
- * bounds its own sends normally settles first, so this only covers one that
- * never settles a send: without it, such a send would pin the Session's serial
- * slot forever, and an abort signal is not a substitute — the frame may already
- * be on the wire.
- */
-export const DEFAULT_EVENT_SEND_TIMEOUT_MS = 30_000;
-
-/**
  * Delivers one Server event (ADR-0008), best-effort: every failure is a warn
  * line, none is thrown, and nothing is buffered for a retry.
  *

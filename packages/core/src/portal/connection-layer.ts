@@ -27,7 +27,6 @@ import type {
   SessionEventQueue,
 } from './connection-events.ts';
 import {
-  DEFAULT_EVENT_SEND_TIMEOUT_MS,
   deliverServerEvent,
   discardSessionQueues,
 } from './connection-events.ts';
@@ -57,6 +56,20 @@ const DEFAULT_STOP_TIMEOUT_MS = 10_000;
  * caller gave up first".
  */
 const EXECUTOR_CLOSE_SLACK_MS = 1000;
+
+/**
+ * The bound on one Server event write when neither the caller nor the transport
+ * supplies one (SPEC 3.8). `Transport.sendTimeoutMs` is optional, so this case
+ * is reachable: without a bound, a send that never settles would pin the
+ * Session's serial slot forever. 30s matches the WS transport's own default, so
+ * a stack that declares nothing behaves as it did before the declaration
+ * existed.
+ *
+ * Named for the case it covers rather than as a general default: delivery
+ * receives the resolved number and must not carry a second fallback that could
+ * disagree with this one.
+ */
+export const UNDECLARED_EVENT_SEND_TIMEOUT_MS = 30_000;
 
 export interface ConnectionLayerOptions {
   transport: Transport;
@@ -118,7 +131,7 @@ export interface ConnectionLayerOptions {
   /**
    * Upper bound on one Server event write. Defaults to the transport's declared
    * `Transport.sendTimeoutMs` when that is a finite number of at least 1, and
-   * to `DEFAULT_EVENT_SEND_TIMEOUT_MS` otherwise. Taking the transport's own
+   * to `UNDECLARED_EVENT_SEND_TIMEOUT_MS` otherwise. Taking the transport's own
    * bound keeps the Session's serial slot held until the transport itself would
    * fail the write, so the slot is never released while a frame is still being
    * written (SPEC 3.8). An explicit value here wins over the declaration and
@@ -533,7 +546,7 @@ export class ConnectionLayer implements TransportHandlers {
 
 /**
  * Resolves the bound on one event write: the layer's explicit option first,
- * then the transport's declaration, then the default.
+ * then the transport's declaration, then this layer's default.
  *
  * A transport's value is only taken when it is usable (finite and at least 1).
  * `Infinity` is legal for a transport — `WsTransport` accepts it to disable its
@@ -550,7 +563,7 @@ function resolveEventSendTimeoutMs(options: ConnectionLayerOptions): number {
   if (declared !== undefined && Number.isFinite(declared) && declared >= 1) {
     return declared;
   }
-  return DEFAULT_EVENT_SEND_TIMEOUT_MS;
+  return UNDECLARED_EVENT_SEND_TIMEOUT_MS;
 }
 
 function assertPositiveInteger(value: unknown, name: string): void {
