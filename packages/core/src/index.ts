@@ -120,11 +120,11 @@ export { IpcExecutor } from './portal/executor/ipc-executor.ts';
 export type {
   SwitchFailureDetails,
   SwitchFailureStage,
-} from './portal/executor/version-switch.ts';
+} from './portal/executor/switch-failure.ts';
 export {
   ServerSwitchError,
   isServerSwitchError,
-} from './portal/executor/version-switch.ts';
+} from './portal/executor/switch-failure.ts';
 export type { ServerExitInfo, SpawnedServer } from './ipc/spawn-port.ts';
 export type { ServerProcessOptions } from './server/server-process.ts';
 export {

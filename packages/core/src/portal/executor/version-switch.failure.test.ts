@@ -11,9 +11,9 @@ import {
   successMessage,
   waitFor,
 } from '../../testing/ipc-executor.ts';
+import { isServerSwitchError, ServerSwitchError } from './switch-failure.ts';
+import type { SwitchFailureDetails } from './switch-failure.ts';
 import { labelledServer, switchable } from './version-switch.support.ts';
-import { isServerSwitchError, ServerSwitchError } from './version-switch.ts';
-import type { SwitchFailureDetails } from './version-switch.ts';
 
 /** The structured failure of a rejection, failing the test if it carries none. */
 async function failureDetails(
