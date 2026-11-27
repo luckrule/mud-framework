@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import { Buffer } from 'node:buffer';
 
+import { withDeadline } from 'mud-framework-test-support';
+
 import { EVENT_BACKLOG_CLOSE_CODE } from '../shared/close-codes.ts';
 import type { ServerEvent } from '../shared/events.ts';
 import { parseFrame, sleep, tick } from '../testing/common.ts';
@@ -371,6 +373,70 @@ describe('ConnectionLayer event backlog bounds', () => {
       h.logs().filter((line) => line.code === 'FRAMEWORK_SHUTDOWN'),
     ).toEqual([]);
 
+    await h.transport.reportClose('c1');
+    await tick();
+  });
+
+  test('drops a request parked on the Session barrier when the overflow closes it', async () => {
+    const h = sessionHarness({
+      maxQueuedEvents: 1,
+      maxQueuedEventBytes: 1_000_000,
+    });
+    await h.layer.start();
+    // c2 binds s1 and starts a request that never returns, so its terminal
+    // barrier stays open. c1 then takes s1 over and its request parks on that
+    // barrier — the path `startAfterGate` reports `false` from, which is
+    // different from waiting in the connection's own writer queue.
+    h.transport.connect('c2');
+    await h.transport.receive('c2', '{"id":"b2","method":"bind"}');
+    const hanging = h.transport.receive('c2', '{"id":"h2","method":"hang"}');
+    await tick();
+
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"b1","method":"bind"}');
+    h.transport.deferCloseReport('c1');
+    const parked = h.transport.receive('c1', '{"id":"p1","method":"work"}');
+    await tick();
+    expect(h.controlled.started).toEqual(['bind', 'hang', 'bind']);
+
+    // c1's event queue overflows while its request waits on the Session.
+    h.controlled.emit(connectionEvent('e:0', 'c1'));
+    h.controlled.emit(connectionEvent('e:1', 'c1'));
+    await tick();
+    expect(h.transport.closedWith('c1')).toMatchObject({
+      code: EVENT_BACKLOG_CLOSE_CODE,
+    });
+
+    await withDeadline(
+      parked,
+      1000,
+      'the backlog close should release the Session wait',
+    );
+    await tick();
+
+    // The wait ended because the layer aborted the connection, not because the
+    // Session became available: the parked request never ran, and the refusal
+    // did not claim a shutdown that is not happening.
+    expect(h.controlled.requests.map((request) => request.method)).toEqual([
+      'bind',
+      'hang',
+      'bind',
+    ]);
+    expect(
+      h.controlled.requests.map((request) => request.clientRequestId),
+    ).not.toContain('p1');
+    expect(
+      h.logs().filter((line) => line.code === 'FRAMEWORK_SHUTDOWN'),
+    ).toEqual([]);
+    expect(
+      h
+        .logs()
+        .filter((line) => line.msg === 'request dropped before start')
+        .map((line) => line.reason),
+    ).toEqual([BACKLOG_CLOSED_REASON]);
+
+    h.controlled.release();
+    await hanging;
     await h.transport.reportClose('c1');
     await tick();
   });
