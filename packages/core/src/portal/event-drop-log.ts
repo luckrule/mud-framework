@@ -58,9 +58,11 @@ interface DropBucket {
  * fields a folded line would name no event at all; with the last one it would
  * attribute the whole batch to a single event id.
  *
- * Aggregation is logging only. A backlog overflow is not a drop stream: it
- * closes one connection and writes one `EVENT_BACKLOG_DISCONNECTED` line
- * (SPEC 3.8), so it does not go through this log.
+ * Aggregation is logging only. The disconnect an overflow causes is one
+ * `EVENT_BACKLOG_DISCONNECTED` line (SPEC 3.8) and does not go through this log;
+ * the frames still queued on the closed connection do, because each of them is
+ * an unwritten event whose loss the operator has to see. Their count is bounded
+ * by the queue bound, so the aggregation turns them into a handful of lines.
  */
 export class EventDropLog {
   private readonly logger: Logger;

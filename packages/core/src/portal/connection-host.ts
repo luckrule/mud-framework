@@ -37,7 +37,8 @@ export interface LayerHost {
   readonly backlog: EventBacklog;
   /**
    * Aggregates repeated `EVENT_DROPPED` lines per reason and target (SPEC 7.1).
-   * A slow reader drops at event rate, so one line per drop would make the
+   * A missing target or a closed connection can recur at emission rate — a room
+   * broadcasting to Sessions nobody holds — so one line per drop would make the
    * diagnostic channel a second unbounded stream.
    */
   readonly dropLog: EventDropLog;

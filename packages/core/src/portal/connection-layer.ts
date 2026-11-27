@@ -61,8 +61,9 @@ const DEFAULT_STOP_TIMEOUT_MS = 10_000;
 const EXECUTOR_CLOSE_SLACK_MS = 1000;
 
 /**
- * Slack added to a transport's declared send bound to form this layer's event
- * write bound (SPEC 3.8).
+ * Slack added to a transport's declared send bound to form this layer's write
+ * bound (SPEC 3.8): one downlink write, an event frame and a response frame
+ * alike.
  *
  * The transport's bound is the one that can explain a stalled write: its own
  * timeout logs the more specific failure and terminates the connection. Two
@@ -77,19 +78,20 @@ export const EVENT_SEND_SLACK_MS = 250;
 
 /**
  * Largest delay `setTimeout` accepts. Bun clamps anything above it to 1ms, so a
- * derived bound that overflowed this would release the Session's serial slot
- * almost at once — the opposite of what the bound is for (SPEC 3.8). Exported
- * so the option tests can name the same ceiling rather than hard-code it.
+ * derived bound that overflowed this would release the writer almost at once —
+ * the opposite of what the bound is for (SPEC 3.8). Exported so the option
+ * tests can name the same ceiling rather than hard-code it.
  */
 export const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 /**
- * The bound on one Server event write when neither the caller nor the transport
- * supplies one (SPEC 3.8). `Transport.sendTimeoutMs` is optional, so this case
- * is reachable: without a bound, a send that never settles would pin the
- * Session's serial slot forever. 30s matches the WS transport's own default, so
- * a stack that declares nothing behaves as it did before the declaration
- * existed.
+ * The bound on one downlink write when neither the caller nor the transport
+ * supplies one (SPEC 3.8): an event frame and a response frame alike.
+ * `Transport.sendTimeoutMs` is optional, so this case is reachable: without a
+ * bound, a send that never settles would pin the Session's serial slot, and with
+ * it the connection's single writer and the Session's terminal barrier, forever.
+ * 30s matches the WS transport's own default, so a stack that declares nothing
+ * behaves as it did before the declaration existed.
  *
  * Named for the case it covers rather than as a general default: delivery
  * receives the resolved number and must not carry a second fallback that could
