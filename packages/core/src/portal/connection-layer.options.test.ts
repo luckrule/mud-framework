@@ -5,6 +5,7 @@ import { FakeTransport } from '../testing/fake-transport.ts';
 import type { Transport } from '../transport/types.ts';
 import {
   ConnectionLayer,
+  EVENT_SEND_SLACK_MS,
   UNDECLARED_EVENT_SEND_TIMEOUT_MS,
 } from './connection-layer.ts';
 import type { ConnectionLayerOptions } from './connection-layer.ts';
@@ -174,15 +175,22 @@ describe('ConnectionLayer option validation', () => {
 });
 
 describe('ConnectionLayer event send bound resolution', () => {
-  test('takes the transport declared sendTimeoutMs when no option is set', () => {
+  test('bounds the write strictly wider than the transport declaration', () => {
+    // The transport's own timeout is the verdict that explains a stalled write,
+    // so this layer's fallback must outlast it rather than race it. Equal
+    // bounds would let the less specific "did not settle" win (SPEC 3.8).
     const layer = layerWithTransport(
       new FakeTransport({ sendTimeoutMs: 60_000 }),
     );
 
-    expect(eventSendTimeoutOf(layer)).toBe(60_000);
+    const bound = eventSendTimeoutOf(layer);
+    expect(bound).toBeGreaterThan(60_000);
+    expect(bound).toBe(60_000 + EVENT_SEND_SLACK_MS);
   });
 
-  test('prefers the explicit layer option over the transport declaration', () => {
+  test('an explicit layer option replaces the transport derivation verbatim', () => {
+    // The option is the layer's own bound, not a competitor to the transport's:
+    // it takes no slack, so an operator who asks for 25ms gets 25ms.
     const layer = new ConnectionLayer({
       transport: new FakeTransport({ sendTimeoutMs: 60_000 }),
       executor: scriptedExecutor([]).executor,
@@ -198,7 +206,8 @@ describe('ConnectionLayer event send bound resolution', () => {
     );
 
     // WsTransport accepts Infinity to disable its own send timeout, so the
-    // layer must not adopt it as the event bound.
+    // layer must not adopt it as the event bound. The fallback is complete on
+    // its own and takes no slack: there is no transport timer to outlast.
     expect(eventSendTimeoutOf(layer)).toBe(UNDECLARED_EVENT_SEND_TIMEOUT_MS);
   });
 
@@ -215,5 +224,16 @@ describe('ConnectionLayer event send bound resolution', () => {
     expect(eventSendTimeoutOf(createLayer())).toBe(
       UNDECLARED_EVENT_SEND_TIMEOUT_MS,
     );
+  });
+
+  test('keeps a near-maximum declaration inside the usable timer range', () => {
+    // Adding slack to a declaration near the 32-bit timer ceiling would push
+    // the delay past it, and Bun clamps that to 1ms — the widest bound would
+    // become the narrowest. The sum is capped instead.
+    const layer = layerWithTransport(
+      new FakeTransport({ sendTimeoutMs: 2_147_483_600 }),
+    );
+
+    expect(eventSendTimeoutOf(layer)).toBe(2_147_483_647);
   });
 });

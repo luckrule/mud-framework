@@ -3,9 +3,16 @@ import { Buffer } from 'node:buffer';
 
 import { withDeadline } from 'mud-framework-test-support';
 
+import { createJsonLogger } from '../logging/json-logger.ts';
 import type { ServerEvent } from '../shared/events.ts';
 import { parseFrame, sleep, tick } from '../testing/common.ts';
 import { sessionHarness } from '../testing/connection-layer.ts';
+import type {
+  Transport,
+  TransportConnection,
+  TransportHandlers,
+} from '../transport/types.ts';
+import { ConnectionLayer, EVENT_SEND_SLACK_MS } from './connection-layer.ts';
 
 function event(overrides: Partial<ServerEvent> = {}): ServerEvent {
   return {
@@ -60,6 +67,50 @@ function sendFailures(
  */
 function sessionQueuesOf(layer: unknown): Map<string, unknown> {
   return (layer as { sessionQueues: Map<string, unknown> }).sessionQueues;
+}
+
+/**
+ * A transport that bounds its own sends the way `WsTransport` does: the write
+ * rejects when its timer expires, and the timer is armed one microtask after
+ * the layer registered its own — the ordering any implementation has when it
+ * queues the frame before arming. That ordering is what makes an equal bound
+ * lose to the layer's fallback.
+ */
+class TransportWithOwnSendTimeout implements Transport {
+  readonly sendTimeoutMs: number;
+  private handlers: TransportHandlers | undefined;
+
+  constructor(sendTimeoutMs: number) {
+    this.sendTimeoutMs = sendTimeoutMs;
+  }
+
+  start(handlers: TransportHandlers): Promise<void> {
+    this.handlers = handlers;
+    return Promise.resolve();
+  }
+
+  stop(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  connect(id: string): void {
+    const connection: TransportConnection = {
+      id,
+      send: () =>
+        Promise.resolve().then(
+          () =>
+            new Promise<void>((_resolve, reject) => {
+              setTimeout(() => {
+                reject(
+                  new Error(`send timed out after ${this.sendTimeoutMs}ms`),
+                );
+              }, this.sendTimeoutMs);
+            }),
+        ),
+      close: () => Promise.resolve(),
+    };
+    void this.handlers?.onConnect(connection);
+  }
 }
 
 describe('ConnectionLayer server events', () => {
@@ -452,9 +503,11 @@ describe('ConnectionLayer server events', () => {
     write.release();
   });
 
-  test('uses the transport declared send bound when the layer has no option', async () => {
+  test('derives the send bound from the transport declaration, wider by the slack', async () => {
     // 30ms is well under the default bound, so only adopting the declaration
-    // can release the slot this quickly.
+    // can release the slot this quickly. The layer's bound must outlast it: at
+    // 30ms the transport's own timeout would have fired, so waiting past that
+    // point without a failure proves the derived bound is strictly wider.
     const h = sessionHarness({ transportSendTimeoutMs: 30 });
     await h.layer.start();
     h.transport.connect('c1');
@@ -464,15 +517,59 @@ describe('ConnectionLayer server events', () => {
     h.controlled.emit(sessionEvent('req-1:0', 'stuck'));
     await write.entered;
     await sleep(60);
+    // Past the transport's own bound and still held: this layer has not given
+    // up on the write yet, which is what lets the transport's verdict land
+    // first when its timer does fire.
+    expect(sendFailures(h.logs())).toEqual([]);
 
+    await sleep(30 + EVENT_SEND_SLACK_MS);
     const failures = sendFailures(h.logs());
     expect(failures).toHaveLength(1);
     expect(failures[0]).toMatchObject({
       eventId: 'req-1:0',
       stage: 'send',
-      reason: 'the transport did not settle the write within 30ms',
+      reason: `the transport did not settle the write within ${30 + EVENT_SEND_SLACK_MS}ms`,
     });
     write.release();
+  });
+
+  test('the transport own timeout is the verdict that gets logged', async () => {
+    // The regression this guards: at equal bounds both timers fire on the same
+    // tick and this layer's wins, so the log says "did not settle" and the
+    // operator cannot tell a stalled socket from a broken transport timeout.
+    // A real transport arms its timer after this layer's, so the transport's
+    // message must be the one that lands.
+    const lines: string[] = [];
+    const logger = createJsonLogger({ sink: (line) => lines.push(line) });
+    const listeners = new Set<(event: ServerEvent) => void>();
+    const transport = new TransportWithOwnSendTimeout(30);
+    const layer = new ConnectionLayer({
+      transport,
+      logger,
+      executor: {
+        start: () => Promise.resolve(),
+        execute: () => Promise.resolve({ ok: true, result: null }),
+        onEvent: (listener) => {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        },
+        cancel: () => Promise.resolve(),
+        close: () => Promise.resolve(),
+        health: () => ({ state: 'ready', ready: true }),
+      },
+    });
+    await layer.start();
+    transport.connect('c1');
+
+    for (const listener of listeners) {
+      listener(event());
+    }
+    await sleep(30 + EVENT_SEND_SLACK_MS + 60);
+
+    const failures = sendFailures(lines.map(parseFrame));
+    expect(failures).toHaveLength(1);
+    expect(failures[0]?.reason).toBe('send timed out after 30ms');
+    await layer.stop();
   });
 
   test('an explicit layer option outranks the transport declared bound', async () => {

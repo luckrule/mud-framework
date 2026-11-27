@@ -60,6 +60,28 @@ const DEFAULT_STOP_TIMEOUT_MS = 10_000;
 const EXECUTOR_CLOSE_SLACK_MS = 1000;
 
 /**
+ * Slack added to a transport's declared send bound to form this layer's event
+ * write bound (SPEC 3.8).
+ *
+ * The transport's bound is the one that can explain a stalled write: its own
+ * timeout logs the more specific failure and terminates the connection. Two
+ * equal bounds race instead, and when this layer's timer wins the log says only
+ * "the transport did not settle the write" — the operator cannot tell a stalled
+ * socket from a broken transport timeout. Making this bound strictly wider
+ * leaves the transport's verdict observable. Same order as
+ * `SHUTDOWN_ACK_SLACK_MS`: enough for timer granularity and event-loop lag
+ * between the two registrations, negligible against a send bound.
+ */
+export const EVENT_SEND_SLACK_MS = 250;
+
+/**
+ * Largest delay `setTimeout` accepts. Bun clamps anything above it to 1ms, so a
+ * derived bound that overflowed this would release the Session's serial slot
+ * almost at once — the opposite of what the bound is for (SPEC 3.8).
+ */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+/**
  * The bound on one Server event write when neither the caller nor the transport
  * supplies one (SPEC 3.8). `Transport.sendTimeoutMs` is optional, so this case
  * is reachable: without a bound, a send that never settles would pin the
@@ -69,7 +91,9 @@ const EXECUTOR_CLOSE_SLACK_MS = 1000;
  *
  * Named for the case it covers rather than as a general default: delivery
  * receives the resolved number and must not carry a second fallback that could
- * disagree with this one.
+ * disagree with this one. No slack is added here: nothing else bounds the
+ * write, so there is no competing timer to lose to and the default is the only
+ * verdict available.
  */
 export const UNDECLARED_EVENT_SEND_TIMEOUT_MS = 30_000;
 
@@ -143,12 +167,19 @@ export interface ConnectionLayerOptions {
   maxConnections?: number;
   /**
    * Upper bound on one Server event write. Defaults to the transport's declared
-   * `Transport.sendTimeoutMs` when that is a finite number of at least 1, and
-   * to `UNDECLARED_EVENT_SEND_TIMEOUT_MS` otherwise. Taking the transport's own
-   * bound keeps the Session's serial slot held until the transport itself would
-   * fail the write, so the slot is never released while a frame is still being
-   * written (SPEC 3.8). An explicit value here wins over the declaration and
-   * must be a positive finite number.
+   * `Transport.sendTimeoutMs` plus `EVENT_SEND_SLACK_MS` when that declaration
+   * is a finite number of at least 1, and to
+   * `UNDECLARED_EVENT_SEND_TIMEOUT_MS` otherwise. Deriving the bound from the
+   * transport keeps the Session's serial slot held until the transport itself
+   * would fail the write, so the slot is never released while a frame is still
+   * being written (SPEC 3.8). The slack makes this bound strictly wider than the
+   * transport's, so a stalled write is reported by the transport's own timeout
+   * rather than by this layer's fallback.
+   *
+   * An explicit value here is the layer's own bound and wins over the
+   * declaration; no slack is added to it, because it replaces the derivation
+   * rather than competing with a transport timer it was meant to outlast. Must
+   * be a positive finite number.
    *
    * It bounds the write, not the disconnect: once a frame is being written an
    * abort does not release the Session's serial slot, because the bytes may
@@ -574,13 +605,26 @@ export class ConnectionLayer implements TransportHandlers {
 
 /**
  * Resolves the bound on one event write: the layer's explicit option first,
- * then the transport's declaration, then this layer's default.
+ * then the transport's declaration plus `EVENT_SEND_SLACK_MS`, then this
+ * layer's default.
  *
  * A transport's value is only taken when it is usable (finite and at least 1).
  * `Infinity` is legal for a transport — `WsTransport` accepts it to disable its
  * own send timeout — but it must not become this bound: an unbounded wait would
  * pin the Session's serial slot forever, the very failure the bound prevents.
  * Such a declaration counts as "no declaration" and falls back to the default.
+ * The fallback is a complete bound of its own, so it takes no slack: nothing
+ * else bounds the write, and there is no transport timer whose verdict the
+ * slack would preserve.
+ *
+ * An explicit option is used verbatim. It replaces the derivation rather than
+ * standing beside it, so it carries no slack; a caller that wants the
+ * transport's bound kept observable leaves the option unset.
+ *
+ * The derived sum is capped at the largest usable timer delay. A transport may
+ * declare a value close to that ceiling, and the addition would push it past
+ * the point where `setTimeout` clamps the delay to 1ms — turning the widest
+ * possible bound into the narrowest one.
  */
 function resolveEventSendTimeoutMs(options: ConnectionLayerOptions): number {
   if (options.eventSendTimeoutMs !== undefined) {
@@ -589,7 +633,7 @@ function resolveEventSendTimeoutMs(options: ConnectionLayerOptions): number {
   }
   const declared = options.transport.sendTimeoutMs;
   if (declared !== undefined && Number.isFinite(declared) && declared >= 1) {
-    return declared;
+    return Math.min(declared + EVENT_SEND_SLACK_MS, MAX_TIMER_DELAY_MS);
   }
   return UNDECLARED_EVENT_SEND_TIMEOUT_MS;
 }

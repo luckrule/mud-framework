@@ -176,7 +176,7 @@ Handler 可以为一个请求声明要发送的事件（ADR-0008）。`ctx.emit(
 
 - 目标 Connection 不存在或已关闭、目标 Session 当前没有 holder 时，事件 MUST 被丢弃并记录 warn（`EVENT_DROPPED`）；编码失败或传输写失败时同样丢弃并记录 `TRANSPORT_SEND_FAILED`。MUST NOT 因失败而缓冲或重试，也不得让请求失败。
 - Session 目标的收件人按实际写出时的当前 holder 解析：排队期间 takeover 会改投新 holder，至多重投递一次，再次变化即丢弃。
-- 同一 Session 的 session 目标事件 MUST 按发射序串行投递：后一条必须等前一条写出或丢弃后才开始，因此 takeover 不改变同一收件 Connection 上这些事件之间的顺序。投递分两段，只有第一段可取消：**queued**（尚未开始写出）时旧连接被移除或 abort，该事件丢弃（`EVENT_DROPPED`，reason 指明写出前连接已关闭）并立即释放串行位；**writing**（已开始写出）时 abort MUST NOT 提前释放串行位，必须等实际写结果（成功或传输失败）结算后再释放，写失败记 `TRANSPORT_SEND_FAILED` 而不是 `EVENT_DROPPED`，因为帧可能已写出。写出本身必须有界：传输发送受其 `sendTimeoutMs` 约束，底层发送 Promise 不保证 settle 时以发送超时为上界，不得用 abort 信号代替。这个写出上界优先取连接层的显式 `eventSendTimeoutMs` 配置，其次取传输声明的单帧发送上界（§5.2），最后取默认值；传输声明不可用（例如 `Infinity`）时按未声明处理，回退到默认值。
+- 同一 Session 的 session 目标事件 MUST 按发射序串行投递：后一条必须等前一条写出或丢弃后才开始，因此 takeover 不改变同一收件 Connection 上这些事件之间的顺序。投递分两段，只有第一段可取消：**queued**（尚未开始写出）时旧连接被移除或 abort，该事件丢弃（`EVENT_DROPPED`，reason 指明写出前连接已关闭）并立即释放串行位；**writing**（已开始写出）时 abort MUST NOT 提前释放串行位，必须等实际写结果（成功或传输失败）结算后再释放，写失败记 `TRANSPORT_SEND_FAILED` 而不是 `EVENT_DROPPED`，因为帧可能已写出。写出本身必须有界：传输发送受其 `sendTimeoutMs` 约束，底层发送 Promise 不保证 settle 时以发送超时为上界，不得用 abort 信号代替。这个写出上界的取值顺序是：连接层的显式 `eventSendTimeoutMs` 配置原样采用；否则取传输声明的单帧发送上界（§5.2）加一段固定余量；传输声明不可用（例如 `Infinity`）时按未声明处理，回退到默认值。余量不是给传输更多时间，而是让连接层的界严格宽于传输的界：两者等值时连接层的兜底计时器与传输自己的计时器几乎同时到期，且常先触发，日志便只剩「传输没有按承诺 settle」，看不出是传输卡死还是传输的超时机制本身失效。只有连接层的界更宽，传输自己的失败判定才是可观测的那个。默认值不加余量：此时没有传输计时器可让位，默认值本身就是唯一判定。显式配置也不加余量：它替换推导结果，而不是与传输计时器竞争。
 - 结果发送失败时，该请求的全部事件 MUST 跳过并记录；请求的成功状态不变。
 - 事件帧之间的发射序按投递路径界定：同一 Session 的 session 目标事件由按 Session 的串行队列保证，同一 Connection 上的 connection 目标事件按发射序写出；connection 目标与 session 目标之间、不同 Connection 之间不承诺发射序。结果帧与事件帧之间的相对顺序见本节“写出调度与有界缓冲”。
 - 事件是附加通道：MUST NOT 改变请求的终态、超时、取消、重放、Session 屏障或关闭语义。
@@ -260,7 +260,7 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 
 Transport MUST 对每个连接的发站缓冲设上限。缓冲耗尽时 MUST 显式失败并终止该连接，不得让未写出的数据无界积压，也不得静默丢弃。单条发送的超时只约束“已接受的帧迟迟写不出去”，MUST NOT 用它代替容量上限：慢客户端可以在超时前持续制造积压。传输实现 MAY 在出站缓冲耗尽时以 close code `1013`（Try Again Later）关闭该连接；这与 §6.1 的准入拒绝使用同一码值，但触发条件不同（已准入连接的服务不可用，而非准入拒绝），传输实现可以映射为本协议的等价语义。
 
-Transport MAY 暴露自己的单帧发送上界（`Transport.sendTimeoutMs`）。暴露时框架用它给 Server 事件的写出设界，保证同一 Session 的串行位不会早于传输自身失败而释放（§3.8）。该字段可选，未暴露或值不可用（例如 `Infinity`）时框架按自己的配置与默认值处理。
+Transport MAY 暴露自己的单帧发送上界（`Transport.sendTimeoutMs`）。暴露时框架用它给 Server 事件的写出设界，保证同一 Session 的串行位不会早于传输自身失败而释放（§3.8）。框架的界取该值加一段固定余量，使其严格宽于传输的界，从而让传输自己的超时判定成为可观测的那个（§3.8）。该字段可选，未暴露或值不可用（例如 `Infinity`）时框架按自己的配置与默认值处理。
 
 `TransportConnection.id` 在连接层实例的生命周期内 MUST 唯一：连接断开后，同一 id MUST NOT 被新连接复用。连接层以该 id 维护活跃连接、Session 路由、请求入口查找与事件投递；复用会让迟到入站消息落到替换连接，或让本应发给旧连接的事件误投到替换连接。需要重连语义时，传输 MUST 铸造新 id（默认 WS 传输的 UUID 满足此约束）。连接层按连接对象身份忽略迟到的旧断线事件，但按 id 投递的事件无法区分新旧，因此唯一性由传输保证。
 
