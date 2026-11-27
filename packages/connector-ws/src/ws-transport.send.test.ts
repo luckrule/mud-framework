@@ -11,8 +11,8 @@ import { SEND_BACKLOG_CLOSE_CODE } from './close-codes.ts';
 import {
   captureLogger,
   first,
-  firstPending,
   floodConnection,
+  lastPending,
   rawClient,
   safeStop,
   startTransport,
@@ -416,11 +416,22 @@ describe('WsTransport sends', () => {
       await until(() => recorded.connected.length === 1, 'onConnect');
       const flood = floodConnection(first(recorded.connected));
       await settle();
-      const blocked = firstPending(flood);
+      // The queue tail, not the head: Bun accepts the frame that fills the
+      // socket buffer and holds it until `drain`, and a disconnect can deliver
+      // `drain` before `close`, so the head may resolve instead of reject.
+      // Everything behind it can only be written after the head clears.
+      const pending = flood.filter((entry) => entry.state() === 'pending');
+      // A lone pending frame could be that written head, which `drain` may
+      // release; the sample is only sound with more queued behind it.
+      expect(pending.length).toBeGreaterThan(1);
+      const blocked = lastPending(flood);
       expect(blocked.state()).toBe('pending');
 
       socket.destroy();
-      await until(() => blocked.state() !== 'pending', 'the blocked send');
+      await until(() => blocked.state() !== 'pending', 'the queued send');
+      // A resolve would mean the frame reached the socket before the
+      // disconnect, so it could not show the close draining the queue.
+      expect(blocked.state()).toBe('rejected');
 
       const error = blocked.error();
       expect(error?.message).toMatch(/closed/);

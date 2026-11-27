@@ -183,9 +183,16 @@ export function floodConnection(connection: TransportConnection): Tracked[] {
   return sent;
 }
 
-/** The oldest unsettled send: the queue head, which settles first. */
-export function firstPending(sent: readonly Tracked[]): Tracked {
-  const pending = sent.find((entry) => entry.state() === 'pending');
+/**
+ * The newest unsettled send: the queue tail. It is the frame most likely to
+ * still be unsent — every payload ahead of it must clear first — so a test
+ * that disconnects the client can rely on it staying queued. The queue head is
+ * a poor choice: Bun accepts the frame that fills the buffer (`-1`) and holds
+ * it until `drain`, and a disconnect can deliver `drain` before `close`, which
+ * resolves that frame instead of rejecting it.
+ */
+export function lastPending(sent: readonly Tracked[]): Tracked {
+  const pending = sent.findLast((entry) => entry.state() === 'pending');
   if (pending === undefined) {
     throw new Error('expected at least one pending send');
   }
