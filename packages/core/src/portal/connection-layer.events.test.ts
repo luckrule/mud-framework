@@ -544,6 +544,35 @@ describe('ConnectionLayer server events', () => {
     });
   });
 
+  test('a disconnect never leaves a route pointing at an untracked connection', async () => {
+    const h = sessionHarness();
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"1","method":"bind"}');
+
+    // A Session-addressed event landing in the same turn as the disconnect must
+    // see a released route, not a route whose connection is already gone: the
+    // "holder is not tracked" branch has no reachable path and this pins it.
+    await h.transport.disconnect('c1');
+    h.controlled.emit(sessionEvent('req-1:0', 'after disconnect'));
+    await tick();
+
+    const dropped = dropLines(h.logs());
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]).toMatchObject({
+      eventId: 'req-1:0',
+      targetKind: 'session',
+      sessionId: 's1',
+      reason: 'no connection holds the session',
+    });
+    // No line ever reports the stale-route reason.
+    expect(
+      h
+        .logs()
+        .filter((line) => line.reason === 'the session holder is not tracked'),
+    ).toEqual([]);
+  });
+
   test('drops a connection target that is gone', async () => {
     const h = sessionHarness();
     await h.layer.start();
