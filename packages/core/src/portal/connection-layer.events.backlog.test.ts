@@ -29,6 +29,25 @@ function dropLines(
   return lines.filter((line) => line.code === 'EVENT_DROPPED');
 }
 
+function highLines(
+  lines: Record<string, unknown>[],
+): Record<string, unknown>[] {
+  return lines.filter((line) => line.code === 'EVENT_BACKLOG_HIGH');
+}
+
+/** Wire size of the event frame a test emits with payload `'x'`. */
+function eventBytes(eventId: string): number {
+  return Buffer.byteLength(
+    JSON.stringify({
+      kind: 'event',
+      eventId,
+      event: 'note',
+      payload: 'x',
+    }),
+    'utf8',
+  );
+}
+
 function frameLabels(frames: readonly (string | Uint8Array)[]): unknown[] {
   return frames.map(parseFrame).map((frame) => frame.id ?? frame.eventId);
 }
@@ -575,5 +594,180 @@ describe('ConnectionLayer event backlog bounds', () => {
       bytes: 0,
       dropped: 0,
     });
+  });
+});
+
+describe('ConnectionLayer aggregate backlog warning', () => {
+  test('warns once when the aggregate crosses the threshold and stays crossed', async () => {
+    const bytes = eventBytes('e:0');
+    const h = sessionHarness({
+      maxQueuedEvents: 100,
+      maxQueuedEventBytes: 1_000_000,
+      eventBacklogWarnBytes: bytes * 2,
+    });
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+
+    // e:0 is on the wire and held; e:1 and e:2 pile up behind it. The second
+    // accepted frame is what reaches the threshold, and the third must not
+    // report again.
+    const held = h.transport.holdSends('c1');
+    h.controlled.emit(sessionEvent('e:0', 'x'));
+    h.controlled.emit(sessionEvent('e:1', 'x'));
+    h.controlled.emit(sessionEvent('e:2', 'x'));
+    await held.entered;
+    await tick();
+
+    const warnings = highLines(h.logs());
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatchObject({
+      bytes: bytes * 2,
+      frames: 2,
+      activeConnections: 1,
+      warnBytes: bytes * 2,
+    });
+
+    // The warning is an observation: every accepted event is still written.
+    held.release();
+    await tick();
+    await tick();
+    await tick();
+    expect(
+      h.transport
+        .sentTo('c1')
+        .map(parseFrame)
+        .filter((frame) => frame.kind === 'event')
+        .map((frame) => frame.eventId),
+    ).toEqual(['e:0', 'e:1', 'e:2']);
+    expect(dropLines(h.logs())).toEqual([]);
+  });
+
+  test('rearms only after the aggregate drains to empty', async () => {
+    const bytes = eventBytes('e:0');
+    const h = sessionHarness({
+      maxQueuedEvents: 100,
+      maxQueuedEventBytes: 1_000_000,
+      eventBacklogWarnBytes: bytes * 2,
+    });
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+
+    const held = h.transport.holdSends('c1');
+    h.controlled.emit(sessionEvent('e:0', 'x'));
+    h.controlled.emit(sessionEvent('e:1', 'x'));
+    await held.entered;
+    await tick();
+    expect(highLines(h.logs())).toHaveLength(1);
+
+    // Draining everything ends the episode; nothing is logged for the recovery
+    // itself, only for the next crossing.
+    held.release();
+    await tick();
+    await tick();
+    await tick();
+    expect(h.layer.health().eventBacklog.frames).toBe(0);
+    expect(highLines(h.logs())).toHaveLength(1);
+
+    const again = h.transport.holdSends('c1');
+    h.controlled.emit(sessionEvent('e:2', 'x'));
+    h.controlled.emit(sessionEvent('e:3', 'x'));
+    await again.entered;
+    await tick();
+    expect(highLines(h.logs())).toHaveLength(2);
+
+    again.release();
+    await tick();
+    await tick();
+    await tick();
+  });
+
+  test('a backlog that stays above the threshold logs once across many frames', async () => {
+    const bytes = eventBytes('e:0');
+    const h = sessionHarness({
+      maxQueuedEvents: 100,
+      maxQueuedEventBytes: 1_000_000,
+      eventBacklogWarnBytes: bytes * 3,
+    });
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+
+    // Every Session frame is charged to the Session queue and then to the
+    // connection queue, so the total dips by one between the two calls. With a
+    // rearm rule of "below the threshold" that dip would re-arm and the next add
+    // would warn again, once per frame. Only draining to empty may re-arm.
+    const held = h.transport.holdSends('c1');
+    for (let i = 0; i < 20; i += 1) {
+      h.controlled.emit(sessionEvent(`e:${i}`, 'x'));
+    }
+    await held.entered;
+    await tick();
+    expect(highLines(h.logs())).toHaveLength(1);
+
+    held.release();
+    await tick();
+    await tick();
+    await tick();
+    await tick();
+    // The frames were all written: the warning never blocked a delivery.
+    expect(h.layer.health().eventBacklog.frames).toBe(0);
+    expect(highLines(h.logs())).toHaveLength(1);
+    expect(dropLines(h.logs())).toEqual([]);
+  });
+
+  test('a handoff between buffers does not rearm, so one frame logs once', async () => {
+    const bytes = eventBytes('e:0');
+    const h = sessionHarness({
+      maxQueuedEvents: 100,
+      maxQueuedEventBytes: 1_000_000,
+      eventBacklogWarnBytes: bytes,
+    });
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+
+    // One Session frame is the whole backlog. The pump shifts it out of the
+    // Session queue (total drops to zero) and queues it on the connection
+    // (total back to one) in two calls; rearming on the dip would fire again
+    // for every single frame.
+    const held = h.transport.holdSends('c1');
+    h.controlled.emit(sessionEvent('e:0', 'x'));
+    await held.entered;
+    await tick();
+    expect(highLines(h.logs())).toHaveLength(1);
+
+    held.release();
+    await tick();
+    await tick();
+    await tick();
+    expect(highLines(h.logs())).toHaveLength(1);
+  });
+
+  test('does not warn while the aggregate stays below the threshold', async () => {
+    const bytes = eventBytes('e:0');
+    const h = sessionHarness({
+      maxQueuedEvents: 100,
+      maxQueuedEventBytes: 1_000_000,
+      eventBacklogWarnBytes: bytes * 10,
+    });
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+
+    const held = h.transport.holdSends('c1');
+    for (let i = 0; i < 5; i += 1) {
+      h.controlled.emit(sessionEvent(`e:${i}`, 'x'));
+    }
+    await held.entered;
+    await tick();
+
+    expect(highLines(h.logs())).toEqual([]);
+    held.release();
+    await tick();
+    await tick();
+    await tick();
+    expect(highLines(h.logs())).toEqual([]);
   });
 });

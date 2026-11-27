@@ -43,6 +43,18 @@ export const DEFAULT_MAX_QUEUED_EVENTS = 1024;
  */
 export const DEFAULT_MAX_QUEUED_EVENT_BYTES = 4 * 1024 * 1024;
 
+/**
+ * Aggregate event bytes above which the layer warns once (SPEC 3.8, 6.6). The
+ * per-queue bounds only cap one slow reader; many slow readers add up to a
+ * number no single bound sees, and the default envelope (connection cap times
+ * per-queue bytes) is far larger than any machine. 1 GiB is two orders of
+ * magnitude above the few MiB a healthy backlog holds, so crossing it means the
+ * deployment is short of capacity rather than applying normal backpressure.
+ * Operators size it against container memory; the warning never rejects or
+ * drops an event.
+ */
+export const DEFAULT_EVENT_BACKLOG_WARN_BYTES = 1024 * 1024 * 1024;
+
 export interface ConnectionState {
   readonly connection: TransportConnection;
   /**

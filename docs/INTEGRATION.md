@@ -156,6 +156,7 @@ core 只提供同步快照，不提供 HTTP 端点（SPEC 6.6）。应用在自�
 - **`eventSendTimeoutMs`**：单条 Server 事件写出的上界（默认值见 `ConnectionLayerOptions`）。优先级是：该选项，其次传输暴露的 `Transport.sendTimeoutMs`（SPEC 5.2），最后默认值。传输声明可用时以它为准，串行位不会早于传输自身失败而释放；声明为 `Infinity` 等不可用值时按未声明处理，回退默认值，避免串行位无界等待。它约束的是写出，不是断线：帧已开始写出后，断线不会提前释放串行位，因为字节可能已经写出（SPEC 3.8）。
 - **`maxQueuedEvents` / `maxQueuedEventBytes`**：每一处事件缓冲的上界（帧数与编码后的字节数，默认值见 `ConnectionLayerOptions`），分别作用于每个 Connection 的事件队列和每个 Session 的待投递队列，不是每 Connection 汇总的上界。超出后丢弃新事件并记 `EVENT_DROPPED`（`reason: 'backlog'`），不影响请求终态（SPEC 3.8）。
 - **事件内存包络**：框架只保证每处缓冲各自有界，进程总量要部署方自己算。上界约为 `内存上界 ≈ maxConnections × maxQueuedEventBytes × 2`。乘 2 是因为每份上限有两处可以同时攒满：该 Connection 的事件队列一份，它那个 Session 的待投递队列一份；两处装的是不同的帧，同一帧不会被重复计数。Session 待投递队列的数量不超过连接数，没有 holder 的队列在投递时即被丢弃，所以这个乘积是量级估算而非严格上界。按默认值（10000 连接 × 4 MiB）该乘积是 80 GiB，远超常见机器；部署时必须按实际连接数与容器内存下调这两个选项之一，不能假设默认值安全。
+- **事件积压告警**：聚合事件缓冲总字节超过 `eventBacklogWarnBytes`（默认 1 GiB）时记一条 `EVENT_BACKLOG_HIGH` warn，带 `bytes`、`frames`、`activeConnections` 与 `warnBytes`。同一段积压只报一次，聚合总量回落到零才重新武装。这是观测信号，不拒绝也不丢弃任何事件；按容器内存的几分之一设置它，让它早于 OOM 触发。
 - **出站队列有界**：传输实现必须限制每个连接的出站缓冲；慢客户端积压到上限时会被关闭，而不是无限占用 Portal 内存（SPEC 5.2）。
 
 ### TLS 终止配置要点

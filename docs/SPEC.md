@@ -188,6 +188,7 @@ Handler 可以为一个请求声明要发送的事件（ADR-0008）。`ctx.emit(
 - 请求优先 MUST NOT 使事件无限期饥饿：事件的等待 MUST 被有界数量的请求工作限制。放行间隔是实现常量，不构成契约；请求优先只决定两者同时就绪时的顺序，公平规则只承诺有界等待，不承诺固定的请求与事件比例。
 - 残余边界：已经交给传输的那一帧事件无法被后续结果抢占；慢客户端上正在写的事件帧会让下一个结果多等一帧的写出时间。这是单写者的固有代价，不是保证。
 - 连接层开始关闭后 MUST 停止接收新事件；每一处事件缓冲内尚未写出的事件，以及 Session 泵已取出、尚未交给任何连接队列的在手帧，MUST 丢弃并记录一条汇总日志（`EVENT_BACKLOG_DISCARDED`，`reason: 'shutdown'`，字段见 §7.1）。在手帧只存在于 takeover 重投递的交接窗口，平时不构成额外缓冲。关闭只排空请求工作，不为事件消耗关闭预算。已经开始写出的事件帧不属于队列内待写项，MUST NOT 被抢占；它仍受写出上界约束，排在其后的请求最多等待该帧的写出上界。汇总日志的 `count`、`frames`、`bytes` 是被丢弃的帧数与字节数，`connections` 是持有被丢弃帧的 Connection 事件队列数；Session 待投递队列与在手帧不计入 `connections`。依据：事件是 best-effort，关闭不为不可靠通道延迟资源释放。
+- 全部缓冲的字节总数越过 `eventBacklogWarnBytes`（默认值见选项定义）时记一条 warn（`EVENT_BACKLOG_HIGH`，字段见 §7.1），同一段积压只报一次：只有聚合总量回落到零才重新武装。用「回落到阈值以下」重新武装不够，因为一帧从 Session 队列交接到 Connection 队列时会短暂从总量里减掉一次，阈值附近的一次交接就会让告警重新武装并按帧重复触发。这是观测，MUST NOT 据此拒绝、丢弃或延迟任何事件：全局硬界会让一个吵闹的发射方导致所有连接丢事件，把局部慢读放大成全局事件丢失。部署方按容器内存设置该阈值，使其早于 OOM 触发；框架不承诺该阈值之内一定不 OOM，它只是让容量不足可观测。
 
 安全边界：框架不对事件做授权。Handler 可以向任意 Session 声明事件；房间成员资格、可见性与内容过滤属于业务。
 
@@ -377,6 +378,8 @@ Server 事件的诊断日志（ADR-0008）分逐事件与批量两类。逐事�
 
 关闭时丢弃未写出事件的汇总日志为 `EVENT_BACKLOG_DISCARDED`，`reason` 取 `'shutdown'`，字段含 `count`、`connections`、`frames`、`bytes`（§3.8）。
 
+聚合事件缓冲越过告警阈值时为 `EVENT_BACKLOG_HIGH`，字段含 `bytes`（当前全部缓冲的字节总数）、`frames`、`activeConnections`（当前已准入连接数，与 §6.6 快照的 `connections` 不同：后者只数持有帧的队列）、`warnBytes`（生效的阈值）。该行只记录观测，不改变任何事件的投递结果（§3.8）。
+
 关闭时丢弃尚未开始的请求为逐条日志 `REQUEST_DROPPED_AT_SHUTDOWN`（§6.3 第 2 步），`reason` 指明排空预算内未开始，字段含 `requestId`、`method`、`clientRequestId`（无则省略）、`connectionId`。该 `code` 用于「从未从调度器队列取出的请求」；已取出但在 Session 屏障前被 abort 的请求走 `FRAMEWORK_SHUTDOWN`（§6.3 第 2 步、§7.2）。`TRANSPORT_CLOSED` 表示连接已不在，不用于关闭预算耗尽。边界：排空等待超时后 `doStop` 才清空连接表，此时仍停在 Session 屏障前的请求会看到连接不匹配，落 `TRANSPORT_CLOSED` 而不是 `FRAMEWORK_SHUTDOWN`；它同样不执行。
 
 ### 7.2 错误码
@@ -405,7 +408,7 @@ Server 事件的诊断日志（ADR-0008）分逐事件与批量两类。逐事�
 
 `TRANSPORT_SEND_FAILED` 的触发条件是“写不出去”，因此它结构上不可能送达客户端，只能作为日志字段被观察到。`TRANSPORT_CLOSED` 只作为请求终态的原因出现：请求因断线结束时连接已不在，没有可回写的通道，因此不承诺送达。两码仍是契约——它们回答“请求为什么结束”，删掉会让终态失去可枚举的说法。
 
-**仅日志诊断字段** 出现在日志的 `code` 字段里，用于定位，不发给客户端，也不构成 wire 契约：`CANCEL_LOST_TO_COMMIT`、`IPC_CHANNEL_CLOSED`、`SERVER_STARTUP_FAILED`、`DUPLICATE_REQUEST`、`INVALID_IPC_MESSAGE`、`EVENT_DROPPED`、`EVENT_SEND_FAILED`、`EVENTS_DROPPED`、`EVENT_LISTENER_FAILED`、`EVENT_BACKLOG_DISCARDED`、`REQUEST_DROPPED_AT_SHUTDOWN` 等。日志里的 `code` 只是一个字段名，取值不受本节约束。`EVENT_DROPPED`、`EVENT_BACKLOG_DISCARDED` 与 `REQUEST_DROPPED_AT_SHUTDOWN` 的 `reason` 与字段见 §7.1。
+**仅日志诊断字段** 出现在日志的 `code` 字段里，用于定位，不发给客户端，也不构成 wire 契约：`CANCEL_LOST_TO_COMMIT`、`IPC_CHANNEL_CLOSED`、`SERVER_STARTUP_FAILED`、`DUPLICATE_REQUEST`、`INVALID_IPC_MESSAGE`、`EVENT_DROPPED`、`EVENT_SEND_FAILED`、`EVENTS_DROPPED`、`EVENT_LISTENER_FAILED`、`EVENT_BACKLOG_DISCARDED`、`EVENT_BACKLOG_HIGH`、`REQUEST_DROPPED_AT_SHUTDOWN` 等。日志里的 `code` 只是一个字段名，取值不受本节约束。`EVENT_DROPPED`、`EVENT_BACKLOG_DISCARDED` 与 `REQUEST_DROPPED_AT_SHUTDOWN` 的 `reason` 与字段见 §7.1。
 
 `FRAMEWORK_` 前缀是示例惯例，不是强制格式。`INVALID_ENVELOPE`、`UNKNOWN_METHOD`、`INTERNAL_ERROR`、`TRANSPORT_SEND_FAILED` 没有该前缀；发布后错误码只增不删；改名等于换码，所以这些名字保持不变。
 

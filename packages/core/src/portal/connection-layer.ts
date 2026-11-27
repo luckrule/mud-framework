@@ -15,6 +15,7 @@ import type {
 } from '../transport/types.ts';
 import type { ConnectionState } from './connection-admission.ts';
 import {
+  DEFAULT_EVENT_BACKLOG_WARN_BYTES,
   DEFAULT_MAX_CONNECTIONS,
   DEFAULT_MAX_QUEUED_EVENTS,
   DEFAULT_MAX_QUEUED_EVENT_BYTES,
@@ -110,6 +111,17 @@ export interface ConnectionLayerOptions {
    */
   maxQueuedEventBytes?: number;
   /**
+   * Aggregate event bytes above which the layer warns once (SPEC 3.8). The
+   * per-queue bounds cap one slow reader each; this one observes what all of
+   * them together hold, which is what the deployment has to fit in memory.
+   * Defaults to `DEFAULT_EVENT_BACKLOG_WARN_BYTES`. Must be a positive integer.
+   *
+   * It is an observation, not an admission rule: crossing it logs
+   * `EVENT_BACKLOG_HIGH` and nothing else. A global cap here would let one loud
+   * emitter drop events for every connection, which is worse than the backlog.
+   */
+  eventBacklogWarnBytes?: number;
+  /**
    * Ceiling on each shutdown wait: draining in-flight requests, closing the
    * executor and stopping the transport (SPEC 6.3). Defaults to
    * `DEFAULT_STOP_TIMEOUT_MS`. Must be a finite number of at least 1.
@@ -165,7 +177,7 @@ export class ConnectionLayer implements TransportHandlers {
   /** Per-Session serialization and bounds for Server events (ADR-0008). */
   private readonly sessionQueues = new Map<string, SessionEventQueue>();
   /** Every event buffer reports here, so health sees detached queues too. */
-  private readonly backlog = new EventBacklog();
+  private readonly backlog: EventBacklog;
   /** Which connection holds which Session, and the reconnect gate (SPEC 3.2). */
   private readonly router: SessionRouter;
   /** One host object; each module takes the narrow `Pick` it declares. */
@@ -198,6 +210,9 @@ export class ConnectionLayer implements TransportHandlers {
     const maxQueuedEventBytes =
       options.maxQueuedEventBytes ?? DEFAULT_MAX_QUEUED_EVENT_BYTES;
     assertPositiveInteger(maxQueuedEventBytes, 'maxQueuedEventBytes');
+    const eventBacklogWarnBytes =
+      options.eventBacklogWarnBytes ?? DEFAULT_EVENT_BACKLOG_WARN_BYTES;
+    assertPositiveInteger(eventBacklogWarnBytes, 'eventBacklogWarnBytes');
     const shutdownTimeoutMs =
       options.shutdownTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
     assertFiniteAtLeastOne(shutdownTimeoutMs, 'shutdownTimeoutMs');
@@ -212,6 +227,11 @@ export class ConnectionLayer implements TransportHandlers {
     this.createRequestId = options.createRequestId ?? randomUUID;
     this.shutdownTimeoutMs = shutdownTimeoutMs;
     this.eventSendTimeoutMs = eventSendTimeoutMs;
+    this.backlog = new EventBacklog({
+      logger: this.logger,
+      warnBytes: eventBacklogWarnBytes,
+      liveConnections: () => this.connections.size,
+    });
     this.router = new SessionRouter({ logger: this.logger });
     const host: LayerHost = {
       codec: this.codec,
