@@ -1,3 +1,5 @@
+import type { ConnectionWriter } from './connection-writer.ts';
+
 /** Point-in-time totals reported by `ConnectionLayer.health()` (SPEC 6.6). */
 export interface EventBacklogSnapshot {
   /** Connection event queues that currently hold frames. */
@@ -10,11 +12,6 @@ export interface EventBacklogSnapshot {
   readonly dropped: number;
 }
 
-/** A buffer that can still hold frames when the layer starts stopping. */
-export interface EventBacklogBuffer {
-  discardQueued(): { readonly frames: number; readonly bytes: number };
-}
-
 /**
  * Aggregate of every event buffer the layer holds (SPEC 6.6). Buffers report
  * their own additions and removals instead of the layer walking the admission
@@ -25,21 +22,21 @@ export class EventBacklog {
   private frameTotal = 0;
   private byteTotal = 0;
   private droppedEvents = 0;
-  private readonly buffers = new Set<EventBacklogBuffer>();
+  private readonly buffers = new Set<ConnectionWriter>();
 
   /** Connection queues with frames, for the shutdown discard. */
-  get connectionBuffers(): ReadonlySet<EventBacklogBuffer> {
+  get connectionBuffers(): ReadonlySet<ConnectionWriter> {
     return this.buffers;
   }
 
-  connectionFrameAdded(buffer: EventBacklogBuffer, bytes: number): void {
+  connectionFrameAdded(buffer: ConnectionWriter, bytes: number): void {
     this.buffers.add(buffer);
     this.frameTotal += 1;
     this.byteTotal += bytes;
   }
 
   connectionFrameRemoved(
-    buffer: EventBacklogBuffer,
+    buffer: ConnectionWriter,
     bytes: number,
     empty: boolean,
   ): void {
