@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
 import { createJsonLogger } from '../logging/json-logger.ts';
+import { closeBudget } from '../shared/budget.ts';
 import type { ServerEvent } from '../shared/events.ts';
 import type { RequestExecutor } from '../shared/executor.ts';
 import { parseFrame, rejectionOf, sleep } from '../testing/common.ts';
@@ -10,7 +11,7 @@ import {
   scriptedTransport,
   sessionHarness,
 } from '../testing/connection-layer.ts';
-import { ConnectionLayer } from './connection-layer.ts';
+import { ConnectionLayer, MAX_TIMER_DELAY_MS } from './connection-layer.ts';
 
 function connectionEvent(eventId: string, connectionId = 'c1'): ServerEvent {
   return {
@@ -198,6 +199,56 @@ describe('ConnectionLayer shutdown (SPEC 6.3)', () => {
 
     gate.resolve();
     await request;
+  });
+
+  test('closes within a shutdown timeout at the timer ceiling', async () => {
+    // `closeBudgetMs` grows with the shutdown timeout, so at the ceiling the
+    // derived budget would exceed it and Bun would clamp the wait to 1ms: the
+    // executor would be abandoned on the tick `stop()` started waiting and the
+    // call would reject with a timeout that never happened. The derived value is
+    // truncated instead, so a close that finishes inside its own budget still
+    // settles and the shutdown succeeds.
+    const order: string[] = [];
+    const executor: RequestExecutor = {
+      start: () => Promise.resolve(),
+      onEvent: () => () => undefined,
+      execute: () => Promise.resolve({ ok: true, result: null }),
+      cancel: () => Promise.resolve(),
+      closeBudgetMs: closeBudget(MAX_TIMER_DELAY_MS),
+      close: async () => {
+        order.push('executor.close');
+        await sleep(20);
+      },
+      health: () => ({ state: 'ready', ready: true }),
+    };
+    const scripted = scriptedTransport(order);
+    const lines: string[] = [];
+    const layer = new ConnectionLayer({
+      transport: scripted.transport,
+      executor,
+      shutdownTimeoutMs: MAX_TIMER_DELAY_MS,
+      logger: createJsonLogger({ sink: (line) => lines.push(line) }),
+    });
+    await layer.start();
+
+    await layer.stop();
+
+    expect(order).toEqual([
+      'transport.start',
+      'executor.close',
+      'transport.stop',
+    ]);
+    expect(
+      lines
+        .map(parseFrame)
+        .filter(
+          (entry) =>
+            entry.msg ===
+              'executor close did not settle before the shutdown timeout' ||
+            entry.msg ===
+              'transport stop did not settle before the shutdown timeout',
+        ),
+    ).toEqual([]);
   });
 
   test('gives the executor at least its declared close budget', async () => {

@@ -159,7 +159,9 @@ export interface ConnectionLayerOptions {
    * its own `close()` (`RequestExecutor.closeBudgetMs`, which `IpcExecutor`
    * does), the executor step is given at least that long. The two used to be
    * independent, and a short value here made `stop()` return while the Server
-   * process was still draining and writing.
+   * process was still draining and writing. That derived budget is capped at
+   * the largest usable timer delay, because it grows with this value and would
+   * otherwise cross the ceiling this option itself is checked against.
    */
   shutdownTimeoutMs?: number;
   /**
@@ -478,12 +480,22 @@ export class ConnectionLayer implements TransportHandlers {
     // `stop()` return while the Server was still writing, which is the defect
     // this budget exists to prevent. A local executor declares nothing, so its
     // step keeps the layer's own timeout.
+    //
+    // Capped at the largest timer delay because this value is derived, not
+    // declared: `closeBudgetMs` grows with `shutdownTimeoutMs`, which may itself
+    // be that ceiling, so the sum would cross it and Bun would clamp the wait to
+    // 1ms — abandoning the executor at once and rejecting `stop()` on the tick
+    // it started. Truncating a derived bound is the honest repair; an explicit
+    // option is rejected instead (see `assertTimerDelay`).
     const executorBudgetMs =
       this.executor.closeBudgetMs === undefined
         ? timeoutMs
-        : Math.max(
-            timeoutMs,
-            this.executor.closeBudgetMs + EXECUTOR_CLOSE_SLACK_MS,
+        : Math.min(
+            Math.max(
+              timeoutMs,
+              this.executor.closeBudgetMs + EXECUTOR_CLOSE_SLACK_MS,
+            ),
+            MAX_TIMER_DELAY_MS,
           );
     let executorFailure: Error | undefined;
     const closed = await settleWithin(this.closeExecutor(), executorBudgetMs);
