@@ -186,8 +186,8 @@ export class ConnectionWriter {
     }
     this.running = true;
     // Deferred: no write starts inside the executor's event-listener stack.
-    // `drain` resets `running` in its own `finally`, so an escaping rejection
-    // cannot leave every later request and event on this connection stuck.
+    // `drain` resets `running` in its own `finally`; an escaping rejection is
+    // logged here, and work still queued resumes on the next submit.
     void Promise.resolve()
       .then(() => this.drain())
       .catch((error: unknown) => {
