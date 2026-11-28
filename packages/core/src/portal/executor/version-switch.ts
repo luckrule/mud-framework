@@ -330,13 +330,16 @@ export class VersionSwitch {
    *
    * The channel can close before the exit is recorded, and the loss is what
    * wakes the switch: without this the tail is read one turn too early and is
-   * empty exactly when the diagnostic matters. Only the self-death case waits —
-   * a timed-out barrier leaves a process that is still alive, and a switch must
-   * not sit on its rejection for that.
+   * empty exactly when the diagnostic matters. `exited` can already be true
+   * because the channel-close path sets it synchronously, while the promise
+   * still has the stderr pipe to drain; awaiting an already settled promise is
+   * immediate, so no case pays for the wait twice. Only the self-death case
+   * waits — a timed-out barrier leaves a process that is still alive, and a
+   * switch must not sit on its rejection for that.
    */
   private async awaitLostExit(op: SwitchOperation): Promise<void> {
     const staged = op.staged;
-    if (staged === undefined || op.stagedLost === undefined || staged.exited) {
+    if (staged === undefined || op.stagedLost === undefined) {
       return;
     }
     await settleWithin(staged.exitPromise, SWITCH_STDERR_GRACE_MS);

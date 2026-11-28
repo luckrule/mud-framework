@@ -1,5 +1,21 @@
 import type { SpawnedServer } from '../../ipc/spawn-port.ts';
 import type { Logger } from '../../logging/types.ts';
+import { assertTimerDelay } from '../connection-layer-options.ts';
+
+/** The executor's timer options, checked as whole milliseconds at construction. */
+export function assertExecutorTimerMs(
+  value: unknown,
+  name: string,
+): asserts value is number {
+  assertTimerDelay(value, name);
+  if (!Number.isInteger(value)) {
+    // A fractional delay is truncated by `setTimeout`, so the bound the caller
+    // configured would not be the bound the executor waits out.
+    throw new RangeError(
+      `${name} must be an integer number of milliseconds, got ${String(value)}`,
+    );
+  }
+}
 
 export interface IpcExecutorOptions {
   spawn: () => SpawnedServer;
@@ -18,9 +34,17 @@ export interface IpcExecutorOptions {
    * handling its first request must be counted as a crash, not as a healthy
    * run that reset the backoff. Otherwise "ready, then die on the first
    * request" restarts at `attempt === 0` (immediate) forever.
+   *
+   * An explicit value must be an integer number of milliseconds from 1 to
+   * `MAX_TIMER_DELAY_MS`, checked at construction. That range check does not
+   * cover this relation: the caller still owns it (ADR-0004).
    */
   stableResetMs?: number;
-  /** Grace period for a graceful shutdown before killing. Default 5000ms. */
+  /**
+   * Grace period for a graceful shutdown before killing. Default 5000ms.
+   * An explicit value must be an integer number of milliseconds from 1 to
+   * `MAX_TIMER_DELAY_MS`, checked at construction.
+   */
   shutdownTimeoutMs?: number;
   /**
    * Overall readiness budget for the first `start()`, including crash retries,
