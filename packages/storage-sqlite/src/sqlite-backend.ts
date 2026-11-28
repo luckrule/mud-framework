@@ -24,16 +24,17 @@ export interface SqliteBackendOptions {
   logger?: Logger;
 }
 
-interface JournalModeRow {
-  journal_mode: string;
-}
-
-interface TimeoutRow {
-  timeout: number;
-}
-
-interface ForeignKeysRow {
-  foreign_keys: number;
+interface PragmaCheck {
+  readonly pragma: string;
+  readonly set: string;
+  readonly read: string;
+  /** Readback column; `busy_timeout` reports `timeout`, not its own name. */
+  readonly key: string;
+  readonly expected: string | number;
+  /** `journal_mode` casing is not part of the contract. */
+  readonly foldCase: boolean;
+  /** Built from the raw readback, so the message keeps the value SQLite returned. */
+  readonly failure: (actual: string | number | undefined) => string;
 }
 
 interface TransactionScope {
@@ -198,53 +199,67 @@ export class SqliteBackend implements StorageBackend {
   }
 
   private configurePragmas(): void {
-    this.db.run(`PRAGMA journal_mode = ${this.requestedJournalMode}`);
-    const journal = this.db
-      .query<JournalModeRow, []>('PRAGMA journal_mode')
-      .get();
-    const journalMode = journal?.journal_mode;
-    this.requirePragma(
-      'journal_mode',
-      this.requestedJournalMode,
-      journalMode,
-      journalMode?.toLowerCase() === this.requestedJournalMode,
-      `SQLite journal_mode is ${String(journalMode)} but ` +
-        `${this.requestedJournalMode} was requested`,
-    );
-
-    this.db.run(`PRAGMA busy_timeout = ${this.busyTimeoutMs}`);
-    const timeout = this.db.query<TimeoutRow, []>('PRAGMA busy_timeout').get();
-    // Readback key is `timeout`, not `busy_timeout`.
-    this.requirePragma(
-      'busy_timeout',
-      this.busyTimeoutMs,
-      timeout?.timeout,
-      timeout?.timeout === this.busyTimeoutMs,
-      `SQLite busy_timeout is ${String(timeout?.timeout)} but ` +
-        `${this.busyTimeoutMs} was requested`,
-    );
-
-    this.db.run('PRAGMA foreign_keys = ON');
-    const foreignKeys = this.db
-      .query<ForeignKeysRow, []>('PRAGMA foreign_keys')
-      .get();
-    this.requirePragma(
-      'foreign_keys',
-      1,
-      foreignKeys?.foreign_keys,
-      foreignKeys?.foreign_keys === 1,
-      'SQLite foreign_keys could not be enabled',
-    );
+    const checks: readonly PragmaCheck[] = [
+      {
+        pragma: 'journal_mode',
+        set: `PRAGMA journal_mode = ${this.requestedJournalMode}`,
+        read: 'PRAGMA journal_mode',
+        key: 'journal_mode',
+        expected: this.requestedJournalMode,
+        foldCase: true,
+        failure: (actual) =>
+          `SQLite journal_mode is ${String(actual)} but ` +
+          `${this.requestedJournalMode} was requested`,
+      },
+      {
+        pragma: 'busy_timeout',
+        set: `PRAGMA busy_timeout = ${this.busyTimeoutMs}`,
+        read: 'PRAGMA busy_timeout',
+        key: 'timeout',
+        expected: this.busyTimeoutMs,
+        foldCase: false,
+        failure: (actual) =>
+          `SQLite busy_timeout is ${String(actual)} but ` +
+          `${this.busyTimeoutMs} was requested`,
+      },
+      {
+        pragma: 'foreign_keys',
+        set: 'PRAGMA foreign_keys = ON',
+        read: 'PRAGMA foreign_keys',
+        key: 'foreign_keys',
+        expected: 1,
+        foldCase: false,
+        failure: () => 'SQLite foreign_keys could not be enabled',
+      },
+    ];
+    for (const check of checks) {
+      this.db.run(check.set);
+      const row = this.db
+        .query<Record<string, string | number>, []>(check.read)
+        .get();
+      const raw = row?.[check.key];
+      this.requirePragma(
+        check.pragma,
+        check.expected,
+        raw,
+        check.foldCase,
+        check.failure(raw),
+      );
+    }
   }
 
   private requirePragma(
     pragma: string,
     expected: string | number,
     actual: string | number | undefined,
-    verified: boolean,
+    foldCase: boolean,
     failure: string,
   ): void {
-    if (verified) {
+    const matches =
+      foldCase && typeof actual === 'string'
+        ? actual.toLowerCase() === expected
+        : actual === expected;
+    if (matches) {
       return;
     }
     this.logger?.error(
