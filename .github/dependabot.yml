@@ -1,0 +1,56 @@
+version: 2
+
+updates:
+  # Bun dependencies are four exact-pinned dev tools. Routine minor/patch
+  # updates are grouped; majors arrive as individual PRs and are decided by a
+  # human running the full gate plus the benchmarks.
+  - package-ecosystem: "bun"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+      time: "04:00"
+      timezone: "Asia/Shanghai"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - "dependencies"
+    groups:
+      lint-toolchain:
+        patterns:
+          - "oxlint"
+          - "oxlint-tsgolint"
+          - "oxfmt"
+        update-types:
+          - "minor"
+          - "patch"
+      typescript:
+        patterns:
+          - "typescript"
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      # Must match .bun-version; bump both by hand so types and runtime cannot
+      # diverge. A bot PR cannot edit .bun-version, so it would be incomplete.
+      - dependency-name: "@types/bun"
+
+  # Workflow actions have no runtime coupling; weekly is cheap and keeps the
+  # supply-chain surface current.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "04:00"
+      timezone: "Asia/Shanghai"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "ci(deps)"
+    labels:
+      - "dependencies"
+      - "ci"
+    groups:
+      actions:
+        patterns:
+          - "*"
