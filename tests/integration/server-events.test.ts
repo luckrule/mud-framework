@@ -1,8 +1,6 @@
 import { describe, expect, test } from 'bun:test';
-import { join } from 'node:path';
 
 import {
-  isRecord,
   nextMessage,
   openClient,
   parseFrame,
@@ -10,77 +8,28 @@ import {
   withDeadline,
 } from 'mud-framework-test-support';
 
-import { WsTransport } from '../../packages/connector-ws/src/index.ts';
 import {
-  ConnectionLayer,
-  createJsonLogger,
-  IpcExecutor,
-  spawnBunServer,
-} from '../../packages/core/src/index.ts';
-import type { Logger } from '../../packages/core/src/index.ts';
+  callOnSocket,
+  createPortal,
+  stopQuietly,
+  urlOf,
+} from './support/two-process-harness.ts';
 
 /**
  * Server-initiated events over the real two-process path (ADR-0008): a WebSocket
  * client, a real Portal and a real Server child running the `extension-trial`
  * fixture. Assertions use the wire frames and Portal log lines only.
  */
-const FIXTURE = join(import.meta.dir, 'fixtures', 'server-entry.ts');
 const REQUEST_TIMEOUT_MS = 5000;
 
-interface Portal {
-  readonly layer: ConnectionLayer;
-  readonly transport: WsTransport;
-  readonly lines: Record<string, unknown>[];
-}
-
-function createPortal(databasePath: string): Portal {
-  const lines: Record<string, unknown>[] = [];
-  const logger: Logger = createJsonLogger({
-    level: 'debug',
-    sink: (line) => {
-      const parsed: unknown = JSON.parse(line);
-      if (isRecord(parsed)) {
-        lines.push(parsed);
-      }
-    },
-  });
-  const executor = new IpcExecutor({
-    spawn: () =>
-      spawnBunServer({
-        command: [
-          process.execPath,
-          'run',
-          FIXTURE,
-          'extension-trial',
-          databasePath,
-        ],
-      }),
+function portalFor(databasePath: string) {
+  return createPortal({
+    databasePath,
+    behavior: 'extension-trial',
     timeoutMs: REQUEST_TIMEOUT_MS,
     startTimeoutMs: 10_000,
-    logger,
+    logTransport: true,
   });
-  const transport = new WsTransport({ port: 0, logger });
-  const layer = new ConnectionLayer({ transport, executor, logger });
-  return { layer, transport, lines };
-}
-
-function urlOf(portal: Portal): string {
-  const port = portal.transport.port;
-  if (port === undefined) {
-    throw new Error('expected the transport to bind a port');
-  }
-  return `ws://127.0.0.1:${port}/`;
-}
-
-async function call(
-  socket: WebSocket,
-  request: { id: string; method: string; payload?: unknown },
-): Promise<Record<string, unknown>> {
-  const reply = nextMessage(socket);
-  socket.send(JSON.stringify(request));
-  return parseFrame(
-    await withDeadline(reply, REQUEST_TIMEOUT_MS, `reply to ${request.id}`),
-  );
 }
 
 /**
@@ -120,35 +69,10 @@ function frameReader(socket: WebSocket): {
   };
 }
 
-function serverPids(lines: readonly Record<string, unknown>[]): number[] {
-  const pids: number[] = [];
-  for (const line of lines) {
-    if (line.msg === 'server ready' && typeof line.pid === 'number') {
-      pids.push(line.pid);
-    }
-  }
-  return pids;
-}
-
-async function stopQuietly(portal: Portal): Promise<void> {
-  try {
-    await portal.layer.stop();
-  } catch {
-    // The test's own failure is the one to report.
-  }
-  for (const pid of serverPids(portal.lines)) {
-    try {
-      process.kill(pid, 'SIGKILL');
-    } catch {
-      // Already gone, which is the expected case.
-    }
-  }
-}
-
 describe('Server events over a real WebSocket and IPC', () => {
   test('sends the response first and the event right behind it', async () => {
     const database = tempDatabase({ prefix: 'mud-events-' });
-    const portal = createPortal(database.path);
+    const portal = portalFor(database.path);
     try {
       await portal.layer.start();
       const socket = await openClient(urlOf(portal), {
@@ -198,28 +122,36 @@ describe('Server events over a real WebSocket and IPC', () => {
 
   test('delivers an event to the connection that holds the Session', async () => {
     const database = tempDatabase({ prefix: 'mud-events-' });
-    const portal = createPortal(database.path);
+    const portal = portalFor(database.path);
     try {
       await portal.layer.start();
       const url = urlOf(portal);
       const alice = await openClient(url, { timeoutMs: REQUEST_TIMEOUT_MS });
       const bob = await openClient(url, { timeoutMs: REQUEST_TIMEOUT_MS });
       try {
-        const created = await call(alice, {
-          id: 'login',
-          method: 'player.create',
-          payload: { name: 'alice', sessionId: 'session-alice' },
-        });
+        const created = await callOnSocket(
+          alice,
+          {
+            id: 'login',
+            method: 'player.create',
+            payload: { name: 'alice', sessionId: 'session-alice' },
+          },
+          REQUEST_TIMEOUT_MS,
+        );
         expect(created.ok).toBe(true);
 
         // Registered before Bob's request: the event reaches Alice's socket
         // without any request of her own.
         const event = nextMessage(alice);
-        const reply = await call(bob, {
-          id: 'tell',
-          method: 'event.to-session',
-          payload: { sessionId: 'session-alice', text: 'hello' },
-        });
+        const reply = await callOnSocket(
+          bob,
+          {
+            id: 'tell',
+            method: 'event.to-session',
+            payload: { sessionId: 'session-alice', text: 'hello' },
+          },
+          REQUEST_TIMEOUT_MS,
+        );
         expect(reply).toEqual({
           id: 'tell',
           ok: true,
@@ -247,7 +179,7 @@ describe('Server events over a real WebSocket and IPC', () => {
 
   test('a failed request emits no event and the connection keeps working', async () => {
     const database = tempDatabase({ prefix: 'mud-events-' });
-    const portal = createPortal(database.path);
+    const portal = portalFor(database.path);
     try {
       await portal.layer.start();
       const socket = await openClient(urlOf(portal), {
@@ -256,8 +188,8 @@ describe('Server events over a real WebSocket and IPC', () => {
       try {
         // The reader is attached before the request, so it sees every frame the
         // failed request produces — including one arriving right behind the
-        // reply. `call` installs a one-shot listener, which would miss an event
-        // between two calls and let the fault escape the test.
+        // reply. `callOnSocket` installs a one-shot listener, which would miss
+        // an event between two calls and let the fault escape the test.
         const frames = frameReader(socket);
         socket.send(
           JSON.stringify({
@@ -288,11 +220,15 @@ describe('Server events over a real WebSocket and IPC', () => {
         expect(stray).toBeUndefined();
 
         // The connection still serves the next request.
-        const echo = await call(socket, {
-          id: 'after-fail',
-          method: 'echo',
-          payload: 'still-alive',
-        });
+        const echo = await callOnSocket(
+          socket,
+          {
+            id: 'after-fail',
+            method: 'echo',
+            payload: 'still-alive',
+          },
+          REQUEST_TIMEOUT_MS,
+        );
         expect(echo).toEqual({
           id: 'after-fail',
           ok: true,
@@ -309,35 +245,43 @@ describe('Server events over a real WebSocket and IPC', () => {
 
   test('drops an event with no target Session and keeps serving', async () => {
     const database = tempDatabase({ prefix: 'mud-events-' });
-    const portal = createPortal(database.path);
+    const portal = portalFor(database.path);
     try {
       await portal.layer.start();
       const socket = await openClient(urlOf(portal), {
         timeoutMs: REQUEST_TIMEOUT_MS,
       });
       try {
-        const reply = await call(socket, {
-          id: 'ghost',
-          method: 'event.to-session',
-          payload: { sessionId: 'session-ghost', text: 'nobody' },
-        });
+        const reply = await callOnSocket(
+          socket,
+          {
+            id: 'ghost',
+            method: 'event.to-session',
+            payload: { sessionId: 'session-ghost', text: 'nobody' },
+          },
+          REQUEST_TIMEOUT_MS,
+        );
         expect(reply).toEqual({
           id: 'ghost',
           ok: true,
           result: { emitted: true },
         });
 
-        const echo = await call(socket, {
-          id: 'after-ghost',
-          method: 'echo',
-          payload: 'still-alive',
-        });
+        const echo = await callOnSocket(
+          socket,
+          {
+            id: 'after-ghost',
+            method: 'echo',
+            payload: 'still-alive',
+          },
+          REQUEST_TIMEOUT_MS,
+        );
         expect(echo).toEqual({
           id: 'after-ghost',
           ok: true,
           result: 'still-alive',
         });
-        const dropped = portal.lines.filter(
+        const dropped = portal.logs.lines.filter(
           (line) => line.code === 'EVENT_DROPPED',
         );
         expect(dropped.some((line) => line.sessionId === 'session-ghost')).toBe(

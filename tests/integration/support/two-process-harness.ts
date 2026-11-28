@@ -7,6 +7,7 @@ import {
   openClient,
   parseFrame,
   sleep,
+  withDeadline,
 } from 'mud-framework-test-support';
 
 import { WsTransport } from '../../../packages/connector-ws/src/index.ts';
@@ -16,7 +17,10 @@ import {
   IpcExecutor,
   spawnBunServer,
 } from '../../../packages/core/src/index.ts';
-import type { Logger } from '../../../packages/core/src/index.ts';
+import type {
+  Logger,
+  SpawnedServer,
+} from '../../../packages/core/src/index.ts';
 
 /**
  * Exercises spawn, handshake, exit and restart using a real Server child rather
@@ -67,29 +71,26 @@ export function createPortal(options: {
   timeoutMs?: number;
   startTimeoutMs?: number;
   restartBackoffMs?: number;
+  /** Forward the captured logger to the transport as well. */
+  logTransport?: boolean;
 }): Portal {
   const logs = capturingLogger();
-  // `process.execPath` is the running Bun binary; the child must be Bun because
-  // the IPC serialization is Bun-only (docs/INTEGRATION.md).
-  const command = [
-    process.execPath,
-    'run',
-    FIXTURE,
-    options.behavior,
-    options.databasePath,
-  ];
+  const spawn = spawnFor(options.databasePath, options.behavior);
   const spawnCounter = { count: 0 };
   const executor = new IpcExecutor({
     spawn: () => {
       spawnCounter.count += 1;
-      return spawnBunServer({ command });
+      return spawn();
     },
     timeoutMs: options.timeoutMs ?? 2000,
     startTimeoutMs: options.startTimeoutMs,
     restartBackoffMs: options.restartBackoffMs,
     logger: logs.logger,
   });
-  const transport = new WsTransport({ port: 0 });
+  const transport = new WsTransport({
+    port: 0,
+    ...(options.logTransport === true ? { logger: logs.logger } : {}),
+  });
   const layer = new ConnectionLayer({
     transport,
     executor,
@@ -104,14 +105,47 @@ export function createPortal(options: {
   };
 }
 
+/** Fixture argv: behavior, database path, and the optional `ready` hold. */
+export function serverCommand(
+  databasePath: string,
+  behavior: Behavior = 'echo',
+  startDelayMs = 0,
+): string[] {
+  // `process.execPath` is the running Bun binary; the child must be Bun because
+  // the IPC serialization is Bun-only (docs/INTEGRATION.md).
+  return [
+    process.execPath,
+    'run',
+    FIXTURE,
+    behavior,
+    databasePath,
+    String(startDelayMs),
+  ];
+}
+
+/** A spawn entry the executor can use, including as a `switchTo` replacement. */
+export function spawnFor(
+  databasePath: string,
+  behavior: Behavior = 'echo',
+  startDelayMs = 0,
+): () => SpawnedServer {
+  const command = serverCommand(databasePath, behavior, startDelayMs);
+  return () => spawnBunServer({ command });
+}
+
 /** One request on an already-open socket, which survives a Server restart. */
 export async function callOnSocket(
   socket: WebSocket,
   request: { id: string; method: string; payload?: unknown },
+  timeoutMs?: number,
 ): Promise<Record<string, unknown>> {
   const reply = nextMessage(socket);
   socket.send(JSON.stringify(request));
-  return parseFrame(await reply);
+  const raw =
+    timeoutMs === undefined
+      ? await reply
+      : await withDeadline(reply, timeoutMs, `reply to ${request.id}`);
+  return parseFrame(raw);
 }
 
 /** One request over a fresh socket, so each call also crosses a new connection. */
@@ -160,12 +194,19 @@ export function urlOf(portal: Portal): string {
   return `ws://127.0.0.1:${port}/`;
 }
 
-/** Every Server process pid the Portal saw reach `ready`, in order. */
+/**
+ * Every Server pid the Portal reported as ready, in order: the initial one and
+ * any replacement a switch activated.
+ */
 export function serverPids(logs: LogCapture): number[] {
   const pids: number[] = [];
   for (const line of logs.lines) {
     const pid = line.pid;
-    if (line.msg === 'server ready' && typeof pid === 'number') {
+    if (
+      (line.msg === 'server ready' ||
+        line.msg === 'replacement server ready') &&
+      typeof pid === 'number'
+    ) {
       pids.push(pid);
     }
   }
@@ -186,10 +227,18 @@ export function replayCounts(logs: LogCapture): number[] {
 /**
  * Always releases the Portal, then any Server pid it ever reported. A test that
  * fails its assertions must not leave a child behind for the rest of the suite.
+ * `stopTimeoutMs` bounds the layer stop when a shutdown that never returns is
+ * itself the failure to report.
  */
-export async function stopQuietly(portal: Portal): Promise<void> {
+export async function stopQuietly(
+  portal: Portal,
+  options: { stopTimeoutMs?: number } = {},
+): Promise<void> {
   try {
-    await portal.layer.stop();
+    const stopping = portal.layer.stop();
+    await (options.stopTimeoutMs === undefined
+      ? stopping
+      : withDeadline(stopping, options.stopTimeoutMs, 'layer stop'));
   } catch {
     // The failure being reported is the test's own; a shutdown error here would
     // replace it with a less useful one.

@@ -1,24 +1,15 @@
 import { describe, expect, test } from 'bun:test';
-import { join } from 'node:path';
 
-import {
-  isRecord,
-  nextMessage,
-  openClient,
-  parseFrame,
-  tempDatabase,
-  withDeadline,
-} from 'mud-framework-test-support';
+import { openClient, tempDatabase } from 'mud-framework-test-support';
 
-import { WsTransport } from '../../packages/connector-ws/src/index.ts';
-import {
-  ConnectionLayer,
-  createJsonLogger,
-  IpcExecutor,
-  spawnBunServer,
-} from '../../packages/core/src/index.ts';
-import type { Logger } from '../../packages/core/src/index.ts';
 import { SqliteBackend } from '../../packages/storage-sqlite/src/index.ts';
+
+import {
+  callOnSocket,
+  createPortal,
+  stopQuietly,
+  urlOf,
+} from './support/two-process-harness.ts';
 
 /**
  * Access control over the real path: a WebSocket client, a real Portal child
@@ -26,89 +17,16 @@ import { SqliteBackend } from '../../packages/storage-sqlite/src/index.ts';
  * use only the wire envelope and the business rows the fixture writes, never
  * framework internals (SPEC 3.7).
  */
-const FIXTURE = join(import.meta.dir, 'fixtures', 'server-entry.ts');
 const REQUEST_TIMEOUT_MS = 5000;
 
-interface Portal {
-  readonly layer: ConnectionLayer;
-  readonly transport: WsTransport;
-  readonly lines: Record<string, unknown>[];
-}
-
-function createPortal(databasePath: string): Portal {
-  const lines: Record<string, unknown>[] = [];
-  const logger: Logger = createJsonLogger({
-    level: 'debug',
-    sink: (line) => {
-      const parsed: unknown = JSON.parse(line);
-      if (isRecord(parsed)) {
-        lines.push(parsed);
-      }
-    },
-  });
-  const executor = new IpcExecutor({
-    spawn: () =>
-      spawnBunServer({
-        command: [
-          process.execPath,
-          'run',
-          FIXTURE,
-          'extension-trial',
-          databasePath,
-        ],
-      }),
+function portalFor(databasePath: string) {
+  return createPortal({
+    databasePath,
+    behavior: 'extension-trial',
     timeoutMs: REQUEST_TIMEOUT_MS,
     startTimeoutMs: 10_000,
-    logger,
+    logTransport: true,
   });
-  const transport = new WsTransport({ port: 0, logger });
-  const layer = new ConnectionLayer({ transport, executor, logger });
-  return { layer, transport, lines };
-}
-
-function urlOf(portal: Portal): string {
-  const port = portal.transport.port;
-  if (port === undefined) {
-    throw new Error('expected the transport to bind a port');
-  }
-  return `ws://127.0.0.1:${port}/`;
-}
-
-async function call(
-  socket: WebSocket,
-  request: { id: string; method: string; payload?: unknown },
-): Promise<Record<string, unknown>> {
-  const reply = nextMessage(socket);
-  socket.send(JSON.stringify(request));
-  return parseFrame(
-    await withDeadline(reply, REQUEST_TIMEOUT_MS, `reply to ${request.id}`),
-  );
-}
-
-/** Pids from `ready` lines, so a failed test cannot leave a Server behind. */
-function serverPids(lines: readonly Record<string, unknown>[]): number[] {
-  const pids: number[] = [];
-  for (const line of lines) {
-    if (line.msg === 'server ready' && typeof line.pid === 'number') {
-      pids.push(line.pid);
-    }
-  }
-  return pids;
-}
-
-async function stopQuietly(portal: Portal): Promise<void> {
-  try {
-    await portal.layer.stop();
-  } catch {
-    // The test's own failure is the one to report.
-  }
-  for (const pid of serverPids(portal.lines)) {
-    try {
-      process.kill(pid, 'SIGKILL');
-    } catch {
-      // Already gone, which is the expected case.
-    }
-  }
 }
 
 /**
@@ -138,27 +56,35 @@ async function probeExecutions(databasePath: string): Promise<number> {
 describe('session access over a real WebSocket and IPC', () => {
   test('an unbound request to a session method gets AUTH_REQUIRED before the handler runs', async () => {
     const database = tempDatabase({ prefix: 'mud-session-access-' });
-    const portal = createPortal(database.path);
+    const portal = portalFor(database.path);
     try {
       await portal.layer.start();
       const socket = await openClient(urlOf(portal), {
         timeoutMs: REQUEST_TIMEOUT_MS,
       });
       try {
-        const whoami = await call(socket, {
-          id: 'whoami-unbound',
-          method: 'player.whoami',
-        });
+        const whoami = await callOnSocket(
+          socket,
+          {
+            id: 'whoami-unbound',
+            method: 'player.whoami',
+          },
+          REQUEST_TIMEOUT_MS,
+        );
         expect(whoami).toMatchObject({
           id: 'whoami-unbound',
           ok: false,
           error: { code: 'AUTH_REQUIRED' },
         });
 
-        const probe = await call(socket, {
-          id: 'probe-unbound',
-          method: 'player.probe',
-        });
+        const probe = await callOnSocket(
+          socket,
+          {
+            id: 'probe-unbound',
+            method: 'player.probe',
+          },
+          REQUEST_TIMEOUT_MS,
+        );
         expect(probe).toMatchObject({
           id: 'probe-unbound',
           ok: false,
@@ -181,28 +107,36 @@ describe('session access over a real WebSocket and IPC', () => {
 
   test('a successful public login binds the Session for later requests on the same connection', async () => {
     const database = tempDatabase({ prefix: 'mud-session-access-' });
-    const portal = createPortal(database.path);
+    const portal = portalFor(database.path);
     try {
       await portal.layer.start();
       const socket = await openClient(urlOf(portal), {
         timeoutMs: REQUEST_TIMEOUT_MS,
       });
       try {
-        const created = await call(socket, {
-          id: 'login',
-          method: 'player.create',
-          payload: { name: 'alice', sessionId: 'session-alice' },
-        });
+        const created = await callOnSocket(
+          socket,
+          {
+            id: 'login',
+            method: 'player.create',
+            payload: { name: 'alice', sessionId: 'session-alice' },
+          },
+          REQUEST_TIMEOUT_MS,
+        );
         expect(created).toEqual({
           id: 'login',
           ok: true,
           result: { created: 'alice', sessionId: 'session-alice' },
         });
 
-        const whoami = await call(socket, {
-          id: 'whoami',
-          method: 'player.whoami',
-        });
+        const whoami = await callOnSocket(
+          socket,
+          {
+            id: 'whoami',
+            method: 'player.whoami',
+          },
+          REQUEST_TIMEOUT_MS,
+        );
         expect(whoami).toEqual({
           id: 'whoami',
           ok: true,
@@ -211,10 +145,14 @@ describe('session access over a real WebSocket and IPC', () => {
 
         // The same handler that was refused above now runs, which is what
         // makes its absence in the unbound test meaningful.
-        const probe = await call(socket, {
-          id: 'probe',
-          method: 'player.probe',
-        });
+        const probe = await callOnSocket(
+          socket,
+          {
+            id: 'probe',
+            method: 'player.probe',
+          },
+          REQUEST_TIMEOUT_MS,
+        );
         expect(probe).toEqual({
           id: 'probe',
           ok: true,
@@ -234,22 +172,26 @@ describe('session access over a real WebSocket and IPC', () => {
 
   test('a login that throws after bindSession leaves the connection unbound', async () => {
     const database = tempDatabase({ prefix: 'mud-session-access-' });
-    const portal = createPortal(database.path);
+    const portal = portalFor(database.path);
     try {
       await portal.layer.start();
       const socket = await openClient(urlOf(portal), {
         timeoutMs: REQUEST_TIMEOUT_MS,
       });
       try {
-        const created = await call(socket, {
-          id: 'login-fail',
-          method: 'player.create',
-          payload: {
-            name: 'bob',
-            sessionId: 'session-bob',
-            fail: true,
+        const created = await callOnSocket(
+          socket,
+          {
+            id: 'login-fail',
+            method: 'player.create',
+            payload: {
+              name: 'bob',
+              sessionId: 'session-bob',
+              fail: true,
+            },
           },
-        });
+          REQUEST_TIMEOUT_MS,
+        );
         expect(created).toMatchObject({
           id: 'login-fail',
           ok: false,
@@ -263,10 +205,14 @@ describe('session access over a real WebSocket and IPC', () => {
 
         // The handler reached bindSession, but the failed request must not
         // commit the route (SPEC 2).
-        const whoami = await call(socket, {
-          id: 'whoami-after-failure',
-          method: 'player.whoami',
-        });
+        const whoami = await callOnSocket(
+          socket,
+          {
+            id: 'whoami-after-failure',
+            method: 'player.whoami',
+          },
+          REQUEST_TIMEOUT_MS,
+        );
         expect(whoami).toMatchObject({
           id: 'whoami-after-failure',
           ok: false,
@@ -283,44 +229,60 @@ describe('session access over a real WebSocket and IPC', () => {
 
   test('logout unbinds the Session so later session methods are refused again', async () => {
     const database = tempDatabase({ prefix: 'mud-session-access-' });
-    const portal = createPortal(database.path);
+    const portal = portalFor(database.path);
     try {
       await portal.layer.start();
       const socket = await openClient(urlOf(portal), {
         timeoutMs: REQUEST_TIMEOUT_MS,
       });
       try {
-        const created = await call(socket, {
-          id: 'login',
-          method: 'player.create',
-          payload: { name: 'carol', sessionId: 'session-carol' },
-        });
+        const created = await callOnSocket(
+          socket,
+          {
+            id: 'login',
+            method: 'player.create',
+            payload: { name: 'carol', sessionId: 'session-carol' },
+          },
+          REQUEST_TIMEOUT_MS,
+        );
         expect(created).toMatchObject({ id: 'login', ok: true });
 
-        const before = await call(socket, {
-          id: 'whoami-before',
-          method: 'player.whoami',
-        });
+        const before = await callOnSocket(
+          socket,
+          {
+            id: 'whoami-before',
+            method: 'player.whoami',
+          },
+          REQUEST_TIMEOUT_MS,
+        );
         expect(before).toEqual({
           id: 'whoami-before',
           ok: true,
           result: { sessionId: 'session-carol' },
         });
 
-        const logout = await call(socket, {
-          id: 'logout',
-          method: 'player.logout',
-        });
+        const logout = await callOnSocket(
+          socket,
+          {
+            id: 'logout',
+            method: 'player.logout',
+          },
+          REQUEST_TIMEOUT_MS,
+        );
         expect(logout).toEqual({
           id: 'logout',
           ok: true,
           result: { loggedOut: true },
         });
 
-        const after = await call(socket, {
-          id: 'whoami-after',
-          method: 'player.whoami',
-        });
+        const after = await callOnSocket(
+          socket,
+          {
+            id: 'whoami-after',
+            method: 'player.whoami',
+          },
+          REQUEST_TIMEOUT_MS,
+        );
         expect(after).toMatchObject({
           id: 'whoami-after',
           ok: false,
@@ -337,24 +299,32 @@ describe('session access over a real WebSocket and IPC', () => {
 
   test('an access policy refusal returns FORBIDDEN before the session handler runs', async () => {
     const database = tempDatabase({ prefix: 'mud-session-access-' });
-    const portal = createPortal(database.path);
+    const portal = portalFor(database.path);
     try {
       await portal.layer.start();
       const socket = await openClient(urlOf(portal), {
         timeoutMs: REQUEST_TIMEOUT_MS,
       });
       try {
-        const created = await call(socket, {
-          id: 'login',
-          method: 'player.create',
-          payload: { name: 'dave', sessionId: 'session-dave' },
-        });
+        const created = await callOnSocket(
+          socket,
+          {
+            id: 'login',
+            method: 'player.create',
+            payload: { name: 'dave', sessionId: 'session-dave' },
+          },
+          REQUEST_TIMEOUT_MS,
+        );
         expect(created).toMatchObject({ id: 'login', ok: true });
 
-        const forbidden = await call(socket, {
-          id: 'forbidden',
-          method: 'player.forbidden',
-        });
+        const forbidden = await callOnSocket(
+          socket,
+          {
+            id: 'forbidden',
+            method: 'player.forbidden',
+          },
+          REQUEST_TIMEOUT_MS,
+        );
         expect(forbidden).toMatchObject({
           id: 'forbidden',
           ok: false,
