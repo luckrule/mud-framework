@@ -1,11 +1,14 @@
 import type { Logger } from '../logging/types.ts';
-import type { ConnectionWriter } from './connection-writer.ts';
+import type { ConnectionBuffer } from './connection-buffer.ts';
 
 /** Point-in-time totals reported by `ConnectionLayer.health()` (SPEC 6.6). */
 export interface EventBacklogSnapshot {
   /** Connection event queues that currently hold frames. */
   readonly connections: number;
-  /** Frames waiting across every connection queue and Session queue. */
+  /**
+   * Frames accepted and not yet settled (including the in-flight frame)
+   * across every connection queue and Session queue.
+   */
   readonly frames: number;
   /** Their encoded size, in the same unit as `maxQueuedEventBytes`. */
   readonly bytes: number;
@@ -42,7 +45,7 @@ export class EventBacklog {
   private frameTotal = 0;
   private byteTotal = 0;
   private backlogDisconnects = 0;
-  private readonly buffers = new Set<ConnectionWriter>();
+  private readonly buffers = new Set<ConnectionBuffer>();
   private readonly logger: Logger;
   private readonly warnBytes: number;
   private readonly liveConnections: () => number;
@@ -58,11 +61,11 @@ export class EventBacklog {
   }
 
   /** Connection queues with frames, for the shutdown discard. */
-  get connectionBuffers(): ReadonlySet<ConnectionWriter> {
+  get connectionBuffers(): ReadonlySet<ConnectionBuffer> {
     return this.buffers;
   }
 
-  connectionFrameAdded(buffer: ConnectionWriter, bytes: number): void {
+  connectionFrameAdded(buffer: ConnectionBuffer, bytes: number): void {
     this.buffers.add(buffer);
     this.frameTotal += 1;
     this.byteTotal += bytes;
@@ -70,7 +73,7 @@ export class EventBacklog {
   }
 
   connectionFrameRemoved(
-    buffer: ConnectionWriter,
+    buffer: ConnectionBuffer,
     bytes: number,
     empty: boolean,
   ): void {

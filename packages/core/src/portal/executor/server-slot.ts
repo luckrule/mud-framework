@@ -22,11 +22,6 @@ export interface ServerState {
   shutdownAcknowledged: boolean;
   pid: number | undefined;
   /**
-   * Owned by a `switchTo` in progress: not the current Server, so losing it
-   * fails the switch instead of triggering the crash-restart path.
-   */
-  staged: boolean;
-  /**
    * The previous Server a `switchTo` is draining. Its exit is expected, so it
    * must not be reported as a crash or restarted.
    */

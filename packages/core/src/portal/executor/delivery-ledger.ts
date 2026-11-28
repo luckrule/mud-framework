@@ -74,9 +74,11 @@ export class DeliveryLedger {
    * the executor is shutting down is read live through `isTerminal`.
    *
    * A request that keeps killing the process starves the later requests on its
-   * connection: every flush stops at it (its replay budget runs out, and the
-   * flush returns), so those requests wait until it reaches a terminal state.
-   * That is the necessary cost of the SPEC 6.5 ordering guarantee, not a drop.
+   * connection: until its replay budget runs out, every flush dies on the send
+   * that kills the process, so those requests wait for the next flush. Once the
+   * budget is exhausted the request is settled and the same flush continues;
+   * only a send that throws ends the flush. That is the necessary cost of the
+   * SPEC 6.5 ordering guarantee, not a drop.
    */
   flush(server: ServerState | undefined): void {
     // `ready` alone is not enough: during a rollback the slot can still name the
@@ -336,7 +338,6 @@ export class DeliveryLedger {
         continue;
       }
       pending.effectiveTimeoutMs = tightened;
-      pending.deadlineAt = pending.startedAt + tightened;
       this.armTimer(pending);
     }
   }

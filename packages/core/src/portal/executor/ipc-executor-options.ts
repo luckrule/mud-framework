@@ -13,11 +13,11 @@ export interface IpcExecutorOptions {
    * How long a Server must stay up before its crash streak is considered over.
    * Defaults to `Math.max(30_000, timeoutMs)`.
    *
-   * The window must exceed both the backoff cap (5000ms) and the longest a
-   * single request can live: a Server that crashes while handling its first
-   * request must be counted as a crash, not as a healthy run that reset the
-   * backoff. Otherwise "ready, then die on the first request" restarts at
-   * `attempt === 0` (immediate) forever.
+   * The window must be at least as long as both the backoff cap (5000ms) and
+   * the longest a single request can live: a Server that crashes while
+   * handling its first request must be counted as a crash, not as a healthy
+   * run that reset the backoff. Otherwise "ready, then die on the first
+   * request" restarts at `attempt === 0` (immediate) forever.
    */
   stableResetMs?: number;
   /** Grace period for a graceful shutdown before killing. Default 5000ms. */

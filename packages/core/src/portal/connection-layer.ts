@@ -13,7 +13,6 @@ import type {
   TransportConnection,
   TransportHandlers,
 } from '../transport/types.ts';
-import type { ConnectionState } from './connection-admission.ts';
 import {
   DEFAULT_EVENT_BACKLOG_WARN_BYTES,
   DEFAULT_MAX_CONNECTIONS,
@@ -29,24 +28,23 @@ import type { LayerHost } from './connection-host.ts';
 import {
   DEFAULT_STOP_TIMEOUT_MS,
   EXECUTOR_CLOSE_SLACK_MS,
-  MAX_TIMER_DELAY_MS,
   assertPositiveInteger,
   assertTimerDelay,
+  clampTimerDelay,
   resolveSendTimeoutMs,
 } from './connection-layer-options.ts';
 import type { ConnectionLayerOptions } from './connection-layer-options.ts';
-import type { RequestHost } from './connection-request.ts';
 import {
   cancelQuietly,
   onMessage as receiveMessage,
 } from './connection-request.ts';
+import type { ConnectionState } from './connection-state.ts';
 import { EventBacklog } from './event-backlog.ts';
 import { EventDropLog } from './event-drop-log.ts';
-import type { EventDeliveryHost } from './event-frame.ts';
 import type { ConnectionHealth, ConnectionLayerStatus } from './health.ts';
 import { connectionHealthSnapshot, readExecutorHealth } from './health.ts';
 import { discardSessionQueues } from './session-event-queue.ts';
-import type { SessionEventQueue } from './session-event-queue.ts';
+import type { SessionEventQueue } from './session-queue-state.ts';
 import { SessionRouter } from './session-router.ts';
 
 /**
@@ -80,9 +78,7 @@ export class ConnectionLayer implements TransportHandlers {
   /** Which connection holds which Session, and the reconnect gate (SPEC 3.2). */
   private readonly router: SessionRouter;
   /** One host object; each module takes the narrow `Pick` it declares. */
-  private readonly requestHost: RequestHost;
-  /** The same host, viewed through delivery's narrower `Pick` (ADR-0008). */
-  private readonly eventHost: EventDeliveryHost;
+  private readonly host: LayerHost;
   /** Set while the layer is subscribed to the executor's event stream. */
   private unsubscribeEvents: (() => void) | undefined;
   /** False from the first instant of shutdown; no event is accepted after it. */
@@ -155,8 +151,7 @@ export class ConnectionLayer implements TransportHandlers {
       sessionQueues: this.sessionQueues,
       sendTimeoutMs: this.sendTimeoutMs,
     };
-    this.requestHost = host;
-    this.eventHost = host;
+    this.host = host;
   }
 
   async start(): Promise<void> {
@@ -173,7 +168,7 @@ export class ConnectionLayer implements TransportHandlers {
       this.unsubscribeEvents = this.executor.onEvent((event) => {
         // Delivery already contains its own failures; this keeps an unexpected
         // rejection out of the process's unhandled-rejection path.
-        void deliverServerEvent(this.eventHost, event).catch(() => undefined);
+        void deliverServerEvent(this.host, event).catch(() => undefined);
       });
       await this.executorStart;
       if (this.status !== 'starting') {
@@ -221,21 +216,21 @@ export class ConnectionLayer implements TransportHandlers {
   }
 
   onConnect(connection: TransportConnection): Promise<void> {
-    return admitConnection(this.requestHost, this.status, connection);
+    return admitConnection(this.host, this.status, connection);
   }
 
   onMessage(
     connection: TransportConnection,
     payload: string | Uint8Array,
   ): Promise<void> {
-    return receiveMessage(this.requestHost, this.status, connection, payload);
+    return receiveMessage(this.host, this.status, connection, payload);
   }
 
   onDisconnect(connection: TransportConnection): Promise<void> {
-    return disconnectConnection(this.requestHost, connection, {
+    return disconnectConnection(this.host, connection, {
       releaseRoute: (connectionId) => this.router.release(connectionId),
       cancel: (requestId, connectionId) =>
-        cancelQuietly(this.requestHost, requestId, connectionId),
+        cancelQuietly(this.host, requestId, connectionId),
     });
   }
 
@@ -342,12 +337,11 @@ export class ConnectionLayer implements TransportHandlers {
     const executorBudgetMs =
       this.executor.closeBudgetMs === undefined
         ? timeoutMs
-        : Math.min(
+        : clampTimerDelay(
             Math.max(
               timeoutMs,
               this.executor.closeBudgetMs + EXECUTOR_CLOSE_SLACK_MS,
             ),
-            MAX_TIMER_DELAY_MS,
           );
     let executorFailure: Error | undefined;
     const closed = await settleWithin(this.closeExecutor(), executorBudgetMs);

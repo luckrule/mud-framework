@@ -21,7 +21,8 @@ export interface ServerShutdownDeps {
   readonly channel: IpcChannel;
   /** Reads `options.abortTimeoutMs ?? ABORT_TIMEOUT_MS` when the budget is used. */
   readonly readAbortBudgetMs: () => number;
-  readonly sendQuietly: (message: IpcMessage, what: string) => void;
+  /** Returns whether the message was sent; callers may ignore it. */
+  readonly sendQuietly: (message: IpcMessage, what: string) => boolean;
   /** Enters `shutting-down`; the facade owns the phase field. */
   readonly markShuttingDown: () => void;
   /** Resolves the process completion with no error. */

@@ -6,11 +6,11 @@ export interface RestartPolicyOptions {
   /**
    * How long a Server must stay up before its crash streak is considered over.
    *
-   * The window must exceed both the backoff cap and the longest a single
-   * request can live: a Server that crashes while handling its first request
-   * must be counted as a crash, not as a healthy run that reset the backoff.
-   * Otherwise "ready, then die on the first request" restarts at attempt 0
-   * (immediate) forever.
+   * The window must be at least as long as both the backoff cap and the
+   * longest a single request can live: a Server that crashes while handling
+   * its first request must be counted as a crash, not as a healthy run that
+   * reset the backoff. Otherwise "ready, then die on the first request"
+   * restarts at attempt 0 (immediate) forever.
    */
   stableResetMs: number;
 }

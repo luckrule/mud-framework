@@ -82,7 +82,7 @@ export class ConnectionWriter {
     return this.requestTail;
   }
 
-  submit(work: () => Promise<void>, queued?: QueuedRequest): Promise<void> {
+  submit(work: () => Promise<void>, queued: QueuedRequest): Promise<void> {
     const { promise, resolve, reject } = Promise.withResolvers<void>();
     this.requests.push({
       run: work,
@@ -147,17 +147,16 @@ export class ConnectionWriter {
   }
 
   /**
-   * Marks a still-queued frame cancelled. False once the write started: an
+   * Marks a still-queued frame cancelled. A no-op once the write started: an
    * abort must not release the Session's serial slot while a frame that may
    * already be on the wire is being written (SPEC 3.8).
    */
-  cancel(event: EventWrite): boolean {
+  cancel(event: EventWrite): void {
     if (event.started || event.settled) {
-      return false;
+      return;
     }
     event.settle('aborted');
     this.release(event.bytes);
-    return true;
   }
 
   /**

@@ -25,7 +25,8 @@ export interface PendingRequest {
   replayCount: number;
   /** Server generation this request was last sent on; `undefined` = never sent. */
   sentOn: number | undefined;
-  deadlineAt: number;
+  /** Derived from the other two so a tightened ceiling cannot leave it stale. */
+  readonly deadlineAt: number;
   effectiveTimeoutMs: number;
   timer: ReturnType<typeof setTimeout> | undefined;
 }
@@ -105,8 +106,10 @@ export class PendingBuffer {
       resolve: outcome.resolve,
       replayCount: 0,
       sentOn: undefined,
-      deadlineAt: startedAt + effectiveTimeoutMs,
       effectiveTimeoutMs,
+      get deadlineAt(): number {
+        return this.startedAt + this.effectiveTimeoutMs;
+      },
       timer: undefined,
     };
     this.pending.set(request.requestId, pending);

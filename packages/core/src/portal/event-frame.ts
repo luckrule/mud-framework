@@ -1,13 +1,23 @@
 import { Buffer } from 'node:buffer';
 
+import type { Logger } from '../logging/types.ts';
+import type { Codec } from '../shared/codec.ts';
 import type { ServerEvent } from '../shared/events.ts';
 import { messageOf } from '../shared/guards.ts';
 import { settleWithin } from '../shared/timeout.ts';
 import { TRANSPORT_SEND_FAILED } from '../shared/wire-codes.ts';
-import type { ConnectionState } from './connection-admission.ts';
-import { BACKLOG_CLOSED_REASON } from './connection-admission.ts';
-import type { LayerHost } from './connection-host.ts';
-import type { EventOutcome, EventWrite } from './event-write.ts';
+import type { ConnectionState } from './connection-state.ts';
+import { BACKLOG_CLOSED_REASON } from './connection-state.ts';
+import type { EventBacklog } from './event-backlog.ts';
+import type { EventDropLog } from './event-drop-log.ts';
+import type {
+  BacklogOverflow,
+  EventOutcome,
+  EventWrite,
+  QueueEventResult,
+} from './event-write.ts';
+import type { SessionEventQueue } from './session-queue-state.ts';
+import type { SessionRouter } from './session-router.ts';
 
 /**
  * The shared primitives of event delivery: what the layer must provide, how one
@@ -20,27 +30,76 @@ import type { EventOutcome, EventWrite } from './event-write.ts';
  * What delivery needs from the connection layer: the two lookup tables (which
  * connection exists, which Session it holds), the wire format, the queue of the
  * connection's single writer, and the per-Session pending queues that keep
- * Session-addressed events in arrival order.
+ * Session-addressed events in arrival order. Declared here rather than picked
+ * from the layer's assembled host so delivery does not depend on it.
  */
-export type EventDeliveryHost = Pick<
-  LayerHost,
-  | 'codec'
-  | 'logger'
-  | 'router'
-  | 'queueEvent'
-  | 'cancelEvent'
-  | 'acceptingEvents'
-  | 'maxQueuedEvents'
-  | 'maxQueuedEventBytes'
-  | 'backlog'
-  | 'sessionQueues'
-  | 'sendTimeoutMs'
-  | 'dropLog'
-  | 'closeForBacklog'
-> & {
+export interface EventDeliveryHost {
+  /** The wire format, and the sink for failures that must not reach the transport. */
+  readonly codec: Codec;
+  readonly logger: Logger;
   /** Read-only: delivery resolves holders, it never admits or removes one. */
   readonly connections: ReadonlyMap<string, ConnectionState>;
-};
+  /** Frame bound of each event buffer (SPEC 3.8). */
+  readonly maxQueuedEvents: number;
+  /** Byte bound of each event buffer (SPEC 3.8). */
+  readonly maxQueuedEventBytes: number;
+  /** Layer-wide event totals every buffer reports to (SPEC 6.6). */
+  readonly backlog: EventBacklog;
+  /**
+   * Aggregates repeated `EVENT_DROPPED` lines per reason and target (SPEC 7.1).
+   * A missing target or a closed connection can recur at emission rate — a room
+   * broadcasting to Sessions nobody holds — so one line per drop would make the
+   * diagnostic channel a second unbounded stream.
+   */
+  readonly dropLog: EventDropLog;
+  readonly router: SessionRouter;
+  /**
+   * Queues one encoded frame on the target connection's event queue. The queue
+   * belongs to the connection's single writer, so the frame is written after
+   * any request work already waiting (SPEC 3.8).
+   */
+  readonly queueEvent: (
+    state: ConnectionState,
+    write: EventWrite,
+  ) => QueueEventResult;
+  /**
+   * Cancels a frame that has not started writing. A no-op once it did: the
+   * write's own bound decides when the serial slot is released.
+   */
+  readonly cancelEvent: (state: ConnectionState, write: EventWrite) => void;
+  /**
+   * Closes the connection owning an overflowing event buffer with `1013`
+   * (SPEC 3.8). Passed in rather than implemented here because the close has to
+   * mark the state before the transport reports the disconnect, so `onDisconnect`
+   * can tell a backlog close from a client leaving. Returns false when this
+   * connection is already being closed for backlog.
+   */
+  readonly closeForBacklog: (
+    state: ConnectionState,
+    overflow: BacklogOverflow,
+  ) => boolean;
+  /**
+   * False once the layer started stopping. Events are best-effort and the
+   * buffers are discarded at that point, so a late event is not accepted
+   * (SPEC 3.8).
+   */
+  readonly acceptingEvents: () => boolean;
+  /**
+   * Pending queues of the Sessions the layer addresses, owned by the layer so
+   * ordering and bound state is per layer (and per test) rather than
+   * process-global. An entry exists while that Session has unfinished delivery
+   * work, which is also when its serial slot is held.
+   */
+  readonly sessionQueues: Map<string, SessionEventQueue>;
+  /**
+   * Upper bound on one downlink write: a Server event frame and a response
+   * frame alike (SPEC 3.8). A transport bounds its own sends, but the layer
+   * cannot assume every implementation does: without this bound a send that
+   * never settles would pin the Session's serial slot — or the connection's
+   * single writer, and with it the Session's terminal barrier — forever.
+   */
+  readonly sendTimeoutMs: number;
+}
 
 type DropTarget =
   | { readonly targetKind: 'connection'; readonly connectionId: string }
@@ -89,7 +148,8 @@ export interface EncodedEvent {
  * Encodes once, when the event is accepted, so the byte bound is charged for
  * the frame that will actually be written and a redelivery reuses it. The cost
  * is that an unencodable event is reported here rather than at write time; the
- * log code, stage and reason are the same, so the diagnosis does not change.
+ * code is the same and `stage` distinguishes `encode` from `send`, so the
+ * diagnosis does not change.
  */
 export function encodeEvent(
   host: EventDeliveryHost,
@@ -143,8 +203,10 @@ export async function writeEventFrame(
   const connectionId = state.connection.id;
   // The write is bounded here rather than by the abort signal: once the frame
   // is handed to the transport an abort says nothing about whether it reached
-  // the wire, so the bound is the transport's own send budget. `settleWithin`
-  // also consumes a rejection, so a late failure cannot escape.
+  // the wire, so the bound is `host.sendTimeoutMs` — the explicit option, the
+  // transport's declaration plus slack, or the undeclared default, resolved by
+  // the layer. `settleWithin` also consumes a rejection, so a late failure
+  // cannot escape.
   let pending: Promise<void>;
   try {
     // Called inside `try` because a transport that throws instead of rejecting
@@ -189,6 +251,18 @@ function logSendFailure(
 }
 
 /**
+ * Why a closed connection can no longer take a frame (SPEC 3.8). A backlog
+ * close is this layer's decision, so it is named as such: otherwise its drops
+ * would be indistinguishable from a client that disconnected on its own, and
+ * the two need different responses from whoever reads the log.
+ */
+export function closedReason(state: ConnectionState): string {
+  return state.backlogClosed
+    ? BACKLOG_CLOSED_REASON
+    : 'the target connection closed before the event was written';
+}
+
+/**
  * Cancels a queued frame when its connection closes, and reports how the write
  * ended. Both target kinds share this, so a connection-addressed event and a
  * Session-addressed one obey the same queued/writing rule (SPEC 3.8): a frame
@@ -226,9 +300,7 @@ export async function watchQueuedWrite(
         host,
         event,
         { ...target, connectionId: queuedFor.connection.id },
-        queuedFor.backlogClosed
-          ? BACKLOG_CLOSED_REASON
-          : 'the target connection closed before the event was written',
+        closedReason(queuedFor),
       );
     }
     return outcome;

@@ -38,8 +38,6 @@ import { ServerSupervisor } from './server-supervisor.ts';
 import type { SwitchDeps, SwitchOperation } from './version-switch.ts';
 import { VersionSwitch } from './version-switch.ts';
 
-export type { IpcExecutorOptions };
-
 /**
  * The Portal side of the process split (ADR-0002): ships Requests to a Server
  * process over IPC and keeps them buffered until the Server acknowledges them.
@@ -118,9 +116,9 @@ export class IpcExecutor implements RequestExecutor {
       options.logger ??
         createJsonLogger({ bindings: { component: 'ipc-executor' } }),
     );
-    // Defaults must exceed the backoff cap (5000ms) and the longest request,
-    // otherwise a Server that dies on its first request would reset the streak
-    // before it crashed and restart with zero backoff every time.
+    // Defaults must be at least the backoff cap (5000ms) and the longest
+    // request, otherwise a Server that dies on its first request would reset
+    // the streak before it crashed and restart with zero backoff every time.
     const restart = new RestartPolicy({
       baseBackoffMs: restartBackoffMs,
       stableResetMs:
@@ -189,60 +187,44 @@ export class IpcExecutor implements RequestExecutor {
       // Nothing was ever spawned. Without this the request would sit in the
       // buffer until its deadline and report a timeout, which looks like a slow
       // backend instead of a missing `start()` (SPEC 6.2 step 3).
-      this.logger.error(
-        {
-          ...requestLogFields(request),
-          code: INTERNAL_ERROR,
-          reason: 'ipc executor was never started',
-        },
-        'request rejected',
-      );
-      return Promise.resolve(
-        failure(INTERNAL_ERROR, 'ipc executor was never started'),
+      return this.reject(
+        request,
+        'error',
+        INTERNAL_ERROR,
+        'ipc executor was never started',
       );
     }
     if (this.slot.status === 'failed') {
       // A failed start is terminal: the restart loop was stopped, so buffering
       // this request would only hold it until its deadline for a Server that is
       // never coming. Failing now is the same answer as the start rejection.
-      this.logger.error(
-        {
-          ...requestLogFields(request),
-          code: INTERNAL_ERROR,
-          reason: 'ipc executor failed to start',
-        },
-        'request rejected',
-      );
-      return Promise.resolve(
-        failure(
-          INTERNAL_ERROR,
-          'ipc executor failed to start: no server is available',
-        ),
+      return this.reject(
+        request,
+        'error',
+        INTERNAL_ERROR,
+        'ipc executor failed to start: no server is available',
+        'ipc executor failed to start',
       );
     }
-    if (this.slot.isTerminal) {
-      // `failed` is included here but unreachable: the branch above returns for
-      // it first, with a message specific to a start that never succeeded.
+    if (this.slot.status === 'closing' || this.slot.status === 'closed') {
       // warn, not error: an orderly shutdown refusal is expected, and the
       // connection layer records the failed outcome at error level already.
-      this.logger.warn(
-        {
-          ...requestLogFields(request),
-          code: FRAMEWORK_SHUTDOWN,
-          reason: `executor ${this.slot.status}`,
-        },
-        'request rejected',
-      );
-      return Promise.resolve(
-        failure(FRAMEWORK_SHUTDOWN, 'ipc executor is shutting down'),
+      return this.reject(
+        request,
+        'warn',
+        FRAMEWORK_SHUTDOWN,
+        'ipc executor is shutting down',
+        `executor ${this.slot.status}`,
       );
     }
     if (this.supervisor.recoveryBlocked) {
-      return Promise.resolve(
-        failure(
-          INTERNAL_ERROR,
-          'server recovery blocked: process exit is unconfirmed',
-        ),
+      // No log: during recovery every request would add a warn with no rate
+      // limit, which is a log storm. The state is exposed by `health()`.
+      return this.reject(
+        request,
+        undefined,
+        INTERNAL_ERROR,
+        'server recovery blocked: process exit is unconfirmed',
       );
     }
     // Capacity before duplicate id, matching the order the admission checks had
@@ -257,19 +239,12 @@ export class IpcExecutor implements RequestExecutor {
       // Request ids are minted by the connection layer and a replay goes
       // through the buffer, so a second execute() for the same id is a caller
       // bug. Failing it beats overwriting a promise nobody would ever settle.
-      this.logger.warn(
-        {
-          ...requestLogFields(request),
-          code: INTERNAL_ERROR,
-          reason: 'duplicate requestId',
-        },
-        'request rejected',
-      );
-      return Promise.resolve(
-        failure(
-          INTERNAL_ERROR,
-          `request ${request.requestId} is already in flight`,
-        ),
+      return this.reject(
+        request,
+        'warn',
+        INTERNAL_ERROR,
+        `request ${request.requestId} is already in flight`,
+        'duplicate requestId',
       );
     }
     const deferred = Promise.withResolvers<ExecutorOutcome>();
@@ -336,6 +311,28 @@ export class IpcExecutor implements RequestExecutor {
         `ipc executor pending buffer is full (${this.buffer.maxPending} unacknowledged)`,
       ),
     );
+  }
+
+  /**
+   * One refusal for the admission checks: at most one log line and the
+   * matching `failure`. `reason` defaults to the outcome message; a branch
+   * whose log and wire text differ passes both. `level: undefined` is for a
+   * refusal that must not log at all.
+   */
+  private reject(
+    request: ExecutorRequest,
+    level: 'warn' | 'error' | undefined,
+    code: string,
+    message: string,
+    reason: string = message,
+  ): Promise<ExecutorOutcome> {
+    if (level !== undefined) {
+      this.logger[level](
+        { ...requestLogFields(request), code, reason },
+        'request rejected',
+      );
+    }
+    return Promise.resolve(failure(code, message));
   }
 
   close(): Promise<void> {

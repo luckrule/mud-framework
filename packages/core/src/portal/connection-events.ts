@@ -1,8 +1,8 @@
 import type { ServerEvent } from '../shared/events.ts';
-import type { ConnectionState } from './connection-admission.ts';
-import { BACKLOG_CLOSED_REASON } from './connection-admission.ts';
+import { BACKLOG_CLOSED_REASON } from './connection-state.ts';
 import type { EventDeliveryHost } from './event-frame.ts';
 import {
+  closedReason,
   encodeEvent,
   warnDropped,
   watchQueuedWrite,
@@ -118,16 +118,4 @@ export function deliverServerEvent(
     return Promise.resolve();
   }
   return enqueueSessionEvent(host, target.sessionId, event, encoded);
-}
-
-/**
- * Why a closed connection can no longer take a frame (SPEC 3.8). A backlog
- * close is this layer's decision, so it is named as such: otherwise its drops
- * would be indistinguishable from a client that disconnected on its own, and
- * the two need different responses from whoever reads the log.
- */
-function closedReason(state: ConnectionState): string {
-  return state.backlogClosed
-    ? BACKLOG_CLOSED_REASON
-    : 'the target connection closed before the event was written';
 }

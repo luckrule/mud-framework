@@ -5,8 +5,13 @@ import { safeLogger } from '../logging/safe-logger.ts';
 import type { Logger } from '../logging/types.ts';
 import { messageOf } from '../shared/guards.ts';
 import { settleWithin } from '../shared/timeout.ts';
+import {
+  STDERR_DRAIN_GRACE_MS,
+  pumpStderr,
+  stderrCapture,
+} from './bun-spawn-stderr.ts';
+import { createEndpointChannel } from './channel-endpoint.ts';
 import { IpcChannelClosedError } from './channel.ts';
-import type { IpcChannel } from './channel.ts';
 import type { IpcMessage } from './protocol.ts';
 import type { ServerExitInfo, SpawnedServer } from './spawn-port.ts';
 
@@ -29,121 +34,6 @@ export interface BunServerSpawnOptions {
 
 const LOCAL_CLOSE_REASON = 'closed by portal';
 const DISCONNECTED_REASON = 'ipc channel disconnected';
-/** Caps one retained line so a child cannot make the tail unbounded. */
-const STDERR_LINE_LIMIT = 2000;
-/**
- * Bounds how long exit reporting waits for the stderr pipe to drain. Bun
- * reports the exit independently of the pipe, so without this the tail a
- * consumer reads can be empty; a grandchild can keep the pipe open forever, so
- * the wait has to be bounded — the tail is diagnostic, not evidence.
- */
-const STDERR_DRAIN_GRACE_MS = 250;
-
-type ServerStdio =
-  | ['ignore', 'inherit', 'inherit']
-  | ['ignore', 'inherit', 'pipe'];
-
-interface StderrCapture {
-  readonly stdio: ServerStdio;
-  /** The live tail, or undefined when capture is off. */
-  readonly lines: string[] | undefined;
-  readonly limit: number;
-}
-
-/**
- * Resolves the capture option to the stdio tuple and the live tail it fills.
- * A bad count throws instead of silently disabling the diagnostic: a caller who
- * asked for a tail must not get a run that looks configured but reports none.
- */
-function stderrCapture(limit: number | undefined): StderrCapture {
-  if (limit === undefined) {
-    return {
-      stdio: ['ignore', 'inherit', 'inherit'],
-      lines: undefined,
-      limit: 0,
-    };
-  }
-  if (!Number.isInteger(limit) || limit <= 0) {
-    throw new TypeError(
-      `stderrTailLines must be a positive integer, got ${String(limit)}`,
-    );
-  }
-  return { stdio: ['ignore', 'inherit', 'pipe'], lines: [], limit };
-}
-
-/**
- * Keeps the last `limit` lines while mirroring every chunk to the Portal's own
- * stderr, and resolves once the pipe is drained.
- *
- * Mirroring rather than logging keeps the operator's view identical to the
- * default `inherit`: the same fd 2, no structured-log flood from a chatty child,
- * and a custom logger sink is not silently bypassed. The mirror is best-effort;
- * a closed stderr must not break exit observation.
- *
- * The tail array is shared with every `ServerExitInfo` this spawn reports. Bun
- * reports the exit independently of the pipe, so a consumer can observe the
- * exit before the last lines have been read; the returned promise lets
- * `recordExit` wait for them within a bound instead of reporting an empty tail.
- */
-function pumpStderr(
-  stream: ReadableStream<Uint8Array>,
-  capture: StderrCapture,
-): Promise<void> {
-  const lines = capture.lines;
-  if (lines === undefined) {
-    return Promise.resolve();
-  }
-  const decoder = new TextDecoder();
-  let pending = '';
-  const trim = (): void => {
-    const overflow = lines.length - capture.limit;
-    if (overflow > 0) {
-      lines.splice(0, overflow);
-    }
-  };
-  const record = (text: string): void => {
-    const parts = text.split('\n');
-    pending = parts.pop() ?? '';
-    for (const part of parts) {
-      lines.push(part.slice(0, STDERR_LINE_LIMIT));
-    }
-    // A child that never writes a newline must not grow the tail either.
-    if (pending.length > STDERR_LINE_LIMIT) {
-      lines.push(pending.slice(0, STDERR_LINE_LIMIT));
-      pending = '';
-    }
-    trim();
-  };
-  return (async () => {
-    try {
-      for await (const chunk of stream) {
-        const text = decoder.decode(chunk, { stream: true });
-        mirrorToPortalStderr(text);
-        record(text);
-      }
-      mirrorToPortalStderr(decoder.decode());
-      if (pending.length > 0) {
-        lines.push(pending);
-        pending = '';
-        trim();
-      }
-    } catch {
-      // A read failure only costs diagnostics; exit observation must not
-      // depend on the pipe.
-    }
-  })();
-}
-
-function mirrorToPortalStderr(text: string): void {
-  if (text.length === 0) {
-    return;
-  }
-  try {
-    process.stderr.write(text);
-  } catch {
-    // The Portal's stderr is gone; the child's output has nowhere to go.
-  }
-}
 
 /**
  * `Bun.spawn` as a `SpawnedServer` (ADR-0002). The IPC callbacks are the only
@@ -159,17 +49,12 @@ function mirrorToPortalStderr(text: string): void {
  *   own. Exit state is therefore taken from `exitCode`/`signalCode` only.
  */
 export function spawnBunServer(options: BunServerSpawnOptions): SpawnedServer {
-  const inbound: unknown[] = [];
   const exit = Promise.withResolvers<ServerExitInfo>();
   const logger =
     options.logger === undefined ? undefined : safeLogger(options.logger);
   const capture = stderrCapture(options.stderrTailLines);
 
-  let onMessage: ((message: unknown) => void) | undefined;
-  let onClose: ((reason: string) => void) | undefined;
-  let closeReason: string | undefined;
   let closedLocally = false;
-  let notified = false;
   let subprocess: Subprocess | undefined;
   let recorded: ServerExitInfo | undefined;
   /**
@@ -180,27 +65,34 @@ export function spawnBunServer(options: BunServerSpawnOptions): SpawnedServer {
    */
   const drained = Promise.withResolvers<void>();
 
-  function notifyClose(): void {
-    if (closeReason === undefined || notified || closedLocally) {
-      return;
-    }
-    if (onClose === undefined) {
-      // Leave `notified` false: a close that beats subscription must still
-      // reach a handler registered later (IpcChannel contract).
-      return;
-    }
-    notified = true;
-    onClose(closeReason);
-  }
-
-  function markClosed(reason: string): void {
-    if (closeReason !== undefined) {
-      return;
-    }
-    closeReason = reason;
-    inbound.length = 0;
-    notifyClose();
-  }
+  const channel = createEndpointChannel({
+    send: (message: IpcMessage): void => {
+      if (subprocess === undefined) {
+        throw new IpcChannelClosedError('server process is not available');
+      }
+      try {
+        subprocess.send(message);
+      } catch (error) {
+        // The child exited between the check above and this call. Surfacing it
+        // as the channel's own error keeps one failure type for "cannot send".
+        throw new IpcChannelClosedError(messageOf(error));
+      }
+    },
+    // Closing the channel closes the pipe, not the process: killing is the
+    // executor's decision, and it already has `kill()` for that.
+    disconnect: (): void => {
+      subprocess?.disconnect();
+    },
+    // The Portal closes this channel itself on every shutdown path; a handler
+    // registered afterwards must not hear about a close it caused.
+    suppressNotifyOnLocalClose: true,
+    defaultCloseReason: LOCAL_CLOSE_REASON,
+    // Read by `recordExit` so a local close does not log the exit as a
+    // peer-side loss.
+    onLocalClose: (): void => {
+      closedLocally = true;
+    },
+  });
 
   /**
    * Records how the process ended and reports it exactly once. `observed` is
@@ -222,9 +114,9 @@ export function spawnBunServer(options: BunServerSpawnOptions): SpawnedServer {
       return;
     }
     recorded = exitInfoOf(code, signal, observed);
-    const channelWasClosed = closeReason !== undefined;
+    const channelWasClosed = channel.closedReason !== undefined;
     if (observed) {
-      markClosed(
+      channel.markClosed(
         signal === null
           ? `server process exited with code ${String(code)}`
           : `server process killed by ${signal}`,
@@ -239,7 +131,7 @@ export function spawnBunServer(options: BunServerSpawnOptions): SpawnedServer {
           code: 'IPC_SERVER_EXITED',
           exitCode: code,
           signal,
-          reason: closeReason,
+          reason: channel.closedReason,
         },
         'server process exited after its channel closed',
       );
@@ -281,20 +173,13 @@ export function spawnBunServer(options: BunServerSpawnOptions): SpawnedServer {
     // Only another Bun process can speak this protocol; a Node child would
     // silently misinterpret the serialized frames.
     ipc: (message: unknown) => {
-      if (closeReason !== undefined) {
-        return;
-      }
-      if (onMessage === undefined) {
-        inbound.push(message);
-        return;
-      }
-      onMessage(message);
+      channel.receive(message);
     },
     onExit: (_subprocess, exitCode, signalCode) => {
       recordExit(exitCode, normaliseSignal(signalCode), true);
     },
     onDisconnect: () => {
-      markClosed(DISCONNECTED_REASON);
+      channel.markClosed(DISCONNECTED_REASON);
     },
     // The child must not read the terminal: stdin is the Portal's. Its logs go
     // to the same stderr so they stay visible; only an explicit capture request
@@ -329,50 +214,6 @@ export function spawnBunServer(options: BunServerSpawnOptions): SpawnedServer {
       recordExit(code, signal, true);
     }
   })();
-
-  const channel: IpcChannel = {
-    send(message: IpcMessage): void {
-      if (closeReason !== undefined) {
-        throw new IpcChannelClosedError(closeReason);
-      }
-      if (subprocess === undefined) {
-        throw new IpcChannelClosedError('server process is not available');
-      }
-      try {
-        subprocess.send(message);
-      } catch (error) {
-        // The child exited between the check above and this call. Surfacing it
-        // as the channel's own error keeps one failure type for "cannot send".
-        throw new IpcChannelClosedError(messageOf(error));
-      }
-    },
-    onMessage(handler: (message: unknown) => void): void {
-      onMessage = handler;
-      const queued = inbound.splice(0);
-      for (const message of queued) {
-        handler(message);
-      }
-    },
-    onClose(handler: (reason: string) => void): void {
-      onClose = handler;
-      notifyClose();
-    },
-    close(reason?: string): void {
-      if (closeReason !== undefined) {
-        return;
-      }
-      closedLocally = true;
-      closeReason = reason ?? LOCAL_CLOSE_REASON;
-      inbound.length = 0;
-      try {
-        // Closing the channel closes the pipe, not the process: killing is the
-        // executor's decision, and it already has `kill()` for that.
-        subprocess?.disconnect();
-      } catch {
-        // Already disconnected or already exited; the state we wanted holds.
-      }
-    },
-  };
 
   return {
     channel,

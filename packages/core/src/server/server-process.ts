@@ -16,11 +16,7 @@ import { requestLogFields } from '../shared/identity.ts';
 import type { RequestRunner } from './request-runner.ts';
 import type { ActivationDeps } from './server-activation.ts';
 import { startAndServe } from './server-activation.ts';
-import {
-  handleChannelClose,
-  handleParentGone,
-  ParentWatch,
-} from './server-liveness.ts';
+import { ParentWatch } from './server-liveness.ts';
 import type { ServerProcessOptions } from './server-process-options.ts';
 import { ABORT_TIMEOUT_MS, ServerShutdown } from './server-shutdown.ts';
 import type { Runtime } from './server-startup.ts';
@@ -142,9 +138,7 @@ class ServerProcess {
       logger: this.logger,
       channel: this.channel,
       readAbortBudgetMs: () => options.abortTimeoutMs ?? ABORT_TIMEOUT_MS,
-      sendQuietly: (message, what) => {
-        this.sendQuietly(message, what);
-      },
+      sendQuietly: (message, what) => this.sendQuietly(message, what),
       markShuttingDown: () => {
         this.enterShuttingDown();
       },
@@ -211,16 +205,42 @@ class ServerProcess {
     await this.activation.promise;
   }
 
+  /**
+   * The parent disappeared. Before activation there is no storage to drain, so
+   * the activation is failed and the link closed; once a runtime exists the
+   * close belongs to `abort`. During `starting` the start owns whatever it
+   * opened and closes it when it finishes.
+   */
   private onParentGone(): void {
-    handleParentGone({
-      ...this.closeDeps(),
-      recordParentGone: (reason) => {
-        this.parentGoneReason = reason;
-      },
-      closeChannel: (reason) => {
-        this.channel.close(reason);
-      },
-    });
+    if (this.phase === 'shutting-down') {
+      return;
+    }
+    const wasStarting = this.phase === 'starting';
+    const reason = 'the parent process is gone';
+    this.enterShuttingDown();
+    this.parentGoneReason = reason;
+    this.logger.error(
+      { code: 'IPC_PARENT_GONE', reason },
+      'parent process gone; server stopping',
+    );
+    const runtime = this.runtime;
+    const runner = this.runner;
+    if (runtime !== undefined && runner !== undefined) {
+      void this.shutdown.abort(runtime, runner, reason);
+      return;
+    }
+    if (wasStarting) {
+      // `startServer` is mid-flight and owns what it opened: it closes the
+      // backend and rejects the activation when it finishes, so rejecting here
+      // would let the caller exit the process while that close is in flight.
+      return;
+    }
+    // ADR-0007: before activation there is no storage to drain, but `run()` is
+    // parked on `activation.promise`, so rejecting it is what makes the process
+    // return instead of outliving the Portal that started it. Closing the link
+    // is what lets the event loop empty; without it an orphan lingers.
+    this.activation.reject(new ServerChannelClosedError(reason));
+    this.channel.close(reason);
   }
 
   /**
@@ -425,41 +445,45 @@ class ServerProcess {
     this.activation.resolve();
   }
 
+  /**
+   * The link closed. The reason is always recorded for a start that may still
+   * be in flight: it must close the storage it just opened instead of
+   * announcing readiness to a Portal that is gone.
+   */
   private onChannelClose(reason: string): void {
-    handleChannelClose(reason, {
-      ...this.closeDeps(),
-      recordChannelClosed: (value) => {
-        this.channelClosedReason = value;
-      },
-    });
+    this.channelClosedReason = reason;
+    if (this.phase === 'shutting-down') {
+      // Our own `close` at the end of an orderly shutdown, or the close that an
+      // abort already issued.
+      return;
+    }
+    const runtime = this.runtime;
+    const runner = this.runner;
+    if (runtime === undefined || runner === undefined) {
+      // ADR-0007: no storage is open before `ready`, so failing here cannot
+      // leave a second writer behind (INV-002). During `starting` the run
+      // itself closes whatever it just opened; rejecting here as well would let
+      // the caller exit the process while that close is still in flight.
+      this.logger.error(
+        { code: 'IPC_CHANNEL_CLOSED', reason },
+        'ipc channel closed before ready; server stopping',
+      );
+      if (this.phase !== 'starting') {
+        this.enterShuttingDown();
+        this.activation.reject(new ServerChannelClosedError(reason));
+      }
+      return;
+    }
+    this.enterShuttingDown();
+    this.logger.error(
+      { code: 'IPC_CHANNEL_CLOSED', reason },
+      'ipc channel closed; server stopping',
+    );
+    void this.shutdown.abort(runtime, runner, reason);
   }
 
   private enterShuttingDown(): void {
     this.phase = 'shutting-down';
-  }
-
-  /**
-   * The deps both liveness paths share: they read the phase and the running
-   * pieces, and fail the process through the same completion.
-   */
-  private closeDeps() {
-    return {
-      logger: this.logger,
-      isShuttingDown: () => this.phase === 'shutting-down',
-      isStarting: () => this.phase === 'starting',
-      enterShuttingDown: () => {
-        this.enterShuttingDown();
-      },
-      runtime: () => this.runtime,
-      runner: () => this.runner,
-      abort: (runtime: Runtime, runner: RequestRunner, reason: string) =>
-        this.shutdown.abort(runtime, runner, reason),
-      channelClosedError: (reason: string) =>
-        new ServerChannelClosedError(reason),
-      rejectActivation: (error: Error) => {
-        this.activation.reject(error);
-      },
-    };
   }
 
   private activationDeps(): ActivationDeps {

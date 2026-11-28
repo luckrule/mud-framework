@@ -4,14 +4,8 @@ import { messageOf } from '../shared/guards.ts';
 import { elapsedMs } from '../shared/timeout.ts';
 import { TRANSPORT_CLOSED, failureLogLevel } from '../shared/wire-codes.ts';
 import type { TransportConnection } from '../transport/types.ts';
-import type {
-  AdmissionHost,
-  ConnectionState,
-  RequestSeat,
-} from './connection-admission.ts';
+import type { AdmissionHost } from './connection-admission.ts';
 import {
-  BACKLOG_CLOSED_REASON,
-  acquireSeat,
   refuseAfterShutdown,
   refuseQueue,
   refuseWithId,
@@ -19,6 +13,8 @@ import {
 import type { LayerHost } from './connection-host.ts';
 import { isExecutorOutcome, toFailure } from './connection-outcome-guards.ts';
 import { rawLengthOf, rejectEnvelope, reply } from './connection-reply.ts';
+import type { ConnectionState, RequestSeat } from './connection-state.ts';
+import { BACKLOG_CLOSED_REASON, acquireSeat } from './connection-state.ts';
 import type { ConnectionLayerStatus } from './health.ts';
 
 /**
@@ -218,8 +214,10 @@ async function handle(
     );
     return;
   }
-  // Registered before the executor is called, so a disconnect that lands while
-  // the request is queued behind another one still cancels it.
+  // Registered before the executor is called, so a disconnect from this point
+  // on cancels the request. A request still waiting behind another at the
+  // Session barrier has not reached here and is not in this set: the
+  // disconnect drops it before start through the aborted `closed` signal.
   state.inFlight.add(requestId);
   let outcome: ExecutorOutcome;
   try {

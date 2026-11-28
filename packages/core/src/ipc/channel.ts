@@ -59,7 +59,7 @@ interface Endpoint {
   notified: boolean;
 }
 
-const DEFAULT_CLOSE_REASON = 'closed by local side';
+export const DEFAULT_CLOSE_REASON = 'closed by local side';
 
 /**
  * Two connected channels for unit tests, with no process and no serialization.

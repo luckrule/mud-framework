@@ -5,9 +5,11 @@ import { describeValue } from '../shared/guards.ts';
 import type { Transport } from '../transport/types.ts';
 
 /**
- * SPEC 6.3 bounds the wait for in-flight work. 10s covers a healthy commit or
- * rollback with room to spare, and is short enough that a deploy hitting a
- * stuck handler looks slow rather than hung.
+ * Floor for the shutdown waits in SPEC 6.3: request drain and transport stop
+ * use it directly; the executor close wait takes the larger of this and the
+ * executor's close budget plus EXECUTOR_CLOSE_SLACK_MS. 10s covers a healthy
+ * commit or rollback with room to spare, and is short enough that a deploy
+ * hitting a stuck handler looks slow rather than hung.
  */
 export const DEFAULT_STOP_TIMEOUT_MS = 10_000;
 
@@ -43,6 +45,11 @@ export const EVENT_SEND_SLACK_MS = 250;
  * tests can name the same ceiling rather than hard-code it.
  */
 export const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+/** Caps a derived delay where `setTimeout` stops honouring it. */
+export function clampTimerDelay(ms: number): number {
+  return Math.min(ms, MAX_TIMER_DELAY_MS);
+}
 
 /**
  * The bound on one downlink write when neither the caller nor the transport
@@ -189,7 +196,7 @@ export function resolveSendTimeoutMs(options: ConnectionLayerOptions): number {
   }
   const declared = options.transport.sendTimeoutMs;
   if (declared !== undefined && Number.isFinite(declared) && declared >= 1) {
-    return Math.min(declared + EVENT_SEND_SLACK_MS, MAX_TIMER_DELAY_MS);
+    return clampTimerDelay(declared + EVENT_SEND_SLACK_MS);
   }
   return UNDECLARED_EVENT_SEND_TIMEOUT_MS;
 }
@@ -203,22 +210,6 @@ export function assertPositiveInteger(value: unknown, name: string): void {
   if (!Number.isInteger(value) || value < 1) {
     throw new RangeError(
       `${name} must be a positive integer, got ${String(value)}`,
-    );
-  }
-}
-
-function assertFiniteAtLeastOne(
-  value: unknown,
-  name: string,
-): asserts value is number {
-  if (typeof value !== 'number') {
-    throw new TypeError(
-      `${name} must be a finite number of at least 1, got ${describeValue(value)}`,
-    );
-  }
-  if (!Number.isFinite(value) || value < 1) {
-    throw new RangeError(
-      `${name} must be a finite number of at least 1, got ${String(value)}`,
     );
   }
 }
@@ -238,7 +229,16 @@ export function assertTimerDelay(
   value: unknown,
   name: string,
 ): asserts value is number {
-  assertFiniteAtLeastOne(value, name);
+  if (typeof value !== 'number') {
+    throw new TypeError(
+      `${name} must be a finite number of at least 1, got ${describeValue(value)}`,
+    );
+  }
+  if (!Number.isFinite(value) || value < 1) {
+    throw new RangeError(
+      `${name} must be a finite number of at least 1, got ${String(value)}`,
+    );
+  }
   if (value > MAX_TIMER_DELAY_MS) {
     throw new RangeError(
       `${name} must not exceed ${MAX_TIMER_DELAY_MS}ms (the largest setTimeout delay), got ${String(value)}`,

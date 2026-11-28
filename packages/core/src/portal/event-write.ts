@@ -12,7 +12,11 @@
 export interface BacklogOverflow {
   /** Which buffer refused the frame; the other one is the bound's other scope. */
   readonly buffer: 'connection' | 'session';
-  /** Frames already waiting in that buffer, including one being written. */
+  /**
+   * Frames already waiting in that buffer. The connection queue counts the
+   * frame being written; the Session queue counts only frames still in
+   * `entries`, because the pump shifts a frame out before writing it.
+   */
   readonly queuedEvents: number;
   /** Their encoded size, matching the bound's unit. */
   readonly queuedEventBytes: number;
@@ -66,14 +70,15 @@ export class EventWrite {
   readonly bytes: number;
   /** Set by `run` before it yields; a started frame can no longer be cancelled. */
   started = false;
-  /** Set with the outcome; a settled frame never writes. */
-  settled = false;
   /**
    * The outcome once settled. A Session queue reads it at shutdown to tell a
    * frame handed back for redelivery (still unwritten) from one that already
    * ended in a connection queue, which that queue has counted.
    */
   settledAs: EventOutcome | undefined;
+  get settled(): boolean {
+    return this.settledAs !== undefined;
+  }
   readonly outcome: Promise<EventOutcome>;
   private readonly write: () => EventOutcome | Promise<EventOutcome>;
   private readonly settleOutcome: (outcome: EventOutcome) => void;
@@ -90,10 +95,9 @@ export class EventWrite {
   }
 
   settle(outcome: EventOutcome): void {
-    if (this.settled) {
+    if (this.settledAs !== undefined) {
       return;
     }
-    this.settled = true;
     this.settledAs = outcome;
     this.settleOutcome(outcome);
   }

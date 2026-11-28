@@ -1,6 +1,6 @@
 import type { ServerEvent } from '../shared/events.ts';
-import type { ConnectionState } from './connection-admission.ts';
-import { BACKLOG_CLOSED_REASON } from './connection-admission.ts';
+import type { ConnectionState } from './connection-state.ts';
+import { BACKLOG_CLOSED_REASON } from './connection-state.ts';
 import type { EventBacklog } from './event-backlog.ts';
 import type { EncodedEvent, EventDeliveryHost } from './event-frame.ts';
 import {
@@ -10,6 +10,12 @@ import {
 } from './event-frame.ts';
 import type { EventOutcome } from './event-write.ts';
 import { EventWrite } from './event-write.ts';
+import type {
+  InHandFrame,
+  SessionEventQueue,
+  SessionQueuedEvent,
+} from './session-queue-state.ts';
+import { createSessionQueue } from './session-queue-state.ts';
 
 /**
  * Serial delivery for one Session: its pending queue, the pump that holds the
@@ -24,59 +30,6 @@ import { EventWrite } from './event-write.ts';
  * would let two connections hand the event back and forth, so it is dropped.
  */
 const MAX_SESSION_REDELIVERIES = 1;
-
-/**
- * One Session-addressed frame waiting for that Session's serial slot.
- * `bytes` is charged against the Session queue's own bound from acceptance
- * until the frame is handed to a connection queue (SPEC 3.8).
- */
-export interface SessionQueuedEvent {
-  readonly event: ServerEvent;
-  readonly frame: string | Uint8Array;
-  readonly bytes: number;
-  /** Resolves the promise `deliverServerEvent` returned for this event. */
-  readonly done: () => void;
-}
-
-/**
- * The pending queue of one Session. Bounded per instance: a Session whose
- * holder cannot write accumulates frames here, not in process memory.
- * `pumping` marks that the Session's serial slot is held — one frame is being
- * delivered, and later ones wait in `entries`.
- */
-export interface SessionEventQueue {
-  readonly sessionId: string;
-  readonly entries: SessionQueuedEvent[];
-  frames: number;
-  bytes: number;
-  pumping: boolean;
-  /**
-   * The frame the pump holds right now: shifted out of `entries`, so no longer
-   * counted by `frames`/`bytes`, and either waiting in a connection queue or
-   * between buffers during a takeover redelivery (SPEC 3.8).
-   */
-  inHand: InHandFrame | undefined;
-}
-
-export function createSessionQueue(sessionId: string): SessionEventQueue {
-  return {
-    sessionId,
-    entries: [],
-    frames: 0,
-    bytes: 0,
-    pumping: false,
-    inHand: undefined,
-  };
-}
-
-/**
- * The frame the pump currently holds. `write` is the latest delivery attempt,
- * replaced on each redelivery.
- */
-export interface InHandFrame {
-  readonly bytes: number;
-  write: EventWrite | undefined;
-}
 
 /**
  * True when this in-hand frame was released by a connection queue for a

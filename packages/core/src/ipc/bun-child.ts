@@ -2,16 +2,15 @@ import { createJsonLogger } from '../logging/json-logger.ts';
 import { safeLogger } from '../logging/safe-logger.ts';
 import type { Logger } from '../logging/types.ts';
 import { messageOf } from '../shared/guards.ts';
+import { createEndpointChannel } from './channel-endpoint.ts';
 import type { IpcChannel } from './channel.ts';
-import { IpcChannelClosedError } from './channel.ts';
+import { DEFAULT_CLOSE_REASON, IpcChannelClosedError } from './channel.ts';
 import type { IpcMessage } from './protocol.ts';
 
 export interface ProcessChannelOptions {
   /** Defaults to the JSON logger; only used when IPC is unavailable. */
   logger?: Logger;
 }
-
-const DEFAULT_CLOSE_REASON = 'closed by local side';
 
 /**
  * The one channel this process owns, if any. `process.send` and the
@@ -60,56 +59,8 @@ export function createProcessChannel(
     );
   }
 
-  let closedReason: string | undefined;
-  let messageHandler: ((message: unknown) => void) | undefined;
-  let closeHandler: ((reason: string) => void) | undefined;
-  let closeNotified = false;
-  const pending: unknown[] = [];
-
-  const notifyClose = (): void => {
-    if (closeHandler === undefined || closeNotified) {
-      return;
-    }
-    if (closedReason === undefined) {
-      return;
-    }
-    closeNotified = true;
-    closeHandler(closedReason);
-  };
-
-  const markClosed = (reason: string): void => {
-    if (closedReason !== undefined) {
-      return;
-    }
-    closedReason = reason;
-    pending.length = 0;
-    notifyClose();
-  };
-
-  process.on('message', (message: unknown) => {
-    if (closedReason !== undefined) {
-      return;
-    }
-    if (messageHandler === undefined) {
-      pending.push(message);
-      return;
-    }
-    messageHandler(message);
-  });
-  process.on('disconnect', () => {
-    markClosed('process disconnected');
-  });
-  // `disconnect` does not fire when the parent dies abruptly, so `exit` is the
-  // fallback that keeps a consumer waiting on `onClose` from hanging.
-  process.on('exit', () => {
-    markClosed('process exited');
-  });
-
-  const channel: IpcChannel = {
-    send(message: IpcMessage): void {
-      if (closedReason !== undefined) {
-        throw new IpcChannelClosedError(closedReason);
-      }
+  const channel = createEndpointChannel({
+    send: (message: IpcMessage): void => {
       if (!hasProcessSend) {
         throw new IpcChannelClosedError('process has no ipc channel');
       }
@@ -125,33 +76,27 @@ export function createProcessChannel(
         throw new IpcChannelClosedError('the ipc channel rejected the message');
       }
     },
-    onMessage(handler: (message: unknown) => void): void {
-      messageHandler = handler;
-      const queued = pending.splice(0);
-      for (const message of queued) {
-        handler(message);
-      }
+    // `disconnect` throws when the process never had an IPC channel, which is
+    // not a failure: the channel is already marked closed by `close()`.
+    disconnect: (): void => {
+      process.disconnect?.();
     },
-    onClose(handler: (reason: string) => void): void {
-      closeHandler = handler;
-      notifyClose();
-    },
-    close(reason?: string): void {
-      if (closedReason !== undefined) {
-        return;
-      }
-      closedReason = reason ?? DEFAULT_CLOSE_REASON;
-      pending.length = 0;
-      // The local side is not notified of its own close, matching the interface.
-      // `disconnect` throws when the process never had an IPC channel, which is
-      // not a failure: the channel is already marked closed above.
-      try {
-        process.disconnect?.();
-      } catch {
-        // Nothing to report: the peer is either gone or was never attached.
-      }
-    },
-  };
+    suppressNotifyOnLocalClose: false,
+    defaultCloseReason: DEFAULT_CLOSE_REASON,
+  });
+
+  process.on('message', (message: unknown) => {
+    channel.receive(message);
+  });
+  process.on('disconnect', () => {
+    channel.markClosed('process disconnected');
+  });
+  // `disconnect` does not fire when the parent dies abruptly, so `exit` is the
+  // fallback that keeps a consumer waiting on `onClose` from hanging.
+  process.on('exit', () => {
+    channel.markClosed('process exited');
+  });
+
   processChannel = channel;
   return channel;
 }
