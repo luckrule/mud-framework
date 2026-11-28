@@ -14,7 +14,11 @@ import {
  */
 const DEFAULT_PORTAL_PORT = 8080;
 const SHUTDOWN_SIGNALS = ['SIGINT', 'SIGTERM'] as const;
-const SERVER_ENTRY = fileURLToPath(new URL('./server.ts', import.meta.url));
+const SERVER_ENTRY_OVERRIDE = process.env.GAME_SLICE_SERVER_ENTRY?.trim();
+const SERVER_ENTRY =
+  SERVER_ENTRY_OVERRIDE === undefined || SERVER_ENTRY_OVERRIDE.length === 0
+    ? fileURLToPath(new URL('./server.ts', import.meta.url))
+    : SERVER_ENTRY_OVERRIDE;
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);

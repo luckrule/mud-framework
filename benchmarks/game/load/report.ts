@@ -6,6 +6,7 @@ import {
   write,
 } from '../support.ts';
 import type { PidTraceReport, ResourceReport } from './resources.ts';
+import type { ServerStatsRead } from './server-stats.ts';
 import type { MainConfig } from './support.ts';
 import { COMMAND_NAMES, Histogram, mixText } from './support.ts';
 import type { CommandName, LoadResultJson } from './support.ts';
@@ -37,6 +38,7 @@ export interface AggregateEvents {
 
 export interface Aggregate {
   clients: number;
+  senders: number;
   measuredFromMs: number;
   measuredUntilMs: number;
   readonly commands: Record<CommandName, AggregateCommand>;
@@ -68,6 +70,7 @@ export function aggregateResults(
   };
   const aggregate: Aggregate = {
     clients: 0,
+    senders: 0,
     measuredFromMs: Number.POSITIVE_INFINITY,
     measuredUntilMs: Number.NEGATIVE_INFINITY,
     commands,
@@ -77,6 +80,7 @@ export function aggregateResults(
   };
   for (const result of results) {
     aggregate.clients += result.clients;
+    aggregate.senders += result.senders;
     aggregate.measuredFromMs = Math.min(
       aggregate.measuredFromMs,
       result.measuredFromMs,
@@ -138,7 +142,7 @@ export function printPerGenerator(results: readonly LoadResultJson[]): void {
       0,
     );
     write(
-      `  ${result.generator}: clients ${integerText(result.clients)}, setup ${(result.setupMs / 1000).toFixed(2)} s, window ${((result.measuredUntilMs - result.measuredFromMs) / 1000).toFixed(2)} s, ops ${integerText(successes)}, errors ${integerText(errorCount(result.errors))}`,
+      `  ${result.generator}: clients ${integerText(result.clients)} (senders ${integerText(result.senders)}, listeners ${integerText(result.clients - result.senders)}), setup ${(result.setupMs / 1000).toFixed(2)} s, window ${((result.measuredUntilMs - result.measuredFromMs) / 1000).toFixed(2)} s, ops ${integerText(successes)}, errors ${integerText(errorCount(result.errors))}`,
     );
   }
 }
@@ -150,7 +154,7 @@ export function printAggregate(aggregate: Aggregate, config: MainConfig): void {
   const totalErrors = errorCount(aggregate.errors);
 
   write(
-    `\nresults (warmup excluded, union measurement window ${(windowMs / 1000).toFixed(2)} s):`,
+    `\nresults (senders ${integerText(aggregate.senders)}, listeners ${integerText(aggregate.clients - aggregate.senders)}, warmup excluded, union measurement window ${(windowMs / 1000).toFixed(2)} s):`,
   );
   write(
     `  successful ops ${integerText(successes)}, ${throughputText(successes, windowNs)}, errors ${integerText(totalErrors)}`,
@@ -226,6 +230,46 @@ export function printAggregate(aggregate: Aggregate, config: MainConfig): void {
   );
 }
 
+function bytesText(bytes: number): string {
+  const mib = 1024 * 1024;
+  return bytes >= mib
+    ? `${(bytes / mib).toFixed(1)} MB`
+    : bytes >= 1024
+      ? `${(bytes / 1024).toFixed(1)} KB`
+      : `${bytes} B`;
+}
+
+export function printServerStats(
+  read: ServerStatsRead,
+  senderSessions: number,
+): void {
+  if (!read.ok) {
+    write(`\nserver ipc/handler stats: unavailable (${read.reason})`);
+    return;
+  }
+  const { ipc, handler } = read.stats;
+  const histogram = new Histogram();
+  histogram.mergeJson(handler.durationNs);
+  const summary = histogram.summary();
+  write(
+    `\nserver ipc/handler stats (benchmark-local counting channel, pid ${read.stats.pid}):`,
+  );
+  write(
+    `  ipc frames: outbound ${integerText(ipc.outboundFrames)} (${bytesText(ipc.outboundBytes)}), inbound ${integerText(ipc.inboundFrames)} (${bytesText(ipc.inboundBytes)})`,
+  );
+  write(
+    `  handler for ${integerText(senderSessions)} sender session(s), whole process lifetime: completed ${integerText(handler.completed)}, failed ${integerText(handler.failed)}, duration ms (Server's integer-ms log field, bucket upper bounds): ${latencyText(
+      {
+        minNs: summary.minNs,
+        p50Ns: summary.p50Ns,
+        p95Ns: summary.p95Ns,
+        p99Ns: summary.p99Ns,
+        maxNs: summary.maxNs,
+      },
+    )}`,
+  );
+}
+
 function pidTraceText(trace: PidTraceReport): string {
   const rssPeak =
     trace.peakRssKb === undefined
@@ -274,5 +318,5 @@ export function buildSummary(aggregate: Aggregate, config: MainConfig): string {
     aggregate.events.gaps === 0
       ? 'no event drops detected (sequence gaps 0)'
       : `${integerText(aggregate.events.gaps)} event gaps`;
-  return `summary: ${integerText(config.clients)} clients, ${config.shared.mode}, ${integerText(successes)} successful ops in ${(windowMs / 1000).toFixed(1)} s = ${throughputText(successes, windowMs * 1e6)}; look p50/p95 ${millisecondsText(look.p50Ns)}/${millisecondsText(look.p95Ns)} ms; move p50/p95 ${millisecondsText(move.p50Ns)}/${millisecondsText(move.p95Ns)} ms; say p50/p95 ${millisecondsText(say.p50Ns)}/${millisecondsText(say.p95Ns)} ms; room.say p50/p95 ${millisecondsText(event.p50Ns)}/${millisecondsText(event.p95Ns)} ms; errors ${integerText(errorCount(aggregate.errors))}; ${drops}; numbers are observations, not assertions`;
+  return `summary: ${integerText(config.clients)} clients (${integerText(config.senders)} senders, ${integerText(config.clients - config.senders)} listeners), ${config.shared.mode}, ${integerText(successes)} successful ops in ${(windowMs / 1000).toFixed(1)} s = ${throughputText(successes, windowMs * 1e6)}; look p50/p95 ${millisecondsText(look.p50Ns)}/${millisecondsText(look.p95Ns)} ms; move p50/p95 ${millisecondsText(move.p50Ns)}/${millisecondsText(move.p95Ns)} ms; say p50/p95 ${millisecondsText(say.p50Ns)}/${millisecondsText(say.p95Ns)} ms; room.say p50/p95 ${millisecondsText(event.p50Ns)}/${millisecondsText(event.p95Ns)} ms; errors ${integerText(errorCount(aggregate.errors))}; ${drops}; numbers are observations, not assertions`;
 }

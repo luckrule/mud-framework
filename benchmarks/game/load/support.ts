@@ -58,6 +58,8 @@ export interface SharedLoadConfig {
 export interface MainConfig {
   readonly shared: SharedLoadConfig;
   readonly clients: number;
+  /** First N global clients send commands; the rest only receive events. */
+  readonly senders: number;
   readonly generators: number;
   readonly dataDirectory: string | undefined;
   readonly keep: boolean;
@@ -160,8 +162,81 @@ export function roomForIndex(globalIndex: number, roomSize: number): string {
   return ROOM_IDS[Math.floor(globalIndex / roomSize) % ROOM_IDS.length];
 }
 
+/** Stable player name of a generator-local client index. */
+export function clientName(generator: number, index: number): string {
+  return `load-${generator}-${index}`;
+}
+
+/** The Session `game.login` binds for that name (see `game.ts`). */
+export function clientSessionId(generator: number, index: number): string {
+  return `player:${clientName(generator, index)}`;
+}
+
+/**
+ * How many of one generator's clients are senders, given the generator's
+ * global client offset. Senders are the first N global clients, so a generator
+ * that starts after N has none.
+ */
+export function senderClientsFor(
+  offset: number,
+  clients: number,
+  senders: number,
+): number {
+  return Math.max(0, Math.min(clients, senders - offset));
+}
+
+/**
+ * `LOAD_SENDERS` defaults to all clients, which keeps the original all-sender
+ * load shape. More senders than clients is a configuration error.
+ */
+export function parseSenderCount(
+  clients: number,
+  raw: string | undefined,
+): number {
+  const text = raw?.trim();
+  if (text === undefined || text.length === 0) {
+    return clients;
+  }
+  const senders = parseInteger('LOAD_SENDERS', text, 1);
+  if (senders > clients) {
+    throw new Error(
+      `LOAD_SENDERS (${senders}) must not exceed LOAD_CLIENTS (${clients})`,
+    );
+  }
+  return senders;
+}
+
 export function effectiveThinkMs(config: SharedLoadConfig): number {
   return config.mode === 'saturate' ? 0 : config.thinkMs;
+}
+
+export interface MeasurementWindow {
+  readonly fromMs: number;
+  readonly untilMs: number;
+}
+
+/** The go barrier line: `go <measurementStartMs>`. */
+export function goStartMsOf(line: string): number | undefined {
+  const match = /^go\s+(\d+)$/.exec(line.trim());
+  if (match?.[1] === undefined) {
+    return undefined;
+  }
+  const startMs = Number(match[1]);
+  return Number.isSafeInteger(startMs) && startMs >= 0 ? startMs : undefined;
+}
+
+/**
+ * Warmup and the measurement window are derived from the coordinator's single
+ * release timestamp. Using each generator's local receipt time here would give
+ * every process a window offset by its stdin scheduling delay.
+ */
+export function measurementWindow(
+  startMs: number,
+  warmupSec: number,
+  durationSec: number,
+): MeasurementWindow {
+  const fromMs = startMs + warmupSec * 1000;
+  return { fromMs, untilMs: fromMs + durationSec * 1000 };
 }
 
 function defaultRunTag(): string {
@@ -225,6 +300,7 @@ export function readMainConfig(): MainConfig {
   return {
     shared,
     clients,
+    senders: parseSenderCount(clients, process.env.LOAD_SENDERS),
     generators,
     dataDirectory:
       dataRaw !== undefined && dataRaw.length > 0
@@ -487,6 +563,7 @@ export interface LoadResultJson {
   readonly version: 1;
   readonly generator: number;
   readonly clients: number;
+  readonly senders: number;
   readonly setupMs: number;
   readonly measuredFromMs: number;
   readonly measuredUntilMs: number;
@@ -559,10 +636,20 @@ export function parseLoadResultJson(value: unknown): LoadResultJson {
   if (measuredUntilMs < measuredFromMs) {
     throw new Error('result measurement window ends before it starts');
   }
+  const clients = readIntegerField(value, 'clients', 'result', 1);
+  // Older generator files have no `senders`; they were all-sender runs.
+  const senders =
+    value.senders === undefined
+      ? clients
+      : readIntegerField(value, 'senders', 'result');
+  if (senders > clients) {
+    throw new Error(`result senders (${senders}) exceeds clients (${clients})`);
+  }
   return {
     version: 1,
     generator: readIntegerField(value, 'generator', 'result'),
-    clients: readIntegerField(value, 'clients', 'result', 1),
+    clients,
+    senders,
     setupMs: readNumberField(value, 'setupMs', 'result'),
     measuredFromMs,
     measuredUntilMs,

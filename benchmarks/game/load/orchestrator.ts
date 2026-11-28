@@ -7,7 +7,12 @@ import { messageOf } from '../../../packages/core/src/shared/guards.ts';
 import { portalStopFailed } from '../cleanup.ts';
 import { pumpLines, startPortal, write, writeError } from '../support.ts';
 import type { PortalHandle } from '../support.ts';
-import { mixText, parseLoadResultJson } from './support.ts';
+import {
+  clientSessionId,
+  mixText,
+  parseLoadResultJson,
+  senderClientsFor,
+} from './support.ts';
 import type {
   LoadResultJson,
   MainConfig,
@@ -21,6 +26,7 @@ import type {
  */
 
 const CLIENT_ENTRY = join(import.meta.dir, 'client.ts');
+const BENCH_SERVER_ENTRY = join(import.meta.dir, 'bench-server.ts');
 const PORTAL_ENTRY = join(
   import.meta.dir,
   '..',
@@ -41,21 +47,36 @@ const GENERATOR_KILL_WAIT_MS = 3000;
 
 type GeneratorProcess = Bun.Subprocess<'pipe', 'pipe', 'inherit'>;
 
+export interface LoadPortalOptions {
+  /** Benchmark-local Server writes its frame/handler counters here. */
+  readonly serverStatsFile: string;
+  /** Session ids of the sender clients, for the handler duration filter. */
+  readonly senderSessions: readonly string[];
+}
+
 export async function startLoadPortal(
   dataDirectory: string,
   shared: SharedLoadConfig,
+  options: LoadPortalOptions,
 ): Promise<PortalHandle> {
   return startPortal({
     entry: PORTAL_ENTRY,
     dataDirectory,
     requestTimeoutMs: shared.requestTimeoutMs,
     readyTimeoutMs: READY_TIMEOUT_MS,
+    extraEnv: {
+      GAME_SLICE_SERVER_ENTRY: BENCH_SERVER_ENTRY,
+      BENCH_SERVER_STATS: options.serverStatsFile,
+      BENCH_SENDER_SESSIONS: options.senderSessions.join(','),
+    },
   });
 }
 
 export interface GeneratorPlan {
   readonly index: number;
   readonly clients: number;
+  /** Clients of this generator that send; always its first `senders`. */
+  readonly senders: number;
   readonly offset: number;
   readonly resultFile: string;
 }
@@ -73,12 +94,26 @@ export function planGenerators(
     plans.push({
       index,
       clients,
+      senders: senderClientsFor(offset, clients, config.senders),
       offset,
       resultFile: join(resultsDir, `generator-${index}.json`),
     });
     offset += clients;
   }
   return plans;
+}
+
+/** Session ids of the sender clients, in global client order. */
+export function senderSessionIds(
+  plans: readonly GeneratorPlan[],
+): readonly string[] {
+  const sessions: string[] = [];
+  for (const plan of plans) {
+    for (let index = 0; index < plan.senders; index += 1) {
+      sessions.push(clientSessionId(plan.index, index));
+    }
+  }
+  return sessions;
 }
 
 export interface GeneratorHandle {
@@ -114,6 +149,7 @@ export function spawnGenerator(
       REQUEST_TIMEOUT_MS: String(shared.requestTimeoutMs),
       LOAD_GENERATOR_INDEX: String(plan.index),
       LOAD_GENERATOR_CLIENTS: String(plan.clients),
+      LOAD_GENERATOR_SENDERS: String(plan.senders),
       LOAD_GENERATOR_OFFSET: String(plan.offset),
       LOAD_GENERATOR_RESULT: plan.resultFile,
     },
@@ -205,13 +241,17 @@ export async function waitForReady(
 
 export async function sendGo(
   generators: readonly GeneratorHandle[],
-): Promise<void> {
+): Promise<number> {
+  // One timestamp for every generator: deriving the window from each process's
+  // local stdin receipt would offset windows by their scheduling delay.
+  const measurementStartMs = Date.now();
   await Promise.all(
     generators.map(async (handle) => {
-      await handle.child.stdin.write('go\n');
+      await handle.child.stdin.write(`go ${measurementStartMs}\n`);
       await handle.child.stdin.end();
     }),
   );
+  return measurementStartMs;
 }
 
 export async function collectResults(
@@ -250,10 +290,11 @@ export async function collectResults(
       const result = parseLoadResultJson(parsed);
       if (
         result.generator !== handle.plan.index ||
-        result.clients !== handle.plan.clients
+        result.clients !== handle.plan.clients ||
+        result.senders !== handle.plan.senders
       ) {
         throw new Error(
-          `generator ${handle.plan.index} result says generator=${result.generator} clients=${result.clients}`,
+          `generator ${handle.plan.index} result says generator=${result.generator} clients=${result.clients} senders=${result.senders}`,
         );
       }
       return result;
