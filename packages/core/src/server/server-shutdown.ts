@@ -19,7 +19,7 @@ export const ABORT_TIMEOUT_MS = 5000;
 export interface ServerShutdownDeps {
   readonly logger: Logger;
   readonly channel: IpcChannel;
-  /** Reads `options.abortTimeoutMs ?? ABORT_TIMEOUT_MS` when the budget is used. */
+  /** Reads the abort budget: the test override, else `ABORT_TIMEOUT_MS`. */
   readonly readAbortBudgetMs: () => number;
   /** Returns whether the message was sent; callers may ignore it. */
   readonly sendQuietly: (message: IpcMessage, what: string) => boolean;

@@ -1,6 +1,11 @@
 import type { SpawnedServer } from '../../ipc/spawn-port.ts';
 import type { Logger } from '../../logging/types.ts';
-import { assertTimerDelay } from '../connection-layer-options.ts';
+import { DEFAULT_MAX_RESTART_BACKOFF_MS } from '../../shared/budget.ts';
+import { describeValue } from '../../shared/guards.ts';
+import {
+  assertTimerDelay,
+  MAX_TIMER_DELAY_MS,
+} from '../connection-layer-options.ts';
 
 /** The executor's timer options, checked as whole milliseconds at construction. */
 export function assertExecutorTimerMs(
@@ -17,27 +22,72 @@ export function assertExecutorTimerMs(
   }
 }
 
+/**
+ * Resolves the restart backoff cap at construction. An omitted cap keeps the
+ * historical default even when `baseBackoffMs` is larger, so a configuration
+ * that predates this option behaves as it did. An explicit cap must be a safe
+ * integer from 1 to `MAX_TIMER_DELAY_MS` and at least the base: above the timer
+ * ceiling Bun clamps the delay to 1ms, and below the base the exponential
+ * growth has no range.
+ */
+export function resolveMaxRestartBackoffMs(
+  value: unknown,
+  baseBackoffMs: number,
+): number {
+  if (value === undefined) {
+    return DEFAULT_MAX_RESTART_BACKOFF_MS;
+  }
+  if (typeof value !== 'number') {
+    throw new TypeError(
+      `maxRestartBackoffMs must be a safe integer between 1 and ${MAX_TIMER_DELAY_MS} (2^31-1), got ${describeValue(value)}`,
+    );
+  }
+  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_TIMER_DELAY_MS) {
+    throw new RangeError(
+      `maxRestartBackoffMs must be a safe integer between 1 and ${MAX_TIMER_DELAY_MS} (2^31-1), got ${String(value)}`,
+    );
+  }
+  if (value < baseBackoffMs) {
+    throw new RangeError(
+      `maxRestartBackoffMs must be at least restartBackoffMs (${String(baseBackoffMs)}), got ${String(value)}`,
+    );
+  }
+  return value;
+}
+
 export interface IpcExecutorOptions {
   spawn: () => SpawnedServer;
   /** Portal-side per-request ceiling; effective = min(this, backend's declared max). */
   timeoutMs: number;
   /** Max replays of one request before it reaches a terminal state. Default 3. */
   maxReplays?: number;
-  /** Base for exponential restart backoff in ms. Default 100, cap 5000. */
+  /** Base for exponential restart backoff in ms. Default 100. */
   restartBackoffMs?: number;
   /**
-   * How long a Server must stay up before its crash streak is considered over.
-   * Defaults to `Math.max(30_000, timeoutMs)`.
+   * Ceiling for exponential restart backoff in ms. Default 5000.
    *
-   * The window must be at least as long as both the backoff cap (5000ms) and
-   * the longest a single request can live: a Server that crashes while
+   * An explicit value must be a safe integer from 1 to `MAX_TIMER_DELAY_MS`
+   * (2^31−1) and at least `restartBackoffMs`, checked at construction. The
+   * upper bound is the largest `setTimeout` delay; Bun clamps anything above
+   * it to 1ms, inverting a longer wait into the shortest. Omission keeps the
+   * default ceiling, including when `restartBackoffMs` is larger.
+   */
+  maxRestartBackoffMs?: number;
+  /**
+   * How long a Server must stay up before its crash streak is considered over.
+   * Defaults to `resolveStableResetMs(timeoutMs, maxRestartBackoffMs)`, i.e.
+   * `Math.max(30_000, timeoutMs, maxRestartBackoffMs)`.
+   *
+   * The window must be at least as long as both the backoff cap and the
+   * longest a single request can live: a Server that crashes while
    * handling its first request must be counted as a crash, not as a healthy
    * run that reset the backoff. Otherwise "ready, then die on the first
    * request" restarts at `attempt === 0` (immediate) forever.
    *
    * An explicit value must be an integer number of milliseconds from 1 to
    * `MAX_TIMER_DELAY_MS`, checked at construction. That range check does not
-   * cover this relation: the caller still owns it (ADR-0004).
+   * cover the relation to the cap or the request timeout, and an explicit
+   * value bypasses the default formula: the caller still owns it (ADR-0004).
    */
   stableResetMs?: number;
   /**

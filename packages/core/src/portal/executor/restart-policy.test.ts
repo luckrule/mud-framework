@@ -1,6 +1,6 @@
 import { describe, expect, jest, test } from 'bun:test';
 
-import { MAX_RESTART_BACKOFF_MS } from '../../shared/budget.ts';
+import { DEFAULT_MAX_RESTART_BACKOFF_MS } from '../../shared/budget.ts';
 import type { RestartPolicyOptions } from './restart-policy.ts';
 import { RestartPolicy } from './restart-policy.ts';
 
@@ -12,6 +12,7 @@ function makePolicy(
 ): RestartPolicy {
   return new RestartPolicy({
     baseBackoffMs: BASE_BACKOFF_MS,
+    maxBackoffMs: DEFAULT_MAX_RESTART_BACKOFF_MS,
     stableResetMs: STABLE_RESET_MS,
     ...options,
   });
@@ -56,16 +57,33 @@ describe('RestartPolicy backoff', () => {
       800,
       1600,
       3200,
-      MAX_RESTART_BACKOFF_MS,
-      MAX_RESTART_BACKOFF_MS,
-      MAX_RESTART_BACKOFF_MS,
+      DEFAULT_MAX_RESTART_BACKOFF_MS,
+      DEFAULT_MAX_RESTART_BACKOFF_MS,
+      DEFAULT_MAX_RESTART_BACKOFF_MS,
     ]);
     expect(policy.attempts).toBe(10);
+  });
 
-    // A base above the cap is capped on the second restart.
-    const capped = makePolicy({ baseBackoffMs: MAX_RESTART_BACKOFF_MS * 2 });
-    expect(capped.nextBackoffMs()).toBe(0);
-    expect(capped.nextBackoffMs()).toBe(MAX_RESTART_BACKOFF_MS);
+  test('the configured cap is the ceiling, including a small one', () => {
+    const policy = makePolicy({ maxBackoffMs: 250 });
+
+    const backoffs = Array.from({ length: 5 }, () => policy.nextBackoffMs());
+
+    expect(backoffs).toEqual([0, 100, 200, 250, 250]);
+  });
+
+  test('a base above the default cap is still capped at it', () => {
+    // A configuration that predates the cap option can set only a base above
+    // the historical 5000ms ceiling; it must keep that ceiling.
+    const policy = makePolicy({ baseBackoffMs: 6000 });
+
+    const backoffs = Array.from({ length: 3 }, () => policy.nextBackoffMs());
+
+    expect(backoffs).toEqual([
+      0,
+      DEFAULT_MAX_RESTART_BACKOFF_MS,
+      DEFAULT_MAX_RESTART_BACKOFF_MS,
+    ]);
   });
 });
 

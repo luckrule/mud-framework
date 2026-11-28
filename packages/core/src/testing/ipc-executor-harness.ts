@@ -17,6 +17,7 @@ export interface HarnessOptions {
   autoPrepare?: boolean;
   crashOnActivate?: boolean;
   restartBackoffMs?: number;
+  maxRestartBackoffMs?: number;
   shutdownTimeoutMs?: number;
   stableResetMs?: number;
   killExits?: boolean;
@@ -81,6 +82,7 @@ export function harness(options: Partial<HarnessOptions> = {}): Harness {
     timeoutMs: options.timeoutMs ?? 1000,
     maxReplays: options.maxReplays,
     restartBackoffMs: options.restartBackoffMs,
+    maxRestartBackoffMs: options.maxRestartBackoffMs,
     shutdownTimeoutMs: options.shutdownTimeoutMs,
     stableResetMs: options.stableResetMs,
     startTimeoutMs: options.startTimeoutMs,

@@ -23,7 +23,7 @@ import {
 } from '../testing/server-process.ts';
 import {
   ServerChannelClosedError,
-  runServerProcess,
+  runServerProcessWithTestOptions,
 } from './server-process.ts';
 
 describe('createProcessChannel singleton', () => {
@@ -197,7 +197,7 @@ describe('runServerProcess lifecycle', () => {
         throw new Error('the portal link refused to close');
       },
     };
-    const done = runServerProcess({
+    const done = runServerProcessWithTestOptions({
       createBackend: () => new MemoryStorageBackend(),
       extensions: [{ name: 'echo', register: echoRegistration }],
       timeoutMs: 1000,

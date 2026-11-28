@@ -6,6 +6,7 @@ import { degradations } from '../storage/degradations.ts';
 import { unmetRequirements } from '../storage/requirements.ts';
 import type { StorageBackend, StorageCapabilities } from '../storage/types.ts';
 import { DispatcherExecutor } from './dispatcher-executor.ts';
+import { resolveMaxEventsPerRequest } from './dispatcher-scope.ts';
 import { Dispatcher } from './dispatcher.ts';
 import type { Extension, ExtensionRegistrar } from './extension.ts';
 import type { ServerProcessOptions } from './server-process-options.ts';
@@ -63,6 +64,17 @@ export interface StartupDeps {
  */
 export async function startServer(deps: StartupDeps): Promise<StartupResult> {
   const { options, logger } = deps;
+  let maxEventsPerRequest: number;
+  try {
+    // SPEC 3.8: the cap is validated before any storage is opened, so an
+    // invalid configuration refuses startup without creating a backend. The
+    // Dispatcher validates again as its own precondition.
+    maxEventsPerRequest = resolveMaxEventsPerRequest(
+      options.maxEventsPerRequest,
+    );
+  } catch (error) {
+    throw reportStartupFailure(error, logger);
+  }
   const backend = await createBackend(options, logger);
   let dispatcher: Dispatcher | undefined;
   try {
@@ -93,7 +105,7 @@ export async function startServer(deps: StartupDeps): Promise<StartupResult> {
     dispatcher = new Dispatcher({
       backend,
       timeoutMs: options.timeoutMs,
-      maxEventsPerRequest: options.maxEventsPerRequest,
+      maxEventsPerRequest,
       authorize: options.authorize,
       logger,
     });
@@ -128,14 +140,7 @@ export async function startServer(deps: StartupDeps): Promise<StartupResult> {
     // otherwise claim readiness before the wire did.
     return { runtime, skippedExtensions };
   } catch (error) {
-    const failure =
-      error instanceof ServerStartupError
-        ? error
-        : new ServerStartupError(messageOf(error));
-    logger.error(
-      { code: failure.code, reason: failure.reason },
-      'server process failed to start',
-    );
+    const failure = reportStartupFailure(error, logger);
     await closeQuietly(dispatcher, backend, logger);
     throw failure;
   }
@@ -200,15 +205,29 @@ async function createBackend(
   try {
     return await options.createBackend();
   } catch (error) {
-    const failure = new ServerStartupError(
-      `storage backend could not be created: ${messageOf(error)}`,
+    throw reportStartupFailure(
+      new ServerStartupError(
+        `storage backend could not be created: ${messageOf(error)}`,
+      ),
+      logger,
     );
-    logger.error(
-      { code: failure.code, reason: failure.reason },
-      'server process failed to start',
-    );
-    throw failure;
   }
+}
+
+/** Wraps a startup failure once and emits the single failure line. */
+function reportStartupFailure(
+  error: unknown,
+  logger: Logger,
+): ServerStartupError {
+  const failure =
+    error instanceof ServerStartupError
+      ? error
+      : new ServerStartupError(messageOf(error));
+  logger.error(
+    { code: failure.code, reason: failure.reason },
+    'server process failed to start',
+  );
+  return failure;
 }
 
 async function closeQuietly(

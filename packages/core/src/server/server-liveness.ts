@@ -6,6 +6,7 @@
  */
 const PARENT_CHECK_INTERVAL_MS = 500;
 
+/** Test-injected knobs; a deployment uses the defaults in this module. */
 export interface ParentWatchOptions {
   readonly parentCheckIntervalMs?: number;
   readonly readParentPid?: () => number;
