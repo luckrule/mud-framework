@@ -346,6 +346,8 @@ TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：
 
 承诺：连接保活 + 未确认输入重放。终态与确认的区别见 §2；重放缓冲的移除条件是确认，不是终态。
 
+崩溃重启的退避上限由 `IpcExecutorOptions.maxRestartBackoffMs` 定义，默认 5000ms；显式值 MUST 是 1 到 2^31−1 的安全整数且不小于 `restartBackoffMs`。未设置上限时沿用 5000ms；即使 `restartBackoffMs` 大于它，也不因此拒绝，退避仍按 5000ms 封顶。首次重启立即，之后按指数递增到该上限。默认稳定窗口取 `max(30_000, timeoutMs, maxRestartBackoffMs)`，显式 `stableResetMs` 不受该公式约束，其关系由调用方保证（ADR-0004）。
+
 恢复受唯一写者屏障约束：只有 `SpawnedServer` 报告退出 `observed: true` 才能解除旧写者屏障。退出 Promise 仍 pending 而等待超时时，框架 MUST 保留引用，迟到的确认可在执行器仍可恢复时继续一次恢复；`close()` 或其它终态之后 MUST NOT 被迟到事件重新启动。若一次性退出结果是 `observed: false`，框架无法据此确认进程释放了存储，MUST 保持屏障，不承诺自动恢复；有界关闭仍无法确认退出时 MUST 失败。恢复可用性不能优先于 INV-002，请求仍受各自 deadline 约束。关闭未能确认退出时，健康态 MUST 保持 `blocked`（§6.6）。
 
 子进程诊断：`ServerExitInfo` 有一个可选字段 `stderrTail`，携带 spawn 被要求捕获时子进程 stderr 的末尾若干行；它是诊断信息，不参与退出判定——`observed` 仍是解除屏障的唯一依据，尾部是否为空或缺失不影响任何恢复、关闭或切换语义。切换失败时框架 MUST 在有诊断可用时把它带进 rejection，使消费方能读到“Server 为什么起不来”，而不是只能从 Portal 控制台看到。捕获开关与排空代价见 `docs/INTEGRATION.md`。
