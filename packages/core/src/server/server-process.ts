@@ -17,7 +17,10 @@ import type { RequestRunner } from './request-runner.ts';
 import type { ActivationDeps } from './server-activation.ts';
 import { startAndServe } from './server-activation.ts';
 import { ParentWatch } from './server-liveness.ts';
-import type { ServerProcessOptions } from './server-process-options.ts';
+import type {
+  ServerProcessOptions,
+  ServerProcessTestOptions,
+} from './server-process-options.ts';
 import { ABORT_TIMEOUT_MS, ServerShutdown } from './server-shutdown.ts';
 import type { Runtime } from './server-startup.ts';
 import { ServerStartupError } from './server-startup.ts';
@@ -81,8 +84,19 @@ export function runServerProcess(options: ServerProcessOptions): Promise<void> {
   return new ServerProcess(options).run();
 }
 
+/**
+ * The test harnesses' entry point. It accepts the overrides in
+ * `ServerProcessTestOptions`, which the package index does not export, so the
+ * public surface states only the production contract.
+ */
+export function runServerProcessWithTestOptions(
+  options: ServerProcessTestOptions,
+): Promise<void> {
+  return new ServerProcess(options).run();
+}
+
 class ServerProcess {
-  private readonly options: ServerProcessOptions;
+  private readonly options: ServerProcessTestOptions;
   private readonly logger: Logger;
   private readonly channel: IpcChannel;
   private readonly completion = Promise.withResolvers<void>();
@@ -126,7 +140,7 @@ class ServerProcess {
    */
   private parentGoneReason: string | undefined;
 
-  constructor(options: ServerProcessOptions) {
+  constructor(options: ServerProcessTestOptions) {
     this.options = options;
     this.logger = safeLogger(
       options.logger ??

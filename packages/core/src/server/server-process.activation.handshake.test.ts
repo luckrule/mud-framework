@@ -13,7 +13,7 @@ import {
   linkedServer,
   types,
 } from './server-process.activation.support.ts';
-import { runServerProcess } from './server-process.ts';
+import { runServerProcessWithTestOptions } from './server-process.ts';
 
 describe('runServerProcess two-phase activation', () => {
   test('ignores requests and cancels while preparing, and logs the fault once', async () => {
@@ -210,7 +210,7 @@ describe('readiness barrier ordering', () => {
     // flush lands inside the `ready` delivery, so this reproduces every run.
     const [portal, serverChannel] = createInMemoryChannelPair();
     let backend: MemoryStorageBackend | undefined;
-    const done = runServerProcess({
+    const done = runServerProcessWithTestOptions({
       createBackend: () => {
         backend = new MemoryStorageBackend();
         return backend;
