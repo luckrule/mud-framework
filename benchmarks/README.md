@@ -1,6 +1,6 @@
 # Benchmarks
 
-四个基准，都不进 CI 门禁，也不做性能断言：`bench:logger` 测 `safeLogger` 包装的每调用开销；`bench:game` 测 `examples/game-slice` 真实双进程装配下的热路径与空闲重启恢复；`bench:switch` 在真实 Portal + Server + WebSocket 上观测一次热升级期间的请求等待与切换耗时；`bench:load` 用独立的生成器进程驱动真实玩家级负载。`bench` 只聚合前两个，`bench:switch` 与 `bench:load` 单独运行：后两者需要更多资源，时长也由环境变量决定。
+基准都不进 CI 门禁，也不做性能断言：`bench:logger` 测 `safeLogger` 包装的每调用开销；`bench:game` 测 `examples/game-slice` 真实双进程装配下的热路径与空闲重启恢复；`bench:switch` 在真实 Portal + Server + WebSocket 上观测一次热升级期间的请求等待与切换耗时；`bench:load` 用独立的生成器进程驱动真实玩家级负载。`bench` 只聚合前两个，`bench:switch` 与 `bench:load` 单独运行：后两者需要更多资源，时长也由环境变量决定。
 
 ## 运行
 
@@ -44,7 +44,7 @@ bun run bench          # logger + game 微基准
 
 `bench:switch` 在真实 Portal + Server + WebSocket 上执行一次热升级（`IpcExecutor.switchTo`），测的是客户端请求在切换期间实际等了多久，而不是只验证连接不断。
 
-实现拆在 `benchmarks/game/switch/`：`portal.ts` 是基准 Portal，装配与 `examples/game-slice/src/portal.ts` 相同（`WsTransport` + `IpcExecutor` + `ConnectionLayer`），额外起一个只监听 `127.0.0.1`、端口由系统分配的 `POST /switch` 控制端点；同一时刻只接受一个切换，响应带服务端测得的 `switchTo` 耗时。`index.ts` 是负载、触发、分相统计与报告，`support.ts` 放配置、分相分类、Portal 生命周期与清理，`budget.ts` 按 ADR-0004 推导外部停止预算并从 Portal stdout 读取 `executor.closeBudgetMs`（读不到才回退常量）。Server 入口复用 `examples/game-slice/src/server.ts`，两个进程世代共用同一个临时 `GAME_SLICE_DATA_DIR`，替换顺序由框架保证旧写者退出后才激活新进程。
+实现拆在 `benchmarks/game/switch/`：`portal.ts` 是基准 Portal，装配与 `examples/game-slice/src/portal.ts` 相同（`WsTransport` + `IpcExecutor` + `ConnectionLayer`），额外起一个只监听 `127.0.0.1`、端口由系统分配的 `POST /switch` 控制端点；同一时刻只接受一个切换，响应带服务端测得的 `switchTo` 耗时。`index.ts` 是负载、触发、分相统计与报告，`support.ts` 放配置、分相分类、Portal 生命周期与清理，`budget.ts` 从 Portal stdout 解析 `executor.closeBudgetMs`，读不到时回退到按 core 公式推导的值，仅用于运行头与告警；外部停止预算由 `support.ts` 的 `portalStopBudgetMs()` 从 core 默认预算推导，不依赖该读数。Server 入口复用 `examples/game-slice/src/server.ts`，两个进程世代共用同一个临时 `GAME_SLICE_DATA_DIR`，替换顺序由框架保证旧写者退出后才激活新进程。
 
 时间线：
 
@@ -58,7 +58,7 @@ bun run bench          # logger + game 微基准
 
 环境变量（默认值见 `benchmarks/game/switch/support.ts` 顶部常量）：`SWITCH_CLIENTS`、`SWITCH_INTERVAL_MS`、`SWITCH_DURATION_SEC`（客户端运行总时长，含 warmup）、`SWITCH_WARMUP_SEC`、`SWITCH_DATA_DIR`、`SWITCH_KEEP=1`、`SWITCH_EVENTS=0`、`REQUEST_TIMEOUT_MS`。同时设 `SWITCH_URL` 与 `SWITCH_CONTROL_URL` 可复用外部 Portal：跳过 spawn、Server pid 检查与数据目录清理，控制端点由外部 Portal 自己提供。
 
-清理：关闭客户端、SIGTERM Portal、按 ADR-0004 的完整外部停止上界 `C + max(C, E + S) + C` 加 1000 ms 诊断余量等待 Portal 退出，超时才 SIGKILL。`C` 与 `S` 是基准中的常量（`C` 就是 Portal 的 `shutdownTimeoutMs`），`E` 不是：Portal 启动时把 `IpcExecutor.closeBudgetMs` 打印成 `portal: executor close budget <n> ms`，协调器从 Portal stdout 解析该值再推导停止预算，因此 core 关闭预算变化会直接反映到等待时长，不会出现“基准和测试一起绿、预算却已漂移”；运行输出也会打印解析到的预算与来源。只有解析不到该行时才回退到 `budget.ts` 的快照常量，并在 stderr 打印 warn，写明回退值与最终预算。随后在有界时间内确认所有已见 Server pid 消失，必要时 SIGKILL。只有 Portal 优雅停止、退出已观测、没有幸存 Server pid 且运行没有失败时才删除临时目录。失败、`SWITCH_KEEP=1` 或 `SWITCH_DATA_DIR` 指定的用户目录都会保留现场并打印路径。只有装配、连接、切换被拒绝、cleanup 或“窗口/基线没有样本”才非零退出；请求失败、超时、掉线与事件缺口只报告，不设阈值。
+清理：关闭客户端、SIGTERM Portal、按 ADR-0004 的完整外部停止上界加 `STOP_DIAGNOSTIC_MARGIN_MS` 诊断余量等待 Portal 退出，超时才 SIGKILL。停止等待使用 `portalStopBudgetMs()` 从 core 的默认预算推导；Portal 打印的 close budget 只用于运行头与警告，不决定停止等待。随后在有界时间内确认所有已见 Server pid 消失，必要时 SIGKILL。只有 Portal 优雅停止、退出已观测、没有幸存 Server pid 且运行没有失败时才删除临时目录。失败、`SWITCH_KEEP=1` 或 `SWITCH_DATA_DIR` 指定的用户目录都会保留现场并打印路径。只有装配、连接、切换被拒绝、cleanup 或“窗口/基线没有样本”才非零退出；请求失败、超时、掉线与事件缺口只报告，不设阈值。
 
 限制：所有进程同机，切换耗时受本机进程启动、文件系统与调度影响；默认数据目录通常是 tmpfs，SQLite 与 Server 启动会比真实磁盘快；look 客户端与协调器同进程，客户端侧 JSON 解析与事件循环调度也算进请求延迟；结果是单机近似，跨机器没有可比性。基准 Portal 沿用 `WsTransport` 默认的消息上限与发送队列容量，`maxQueuedBytes` 不得小于 `maxMessageBytes` 的启动期校验因此不会触发；复用外部 Portal（`SWITCH_URL`）时，该 Portal 自己的装配若把队列设得小于单帧上限，会在启动时报 `RangeError`，基准侧只看到连接失败。结果不写入仓库文档。
 
@@ -66,19 +66,19 @@ bun run bench          # logger + game 微基准
 
 `bench:load` 与微基准的关键区别是客户端不共享协调器的事件循环：主程序 spawn 真实 Portal + Server，再 spawn 若干独立的 `benchmarks/game/load/client.ts` 生成器进程，每个进程只跑自己那份 WebSocket 客户端。客户端的 JSON 解析、事件分发与命令循环因此分散在多个进程里；单进程微基准里“所有客户端挤在一个 Bun 事件循环”的客户端侧瓶颈不会直接成为全局瓶颈。它仍是一台机器：生成器与框架争用同一批 CPU，时钟也是同机的，所以是同一主机上的近似，不是跨机器容量。
 
-实现按职责拆在 `benchmarks/game/load/`：`index.ts` 是入口与阶段编排，`orchestrator.ts` 管 Portal/生成器生命周期与清理，`report.ts` 管聚合与报告，`resources.ts` 管 RSS/fd 采样，`client.ts` 是生成器进程，`support.ts` 放配置、类型、直方图与结果解析。
+实现按职责拆在 `benchmarks/game/load/`：`index.ts` 是入口与阶段编排，`orchestrator.ts` 管 Portal/生成器生命周期与清理，`report.ts` 管聚合与报告，`resources.ts` 管 RSS/fd 采样，`client.ts` 是生成器进程，`sequence.ts` 管发送序号与事件缺口跟踪，`support.ts` 放配置、类型、直方图与结果解析。
 
 负载模型：
 
 - 每个客户端登录唯一名字 `load-<generator>-<index>`，按 `LOAD_ROOM_SIZE` 分组落到 square/market/smithy/tavern；setup 阶段沿现有出口走到目标房间（复用外部 Portal 时也按登录返回的实际房间重新寻路），全部就绪后各生成器打印 `ready`，主程序汇总后通过 stdin 的 `go` 屏障统一释放测量。
-- 每个客户端同一时刻最多一个在途请求。命令混合 `look` 60%、`who` 10%、`move` 20%、`say` 10%（`LOAD_MIX` 可改）。`game-slice` 没有独立的 `who` handler，交互客户端把 `who` 映射为 `game.look` 并只看玩家列表；负载生成器也把 `who` 记为 `game.look` 读路径，不伪造一个不存在的线上方法。`move` 在 square/market 之间往返；分到 smithy/tavern 的客户端在 setup 后先走到 market/square，因此不会撞无效出口。
+- 每个客户端同一时刻最多一个在途请求。命令混合比例由 `LOAD_MIX` 配置，默认值见 `DEFAULT_MIX`。`game-slice` 没有独立的 `who` handler，交互客户端把 `who` 映射为 `game.look` 并只看玩家列表；负载生成器也把 `who` 记为 `game.look` 读路径，不伪造一个不存在的线上方法。`move` 在 square/market 之间往返；分到 smithy/tavern 的客户端在 setup 后先走到 market/square，因此不会撞无效出口。
 - `realistic` 模式在每个命令后等待围绕 `LOAD_THINK_MS` 的随机 think time（抖动比例是脚本常量），模拟玩家节奏；`saturate` 不加 think time，找吞吐上限。`LOAD_DURATION_SEC` 是测量窗口，`LOAD_WARMUP_SEC` 的 warmup 在 `go` 之后、统计之前执行，不计入样本。
-- `say` 的文本带唯一 token：run tag、发送者、房间 epoch、序号、发送时间戳与发送者当前房间。接收端按 token 统计从发送到 `room.say` 到达的延迟；发送方自己的响应延迟单独记在 `say` 命令延迟里。Server 的 `game.say` 只向发送者发送时所在房间的会话广播，所以收到的样本都算同房间投递；如果事件在队列里等待期间接收端已经走开，另记 `receiver-moved`，但样本仍计入延迟（剔除它会把“赶上换房间”的高延迟事件偏掉）。发送者每次成功换房间就把 epoch 加一。序号只在 `game.say` 成功后推进：被拒绝（如 `FRAMEWORK_QUEUE_FULL`）或超时的尝试不消耗序号，分别记入 `attempted`/`failed`，不计入 `sent`，因此不会在接收端留下序号空洞；`deliveries/say` 用成功发送数作分母——成功响应是可确认的广播集合，而超时但已提交的 say 可能也已广播，因此该比值可能大于 1。接收端只在 token 房间与本地快照一致时做缺口跟踪，在同一 (sender, epoch) 的成功序号序列内看到跳号才计为事件缺口，因此换房间与失败尝试都不会被误报成丢事件。超时但已提交的 say 可能已经广播，重试会复用同一序号，接收端把它记成 duplicate；duplicate 也可能是真实重复投递，两者无法区分，不能当丢包。重复投递、`receiver-moved` 与过期 epoch 分开计数。所有进程同机，`Date.now()` 可直接比较；事件延迟的分辨率因此是 1 ms。
-- 延迟用固定桶直方图累计（5% 相对桶宽，覆盖 1 µs 到 60 s，另有溢出桶），p50/p95/p99 取命中桶的上界；精确的 min/max/均值/样本数另记。这样饱和档的几十万样本也不会撑大结果 JSON。ops/s = 成功命令数 / 各生成器测量窗口的并集（warmup 已排除）。错误按线上 `code` 计数，额外标出 `FRAMEWORK_QUEUE_FULL` 与客户端超时。
+- `say` 的文本带唯一 token：run tag、发送者、房间 epoch、序号、发送时间戳与发送者当前房间。接收端按 token 统计从发送到 `room.say` 到达的延迟；发送方自己的响应延迟单独记在 `say` 命令延迟里。Server 的 `game.say` 只向发送者发送时所在房间的会话广播，所以收到的样本都算同房间投递；如果事件在队列里等待期间接收端已经走开，另记 `receiver-moved`，但样本仍计入延迟（剔除它会把“赶上换房间”的高延迟事件偏掉）。发送者每次成功换房间就把 epoch 加一。序号只在 `game.say` 成功后推进：被拒绝（如 `FRAMEWORK_QUEUE_FULL`）或超时的尝试不消耗序号，分别记入 `attempted`/`failed`，不计入 `sent`，因此不会在接收端留下序号空洞；`deliveries/say` 用成功发送数作分母——成功响应是可确认的广播集合，而超时但已提交的 say 可能也已广播，因此该比值可能大于 1。接收端只在 token 房间与本地快照一致时做缺口跟踪，在同一 (sender, epoch) 的成功序号序列内看到跳号才计为事件缺口，因此换房间与失败尝试都不会被误报成丢事件。超时但已提交的 say 可能已经广播，重试会复用同一序号，接收端把它记成 duplicate；duplicate 也可能是真实重复投递，两者无法区分，不能当丢包。重复投递、`receiver-moved` 与过期 epoch 分开计数。所有进程同机，`Date.now()` 可直接比较；事件延迟的分辨率因此以毫秒计。
+- 延迟用固定桶直方图累计（相对桶宽与覆盖范围见 `HISTOGRAM_RATIO` 与 `HISTOGRAM_EDGES`，另有溢出桶），p50/p95/p99 取命中桶的上界；精确的 min/max/样本数另记。这样饱和档的几十万样本也不会撑大结果 JSON。ops/s = 成功命令数 / 各生成器测量窗口的并集（warmup 已排除）。错误按线上 `code` 计数，额外标出 `FRAMEWORK_QUEUE_FULL` 与客户端超时。
 - 主程序每秒读 `/proc/<pid>` 采样 Portal 与 Server 的 RSS 与 fd 数，报告峰值与结束值；Server pid 从 Portal 日志的 `server process ready` 行解析，拿不到时跳过并注明。Linux 之外的平台跳过资源采样。
 - 清理：先停采样，关闭生成器（SIGTERM、有界等待、必要时 SIGKILL），SIGTERM Portal 并在有界时间内确认 Portal 与 Server pid 消失，必要时 SIGKILL；只有 Portal 停止成功（未走 SIGKILL 兜底）、退出已观测且没有幸存 Server pid 时才删除临时目录与结果文件，否则保留并打印路径与原因（`cleanup: kept ...`），同时非零退出。信号退出且没有幸存 Server pid 时视为退出已观测；走 SIGKILL 兜底（`forced`）视为非优雅停止，即使没有幸存进程也保留目录。`LOAD_KEEP=1` 保留临时目录与结果文件；`LOAD_DATA_DIR` 是用户数据目录，不会删除。只有装配、连接或清理失败才非零退出；负载本身的超时、队列满与事件缺口只报告，不触发失败。
 
-环境变量（默认值见 `benchmarks/game/load/support.ts` 顶部常量）：`LOAD_CLIENTS`、`LOAD_GENERATORS`、`LOAD_ROOM_SIZE`、`LOAD_DURATION_SEC`、`LOAD_WARMUP_SEC`、`LOAD_THINK_MS`、`LOAD_MODE=realistic|saturate`、`LOAD_MIX`、`LOAD_DATA_DIR`、`LOAD_URL`、`LOAD_KEEP=1`、`REQUEST_TIMEOUT_MS`。`LOAD_URL` 复用外部 Portal 时跳过 spawn、Server pid 采样与清理；此时数据目录由外部 Portal 自己决定，两个并发运行不要共用同一个数据库。
+环境变量（默认值见 `benchmarks/game/load/support.ts` 顶部常量）：`LOAD_CLIENTS`、`LOAD_GENERATORS`、`LOAD_ROOM_SIZE`、`LOAD_DURATION_SEC`、`LOAD_WARMUP_SEC`、`LOAD_THINK_MS`、`LOAD_MODE=realistic|saturate`、`LOAD_MIX`、`LOAD_RUN_TAG`、`LOAD_DATA_DIR`、`LOAD_URL`、`LOAD_KEEP=1`、`REQUEST_TIMEOUT_MS`。`LOAD_URL` 复用外部 Portal 时跳过 spawn、Server pid 采样与清理；此时数据目录由外部 Portal 自己决定，两个并发运行不要共用同一个数据库。
 
 ### tmpfs 与真实磁盘
 

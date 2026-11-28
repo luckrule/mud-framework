@@ -18,7 +18,7 @@ ADR-0002 决定了拆成两个进程，但没定两件事：两个进程之间�
 
 - **没有发送背压**：`send()` 恒返回 true，框架不能靠返回值判断对方是否跟上，内存约束只能由框架自己设。这与 SPEC 3.5 的入站队列上限不是同一个东西：那条上限管的是尚未开始执行的请求，请求进入未确认缓冲后是另一份占用。
 - **子进程退出瞬间可能丢消息**。因此确认 MUST 定义为“收到 `result`”，不能是“`send()` 返回”：丢失的消息仍在未确认缓冲里，重放会补上。这是确认语义不能建立在发送成功上的直接原因。
-- **`ipc` 回调同步派发，返回值不被 await**。回调本身只做解析与入队，不做长同步工作，否则会直接变成事件循环上的延迟。`ready` 到达后回调末尾会同步调用一次重放，规模受未确认缓冲上限（`IpcExecutor.maxPending`）约束。
+- **`ipc` 回调同步派发，返回值不被 await**。回调本身只做解析与入队，不做长同步工作，否则会直接变成事件循环上的延迟。`ready` 到达后回调末尾会同步调用一次重放，规模受未确认缓冲上限（`IpcExecutorOptions.maxPending`）约束。
 
 ### 恢复：重放缓冲在内存，确认以 `result` 为界
 
@@ -28,9 +28,9 @@ ADR-0002 决定了拆成两个进程，但没定两件事：两个进程之间�
 
 确认 = 收到 `result`。Portal 自己判定的终态（超时、重放耗尽、关闭、取消）直接销账：Portal 就是连接层，这些终态发生时结果已经交回调用方，不存在“已终态未确认”的窗口。Server 判定终态但 `result` 未送达时，请求仍在缓冲里，重放会再来一次——这正是 at-least-once 的来源。框架不提供去重，幂等由业务负责（INV-011、SPEC 6.4）；重放时 `requestId` 不变、`replayCount` 递增，两者一起才能回答“这条日志是玩家哪一次输入的第几次尝试”（SPEC 7.3）。
 
-重放上限可配，超限进入终态 `FRAMEWORK_REPLAY_EXHAUSTED`。上限存在的理由是对称的：太少会让“重启窗口”“握手超时”这类偶发失败也变成终态；太多则把同一个坏输入变成对 Server 的持续冲击。重启退避首次立即，之后按指数递增到上限；重置条件是稳定运行超过一个同时长于退避上限与单请求最长存活时间的窗口，不是“收到 ready”。否则一个能起来但一处理请求就崩的 Server 会让退避形同不存在。重放顺序按 `connectionId` 分组，组内按接收序号升序（SPEC 6.5）；代价是一个坏请求会饿死同连接上的后续请求，直到它的重放预算耗尽——顺序保证与“跳过坏请求继续后面”不可兼得。
+重放上限可配，超限进入终态 `FRAMEWORK_REPLAY_EXHAUSTED`。上限存在的理由是对称的：太少会让“重启窗口”“握手超时”这类偶发失败也变成终态；太多则把同一个坏输入变成对 Server 的持续冲击。重启退避首次立即，之后按指数递增到上限；重置条件是稳定运行超过一个不小于退避上限与单请求最长存活时间的窗口，不是“收到 ready”。否则一个能起来但一处理请求就崩的 Server 会让退避形同不存在。重放顺序按 `connectionId` 分组，组内按接收序号升序（SPEC 6.5）；代价是一个坏请求会饿死同连接上的后续请求，直到它的重放预算耗尽——顺序保证与“跳过坏请求继续后面”不可兼得。
 
-关闭预算：`IpcExecutor` 自己声明关闭的最坏耗时 `closeBudgetMs`，是六段串行等待之和，不能压成一个乘式：中止进行中的切换（`shutdownTimeoutMs`）、排空未确认请求（`shutdownTimeoutMs`）、等 Server 回 `closed`（`shutdownTimeoutMs + SHUTDOWN_ACK_SLACK_MS`）、等进程退出（`EXIT_WAIT_TIMEOUT_MS`）、`SIGKILL` 后再等一次（`EXIT_WAIT_TIMEOUT_MS`）、对被 `close()` 中止的切换所放弃且已 `activate` 的替换进程再做一次“等退出 → kill → 再等”（`2 × EXIT_WAIT_TIMEOUT_MS`）。预算是 `closeBudget(shutdownTimeoutMs)`，即上述六段之和 `3 × shutdownTimeoutMs + SHUTDOWN_ACK_SLACK_MS + 4 × EXIT_WAIT_TIMEOUT_MS`；常量以 `packages/core/src/shared/budget.ts` 为准，这里不写死数值。外层 `ConnectionLayer` 关闭执行器时取自身 `shutdownTimeoutMs` 与该预算加关闭余量的较大者，避免外层先放弃执行器的退出确认。完整 `ConnectionLayer.stop()` 的外部预算还必须覆盖另外两段串行等待：记 `C = ConnectionLayer.shutdownTimeoutMs`、`E = RequestExecutor.closeBudgetMs`、`S = EXECUTOR_CLOSE_SLACK_MS`，上界为 `C + max(C, E + S) + C`，依次是连接层排空、执行器关闭、传输关闭。没有声明 E 的执行器三段均使用 C；S 以 `packages/core/src/portal/connection-layer-options.ts` 为准。systemd 等外部停止预算应长于完整上界，而不是仅长于 E；关闭失败仍要尽力收尾传输，再传播失败，不能把预算耗尽解释为存储已释放。
+关闭预算：`IpcExecutor` 自己声明关闭的最坏耗时 `closeBudgetMs`，是六段串行等待之和，不能压成一个乘式：中止进行中的切换（`shutdownTimeoutMs`）、排空未确认请求（`shutdownTimeoutMs`）、等 Server 回 `closed`（`shutdownTimeoutMs + SHUTDOWN_ACK_SLACK_MS`）、等进程退出（`EXIT_WAIT_TIMEOUT_MS`）、`SIGKILL` 后再等一次（`EXIT_WAIT_TIMEOUT_MS`）、对被 `close()` 中止的切换所放弃且已 `activate` 的替换进程再做一次“等退出 → kill → 再等”（`2 × EXIT_WAIT_TIMEOUT_MS`）。预算是 `closeBudget(shutdownTimeoutMs)`，即上述六段之和 `3 × shutdownTimeoutMs + SHUTDOWN_ACK_SLACK_MS + 4 × EXIT_WAIT_TIMEOUT_MS`；常量以 `packages/core/src/shared/budget.ts` 为准，这里不写死数值。外层 `ConnectionLayer` 关闭执行器时取自身 `shutdownTimeoutMs` 与该预算加关闭余量的较大者，避免外层先放弃执行器的退出确认。完整 `ConnectionLayer.stop()` 的外部预算还必须覆盖另外两段串行等待：记 `C = ConnectionLayerOptions.shutdownTimeoutMs`、`E = RequestExecutor.closeBudgetMs`、`S = EXECUTOR_CLOSE_SLACK_MS`，上界为 `C + max(C, E + S) + C`，依次是连接层排空、执行器关闭、传输关闭。没有声明 E 的执行器三段均使用 C；S 以 `packages/core/src/portal/connection-layer-options.ts` 为准。systemd 等外部停止预算应长于完整上界，而不是仅长于 E；关闭失败仍要尽力收尾传输，再传播失败，不能把预算耗尽解释为存储已释放。
 
 预算单向派生：`shutdown` 消息携带 `timeoutMs`，由 Portal 声明自己愿意等 `closed` 多久；Server 的排空与关闭存储共享这一个 deadline，不再各自乘一次 `timeoutMs`，也不从自己的 `shutdownTimeoutMs` 推导。预算由 Portal 声明，Server 必须服从；缺该字段的消息被解析层拒绝，没有回退路径。`SHUTDOWN_ACK_SLACK_MS` 是对齐而非余量：Server 的计时从收到 `shutdown` 开始，比 Portal 的 `waitForClosed` 晚一个 IPC 跳；两侧取同一值时 Portal 的定时器总是先到，Server 用满预算就会被杀在正常关闭途中。
 
@@ -49,7 +49,7 @@ ADR-0002 决定了拆成两个进程，但没定两件事：两个进程之间�
 获得：通道不自带分帧的代价由 Bun 承担；确认语义与消息丢失解耦，重放能补上退出瞬间丢的消息；重放与退避的边界写死，坏输入不会变成重启循环；框架能力的上限有明确记录。代价与必须接受的限制：
 
 - Portal 崩溃会丢未确认输入。这是 SPEC 6.1 允许的，但意味着“业务进程可崩”与“连接层可崩”的恢复强度不对称。
-- 通道无发送背压，内存约束分两层：`ConnectionLayer.maxQueuedPerConnection` 只限制入站队列（尚未开始执行的请求）；请求进入 `IpcExecutor` 后转入未确认缓冲，其规模由“连接数 × 每连接在途数”决定，受 deadline 自然收敛，另有一个总数上限（`maxPending`）兜底。没有任何一层能感知对端的读取速度。
+- 通道无发送背压，内存约束分两层：`ConnectionLayerOptions.maxQueuedPerConnection` 只限制入站队列（尚未开始执行的请求）；请求进入 `IpcExecutor` 后转入未确认缓冲，其规模由“连接数 × 每连接在途数”决定，受 deadline 自然收敛，另有一个总数上限（`maxPending`）兜底。没有任何一层能感知对端的读取速度。
 - 取消与超时可能以一次已提交的写入收场，只留下 `CANCEL_LOST_TO_COMMIT` 日志。消除这个窗口必须改存储接口，属破坏性变更。
 - 同连接上的坏请求会阻塞后续请求直到重放预算耗尽，期间这些请求延迟上升，而不是快速失败。
 - 通道仅兼容其他 Bun 进程（ADR-0001），跨语言或跨运行时的业务进程无法接入。

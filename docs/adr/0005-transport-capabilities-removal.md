@@ -11,7 +11,7 @@
 移除传输能力协商：
 
 - 删除 `TransportCapabilities` 及其公共导出。
-- 从 `Transport` 接口删除 `capabilities()`；接口只保留 `start`、`stop` 与传输的职责边界（接受连接、交付入站数据、写出发站数据、关闭，见 SPEC 5.2）。
+- 从 `Transport` 接口删除 `capabilities()`；当时只保留 `start`、`stop` 与传输的职责边界（接受连接、交付入站数据、写出发站数据、关闭，见 SPEC 5.2）；后续新增可选 `sendTimeoutMs`（§5.2）。
 - 传输不需要能力协商。框架的顺序、队列上限、重放与 Session 路由都在连接层实现（SPEC 5.2），不按传输能力分叉。能力声明只有在框架为每种声明准备好替代实现时才是契约；否则它只是让传输作者以为声明弱能力会触发降级，而框架并不会。
 - 存储能力声明保留：`StorageCapabilities` 驱动事务超时、降级告警与 Extension 的 `requires` 校验，后端能力有真实差异（SPEC 4.2、4.3）。
 

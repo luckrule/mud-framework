@@ -6,7 +6,7 @@
 
 ## 这不是认证方案
 
-`game.login {name}` 是 `public` Handler，只校验名字非空，然后绑定稳定 Session `player:<name>`。任何人可以用任意名字登录，也可以再次用同名登录接管已有 Session。它演示 Session 绑定、重连与 takeover 的语义，不是认证：生产环境必须在登录入口校验凭据，并由真实用户库决定 Session id。
+`game.login {name}` 是 `public` Handler，校验名字非空且不超过 `MAX_NAME_LENGTH`，然后绑定稳定 Session `player:<name>`。任何人可以用任意名字登录，也可以再次用同名登录接管已有 Session。它演示 Session 绑定、重连与 takeover 的语义，不是认证：生产环境必须在登录入口校验凭据，并由真实用户库决定 Session id。
 
 ## 前置条件
 
@@ -51,20 +51,20 @@ PORTAL_PORT=9090 bun run examples/game-slice/src/client.ts --name alice
 
 ## 命令表
 
-交互式客户端读 stdin，一行一个命令：
+交互式客户端读 stdin，一行一个命令；命令与 Handler 的对应以 `src/game.ts` 为准：
 
-| 命令             | Handler          | 说明                                            |
-| ---------------- | ---------------- | ----------------------------------------------- |
-| `look` / `l`     | `game.look`      | 当前房间名、描述、出口、地上物品、同房间玩家    |
-| `who`            | `game.look`      | 只打印同房间其他玩家                            |
-| `go <direction>` | `game.move`      | 走一个出口；向旧/新房间的其他玩家广播           |
-| `say <text>`     | `game.say`       | 向同房间其他玩家广播；文本非空且不超过 500 字符 |
-| `take <item>`    | `game.take`      | 拾取当前房间地上的物品；id 或名字均可           |
-| `drop <item>`    | `game.drop`      | 丢下背包里的物品到当前房间                      |
-| `inv`            | `game.inventory` | 打印背包                                        |
-| `quit` / `exit`  | `game.logout`    | 解绑 Session 并关闭连接                         |
+| 命令             | Handler          | 说明                                                    |
+| ---------------- | ---------------- | ------------------------------------------------------- |
+| `look` / `l`     | `game.look`      | 当前房间名、描述、出口、地上物品、同房间玩家            |
+| `who`            | `game.look`      | 只打印同房间其他玩家                                    |
+| `go <direction>` | `game.move`      | 走一个出口；向旧/新房间的其他玩家广播                   |
+| `say <text>`     | `game.say`       | 向同房间其他玩家广播；文本非空且不超过 `MAX_SAY_LENGTH` |
+| `take <item>`    | `game.take`      | 拾取当前房间地上的物品；id 或名字均可                   |
+| `drop <item>`    | `game.drop`      | 丢下背包里的物品到当前房间                              |
+| `inv`            | `game.inventory` | 打印背包                                                |
+| `quit` / `exit`  | `game.logout`    | 解绑 Session 并关闭连接                                 |
 
-Handler 契约：
+Handler 契约以 `src/game.ts` 的注册元数据为准：
 
 | Handler          | access    | mayChangeSession | 返回                                                 |
 | ---------------- | --------- | ---------------- | ---------------------------------------------------- |
@@ -79,7 +79,7 @@ Handler 契约：
 
 `room` 快照字段：`id`、`name`、`description`、`exits`（方向数组）、`items`（地上物品 `{id,name}`）、`players`（同房间其他在线玩家名）、`you`。
 
-业务错误通过 `BusinessError` 返回，客户端可读；不使用框架错误码：
+业务错误通过 `BusinessError` 返回，客户端可读；不使用框架错误码，具体取值以 `src/game.ts` 为准：
 
 | code             | 触发场景                          |
 | ---------------- | --------------------------------- |
@@ -94,7 +94,7 @@ Handler 契约：
 
 ## 事件语义
 
-服务端主动事件只走 `ctx.emitToSession`，没有轮询接口：
+服务端主动事件只走 `ctx.emitToSession`，没有轮询接口；事件名与 payload 以 `src/game.ts` 为准：
 
 | 事件           | 接收者                       | payload                           |
 | -------------- | ---------------------------- | --------------------------------- |
@@ -114,13 +114,13 @@ Handler 契约：
 
 ## 世界与种子
 
-Server 启动时幂等建表并插入种子（已存在的行不覆盖，所以重启不会重置玩家位置或物品归属）：
+Server 启动时幂等建表并插入种子（已存在的行不覆盖，所以重启不会重置玩家位置或物品归属），种子内容以 `src/world.ts` 为准：
 
 - 房间：`square`（起点）、`market`、`smithy`、`tavern`。
 - 有向出口：square north→market、square east→tavern、market south→square、market east→smithy、smithy west→market、tavern west→square。
 - 物品：`sword`（square）、`bread`（market）、`lantern`（tavern）。
 
-表：
+表结构以 `src/world.ts` 为准：
 
 - `rooms(id, name, description)`
 - `exits(room_id, direction, to_room)`，主键 `(room_id, direction)`

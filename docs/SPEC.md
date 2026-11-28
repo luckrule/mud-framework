@@ -51,7 +51,7 @@
 
 **Connection Process（连接层进程）** — 只负责传输接入、Session 路由与输入缓冲的进程。它不执行 Handler，不访问存储。
 
-实现命名：Connection Process 在实现里叫 **Portal**（`ConnectionLayer` 与 `IpcExecutor` 两个类的组合），Business Process 叫 **Server**（`runServerProcess` 启动的进程）。
+实现命名：Connection Process 在实现里叫 **Portal**，Business Process 叫 **Server**（装配见 ADR-0002 与 `docs/INTEGRATION.md`）。
 
 **Input Queue（输入队列）** — 每个 Connection 上的有界请求队列，保证同连接内请求有序（§3.5）。
 
@@ -110,7 +110,7 @@ Handler 内 MUST NOT 开启新事务。需要多段原子性的业务应拆成�
 
 ### 3.4 超时与无界等待
 
-每个 Request MUST 有超时上限，由框架配置，不由 Handler 自行决定。实际生效的超时取 `min(框架配置, 后端声明的 maxTransactionDurationMs)`：后端声明的是它自身能承受的上限，框架不得超过它。
+每个 Request MUST 有超时上限，由框架配置，不由 Handler 自行决定。实际生效的超时以 `min(框架配置, 后端声明的 maxTransactionDurationMs)` 为上限：后端声明的是它自身能承受的上限，框架不得超过它；调用方的剩余预算只能在此基础上再收紧，不能放宽。
 
 超时后的语义：
 
@@ -133,7 +133,7 @@ COMMIT 完成时刻晚于 deadline 时，请求仍以超时终态结束：不返
 
 选择拒绝而非背压：拒绝是队列自己能兑现的唯一策略，让请求立刻以稳定错误码失败，而不是把整条连接堵在一个满队列后面。
 
-`FRAMEWORK_QUEUE_FULL` 同时表示 Portal 的未确认缓冲达到上限（`IpcExecutor.maxPending`）。两层队列的拒绝语义一致：以同一稳定错误码立即失败，不静默丢弃。
+`FRAMEWORK_QUEUE_FULL` 同时表示 Portal 的未确认缓冲达到上限（`IpcExecutorOptions.maxPending`）。两层队列的拒绝语义一致：以同一稳定错误码立即失败，不静默丢弃。
 
 事件缓冲的上界见 §3.8。它与本节 Input Queue 的上界是两个独立的界：分别计量、分别执行各自的溢出策略，不合并为一个总上限。
 
@@ -149,7 +149,7 @@ Connection 在 Request 处理中关闭时，该 Request MUST 进入终态，不�
 
 需要不可回滚副作用的业务 MUST 自行保证幂等与重试安全，不能把断线取消或超时当作副作用未发生的证明。
 
-断线不等于 Session 结束。Session 状态在业务进程侧保留一段时间（由配置决定），期间重连可恢复；超时未重连则按业务规则结束。
+断线不等于 Session 结束。Session 状态保留多久、何时结束由业务自行决定并实现；期间重连可恢复。
 
 ### 3.7 访问检查
 
@@ -178,7 +178,7 @@ Handler 可以为一个请求声明要发送的事件（ADR-0008）。`ctx.emit(
 
 - 目标 Connection 不存在或已关闭、目标 Session 当前没有 holder 时，事件 MUST 被丢弃并记录 warn（`EVENT_DROPPED`）；编码失败或传输写失败时同样丢弃并记录 `TRANSPORT_SEND_FAILED`。MUST NOT 因失败而缓冲或重试，也不得让请求失败。
 - Session 目标的收件人按实际写出时的当前 holder 解析：排队期间 takeover 会改投新 holder，至多重投递一次，再次变化即丢弃。
-- 同一 Session 的 session 目标事件 MUST 按发射序串行投递：后一条必须等前一条写出或丢弃后才开始，因此 takeover 不改变同一收件 Connection 上这些事件之间的顺序。投递分两段，只有第一段可取消：**queued**（尚未开始写出）时旧连接被移除或 abort，该事件丢弃（`EVENT_DROPPED`，reason 指明写出前连接已关闭）并立即释放串行位；**writing**（已开始写出）时 abort MUST NOT 提前释放串行位，必须等实际写结果（成功或传输失败）结算后再释放，写失败记 `TRANSPORT_SEND_FAILED` 而不是 `EVENT_DROPPED`，因为帧可能已写出。写出本身必须有界：传输发送受其 `sendTimeoutMs` 约束，底层发送 Promise 不保证 settle 时以发送超时为上界，不得用 abort 信号代替。这个写出上界的取值顺序是：连接层的显式 `eventSendTimeoutMs` 配置原样采用；否则取传输声明的单帧发送上界（§5.2）加一段固定余量；传输声明不可用（例如 `Infinity`）时按未声明处理，回退到默认值。余量不是给传输更多时间，而是让连接层的界严格宽于传输的界：两者等值时连接层的兜底计时器与传输自己的计时器几乎同时到期，且常先触发，日志便只剩「传输没有按承诺 settle」，看不出是传输卡死还是传输的超时机制本身失效。只有连接层的界更宽，传输自己的失败判定才是可观测的那个。默认值不加余量：此时没有传输计时器可让位，默认值本身就是唯一判定。显式配置也不加余量：它替换推导结果，而不是与传输计时器竞争。
+- 同一 Session 的 session 目标事件 MUST 按发射序串行投递：后一条必须等前一条写出或丢弃后才开始，因此 takeover 不改变同一收件 Connection 上这些事件之间的顺序。投递分两段，只有第一段可取消：**queued**（尚未开始写出）时旧连接被移除或 abort，该事件丢弃（`EVENT_DROPPED`，reason 指明写出前连接已关闭）并立即释放串行位；**writing**（已开始写出）时 abort MUST NOT 提前释放串行位，必须等实际写结果（成功或传输失败）结算后再释放，写失败记 `TRANSPORT_SEND_FAILED` 而不是 `EVENT_DROPPED`，因为帧可能已写出。写出本身必须有界：传输发送受其 `sendTimeoutMs` 约束，底层发送 Promise 不保证 settle 时以发送超时为上界，不得用 abort 信号代替。这个写出上界的取值顺序是：连接层的显式 `eventSendTimeoutMs` 配置原样采用；否则取传输声明的单帧发送上界（§5.2）加一段固定余量；传输声明不可用（例如 `Infinity`）时按未声明处理，回退到默认值。余量不是给传输更多时间，而是让连接层的界在 `MAX_TIMER_DELAY_MS` 以下严格宽于传输的界：两者等值时连接层的兜底计时器与传输自己的计时器几乎同时到期，且常先触发，日志便只剩「传输没有按承诺 settle」，看不出是传输卡死还是传输的超时机制本身失效；触顶时以封顶值为准。只有连接层的界更宽，传输自己的失败判定才是可观测的那个。默认值不加余量：此时没有传输计时器可让位，默认值本身就是唯一判定。显式配置也不加余量：它替换推导结果，而不是与传输计时器竞争。
 - 结果发送失败时，该请求的全部事件 MUST 跳过并记录；请求的成功状态不变。
 - 结果帧的写出同样 MUST 有界，上界与事件帧同源（§5.2，取值顺序同本节上一条）。传输的发送 Promise 不保证 settle，无界等待会让该连接的单写者永不推进，并让承载该请求的 Session 终态屏障永久持有（INV-004），其他连接上针对该 Session 的请求随之无限等待。超过上界时 MUST 记录 `TRANSPORT_SEND_FAILED` 并继续，不抛错：请求的成功状态不变，也不承诺发出响应（§5.4）。这个界同样约束不经过连接调度器的准入拒绝与关闭拒绝帧（§5.4）；它们若阻塞，卡住的是该连接的输入处理。
 - 事件帧之间的发射序按投递路径界定：同一 Session 的 session 目标事件由按 Session 的串行队列保证，同一 Connection 上的 connection 目标事件按发射序写出；connection 目标与 session 目标之间、不同 Connection 之间不承诺发射序。结果帧与事件帧之间的相对顺序见本节“写出调度与有界缓冲”。
@@ -186,12 +186,12 @@ Handler 可以为一个请求声明要发送的事件（ADR-0008）。`ctx.emit(
 
 写出调度与有界缓冲：
 
-- 连接层持有的每一处事件缓冲（每 Connection 的事件队列、每 Session 的待投递队列）MUST 有界：已接收、尚未写出的事件帧数与字节数都不得越过上限，上限由连接层选项 `maxQueuedEvents` 与 `maxQueuedEventBytes` 定义，默认值见选项定义。字节数按事件帧经当前 `Codec` 编码后在 wire 上的字节数计，不按字符数计。上限是每个队列实例的上界，不是每 Connection 汇总的上界，也不是进程总量的上界：各队列的上界互不推导，全部缓冲合起来能占多少内存取决于同时积压的队列数，由部署方按 §6.1 的连接数上限与这两个选项自行约束。达到任一上限时 MUST 以 close code `1013`（Try Again Later）断开该缓冲所属的连接并记录（`EVENT_BACKLOG_DISCONNECTED`，字段见 §7.1），MUST NOT 静默处理，MUST NOT 因此改变请求终态或让请求失败。Connection 事件队列溢出断开该 Connection；Session 待投递队列溢出断开该 Session 当时的 holder，没有 holder 时无从断开，该事件按「目标缺失」丢弃（§7.1）。断开是框架主动关闭，不是客户端离开：该连接上已开始的请求 MUST 继续结算、不取消执行（§3.6 的取消策略只覆盖客户端或传输发起的关闭），其结果写不出去时记 `TRANSPORT_SEND_FAILED`，受同一个写出上界约束（§5.4）；尚未开始写出的队列内事件帧与尚未开始的请求 MUST 不再写出或执行。断开在决策时刻生效，不等传输回报关闭：排队中的请求与事件帧据此判定，否则传输的关闭事件晚于写者的下一轮调度时，会有一个请求在已决定断开的连接上开始执行。理由：队列满说明客户端持续读不动，静默丢事件会让玩家在已经失真的世界里继续玩；断开至少让他知道并重连恢复。
-- 每个 Connection 的写出由该连接内的单一调度器串行执行；不同 Connection 之间仍并发写出，不共享调度器。请求工作指从输入准入到结果写出的整段（读输入 → 准入 gate → 执行 → 写结果），是一个调度单元，不是仅写结果帧；MUST NOT 把请求执行留在原链、只把结果帧交给新队列，那会产生两个写者，违背单写者前提。队列中存在就绪的请求工作时，MUST 先处理该请求工作；没有就绪请求工作时才写事件。因此结果帧 MAY 越过尚未写出的事件帧，事件帧之间仍保持发射序（范围见本节“投递语义”）。准入拒绝与关闭拒绝的响应帧不经过该调度器：它们不是请求工作，也不承载事件（§5.4 允许这类帧越过已接受输入）。这是方向性变更：原规则是结果帧与事件帧按 FIFO 顺序写出，新规则是请求工作优先，不是措辞澄清。
+- 连接层持有的每一处事件缓冲（每 Connection 的事件队列、每 Session 的待投递队列）MUST 有界：已接收、尚未写出的事件帧数与字节数都不得越过上限，上限由连接层选项 `maxQueuedEvents` 与 `maxQueuedEventBytes` 定义，默认值见选项定义。字节数按事件帧经当前 `Codec` 编码后在 wire 上的字节数计，不按字符数计。上限是每个队列实例的上界，不是每 Connection 汇总的上界，也不是进程总量的上界：各队列的上界互不推导，全部缓冲合起来能占多少内存取决于同时积压的队列数，由部署方按 §6.1 的连接数上限与这两个选项自行约束。达到任一上限时 MUST 以 close code `1013`（Try Again Later）断开该缓冲当前的持有连接（Session 待投递队列为当时的 holder）并记录（`EVENT_BACKLOG_DISCONNECTED`，字段见 §7.1），MUST NOT 静默处理，MUST NOT 因此改变请求终态或让请求失败。Session 待投递队列没有 holder 时无从断开，该事件按「目标缺失」丢弃并记录（§7.1）。断开是框架主动关闭，不是客户端离开：该连接上已开始的请求 MUST 继续结算、不取消执行（§3.6 的取消策略只覆盖客户端或传输发起的关闭），其结果写不出去时记 `TRANSPORT_SEND_FAILED`，受同一个写出上界约束（§5.4）；尚未开始写出的队列内事件帧与尚未开始的请求 MUST 不再写出或执行。断开在决策时刻生效，不等传输回报关闭：排队中的请求与事件帧据此判定，否则传输的关闭事件晚于写者的下一轮调度时，会有一个请求在已决定断开的连接上开始执行。理由：队列满说明客户端持续读不动，静默丢事件会让玩家在已经失真的世界里继续玩；断开至少让他知道并重连恢复。
+- 每个 Connection 的写出由该连接内的单一调度器串行执行；不同 Connection 之间仍并发写出，不共享调度器。请求工作指从输入准入到结果写出的整段（读输入 → 准入 gate → 执行 → 写结果），是一个调度单元，不是仅写结果帧；MUST NOT 把请求执行留在原链、只把结果帧交给新队列，那会产生两个写者，违背单写者前提。请求工作 MUST 优先于事件：队列中有就绪的请求工作时，先处理该请求工作；事件的放行间隔由实现决定，但 MUST 保证事件的等待被有界数量的请求工作限制。结果帧 MAY 越过尚未写出的事件帧，事件帧之间仍保持发射序（范围见本节“投递语义”）。准入拒绝与关闭拒绝的响应帧不经过该调度器：它们不是请求工作，也不承载事件（§5.4 允许这类帧越过已接受输入）。
 - 请求优先 MUST NOT 使事件无限期饥饿：事件的等待 MUST 被有界数量的请求工作限制。放行间隔是实现常量，不构成契约；请求优先只决定两者同时就绪时的顺序，公平规则只承诺有界等待，不承诺固定的请求与事件比例。
 - 残余边界：已经交给传输的那一帧事件无法被后续结果抢占；慢客户端上正在写的事件帧会让下一个结果多等一帧的写出时间。这是单写者的固有代价，不是保证。
-- 连接层开始关闭后 MUST 停止接收新事件；每一处事件缓冲内尚未写出的事件，以及 Session 泵已取出、尚未交给任何连接队列的在手帧，MUST 丢弃并记录一条汇总日志（`EVENT_BACKLOG_DISCARDED`，`reason: 'shutdown'`，字段见 §7.1）。在手帧只存在于 takeover 重投递的交接窗口，平时不构成额外缓冲。关闭只排空请求工作，不为事件消耗关闭预算。已经开始写出的事件帧不属于队列内待写项，MUST NOT 被抢占；它仍受写出上界约束，排在其后的请求最多等待该帧的写出上界。汇总日志的 `count`、`frames`、`bytes` 是被丢弃的帧数与字节数，`connections` 是持有被丢弃帧的 Connection 事件队列数；Session 待投递队列与在手帧不计入 `connections`。依据：事件是 best-effort，关闭不为不可靠通道延迟资源释放。
-- 全部缓冲的字节总数越过 `eventBacklogWarnBytes`（默认值见选项定义）时记一条 warn（`EVENT_BACKLOG_HIGH`，字段见 §7.1），同一段积压只报一次：只有聚合总量回落到零才重新武装。用「回落到阈值以下」重新武装不够，因为一帧从 Session 队列交接到 Connection 队列时会短暂从总量里减掉一次，阈值附近的一次交接就会让告警重新武装并按帧重复触发。这是观测，MUST NOT 据此拒绝、丢弃或延迟任何事件：全局硬界会让一个吵闹的发射方导致所有连接丢事件，把局部慢读放大成全局事件丢失。部署方按容器内存设置该阈值，使其早于 OOM 触发；框架不承诺该阈值之内一定不 OOM，它只是让容量不足可观测。
+- 连接层开始关闭后 MUST 停止接收新事件；每一处事件缓冲内尚未写出的事件，以及 Session 泵已取出、尚未交给任何连接队列的在手帧，MUST 丢弃并记录一条汇总日志（`EVENT_BACKLOG_DISCARDED`，`reason: 'shutdown'`，字段见 §7.1）。关闭只排空请求工作，不为事件消耗关闭预算。已经开始写出的事件帧不属于队列内待写项，MUST NOT 被抢占；它仍受写出上界约束，排在其后的请求最多等待该帧的写出上界。汇总日志的 `count`、`frames`、`bytes` 是被丢弃的帧数与字节数，`connections` 是持有被丢弃帧的 Connection 事件队列数；Session 待投递队列与在手帧不计入 `connections`。依据：事件是 best-effort，关闭不为不可靠通道延迟资源释放。在手帧只存在于 takeover 重投递的交接窗口，平时不构成额外缓冲。
+- 全部缓冲的字节总数达到或超过 `eventBacklogWarnBytes`（默认值见选项定义）时记一条 warn（`EVENT_BACKLOG_HIGH`，字段见 §7.1），同一段积压只报一次：只有聚合总量回落到零才重新武装。阈值附近的一次交接会让总量短暂归零，所以必须等稳定回落到零才重新武装。这是观测，MUST NOT 据此拒绝、丢弃或延迟任何事件：全局硬界会让一个吵闹的发射方导致所有连接丢事件，把局部慢读放大成全局事件丢失。部署方按容器内存设置该阈值，使其早于 OOM 触发；框架不承诺该阈值之内一定不 OOM，它只是让容量不足可观测。
 
 安全边界：框架不对事件做授权。Handler 可以向任意 Session 声明事件；房间成员资格、可见性与内容过滤属于业务。
 
@@ -203,7 +203,7 @@ Handler 可以为一个请求声明要发送的事件（ADR-0008）。`ctx.emit(
 
 ### 4.2 能力声明
 
-后端 MUST 导出能力声明。字段语义如下，类型签名以 `packages/core/src/storage/types.ts` 为准：
+后端 MUST 导出能力声明。字段语义如下，类型签名以 `StorageCapabilities` 类型定义为准：
 
 | 字段                       | 类型                            | 语义                                                                |
 | -------------------------- | ------------------------------- | ------------------------------------------------------------------- |
@@ -263,11 +263,11 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 
 Transport MUST 对每个连接的发站缓冲设上限。缓冲耗尽时 MUST 显式失败并终止该连接，不得让未写出的数据无界积压，也不得静默丢弃。单条发送的超时只约束“已接受的帧迟迟写不出去”，MUST NOT 用它代替容量上限：慢客户端可以在超时前持续制造积压。传输实现 MAY 在出站缓冲耗尽时以 close code `1013`（Try Again Later）关闭该连接；这与 §6.1 的准入拒绝使用同一码值，但触发条件不同（已准入连接的服务不可用，而非准入拒绝），传输实现可以映射为本协议的等价语义。
 
-Transport MAY 暴露自己的单帧发送上界（`Transport.sendTimeoutMs`）。暴露时框架用它给所有下行帧的写出设界——事件帧与响应帧一样——保证同一 Session 的串行位不会早于传输自身失败而释放（§3.8），也让一个不读的客户端无法永久占住连接的单写者。框架的界取该值加一段固定余量，使其严格宽于传输的界，从而让传输自己的超时判定成为可观测的那个（§3.8）。该字段可选，未暴露或值不可用（例如 `Infinity`）时框架按自己的配置与默认值处理。
+Transport MAY 暴露自己的单帧发送上界（`Transport.sendTimeoutMs`）。暴露时框架用它给所有下行帧的写出设界——事件帧与响应帧一样——保证同一 Session 的串行位不会早于传输自身失败而释放（§3.8），也让一个不读的客户端无法永久占住连接的单写者。框架的界在该值上加一段固定余量派生（§3.8），在 `MAX_TIMER_DELAY_MS` 以下严格宽于传输的界，从而让传输自己的超时判定成为可观测的那个；触顶时以封顶值为准。该字段可选，未暴露或值不可用（例如 `Infinity`）时框架按自己的配置与默认值处理。
 
 `TransportConnection.id` 在连接层实例的生命周期内 MUST 唯一：连接断开后，同一 id MUST NOT 被新连接复用。连接层以该 id 维护活跃连接、Session 路由、请求入口查找与事件投递；复用会让迟到入站消息落到替换连接，或让本应发给旧连接的事件误投到替换连接。需要重连语义时，传输 MUST 铸造新 id（默认 WS 传输的 UUID 满足此约束）。连接层按连接对象身份忽略迟到的旧断线事件，但按 id 投递的事件无法区分新旧，因此唯一性由传输保证。
 
-职责拆分：Session 路由、输入缓冲与重放在连接层进程（§6.1）；访问检查点与拒绝语义（`AUTH_REQUIRED` / `FORBIDDEN`、检查顺序）在 core 的 Dispatcher 内，随 Handler 在业务进程执行（§3.7）；认证与授权策略、登录流程属于消费方。
+职责拆分：Session 路由、输入缓冲与重放在连接层进程（§6.1）；访问检查点与拒绝语义（`AUTH_REQUIRED` / `FORBIDDEN`、检查顺序）随 Handler 在业务进程执行（§3.7）；认证与授权策略、登录流程属于消费方。
 
 TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：core 不终止 TLS，也不承载 TLS 配置，只处理传输已经解出的 payload。部署方 MUST 在不可信网络前终止 TLS——由反向代理前置终止，或由具体传输实现自行终止；框架不承诺明文监听可以安全地暴露在不可信网络上。TLS 终止不替代消费方的认证与授权策略（§3.7），也不改变 §5.4 的 Envelope 线格式。
 
@@ -291,7 +291,7 @@ TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：
 
 `result` 无法被当前 `Codec` 编码时，框架用同一 `Codec` 编码一条 `INTERNAL_ERROR` 失败响应作为兜底；若该兜底仍无法编码，框架只能记录 `TRANSPORT_SEND_FAILED`，不承诺发出响应。
 
-响应帧的写出 MUST 有界，上界与事件帧同源（§3.8、§5.2）。传输的发送 Promise 不保证 settle；无界等待会让该连接的单写者停在队头帧上，后续请求与事件全部积压，承载该请求的 Session 终态屏障也不会释放。超过上界时框架记录 `TRANSPORT_SEND_FAILED` 并继续，不改变请求终态，也不承诺该响应送达（§3.8）。这个界覆盖所有响应帧，包括不经过连接调度器的准入拒绝（`FRAMEWORK_QUEUE_FULL`）与关闭拒绝（`FRAMEWORK_SHUTDOWN`）帧：它们直接在输入处理路径上写出，阻塞会卡住该连接的后续输入。
+响应帧的写出 MUST 有界，上界与事件帧同源（§3.8、§5.2）：超过上界时记录 `TRANSPORT_SEND_FAILED` 并继续，不改变请求终态，也不承诺该响应送达。这个界覆盖所有响应帧，包括不经过连接调度器的准入拒绝（`FRAMEWORK_QUEUE_FULL`）与关闭拒绝（`FRAMEWORK_SHUTDOWN`）帧：它们直接在输入处理路径上写出，阻塞会卡住该连接的后续输入。
 
 下行帧有两类，响应帧的线格式保持不变：响应是 `{id, ok, ...}`，不带 `kind`；事件帧是 `{kind:'event', eventId, event, payload}`，`kind` 是事件帧的判别字段。事件帧的 `eventId` 为 `${requestId}:${index}`，同一请求、同一发射顺序的重放得到相同值，客户端可用它去重；框架不保证事件不重复。客户端 MUST 忽略不认识的帧，MUST NOT 因一个事件帧终止连接。事件投递失败不影响任何响应帧。
 
@@ -345,7 +345,7 @@ TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：
 
 恢复受唯一写者屏障约束：只有 `SpawnedServer` 报告退出 `observed: true` 才能解除旧写者屏障。退出 Promise 仍 pending 而等待超时时，框架 MUST 保留引用，迟到的确认可在执行器仍可恢复时继续一次恢复；`close()` 或其它终态之后 MUST NOT 被迟到事件重新启动。若一次性退出结果是 `observed: false`，框架无法据此确认进程释放了存储，MUST 保持屏障，不承诺自动恢复；有界关闭仍无法确认退出时 MUST 失败。恢复可用性不能优先于 INV-002，请求仍受各自 deadline 约束。关闭未能确认退出时，健康态 MUST 保持 `blocked`（§6.6）。
 
-子进程诊断：`ServerExitInfo` 有一个可选字段 `stderrTail`，携带 spawn 被要求捕获时子进程 stderr 的末尾若干行。默认的 spawn 不捕获（stderr 继承 Portal 的对应流），因此该字段通常缺失；它是诊断信息，不参与退出判定——`observed` 仍是解除屏障的唯一依据，尾部是否为空或缺失不影响任何恢复、关闭或切换语义。切换失败时框架 MUST 在有诊断可用时把它带进 rejection，使消费方能读到“Server 为什么起不来”，而不是只能从 Portal 控制台看到。
+子进程诊断：`ServerExitInfo` 有一个可选字段 `stderrTail`，携带 spawn 被要求捕获时子进程 stderr 的末尾若干行；它是诊断信息，不参与退出判定——`observed` 仍是解除屏障的唯一依据，尾部是否为空或缺失不影响任何恢复、关闭或切换语义。切换失败时框架 MUST 在有诊断可用时把它带进 rejection，使消费方能读到“Server 为什么起不来”，而不是只能从 Portal 控制台看到。捕获开关与排空代价见 `docs/INTEGRATION.md`。
 
 语义是 at-least-once：同一个 Request 可能被执行多次。框架 MUST NOT 声称 exactly-once。幂等由业务负责：需要“只生效一次”的效果（扣钱、发物品、唯一命名），MUST 由 Extension 用业务幂等键实现，不能依赖框架。理由：at-least-once 是“连接保活”承诺的直接代价——只要允许重放，重复执行就无法在框架层排除。
 
@@ -363,13 +363,13 @@ TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：
 
 快照是建议性的，可能在返回后立即过期，MUST NOT 作为每个请求的准入 gate——请求仍受 §3.5 队列上限、§6.2 启动顺序与各自 deadline 约束。包内不提供传输层健康端点：如何把快照映射为 HTTP 探针由应用决定（见 INTEGRATION.md）。
 
-快照包含聚合字段 `eventBacklog: { connections, frames, bytes, dropped }`：`connections` 只统计事件队列非空的 Connection；Session 待投递队列在事件解析出 holder 之前不归属于任何 Connection，只体现在 `frames` 与 `bytes` 中。`frames` 与 `bytes` 是当前全部事件缓冲（每 Connection 的事件队列与每 Session 的待投递队列）的在途总量，含正在写出、尚未结算的那一帧；`dropped` 统计因事件缓冲达到上界而被断开的 Connection 数，是自本连接层启动以来的累计值（不是瞬时值；正式装配为单进程单层，与自进程启动等价），不含关闭时的批量丢弃——后者走 `EVENT_BACKLOG_DISCARDED` 汇总日志，不进入该计数。字段名 `dropped` 保留（探针契约），语义是断开数而不是事件数：溢出不再丢事件并保留连接（§3.8）。理由：探针读 `dropped` 是为了判断运行期是否在持续出现积压断开（背压或滥用）；把关闭期的正常丢弃混进来，会让每次滚动重启都出现一次计数跳变，形成误报。快照不提供 per-connection 深度，单连接诊断走日志（§7.1）。
+快照包含聚合字段 `eventBacklog: { connections, frames, bytes, dropped }`：`connections` 只统计事件队列非空的 Connection；Session 待投递队列在事件解析出 holder 之前不归属于任何 Connection，只体现在 `frames` 与 `bytes` 中。`frames` 与 `bytes` 是当前全部事件缓冲（每 Connection 的事件队列与每 Session 的待投递队列）的在途总量，含正在写出、尚未结算的那一帧；`dropped` 统计因事件缓冲达到上界而被断开的 Connection 数，是自本连接层启动以来的累计值（不是瞬时值），不含关闭时的批量丢弃——后者走 `EVENT_BACKLOG_DISCARDED` 汇总日志，不进入该计数。字段名 `dropped` 保留（探针契约），语义是断开数而不是事件数（§3.8）。理由：探针读 `dropped` 是为了判断运行期是否在持续出现积压断开（背压或滥用）；把关闭期的正常丢弃混进来，会让每次滚动重启都出现一次计数跳变，形成误报。快照不提供 per-connection 深度，单连接诊断走日志（§7.1）。
 
 ## 7. 可观测性
 
 ### 7.1 结构化日志
 
-框架日志 MUST 是结构化的（字段而非拼接字符串）。字段名是契约，文案与日志行的产出顺序不是契约。每个 Request 的日志 SHOULD 至少携带：请求标识、Session ID、Connection ID、Extension 名、耗时、结果、错误码。日志级别按语义使用：告警级用于能力降级、重放、队列拒绝这类“能继续运行但需要人知道”的事件；错误级用于请求失败；不得用错误级记录预期内的业务拒绝，包括 `AUTH_REQUIRED` 与 `FORBIDDEN`（§3.7、§7.2）。
+框架日志 MUST 是结构化的（字段而非拼接字符串）。字段名是契约，文案与日志行的产出顺序不是契约。每个 Request 的日志 SHOULD 至少携带请求标识、Session ID、Connection ID、Extension 名与耗时；失败时带 `code`，成功由日志消息表达，不承诺 `result` 字段。日志级别按语义使用：告警级用于能力降级、重放、队列拒绝这类“能继续运行但需要人知道”的事件；错误级用于请求失败；不得用错误级记录预期内的业务拒绝，包括 `AUTH_REQUIRED` 与 `FORBIDDEN`（§3.7、§7.2）。
 
 注入的日志实现抛错 MUST NOT 改变框架控制流。日志实现失败时框架不保证 `child()` 的绑定字段完整：`safeLogger` 的 `child` 抛错会回退到父包装。
 
@@ -381,17 +381,17 @@ TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：
 
 结果/完成类日志（`request completed`、`result received`、失败日志）的 `sessionId` 表示请求入口 Session（与 `RequestIdentity` 同义），不会因 Handler 绑定而被改写；入口无 Session 时不写。成功请求声明了 Session 变更时写 `sessionChange`，值为 `SessionChange` 对象（`{type:'bind',sessionId}` 或 `{type:'unbind'}`）；没有变更不写。字段名与语义都是契约。路由事件行（`session bound`、`session rebound to a new connection`）的 `sessionId` 表示本次被建立或接管的路由 id，与请求入口 Session 无关。
 
-Server 事件的诊断日志（ADR-0008）分逐事件与批量两类。逐事件日志（`EVENT_SEND_FAILED`）带 `eventId`、`event`、`reason` 与目标字段。Server 侧的 `EVENT_SEND_FAILED` 与请求入口身份写在同一行，目标字段用 `target` 前缀与入口身份区分：`targetKind` 取 `'connection'` 或 `'session'`，并相应带 `targetConnectionId` 或 `targetSessionId`；入口身份字段（`requestId`、`connectionId`、`clientRequestId`、`sessionId`）语义不变，`sessionId` 始终是请求入口 Session，不是投递目标。批量日志 `EVENTS_DROPPED` 是该请求的全部事件随未发出的结果一起被跳过时的单行记录，只有 `count`、`reason` 与请求入口身份，没有单一的 `eventId` 或目标字段。Portal 侧的 `EVENT_DROPPED`、`EVENT_LISTENER_FAILED` 带目标字段，沿用目标自身的 `connectionId` 或 `sessionId`，并同样带 `targetKind`；`EVENT_DROPPED` 可以代表一批同类丢弃，见下段。`code` 取值：`EVENT_DROPPED`（目标缺失、连接已关闭，或没有事件监听者）、`EVENT_BACKLOG_DISCONNECTED`（事件缓冲达到上界，断开该连接，§3.8）、`EVENT_SEND_FAILED`（Server 侧单条事件 IPC 发送失败）、`EVENTS_DROPPED`（结果未发出，该请求的全部事件被跳过）、`EVENT_LISTENER_FAILED`（事件监听者抛错）、`EVENT_BACKLOG_DISCARDED`（关闭时丢弃未写出的事件，单行汇总）；Portal 侧编码或传输写失败记录 `TRANSPORT_SEND_FAILED`，并以 `stage` 区分 `encode` 与 `send`。这些是仅在日志中出现的诊断字段，不发往客户端；事件投递失败 MUST NOT 改变请求的日志结论或终态。
+Server 事件的诊断日志（ADR-0008）分逐事件与批量两类。逐事件日志（`EVENT_SEND_FAILED`）带 `eventId`、`event`、`reason` 与目标字段。Server 侧的 `EVENT_SEND_FAILED` 与请求入口身份写在同一行，目标字段用 `target` 前缀与入口身份区分：`targetKind` 取 `'connection'` 或 `'session'`，并相应带 `targetConnectionId` 或 `targetSessionId`；入口身份字段（`requestId`、`connectionId`、`clientRequestId`、`sessionId`）语义不变，`sessionId` 始终是请求入口 Session，不是投递目标。批量日志 `EVENTS_DROPPED` 是该请求的全部事件随未发出的结果一起被跳过时的单行记录，只有 `count`、`reason` 与请求入口身份，没有单一的 `eventId` 或目标字段。Portal 侧的 `EVENT_DROPPED`、`EVENT_LISTENER_FAILED` 带目标字段，沿用目标自身的 `connectionId` 或 `sessionId`，并同样带 `targetKind`；`EVENT_DROPPED` 可以代表一批同类丢弃，见下段。`code` 取值：`EVENT_DROPPED`（目标缺失、连接已关闭，或没有事件监听者）、`EVENT_BACKLOG_DISCONNECTED`（事件缓冲达到上界，断开该连接，§3.8）、`EVENT_SEND_FAILED`（Server 侧单条事件 IPC 发送失败）、`EVENTS_DROPPED`（结果未发出，该请求的全部事件被跳过）、`EVENT_LISTENER_FAILED`（事件监听者抛错）、`EVENT_BACKLOG_DISCARDED`（关闭时丢弃未写出的事件，单行汇总）；Portal 侧结果无法编码时记录 `INTERNAL_ERROR`（`stage: 'encode'`），并用同一 `Codec` 编码一条兜底失败响应；兜底仍无法编码时记录 `TRANSPORT_SEND_FAILED`（`stage: 'encode'`）。写出超时或被拒时记录 `TRANSPORT_SEND_FAILED`（`stage: 'send'`）。这些是仅在日志中出现的诊断字段，不发往客户端；事件投递失败 MUST NOT 改变请求的日志结论或终态。
 
 事件缓冲达到任一处上界时为 `EVENT_BACKLOG_DISCONNECTED`（`reason: 'event buffer reached its bound'`）：字段含 `connectionId`（被断开的 Connection）、`buffer`（`'connection'` 或 `'session'`，指明哪一处缓冲溢出）、`closeCode`（传给传输的关闭码 `1013`）、`eventId` 与 `event`（触发断开的那条事件，用于回答「哪条事件压垮了队列」）、`queuedEvents`、`queuedEventBytes`、`maxQueuedEvents`、`maxQueuedEventBytes`（溢出时的观测值）；`sessionId` 在缓冲归属一个 Session 时带上：Session 待投递队列溢出必带（溢出队列属于该 Session），Session 目标投递引发的 Connection 队列溢出也带（标识被投递的 Session，与 `connectionId` 一起给出「哪个 Session 的投递压垮了哪条连接」）。connection 目标投递不带，因为那条事件本就没有 Session。这条日志每个被断开的 Connection 一行，不聚合：一次溢出只断开一次，不构成慢读者那种逐事件流。
 
-Portal 侧的 `EVENT_DROPPED` 按（`reason`，目标 id）聚合，同一批的后续丢弃合并进下一行，不是每条丢弃一行。理由：慢读者使每条新事件都成为一次丢弃，逐条记录会把诊断通道变成第二条无界流——正是事件上界要卸掉的压力；注入同步写文件的 logger 时还会直接阻塞事件循环。聚合规则：该组合的首条丢弃立即记录，之后累计计数每翻一倍记一行，静默满 60 秒后的首条也立即记录。由此行数随丢弃数的对数增长，低速率的目标也不会因累计值变大而长期静默。
+Portal 侧的 `EVENT_DROPPED` 按（`reason`，目标 id）聚合，同一批的后续丢弃合并进下一行，不是每条丢弃一行。理由：慢读者使每条新事件都成为一次丢弃，逐条记录会把诊断通道变成第二条无界流——正是事件上界要卸掉的压力；注入同步写文件的 logger 时还会直接阻塞事件循环。聚合保证：该组合的首条丢弃立即记录，之后按对数增长记录，静默达到 `QUIET_RESET_MS` 后的首条也立即记录；低速率的目标不会因累计值变大而长期静默。算法见 ADR-0008。
 
-聚合行 MUST 保留 `code`、`reason`、目标字段（`connectionId` 或 `sessionId` 与 `targetKind`）以及 `count`（本行代表的丢弃条数）与 `droppedTotal`（该组合的累计丢弃数）。`eventId` 与 `event` 取本批首条丢弃的事件，用于回答「丢的是哪条」；聚合行不声称本批只有该事件，`count > 1` 即表示它是首条。`EVENT_BACKLOG_DISCONNECTED` 只描述断开本身：被断开连接上尚未写出的帧仍逐条记 `EVENT_DROPPED`，经本条聚合，所以一次溢出产生一行断开日志，加至多约 log2(队列上限) 行聚合丢弃。这些丢弃的 `reason` 与客户端主动断开不同（`the connection was closed after an event backlog overflow` 对 `the target connection closed before the event was written`），运维据此区分「客户端走了」与「框架断开了它」。聚合只影响日志：`eventBacklog.dropped` 按断开计数（§6.6），探针读到的不是聚合值。聚合状态属于本连接层实例，重启即清零；同时活跃的（`reason`，目标 id）组合超过 4096 个时，最久未再丢弃的组合会被淘汰，其累计值随新桶从 1 重新计数——此时仍会立即记录该目标的每条新丢弃，只是 `droppedTotal` 不再是从启动起的累计。
+聚合行 MUST 保留 `code`、`reason`、目标字段（`connectionId` 或 `sessionId` 与 `targetKind`）以及 `count`（本行代表的丢弃条数）与 `droppedTotal`（该组合的累计丢弃数）。`eventId` 与 `event` 取本批首条丢弃的事件，用于回答「丢的是哪条」；聚合行不声称本批只有该事件，`count > 1` 即表示它是首条。`EVENT_BACKLOG_DISCONNECTED` 只描述断开本身：被断开连接上尚未写出的帧仍逐条记 `EVENT_DROPPED`，经本条聚合，所以一次溢出只产生一行断开日志，加有界数量的聚合丢弃行。这些丢弃的 `reason` 与客户端主动断开不同（`the connection was closed after an event backlog overflow` 对 `the target connection closed before the event was written`），运维据此区分「客户端走了」与「框架断开了它」。聚合只影响日志：`eventBacklog.dropped` 按断开计数（§6.6），探针读到的不是聚合值。聚合状态属于本连接层实例，重启即清零；同时活跃的（`reason`，目标 id）组合数有上界 `MAX_BUCKETS`。表满时先淘汰静默达到 `QUIET_RESET_MS` 的组合，仍满则淘汰最久未再丢弃的组合，被淘汰的组合先 flush 再删除；新组合与被淘汰组合的后续丢弃都从新桶重新计数，其首条立即记录，之后继续按对数增长。
 
 关闭时丢弃未写出事件的汇总日志为 `EVENT_BACKLOG_DISCARDED`，`reason` 取 `'shutdown'`，字段含 `count`、`connections`、`frames`、`bytes`（§3.8）。
 
-聚合事件缓冲越过告警阈值时为 `EVENT_BACKLOG_HIGH`，字段含 `bytes`（当前全部缓冲的字节总数）、`frames`、`activeConnections`（当前已准入连接数，与 §6.6 快照的 `connections` 不同：后者只数持有帧的队列）、`warnBytes`（生效的阈值）。该行只记录观测，不改变任何事件的投递结果（§3.8）。
+聚合事件缓冲达到或超过告警阈值时为 `EVENT_BACKLOG_HIGH`，字段含 `bytes`（当前全部缓冲的字节总数）、`frames`、`activeConnections`（当前已准入连接数，与 §6.6 快照的 `connections` 不同：后者只数持有帧的队列）、`warnBytes`（生效的阈值）。该行只记录观测，不改变任何事件的投递结果（§3.8）。
 
 关闭时丢弃尚未开始的请求为逐条日志 `REQUEST_DROPPED_AT_SHUTDOWN`（§6.3 第 2 步），`reason` 指明排空预算内未开始，字段含 `requestId`、`method`、`clientRequestId`（无则省略）、`connectionId`。该 `code` 用于「从未从调度器队列取出的请求」；已取出但在 Session 屏障前被 abort 的请求走 `FRAMEWORK_SHUTDOWN`（§6.3 第 2 步、§7.2）。`TRANSPORT_CLOSED` 表示连接已不在，不用于关闭预算耗尽。边界：排空等待超时后 `doStop` 才清空连接表，此时仍停在 Session 屏障前的请求会看到连接不匹配，落 `TRANSPORT_CLOSED` 而不是 `FRAMEWORK_SHUTDOWN`；它同样不执行。
 

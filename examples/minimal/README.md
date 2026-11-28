@@ -53,4 +53,4 @@ rm -rf examples/minimal/data
 curl -i "http://127.0.0.1:<health-port>/"
 ```
 
-`layer.health().ready` 为 true 时返回 200，否则 503；响应体是完整快照。端点由应用层提供，core 只提供同步快照（SPEC 6.6）；快照立即过期，不能替代请求准入或 deadline。把 `<health-port>` 换成 `HEALTH_PORT` 的值；未设置时端口取 `src/portal.ts` 的默认常量。
+`layer.health().ready` 为 true 时返回 200，否则 503；响应体为 `{status, health}`，`health` 是完整快照。端点由应用层提供，core 只提供同步快照（SPEC 6.6）；快照立即过期，不能替代请求准入或 deadline。把 `<health-port>` 换成 `HEALTH_PORT` 的值；未设置时端口取 `src/portal.ts` 的默认常量。
