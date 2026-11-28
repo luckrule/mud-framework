@@ -21,8 +21,11 @@ import {
 import type { SaySequence, SenderArrivals } from './sequence.ts';
 import {
   Histogram,
+  clientName,
   effectiveThinkMs,
   envIntegerRequired,
+  goStartMsOf,
+  measurementWindow,
   pickCommand,
   readSharedLoadConfig,
   roomForIndex,
@@ -40,7 +43,8 @@ import type {
  * clients for the whole run, so those clients share this event loop and no
  * other process's. The coordinator gives it a room target and result path,
  * waits for the `ready` line, then releases the measurement barrier over
- * stdin. Each client has at most one request in flight.
+ * stdin. The first `LOAD_GENERATOR_SENDERS` local clients run the command
+ * loop; the rest stay connected, drain events and send nothing.
  *
  * `game-slice` has no separate `who` handler; the interactive client maps
  * `who` to `game.look` and prints the player list. This generator does the
@@ -50,7 +54,9 @@ import type {
 
 const TOKEN_PREFIX = 'mudload';
 const GO_TIMEOUT_MS = 300_000;
-const EVENT_DRAIN_MS = 500;
+// A high-fanout tail can still be in the WebSocket/IPC queues when the last
+// sender stops, so the drain is longer than a normal think-time pause.
+const EVENT_DRAIN_MS = 2000;
 const LOGOUT_TIMEOUT_MS = 2000;
 
 /** Directed exit graph of the game slice, used only to find setup paths. */
@@ -66,6 +72,8 @@ interface GeneratorConfig {
   readonly url: string;
   readonly generator: number;
   readonly clients: number;
+  /** First N local clients send; the rest are listeners. */
+  readonly senders: number;
   readonly globalOffset: number;
   readonly resultFile: string;
 }
@@ -79,11 +87,19 @@ function readGeneratorConfig(): GeneratorConfig {
   if (resultFile === undefined || resultFile.length === 0) {
     throw new Error('LOAD_GENERATOR_RESULT is required by a load generator');
   }
+  const clients = envIntegerRequired('LOAD_GENERATOR_CLIENTS', 1);
+  const senders = envIntegerRequired('LOAD_GENERATOR_SENDERS', 0);
+  if (senders > clients) {
+    throw new Error(
+      `LOAD_GENERATOR_SENDERS (${senders}) must not exceed LOAD_GENERATOR_CLIENTS (${clients})`,
+    );
+  }
   return {
     shared,
     url: shared.externalUrl,
     generator: envIntegerRequired('LOAD_GENERATOR_INDEX', 0),
-    clients: envIntegerRequired('LOAD_GENERATOR_CLIENTS', 1),
+    clients,
+    senders,
     globalOffset: envIntegerRequired('LOAD_GENERATOR_OFFSET', 0),
     resultFile,
   };
@@ -393,7 +409,7 @@ async function setupClient(
   index: number,
   stats: GeneratorStats,
 ): Promise<ClientRuntime> {
-  const name = `load-${config.generator}-${index}`;
+  const name = clientName(config.generator, index);
   const client = await GameClient.connect({
     url: config.url,
     timeoutMs: config.shared.requestTimeoutMs,
@@ -534,12 +550,24 @@ async function clientLoop(
   }
 }
 
-function waitForGo(): Promise<void> {
-  const go = Promise.withResolvers<void>();
+/**
+ * Listeners send nothing but must hold their connection (and keep recording
+ * events) for the whole measurement window.
+ */
+async function lingerUntil(endsAtMs: number): Promise<void> {
+  const remaining = endsAtMs - Date.now();
+  if (remaining > 0) {
+    await sleep(remaining);
+  }
+}
+
+function waitForGo(): Promise<number> {
+  const go = Promise.withResolvers<number>();
   const reader = createInterface({ input: process.stdin, terminal: false });
   reader.on('line', (line) => {
-    if (line.trim() === 'go') {
-      go.resolve();
+    const startMs = goStartMsOf(line);
+    if (startMs !== undefined) {
+      go.resolve(startMs);
     }
   });
   reader.on('close', () => {
@@ -599,6 +627,7 @@ function resultJson(
     version: 1,
     generator: config.generator,
     clients: config.clients,
+    senders: config.senders,
     setupMs,
     measuredFromMs,
     measuredUntilMs,
@@ -630,23 +659,32 @@ async function runGenerator(config: GeneratorConfig): Promise<void> {
     setupMs = Date.now() - setupStartedMs;
     write('ready');
 
-    // The barrier is the single release point for measurement.
-    await waitForGo();
-    measuredFromMs = Date.now() + config.shared.warmupSec * 1000;
-    measuredUntilMs = measuredFromMs + config.shared.durationSec * 1000;
+    // The barrier is the single release point for measurement. Its timestamp
+    // is coordinator-wide, so every generator filters event tokens by the same
+    // window instead of its own stdin receipt time.
+    const measurementStartMs = await waitForGo();
+    const window = measurementWindow(
+      measurementStartMs,
+      config.shared.warmupSec,
+      config.shared.durationSec,
+    );
+    measuredFromMs = window.fromMs;
+    measuredUntilMs = window.untilMs;
     measurement.fromMs = measuredFromMs;
     measurement.untilMs = measuredUntilMs;
     measurement.active = true;
 
     await Promise.all(
-      clients.map((runtime) =>
-        clientLoop(
-          runtime,
-          config,
-          stats,
-          measuredUntilMs,
-          effectiveThinkMs(config.shared),
-        ),
+      clients.map((runtime, index) =>
+        index < config.senders
+          ? clientLoop(
+              runtime,
+              config,
+              stats,
+              measuredUntilMs,
+              effectiveThinkMs(config.shared),
+            )
+          : lingerUntil(measuredUntilMs),
       ),
     );
     // The window is the nominal duration: trailing think time and a last

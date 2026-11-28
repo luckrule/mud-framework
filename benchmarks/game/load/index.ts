@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 import { messageOf } from '../../../packages/core/src/shared/guards.ts';
 import { environmentLine } from '../../environment.ts';
@@ -11,6 +11,7 @@ import {
   collectResults,
   planGenerators,
   sendGo,
+  senderSessionIds,
   spawnGenerator,
   startLoadPortal,
   stopGenerators,
@@ -25,8 +26,11 @@ import {
   printAggregate,
   printPerGenerator,
   printResources,
+  printServerStats,
 } from './report.ts';
 import { ResourceSampler } from './resources.ts';
+import { readServerStatsFile } from './server-stats.ts';
+import type { ServerStatsRead } from './server-stats.ts';
 import { effectiveThinkMs, mixText, readMainConfig } from './support.ts';
 import type { MainConfig } from './support.ts';
 
@@ -126,20 +130,29 @@ function cleanupDirectories(
 async function main(): Promise<void> {
   const config = readMainConfig();
   const thinkMs = effectiveThinkMs(config.shared);
+  const resourceJsonlRaw = process.env.LOAD_RESOURCE_JSONL?.trim();
+  const resourceJsonl =
+    resourceJsonlRaw !== undefined && resourceJsonlRaw.length > 0
+      ? resolve(resourceJsonlRaw)
+      : undefined;
 
   write('mud-framework player-level load benchmark');
   write(environmentLine({ cores: true }));
   write(
-    `config: clients=${integerText(config.clients)} generators=${config.generators} room-size=${config.shared.roomSize} mode=${config.shared.mode} duration=${config.shared.durationSec}s warmup=${config.shared.warmupSec}s think=${thinkMs}ms mix=${mixText(config.shared.mix)} request-timeout=${config.shared.requestTimeoutMs}ms`,
+    `config: clients=${integerText(config.clients)} senders=${integerText(config.senders)} listeners=${integerText(config.clients - config.senders)} generators=${config.generators} room-size=${config.shared.roomSize} mode=${config.shared.mode} duration=${config.shared.durationSec}s warmup=${config.shared.warmupSec}s think=${thinkMs}ms mix=${mixText(config.shared.mix)} request-timeout=${config.shared.requestTimeoutMs}ms`,
   );
 
   let portal: PortalHandle | undefined;
   let dirs: Directories | undefined;
   let sampler: ResourceSampler | undefined;
+  let serverStatsFile: string | undefined;
+  let serverStats: ServerStatsRead | undefined;
   const generators: GeneratorHandle[] = [];
   let summary: string | undefined;
   try {
     dirs = prepareDirectories(config);
+    const plans = planGenerators(config, dirs.resultsDir);
+    const senderSessions = senderSessionIds(plans);
     write(
       `data dir: ${dirs.dataDir ?? 'not used (external Portal)'}${dirs.userDataDir ? ' (LOAD_DATA_DIR; never removed)' : ''}`,
     );
@@ -149,23 +162,29 @@ async function main(): Promise<void> {
     if (config.shared.externalUrl !== undefined) {
       url = config.shared.externalUrl;
       write(
-        `portal: reusing ${url}; spawn, Server pid sampling and cleanup are skipped`,
+        `portal: reusing ${url}; spawn, Server pid sampling, Server stats and cleanup are skipped`,
       );
     } else {
       if (dirs.dataDir === undefined) {
         throw new Error('internal: spawn path has no data directory');
       }
-      portal = await startLoadPortal(dirs.dataDir, config.shared);
+      serverStatsFile = join(dirs.resultsDir, 'server-stats.json');
+      portal = await startLoadPortal(dirs.dataDir, config.shared, {
+        serverStatsFile,
+        senderSessions,
+      });
       url = portal.url;
       write(`portal: spawned pid ${portal.pid}, listening on ${url}`);
     }
 
-    sampler = new ResourceSampler(portal);
+    sampler = new ResourceSampler(portal, resourceJsonl);
     sampler.start();
+    if (resourceJsonl !== undefined) {
+      write(`resources jsonl: ${resourceJsonl}`);
+    }
 
-    const plans = planGenerators(config, dirs.resultsDir);
     write(
-      `generators: ${plans.map((plan) => `${plan.index}:${plan.clients}`).join(' ')} (clients per process)`,
+      `generators: ${plans.map((plan) => `${plan.index}:${plan.clients}(${plan.senders} senders)`).join(' ')}`,
     );
     const setupStartedMs = Date.now();
     for (const plan of plans) {
@@ -191,11 +210,23 @@ async function main(): Promise<void> {
       portal,
       config.shared.externalUrl !== undefined,
     );
+    // The Server writes its counters as it shuts down, so read them after the
+    // Portal stop and before cleanup removes the result directory.
+    if (serverStatsFile !== undefined) {
+      serverStats = readServerStatsFile(serverStatsFile);
+    }
     if (dirs !== undefined) {
       cleanupDirectories(dirs, portalStop, config.keep);
     }
     if (resources !== undefined) {
       printResources(resources);
+    }
+    if (serverStats !== undefined) {
+      printServerStats(serverStats, config.senders);
+    } else if (config.shared.externalUrl !== undefined) {
+      write(
+        'server ipc/handler stats: skipped (LOAD_URL reuses an external Portal that does not run the benchmark Server entry)',
+      );
     }
   }
 

@@ -219,6 +219,8 @@ export async function startPortal(options: {
   readonly dataDirectory: string;
   readonly requestTimeoutMs: number;
   readonly readyTimeoutMs: number;
+  /** Extra environment for the Portal and the Server it spawns. */
+  readonly extraEnv?: Readonly<Record<string, string>>;
 }): Promise<PortalHandle> {
   const child = Bun.spawn({
     cmd: [process.execPath, 'run', options.entry],
@@ -231,6 +233,7 @@ export async function startPortal(options: {
       PORTAL_PORT: '0',
       GAME_SLICE_DATA_DIR: options.dataDirectory,
       REQUEST_TIMEOUT_MS: String(options.requestTimeoutMs),
+      ...options.extraEnv,
     },
   });
 
