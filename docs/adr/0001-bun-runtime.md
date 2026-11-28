@@ -30,7 +30,7 @@ P2 承诺的是 Handler 可 await、调度建立在 Promise 上，不是每次�
 - `bun:sqlite` 只有同步 API，长查询会阻塞事件循环，拖慢进程内全部连接。
 - SQLite 单连接：请求 A `BEGIN IMMEDIATE` 后 await，请求 B 的写入会被并入 A 的事务；A 回滚时 B 的写入一并消失。异步回调里首个 await 处即提交，此后抛错不回滚。
 - `worker_threads` 只是部分实现；`AsyncLocalStorage` 不进入 `Bun.serve` 的 handler，请求上下文只能显式传参。
-- `Bun.spawn` 的 IPC 仅兼容其他 Bun 进程，跨 Node 需退化为 JSON 序列化。
+- `Bun.spawn` 的 IPC 仅兼容其他 Bun 进程；Node 子进程无法使用该通道，跨 Node 只能改用 stdio/socket 并自行分帧与 JSON 序列化，框架不提供该路径（ADR-0004、`docs/INTEGRATION.md`）。
 - Windows 没有 tier 分级声明。
 
 缓解：SQLite 后端按 `concurrency: 'single'` 声明并内部串行化事务（ADR-0003）；需要真异步存储时改用 Postgres 后端。
