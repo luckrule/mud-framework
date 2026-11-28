@@ -12,6 +12,10 @@ import {
   closeBudget,
   resolveStableResetMs,
 } from '../../shared/budget.ts';
+import {
+  CLIENT_REQUEST_ID_EMPTY_MESSAGE,
+  isValidClientRequestId,
+} from '../../shared/client-request-id.ts';
 import type { ServerEvent } from '../../shared/events.ts';
 import type {
   ExecutorHealth,
@@ -20,10 +24,7 @@ import type {
   RequestExecutor,
 } from '../../shared/executor.ts';
 import { messageOf } from '../../shared/guards.ts';
-import {
-  EMPTY_CLIENT_REQUEST_ID,
-  requestLogFields,
-} from '../../shared/identity.ts';
+import { requestLogFields } from '../../shared/identity.ts';
 import { tightenTimeout } from '../../shared/timeout.ts';
 import {
   FRAMEWORK_QUEUE_FULL,
@@ -204,7 +205,7 @@ export class IpcExecutor implements RequestExecutor {
   }
 
   execute(request: ExecutorRequest): Promise<ExecutorOutcome> {
-    if (request.clientRequestId === '') {
+    if (!isValidClientRequestId(request.clientRequestId)) {
       // Absence is the only way to say "no correlation key" (SPEC 7.3). The
       // line omits the invalid value: an empty string is not an id, so it must
       // not become one in the log either.
@@ -213,7 +214,7 @@ export class IpcExecutor implements RequestExecutor {
         valid,
         'warn',
         INTERNAL_ERROR,
-        EMPTY_CLIENT_REQUEST_ID,
+        CLIENT_REQUEST_ID_EMPTY_MESSAGE,
       );
     }
     if (this.slot.status === 'idle') {

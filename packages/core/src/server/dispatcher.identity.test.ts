@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 
+import { CLIENT_REQUEST_ID_EMPTY_MESSAGE } from '../shared/client-request-id.ts';
 import { rejectionOf } from '../testing/common.ts';
 import { quietDispatcher } from '../testing/dispatcher.ts';
 import { MemoryStorageBackend } from '../testing/memory-backend.ts';
@@ -146,7 +147,7 @@ describe('Dispatcher.identity', () => {
     const error = await rejectionOf(
       dispatcher.dispatch('inspect', null, { clientRequestId: '' }),
     );
-    expect(error.message).toContain('clientRequestId');
+    expect(error.message).toBe(CLIENT_REQUEST_ID_EMPTY_MESSAGE);
     expect(ran).toBe(false);
   });
 

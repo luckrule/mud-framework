@@ -3,8 +3,8 @@ import { randomUUID } from 'node:crypto';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import { safeLogger } from '../logging/safe-logger.ts';
 import type { Logger } from '../logging/types.ts';
+import { assertClientRequestId } from '../shared/client-request-id.ts';
 import { describeValue, messageOf } from '../shared/guards.ts';
-import { EMPTY_CLIENT_REQUEST_ID } from '../shared/identity.ts';
 import { elapsedMs, tightenTimeout } from '../shared/timeout.ts';
 import {
   AUTH_REQUIRED,
@@ -170,9 +170,7 @@ export class Dispatcher {
     // Absence means "the caller supplied none"; an empty string cannot mean
     // the same thing without making a present-but-empty id indistinguishable
     // from a missing one (SPEC 7.3).
-    if (meta.clientRequestId === '') {
-      throw new TypeError(EMPTY_CLIENT_REQUEST_ID);
-    }
+    assertClientRequestId(meta.clientRequestId);
     // The supplied id wins: a replay must keep the id the original request
     // got on entry (SPEC 7.3), and generating a fresh one would split one
     // player input across two unrelated log trails.

@@ -1,3 +1,4 @@
+import { isValidClientRequestId } from '../shared/client-request-id.ts';
 import type { ServerEventTarget } from '../shared/events.ts';
 import type { SessionChange } from '../shared/executor.ts';
 import { describeValue, isRecord, messageOf } from '../shared/guards.ts';
@@ -105,7 +106,7 @@ function buildRequest(raw: Record<string, unknown>): RequestMessage {
     connectionId: readString(raw, 'request', 'connectionId', true),
     // Optional correlation key (SPEC 7.3): absent when the client supplied
     // none, and still rejected when present but empty.
-    clientRequestId: readOptionalString(raw, 'request', 'clientRequestId'),
+    clientRequestId: readClientRequestId(raw, 'request', 'clientRequestId'),
     sessionId: readOptionalString(raw, 'request', 'sessionId'),
     method: readString(raw, 'request', 'method', true),
     payload: raw.payload,
@@ -299,6 +300,28 @@ function readOptionalString(
   return raw[field] === undefined
     ? undefined
     : readString(raw, messageType, field, true);
+}
+
+/**
+ * Absence is allowed, an empty string is not (SPEC 7.3). The type check stays
+ * separate so a non-string still reports "a string" rather than the empty-id
+ * wording; `isValidClientRequestId` owns only the empty-string rule.
+ */
+function readClientRequestId(
+  raw: Record<string, unknown>,
+  messageType: string,
+  field: string,
+): string | undefined {
+  if (raw[field] === undefined) {
+    return undefined;
+  }
+  const value = readString(raw, messageType, field, false);
+  if (!isValidClientRequestId(value)) {
+    throw new ShapeError(
+      fieldReason(messageType, field, 'a non-empty string', value),
+    );
+  }
+  return value;
 }
 
 function readBoolean(

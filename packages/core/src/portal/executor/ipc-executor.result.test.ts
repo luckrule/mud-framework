@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 
+import { CLIENT_REQUEST_ID_EMPTY_MESSAGE } from '../../shared/client-request-id.ts';
 import {
   FakeServerProcess,
   failureOf,
@@ -22,7 +23,7 @@ describe('IpcExecutor result', () => {
 
     expect(failureOf(outcome)).toEqual({
       code: 'INTERNAL_ERROR',
-      message: 'clientRequestId must be a non-empty string when provided',
+      message: CLIENT_REQUEST_ID_EMPTY_MESSAGE,
     });
     expect(requestMessages(server)).toHaveLength(0);
     const rejected = h.logs().find((line) => line.msg === 'request rejected');

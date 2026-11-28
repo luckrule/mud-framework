@@ -30,14 +30,6 @@ export interface RequestIdentity {
 }
 
 /**
- * The one invalid value an optional `clientRequestId` admits. Kept next to the
- * type so every entry that accepts one refuses it with the same wording
- * (SPEC 7.3).
- */
-export const EMPTY_CLIENT_REQUEST_ID =
-  'clientRequestId must be a non-empty string when provided';
-
-/**
  * `RequestIdentity` as request-level log bindings (SPEC 7.1). Both processes
  * build these fields, so the mapping lives here rather than in either one.
  *
