@@ -1,0 +1,106 @@
+name: Decision
+description: A trade-off that needs an owner decision; options and impact first, no implementation yet
+title: "[Decision] "
+labels: ["decision"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A decision issue does not enter implementation until it is decided. Every decision must include and assess "Do nothing" as a baseline.
+        Record the outcome under "Decision outcome" and, if needed, update SPEC/ADR.
+  - type: textarea
+    id: question
+    attributes:
+      label: Decision question
+      description: State the choice in one sentence and the consequence of not deciding.
+    validations:
+      required: true
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Context and constraints
+      description: Relevant SPEC/INV/ADR, prior decisions, and constraints that must not be reopened.
+    validations:
+      required: true
+  - type: textarea
+    id: options
+    attributes:
+      label: Options
+      description: For each option, give the approach, cost, and risk; include "Do nothing" and its consequences.
+      placeholder: |
+        1. Do nothing
+           Cost:
+           Risk:
+        2. ...
+           Cost:
+           Risk:
+    validations:
+      required: true
+  - type: checkboxes
+    id: do_nothing
+    attributes:
+      label: Baseline check
+      options:
+        - label: The options include "Do nothing" and its consequences.
+          required: true
+  - type: textarea
+    id: recommendation
+    attributes:
+      label: Recommendation and rationale
+      description: Give one clear recommendation and explain why the other options, including Do nothing, were rejected.
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: Effects on public API, protocol, error codes, log fields, storage, deployment, and tests.
+      placeholder: None / Requires ADR / Requires SPEC change / Breaking change
+    validations:
+      required: true
+  - type: input
+    id: adr_link
+    attributes:
+      label: Related ADR
+      description: Link or ADR number; write "None" if not yet recorded.
+    validations:
+      required: false
+  - type: input
+    id: supersedes
+    attributes:
+      label: Supersedes
+      description: Existing ADR or decision this replaces; write "None" if it does not replace one.
+    validations:
+      required: false
+  - type: textarea
+    id: revisit_trigger
+    attributes:
+      label: Revisit trigger
+      description: Condition that reopens this decision; write "Never" if it is a one-way door.
+    validations:
+      required: true
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: The maintainer applies the P0/P1/P2 label.
+      options:
+        - P0
+        - P1
+        - P2
+    validations:
+      required: true
+  - type: input
+    id: deadline
+    attributes:
+      label: Decision owner / deadline
+      description: Who decides and by when; write "None" if not applicable.
+    validations:
+      required: false
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Decision outcome
+      description: "Fill in after the decision is made: what was chosen, why, boundaries, and follow-up actions."
+    validations:
+      required: false

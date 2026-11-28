@@ -1,0 +1,95 @@
+name: Bug
+description: Reproducible incorrect behavior or a contract violation
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        `bug` is a cross-cutting marker, not a type or priority. Maintainers add capacity/contract/events/release and P0/P1/P2 after triage.
+        Rule out configuration and deployment issues first. When error codes, event semantics, or hot-upgrade failure paths are involved, cite the relevant SPEC/INV clause.
+  - type: textarea
+    id: symptom
+    attributes:
+      label: Symptom
+      description: One sentence describing the incorrect behavior and its impact.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Minimal steps; include commands or test names where possible.
+      placeholder: |
+        1. ...
+        2. ...
+        Expected:
+        Actual:
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: Which contract, document, or invariant says so.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and evidence
+      description: Error code, log excerpt, stack trace, failing test output, or process state.
+    validations:
+      required: true
+  - type: input
+    id: affected_version
+    attributes:
+      label: Affected version / commit
+      description: Release version, commit SHA, or branch where the bug was observed.
+      placeholder: v0.0.0 / 52edad8 / main
+    validations:
+      required: true
+  - type: dropdown
+    id: regression
+    attributes:
+      label: Regression?
+      description: Did this work in an earlier version or commit?
+      options:
+        - "Yes"
+        - "No"
+        - Unknown
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Bun version, OS, deployment mode, relevant config (no credentials).
+      placeholder: Bun 1.4.5 / Ubuntu 24.04 / two-process / ...
+    validations:
+      required: true
+  - type: textarea
+    id: workaround
+    attributes:
+      label: Workaround
+      description: Any known workaround; write "None" if there is none.
+    validations:
+      required: false
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: Your assessment; the maintainer confirms the P0/P1/P2 label.
+      options:
+        - P0
+        - P1
+        - P2
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: Whether connection continuity, storage consistency, event ordering, or hot upgrade is affected.
+    validations:
+      required: false
