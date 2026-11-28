@@ -15,6 +15,14 @@ export interface ServerProcessOptions {
   /** Framework-side request ceiling; effective = min(this, backend max). */
   timeoutMs: number;
   /**
+   * How many events one request may buffer (SPEC 3.8). `ctx.emit` and
+   * `ctx.emitToSession` share the budget, which resets for each request.
+   * Defaults to 1024. Must be a safe integer of at least 1; an invalid value
+   * refuses startup. The overflow is an ordinary handler error: caught, the
+   * request can still succeed; uncaught, it fails with `INTERNAL_ERROR`.
+   */
+  maxEventsPerRequest?: number;
+  /**
    * Optional access policy for every registered handler (SPEC 3.7). Forwarded
    * unchanged to the dispatcher this process creates; returning false refuses
    * a request with `FORBIDDEN` before its transaction opens.

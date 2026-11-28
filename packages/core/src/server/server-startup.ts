@@ -93,6 +93,7 @@ export async function startServer(deps: StartupDeps): Promise<StartupResult> {
     dispatcher = new Dispatcher({
       backend,
       timeoutMs: options.timeoutMs,
+      maxEventsPerRequest: options.maxEventsPerRequest,
       authorize: options.authorize,
       logger,
     });

@@ -155,11 +155,13 @@ core 只提供同步快照，不提供 HTTP 端点（SPEC 6.6）。应用在自�
 - **确认没有孤儿进程**：`process.kill(pid, 0)` 抛 `ESRCH` 可用于检查该 pid 已消失。`pid` 来自 `prepared`/`ready` 消息。框架内部只有 `observed: true` 的退出确认才解除写者屏障；等待超时说明尚未确认，不能仅凭日志诊断进程不可中断。迟到确认只允许在执行器尚可恢复时解除屏障；一次性 `observed: false` 不保证自动恢复，需要部署方处理。
 - **`maxPending`**：Portal 未确认缓冲的硬上限（默认值见 `IpcExecutorOptions`），超出后请求以 `FRAMEWORK_QUEUE_FULL` 拒绝。deadline 在 Server 未就绪或不可用时仍会结算请求，只限制单条请求的驻留时间；总数上限控制同时在途的数量，不能用来延长 deadline。
 - **`maxConnections`**：连接层同时接纳的活跃连接上限（默认值见 `ConnectionLayerOptions`）。达到上限后，新连接以 WebSocket close code `1013`（Try Again Later）关闭，不进入请求处理；连接断开才释放名额。它是准入上限，不是业务 Session 的生命周期限制。
-- **`eventSendTimeoutMs`**：所有下行帧写出的上界——事件帧与响应帧共用同一个界（取值顺序与余量理由见 SPEC §3.8、§5.2；默认值见 `ConnectionLayerOptions`）。它约束的是写出，不是断线：帧已开始写出后，断线不会提前释放串行位，因为字节可能已经写出（SPEC §3.8）。显式配置不得超过 `MAX_TIMER_DELAY_MS`，否则构造时抛错——超过该值时 Bun 会把定时器钳制为 1ms，最长与最短的界会互换。
+- **`eventSendTimeoutMs`**：所有下行帧写出的上界——事件帧与响应帧共用同一个界（取值顺序与余量理由见 SPEC §3.8、§5.2；默认值见 `ConnectionLayerOptions`）。它约束的是写出，不是断线：帧已开始写出后，断线不会提前释放串行位，因为字节可能已经写出（SPEC §3.8）。显式配置不得超过 Bun `setTimeout` 可接受的最大延时（2^31−1 ms，内部上限），否则构造时抛错——超过该值时 Bun 会把定时器钳制为 1ms，最长与最短的界会互换。
 - **`maxQueuedEvents` / `maxQueuedEventBytes`**：每一处事件缓冲的上界（帧数与编码后的字节数，默认值见 `ConnectionLayerOptions`），上界语义、溢出断开、无 holder 时的丢弃与请求终态见 SPEC §3.8。客户端看到 `1013` 应重连并从权威状态恢复，而不是在原连接上继续操作一个已经失真的事件流。
+- **`ServerProcessOptions.maxEventsPerRequest`**：`runServerProcess` 的单请求事件上限，默认 1024；`ctx.emit` 与 `ctx.emitToSession` 共用这个额度，按请求重置。必须是大于等于 1 的安全整数，非法值在启动期拒绝。Handler 未捕获溢出错误时请求以 `INTERNAL_ERROR` 失败，错误信息带实际配置值；一次广播可覆盖的目标 Session/收件人数也受该值约束。调高前先测量：上限会放大单请求的事件帧数、Portal 与 Server 之间的 IPC 传输量以及连接层事件缓冲的占用，进而影响请求延迟与进程 RSS。依据实际广播扇出和容器内存验证后再调整，不要只按默认值推算容量。
 - **事件内存包络**：框架只保证每处缓冲各自有界，进程总量要部署方自己算。量级估算 ≈ `maxConnections × maxQueuedEventBytes × 2`：两处缓冲可同时攒满——该 Connection 的事件队列一份，它那个 Session 的待投递队列一份；两处装的是不同的帧，同一帧不会被重复计数。这是量级估算而非严格上界。部署时必须按实际连接数与容器内存下调这两个选项之一，不能假设默认值安全。
 - **事件积压告警**：聚合事件缓冲总字节达到或超过 `eventBacklogWarnBytes`（默认值见 `DEFAULT_EVENT_BACKLOG_WARN_BYTES`）时记一条 `EVENT_BACKLOG_HIGH` warn，带 `bytes`、`frames`、`activeConnections` 与 `warnBytes`。同一段积压只报一次，聚合总量回落到零才重新武装。这是观测信号，不拒绝、不丢弃、不延迟任何事件；按容器内存的几分之一设置它，让它早于 OOM 触发。单连接积压由上面的 `1013` 断开处理，这条告警看的是所有连接加起来的内存占用。
 - **出站队列有界**：传输实现必须限制每个连接的出站缓冲；慢客户端积压到上限时会被关闭，而不是无限占用 Portal 内存（SPEC 5.2）。
+- **WS 传输容量配置**：`maxMessageBytes`（单条消息上限，双向）、`idleTimeoutSeconds`（空闲超时）、`maxQueuedFrames` 与 `maxQueuedBytes`（每连接出站队列的帧数与字节数上限，溢出时失败并断开该连接，SPEC 5.2）。默认值见 `WsTransportOptions` 及 `resolveWsTransportSettings` 的默认常量；`maxQueuedBytes` 不得小于 `maxMessageBytes`。
 
 ### TLS 终止配置要点
 
