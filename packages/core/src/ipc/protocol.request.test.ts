@@ -31,6 +31,47 @@ describe('parseIpcMessage', () => {
     });
   });
 
+  test('accepts a request without a clientRequestId', () => {
+    const parsed = parseIpcMessage({
+      type: 'request',
+      requestId: 'req-1',
+      connectionId: 'conn-1',
+      method: 'ping',
+      timeoutMs: 250,
+      replayCount: 0,
+    });
+
+    expect(parsed).toEqual({
+      ok: true,
+      message: {
+        type: 'request',
+        requestId: 'req-1',
+        connectionId: 'conn-1',
+        clientRequestId: undefined,
+        sessionId: undefined,
+        method: 'ping',
+        payload: undefined,
+        timeoutMs: 250,
+        replayCount: 0,
+      },
+    });
+  });
+
+  test('rejects an empty clientRequestId', () => {
+    expectRejected(
+      {
+        type: 'request',
+        requestId: 'req-1',
+        connectionId: 'conn-1',
+        clientRequestId: '',
+        method: 'ping',
+        timeoutMs: 250,
+        replayCount: 0,
+      },
+      'clientRequestId',
+    );
+  });
+
   test('accepts activate and drops extra fields', () => {
     const parsed = parseIpcMessage({ type: 'activate', futureField: true });
 

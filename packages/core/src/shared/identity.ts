@@ -11,9 +11,11 @@ import type { LogFields } from '../logging/types.ts';
  * that starts one declares it through `bindSession`, which takes effect only if
  * the request succeeds (SPEC 2).
  *
- * `connectionId` and `clientRequestId` are empty strings rather than absent when
- * the caller supplied none: a direct `dispatch` has no connection. Only
- * `sessionId` uses absence to mean something ("not bound").
+ * `clientRequestId` is present only when the caller supplied one: it is the
+ * client's own correlation key, not a framework id, and an empty string is not
+ * a way to say "none" (SPEC 7.3). `connectionId` is an empty string rather than
+ * absent when a direct `dispatch` has no connection, and `sessionId` uses
+ * absence to mean "not bound".
  *
  * `readonly` because two of the five users are already read-only shapes and a
  * field nobody assigns needs no mutable declaration. It is also the whole safety
@@ -23,24 +25,34 @@ import type { LogFields } from '../logging/types.ts';
 export interface RequestIdentity {
   readonly requestId: string;
   readonly connectionId: string;
-  readonly clientRequestId: string;
+  readonly clientRequestId?: string;
   readonly sessionId?: string;
 }
+
+/**
+ * The one invalid value an optional `clientRequestId` admits. Kept next to the
+ * type so every entry that accepts one refuses it with the same wording
+ * (SPEC 7.3).
+ */
+export const EMPTY_CLIENT_REQUEST_ID =
+  'clientRequestId must be a non-empty string when provided';
 
 /**
  * `RequestIdentity` as request-level log bindings (SPEC 7.1). Both processes
  * build these fields, so the mapping lives here rather than in either one.
  *
- * `sessionId` is omitted, not written as `undefined` or an empty string, when
- * the connection holds no Session: absence is the contract for "unbound"
- * (SPEC 2).
+ * `clientRequestId` and `sessionId` are omitted, not written as `undefined` or
+ * an empty string, when absent: a client that supplied no correlation key and a
+ * connection that holds no Session both mean "not there" (SPEC 2, 7.3).
  */
 export function requestLogFields(identity: RequestIdentity): LogFields {
   const fields: LogFields = {
     requestId: identity.requestId,
     connectionId: identity.connectionId,
-    clientRequestId: identity.clientRequestId,
   };
+  if (identity.clientRequestId !== undefined) {
+    fields.clientRequestId = identity.clientRequestId;
+  }
   if (identity.sessionId !== undefined) {
     fields.sessionId = identity.sessionId;
   }

@@ -374,7 +374,7 @@ TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：
 
 ### 7.1 结构化日志
 
-框架日志 MUST 是结构化的（字段而非拼接字符串）。字段名是契约，文案与日志行的产出顺序不是契约。每个 Request 的日志 SHOULD 至少携带请求标识、Session ID、Connection ID、Extension 名与耗时；失败时带 `code`，成功由日志消息表达，不承诺 `result` 字段。日志级别按语义使用：告警级用于能力降级、重放、队列拒绝这类“能继续运行但需要人知道”的事件；错误级用于请求失败；不得用错误级记录预期内的业务拒绝，包括 `AUTH_REQUIRED` 与 `FORBIDDEN`（§3.7、§7.2）。
+框架日志 MUST 是结构化的（字段而非拼接字符串）。字段名是契约，文案与日志行的产出顺序不是契约。每个 Request 的日志 SHOULD 至少携带请求标识、Session ID、Connection ID、Extension 名与耗时；失败时带 `code`，成功由日志消息表达，不承诺 `result` 字段。`requestId` 始终存在；`clientRequestId` 是可选关联键，客户端未提供时日志 MUST 省略该字段，不得写成空字符串（§7.3）。日志级别按语义使用：告警级用于能力降级、重放、队列拒绝这类“能继续运行但需要人知道”的事件；错误级用于请求失败；不得用错误级记录预期内的业务拒绝，包括 `AUTH_REQUIRED` 与 `FORBIDDEN`（§3.7、§7.2）。
 
 注入的日志实现抛错 MUST NOT 改变框架控制流。日志实现失败时框架不保证 `child()` 的绑定字段完整：`safeLogger` 的 `child` 抛错会回退到父包装。
 
@@ -437,6 +437,8 @@ Portal 侧的 `EVENT_DROPPED` 按（`reason`，目标 id）聚合，同一批的
 ### 7.3 请求标识与关联
 
 每个 Request 在进入框架时分配请求标识，并在整个生命周期内保持不变——包括跨进程投递与重放。理由：一次重放会产生多条日志，分布在两个进程；若重放时换新标识，就无法回答“这条日志对应玩家哪一次输入”。重放时 SHOULD 额外记录重放次数与原始接收时间（绝对时间戳），用于识别“同一个请求反复失败”的情况，并让分布在两个进程的日志能按原始接收时刻对齐。原始接收时间指连接层把该请求交给执行器的时刻，不是连接层收到帧的时刻：请求可能先在调度器队列与 Session 屏障前等待。Portal 侧的请求标识由 `ConnectionLayerOptions.createRequestId` 生成，默认 `randomUUID`；该标识随请求跨进程投递，执行器沿用而不重新生成。
+
+`clientRequestId` 是客户端提供的可选关联键，经客户端线格式的 `Envelope.id` 进入框架，Handler 通过 `RequestContext.clientRequestId` 读取，类型为 `string | undefined`。客户端未提供时它是 `undefined`，日志省略该字段；空字符串不是“未提供”的替代值，所有接受该字段的入口（`Dispatcher.dispatch`、`IpcExecutor.execute`、IPC `request` 消息解析）MUST 拒绝空串。该字段由客户端控制，MUST NOT 用于鉴权或唯一性判断；需要幂等的业务 MUST 自行校验。它与 `requestId` 相互独立：`requestId` 由框架在入口生成且跨重放稳定，`clientRequestId` 只在同一客户端输入内保持原值（§6.4）。
 
 ## 8. 变更规则
 

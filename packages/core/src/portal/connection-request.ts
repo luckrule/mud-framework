@@ -49,7 +49,7 @@ export function onMessage(
     envelope = host.codec.decode(payload);
   } catch (error) {
     if (state.queued >= host.maxQueuedPerConnection) {
-      return refuseQueue(host, state, '');
+      return refuseQueue(host, state, undefined);
     }
     const rawLength = rawLengthOf(payload);
     const reason = messageOf(error);

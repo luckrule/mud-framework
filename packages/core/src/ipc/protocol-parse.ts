@@ -103,7 +103,9 @@ function buildRequest(raw: Record<string, unknown>): RequestMessage {
     type: 'request',
     requestId: readString(raw, 'request', 'requestId', true),
     connectionId: readString(raw, 'request', 'connectionId', true),
-    clientRequestId: readString(raw, 'request', 'clientRequestId', true),
+    // Optional correlation key (SPEC 7.3): absent when the client supplied
+    // none, and still rejected when present but empty.
+    clientRequestId: readOptionalString(raw, 'request', 'clientRequestId'),
     sessionId: readOptionalString(raw, 'request', 'sessionId'),
     method: readString(raw, 'request', 'method', true),
     payload: raw.payload,

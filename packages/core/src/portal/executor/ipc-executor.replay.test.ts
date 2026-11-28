@@ -40,6 +40,9 @@ describe('IpcExecutor replay', () => {
     const [replay] = requestMessages(second);
     expect(replay?.requestId).toBe('req-1');
     expect(replay?.replayCount).toBe(1);
+    // The client correlation key is part of the same identity: when present it
+    // survives the replay unchanged.
+    expect(replay?.clientRequestId).toBe('client-1');
     expect(
       h
         .logs()

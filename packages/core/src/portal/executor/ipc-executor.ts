@@ -20,7 +20,10 @@ import type {
   RequestExecutor,
 } from '../../shared/executor.ts';
 import { messageOf } from '../../shared/guards.ts';
-import { requestLogFields } from '../../shared/identity.ts';
+import {
+  EMPTY_CLIENT_REQUEST_ID,
+  requestLogFields,
+} from '../../shared/identity.ts';
 import { tightenTimeout } from '../../shared/timeout.ts';
 import {
   FRAMEWORK_QUEUE_FULL,
@@ -201,6 +204,18 @@ export class IpcExecutor implements RequestExecutor {
   }
 
   execute(request: ExecutorRequest): Promise<ExecutorOutcome> {
+    if (request.clientRequestId === '') {
+      // Absence is the only way to say "no correlation key" (SPEC 7.3). The
+      // line omits the invalid value: an empty string is not an id, so it must
+      // not become one in the log either.
+      const { clientRequestId: _invalid, ...valid } = request;
+      return this.reject(
+        valid,
+        'warn',
+        INTERNAL_ERROR,
+        EMPTY_CLIENT_REQUEST_ID,
+      );
+    }
     if (this.slot.status === 'idle') {
       // Nothing was ever spawned. Without this the request would sit in the
       // buffer until its deadline and report a timeout, which looks like a slow
