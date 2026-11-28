@@ -129,7 +129,7 @@ COMMIT 完成时刻晚于 deadline 时，请求仍以超时终态结束：不返
 
 ### 3.5 有界队列
 
-每个 Connection 的 Input Queue MUST 有明确上限。队列满时 MUST 显式拒绝新输入并返回 `FRAMEWORK_QUEUE_FULL`，MUST NOT 静默丢弃——静默丢弃会让玩家指令凭空消失且不可诊断。
+每个 Connection 的 Input Queue MUST 有明确上限，上限由 `ConnectionLayerOptions.maxQueuedPerConnection` 定义（默认值见选项定义）。队列满时 MUST 显式拒绝新输入并返回 `FRAMEWORK_QUEUE_FULL`，MUST NOT 静默丢弃——静默丢弃会让玩家指令凭空消失且不可诊断。
 
 选择拒绝而非背压：拒绝是队列自己能兑现的唯一策略，让请求立刻以稳定错误码失败，而不是把整条连接堵在一个满队列后面。
 
@@ -179,7 +179,7 @@ Handler 可以为一个请求声明要发送的事件（ADR-0008）。`ctx.emit(
 
 - 目标 Connection 不存在或已关闭、目标 Session 当前没有 holder 时，事件 MUST 被丢弃并记录 warn（`EVENT_DROPPED`）；编码失败或传输写失败时同样丢弃并记录 `TRANSPORT_SEND_FAILED`。MUST NOT 因失败而缓冲或重试，也不得让请求失败。
 - Session 目标的收件人按实际写出时的当前 holder 解析：排队期间 takeover 会改投新 holder，至多重投递一次，再次变化即丢弃。
-- 同一 Session 的 session 目标事件 MUST 按发射序串行投递：后一条必须等前一条写出或丢弃后才开始，因此 takeover 不改变同一收件 Connection 上这些事件之间的顺序。投递分两段，只有第一段可取消：**queued**（尚未开始写出）时旧连接被移除或 abort，该事件丢弃（`EVENT_DROPPED`，reason 指明写出前连接已关闭）并立即释放串行位；**writing**（已开始写出）时 abort MUST NOT 提前释放串行位，必须等实际写结果（成功或传输失败）结算后再释放，写失败记 `TRANSPORT_SEND_FAILED` 而不是 `EVENT_DROPPED`，因为帧可能已写出。写出本身必须有界：传输发送受其 `sendTimeoutMs` 约束，底层发送 Promise 不保证 settle 时以发送超时为上界，不得用 abort 信号代替。这个写出上界的取值顺序是：连接层的显式 `eventSendTimeoutMs` 配置原样采用；否则取传输声明的单帧发送上界（§5.2）加一段固定余量；传输声明不可用（例如 `Infinity`）时按未声明处理，回退到默认值。余量不是给传输更多时间，而是让连接层的界在 `MAX_TIMER_DELAY_MS` 以下严格宽于传输的界：两者等值时连接层的兜底计时器与传输自己的计时器几乎同时到期，且常先触发，日志便只剩「传输没有按承诺 settle」，看不出是传输卡死还是传输的超时机制本身失效；触顶时以封顶值为准。只有连接层的界更宽，传输自己的失败判定才是可观测的那个。默认值不加余量：此时没有传输计时器可让位，默认值本身就是唯一判定。显式配置也不加余量：它替换推导结果，而不是与传输计时器竞争。
+- 同一 Session 的 session 目标事件 MUST 按发射序串行投递：后一条必须等前一条写出或丢弃后才开始，因此 takeover 不改变同一收件 Connection 上这些事件之间的顺序。投递分两段，只有第一段可取消：**queued**（尚未开始写出）时旧连接被移除或 abort，该事件丢弃（`EVENT_DROPPED`，reason 指明写出前连接已关闭）并立即释放串行位；**writing**（已开始写出）时 abort MUST NOT 提前释放串行位，必须等实际写结果（成功或传输失败）结算后再释放，写失败记 `TRANSPORT_SEND_FAILED` 而不是 `EVENT_DROPPED`，因为帧可能已写出。写出本身必须有界：传输发送受其 `sendTimeoutMs` 约束，底层发送 Promise 不保证 settle 时以发送超时为上界，不得用 abort 信号代替。这个写出上界的取值顺序是：连接层的显式 `eventSendTimeoutMs` 配置原样采用；否则取传输声明的单帧发送上界（§5.2）加一段固定余量；传输声明不可用（例如 `Infinity`）时按未声明处理，回退到默认值。显式值 MUST 是不小于 1 的有限数且不超过 Bun `setTimeout` 可接受的最大延时（2^31−1 ms）；超过时 `ConnectionLayer` 构造抛错，MUST NOT 钳制——Bun 会把超过上限的定时器钳为 1ms，最宽的界反而变成最窄的。余量不是给传输更多时间，而是让连接层的界在 Bun `setTimeout` 可接受的最大延时（2^31−1 ms）以下严格宽于传输的界：两者等值时连接层的兜底计时器与传输自己的计时器几乎同时到期，且常先触发，日志便只剩「传输没有按承诺 settle」，看不出是传输卡死还是传输的超时机制本身失效；触顶时以封顶值为准。只有连接层的界更宽，传输自己的失败判定才是可观测的那个。默认值不加余量：此时没有传输计时器可让位，默认值本身就是唯一判定。显式配置也不加余量：它替换推导结果，而不是与传输计时器竞争。
 - 结果发送失败时，该请求的全部事件 MUST 跳过并记录；请求的成功状态不变。
 - 结果帧的写出同样 MUST 有界，上界与事件帧同源（§5.2，取值顺序同本节上一条）。传输的发送 Promise 不保证 settle，无界等待会让该连接的单写者永不推进，并让承载该请求的 Session 终态屏障永久持有（INV-004），其他连接上针对该 Session 的请求随之无限等待。超过上界时 MUST 记录 `TRANSPORT_SEND_FAILED` 并继续，不抛错：请求的成功状态不变，也不承诺发出响应（§5.4）。这个界同样约束不经过连接调度器的准入拒绝与关闭拒绝帧（§5.4）；它们若阻塞，卡住的是该连接的输入处理。
 - 事件帧之间的发射序按投递路径界定：同一 Session 的 session 目标事件由按 Session 的串行队列保证，同一 Connection 上的 connection 目标事件按发射序写出；connection 目标与 session 目标之间、不同 Connection 之间不承诺发射序。结果帧与事件帧之间的相对顺序见本节“写出调度与有界缓冲”。
@@ -264,7 +264,7 @@ Transport 只负责四件事：接受连接、交付入站数据、写出发站�
 
 Transport MUST 对每个连接的发站缓冲设上限。缓冲耗尽时 MUST 显式失败并终止该连接，不得让未写出的数据无界积压，也不得静默丢弃。单条发送的超时只约束“已接受的帧迟迟写不出去”，MUST NOT 用它代替容量上限：慢客户端可以在超时前持续制造积压。传输实现 MAY 在出站缓冲耗尽时以 close code `1013`（Try Again Later）关闭该连接；这与 §6.1 的准入拒绝使用同一码值，但触发条件不同（已准入连接的服务不可用，而非准入拒绝），传输实现可以映射为本协议的等价语义。
 
-Transport MAY 暴露自己的单帧发送上界（`Transport.sendTimeoutMs`）。暴露时框架用它给所有下行帧的写出设界——事件帧与响应帧一样——保证同一 Session 的串行位不会早于传输自身失败而释放（§3.8），也让一个不读的客户端无法永久占住连接的单写者。框架的界在该值上加一段固定余量派生（§3.8），在 `MAX_TIMER_DELAY_MS` 以下严格宽于传输的界，从而让传输自己的超时判定成为可观测的那个；触顶时以封顶值为准。该字段可选，未暴露或值不可用（例如 `Infinity`）时框架按自己的配置与默认值处理。
+Transport MAY 暴露自己的单帧发送上界（`Transport.sendTimeoutMs`）。暴露时框架用它给所有下行帧的写出设界——事件帧与响应帧一样——保证同一 Session 的串行位不会早于传输自身失败而释放（§3.8），也让一个不读的客户端无法永久占住连接的单写者。框架的界在该值上加一段固定余量派生（§3.8），在 Bun `setTimeout` 可接受的最大延时（2^31−1 ms）以下严格宽于传输的界，从而让传输自己的超时判定成为可观测的那个；触顶时以封顶值为准。该字段可选，未暴露或值不可用（例如 `Infinity`）时框架按自己的配置与默认值处理。
 
 `TransportConnection.id` 在连接层实例的生命周期内 MUST 唯一：连接断开后，同一 id MUST NOT 被新连接复用。连接层以该 id 维护活跃连接、Session 路由、请求入口查找与事件投递；复用会让迟到入站消息落到替换连接，或让本应发给旧连接的事件误投到替换连接。需要重连语义时，传输 MUST 铸造新 id（默认 WS 传输的 UUID 满足此约束）。连接层按连接对象身份忽略迟到的旧断线事件，但按 id 投递的事件无法区分新旧，因此唯一性由传输保证。
 
@@ -316,6 +316,8 @@ TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：
 
 就绪由两阶段握手表达（ADR-0007）：业务进程收到 `hello` 后先回 `prepared`，此时 MUST NOT 打开存储、注册 Extension 或执行 Handler；只有收到 `activate` 才执行第 1、2 步并安装请求处理器，然后发 `ready`。连接层在收到 `ready` 之后才开始接受连接。边界：`prepared` 只表示进程活着且等待激活，不表示可用；连接层 MUST NOT 向 prepared 的业务进程投递 Request。
 
+产品约束（部署期间不接受可感知的秒级延迟上升、不接受玩家重连）记录在 ADR-0007；它不是协议时限或观测口径，`switchTo` 只承诺有界缓冲与连接不断开。
+
 初次 `start()` 的整体等待受 `startTimeoutMs` 约束，期间的失败重试不延长总时限；自动恢复启动的每一代另有同值的独立握手时限，从该代启动到 `ready`。计时器 MUST 绑定该代，在该代 ready、丢失或关闭后失效，不得影响其他代或使终态执行器复活。切换的 prepared 与 ready 两个等待分别有界（ADR-0007）。
 
 版本切换复用同一协议，顺序是契约：连接层先起新进程并等到 `prepared`，再停旧进程、等它 `closed` 且退出被观测到，然后才向新进程发 `activate` 并等 `ready`，最后把缓冲请求投给新进程。`activate` MUST NOT 在旧进程仍可能持有存储时发出（INV-002）；`closed`、kill 返回与退出等待超时都不能代替退出确认。切换期间连接层 MUST 继续按容量与 deadline 接受、缓冲请求，不得向即将退役的旧进程或尚未 `ready` 的新进程投递；新进程 `ready` 后按 §6.5 的顺序投递。
@@ -336,7 +338,7 @@ TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：
 3. 执行器等待已接受工作，并关闭 Server 与存储，所有等待有界；超时或失败必须可观测，不得当作已确认资源释放。
 4. 尽力关闭传输并传播其失败，即使执行器关闭已经失败也不得跳过。
 
-所有关闭等待 MUST 有界。`ConnectionLayer.stop()` MUST 在传输收尾后传播执行器与传输的关闭失败或超时：仅执行器失败时传播该失败，仅传输失败时直接拒绝，两者都失败时以 `AggregateError` 同时报告；不得以成功返回掩盖退出或监听未确认。`status` 变为 `stopped` 不等于资源已确认释放。重复调用 `stop()` MUST 返回同一关闭结果，不重新发起关闭。执行器有界返回不等于进程已经退出；旧写者退出未被观测时 MUST NOT 启动新的写者。完整外部停止预算必须覆盖连接层排空、执行器关闭与传输关闭三段，不能只使用 `IpcExecutor.closeBudgetMs`；公式与常量来源见 ADR-0004。
+所有关闭等待 MUST 有界。`ConnectionLayerOptions.shutdownTimeoutMs` 的显式值 MUST 是不小于 1 的有限数且不超过 Bun `setTimeout` 可接受的最大延时（2^31−1 ms）；超限时连接层构造抛错，不钳制——钳制会把最长等待变成 1ms，关闭时直接丢弃排队请求。`ConnectionLayer.stop()` MUST 在传输收尾后传播执行器与传输的关闭失败或超时：仅执行器失败时传播该失败，仅传输失败时直接拒绝，两者都失败时以 `AggregateError` 同时报告；不得以成功返回掩盖退出或监听未确认。`status` 变为 `stopped` 不等于资源已确认释放。重复调用 `stop()` MUST 返回同一关闭结果，不重新发起关闭。执行器有界返回不等于进程已经退出；旧写者退出未被观测时 MUST NOT 启动新的写者。完整外部停止预算必须覆盖连接层排空、执行器关闭与传输关闭三段，不能只使用 `IpcExecutor.closeBudgetMs`；公式与常量来源见 ADR-0004。
 
 顺序的理由是先结束业务调度，再释放存储与传输；但关闭错误码不证明请求未执行或未提交，阶段边界见 §7.2。
 
@@ -384,6 +386,8 @@ TLS 是传输/部署边界，不是认证机制，也不属于 core 的职责：
 
 Server 事件的诊断日志（ADR-0008）分逐事件与批量两类。逐事件日志（`EVENT_SEND_FAILED`）带 `eventId`、`event`、`reason` 与目标字段。Server 侧的 `EVENT_SEND_FAILED` 与请求入口身份写在同一行，目标字段用 `target` 前缀与入口身份区分：`targetKind` 取 `'connection'` 或 `'session'`，并相应带 `targetConnectionId` 或 `targetSessionId`；入口身份字段（`requestId`、`connectionId`、`clientRequestId`、`sessionId`）语义不变，`sessionId` 始终是请求入口 Session，不是投递目标。批量日志 `EVENTS_DROPPED` 是该请求的全部事件随未发出的结果一起被跳过时的单行记录，只有 `count`、`reason` 与请求入口身份，没有单一的 `eventId` 或目标字段。Portal 侧的 `EVENT_DROPPED`、`EVENT_LISTENER_FAILED` 带目标字段，沿用目标自身的 `connectionId` 或 `sessionId`，并同样带 `targetKind`；`EVENT_DROPPED` 可以代表一批同类丢弃，见下段。`code` 取值：`EVENT_DROPPED`（目标缺失、连接已关闭，或没有事件监听者）、`EVENT_BACKLOG_DISCONNECTED`（事件缓冲达到上界，断开该连接，§3.8）、`EVENT_SEND_FAILED`（Server 侧单条事件 IPC 发送失败）、`EVENTS_DROPPED`（结果未发出，该请求的全部事件被跳过）、`EVENT_LISTENER_FAILED`（事件监听者抛错）、`EVENT_BACKLOG_DISCARDED`（关闭时丢弃未写出的事件，单行汇总）；Portal 侧结果无法编码时记录 `INTERNAL_ERROR`（`stage: 'encode'`），并用同一 `Codec` 编码一条兜底失败响应；兜底仍无法编码时记录 `TRANSPORT_SEND_FAILED`（`stage: 'encode'`）。写出超时或被拒时记录 `TRANSPORT_SEND_FAILED`（`stage: 'send'`）。这些是仅在日志中出现的诊断字段，不发往客户端；事件投递失败 MUST NOT 改变请求的日志结论或终态。
 
+`EVENT_LISTENER_FAILED` 的“事件监听者”指通过公开 API `RequestExecutor.onEvent` 注册的 sink：注册返回退订函数；一次事件按注册顺序同步调用所有 sink；单个 sink 抛错只记 `EVENT_LISTENER_FAILED`，不影响其他 sink，也不改变任何请求的终态；执行器关闭后注册为 no-op；没有可用 sink 时事件丢弃并记 `EVENT_DROPPED`。`ConnectionLayer` 在启动时注册一个 sink，`onEvent` 保持为公开 API。
+
 事件缓冲达到任一处上界时为 `EVENT_BACKLOG_DISCONNECTED`（`reason: 'event buffer reached its bound'`）：字段含 `connectionId`（被断开的 Connection）、`buffer`（`'connection'` 或 `'session'`，指明哪一处缓冲溢出）、`closeCode`（传给传输的关闭码 `1013`）、`eventId` 与 `event`（触发断开的那条事件，用于回答「哪条事件压垮了队列」）、`queuedEvents`、`queuedEventBytes`、`maxQueuedEvents`、`maxQueuedEventBytes`（溢出时的观测值）；`sessionId` 在缓冲归属一个 Session 时带上：Session 待投递队列溢出必带（溢出队列属于该 Session），Session 目标投递引发的 Connection 队列溢出也带（标识被投递的 Session，与 `connectionId` 一起给出「哪个 Session 的投递压垮了哪条连接」）。connection 目标投递不带，因为那条事件本就没有 Session。这条日志每个被断开的 Connection 一行，不聚合：一次溢出只断开一次，不构成慢读者那种逐事件流。
 
 Portal 侧的 `EVENT_DROPPED` 按（`reason`，目标 id）聚合，同一批的后续丢弃合并进下一行，不是每条丢弃一行。理由：慢读者使每条新事件都成为一次丢弃，逐条记录会把诊断通道变成第二条无界流——正是事件上界要卸掉的压力；注入同步写文件的 logger 时还会直接阻塞事件循环。聚合保证：该组合的首条丢弃立即记录，之后按对数增长记录，静默达到 `QUIET_RESET_MS` 后的首条也立即记录；低速率的目标不会因累计值变大而长期静默。算法见 ADR-0008。
@@ -424,13 +428,13 @@ Portal 侧的 `EVENT_DROPPED` 按（`reason`，目标 id）聚合，同一批的
 
 **仅日志诊断字段** 出现在日志的 `code` 字段里，用于定位，不发给客户端，也不构成 wire 契约：`CANCEL_LOST_TO_COMMIT`、`IPC_CHANNEL_CLOSED`、`SERVER_STARTUP_FAILED`、`DUPLICATE_REQUEST`、`INVALID_IPC_MESSAGE`、`EVENT_DROPPED`、`EVENT_SEND_FAILED`、`EVENTS_DROPPED`、`EVENT_LISTENER_FAILED`、`EVENT_BACKLOG_DISCONNECTED`、`EVENT_BACKLOG_DISCARDED`、`EVENT_BACKLOG_HIGH`、`REQUEST_DROPPED_AT_SHUTDOWN` 等。日志里的 `code` 只是一个字段名，取值不受本节约束。`EVENT_DROPPED`、`EVENT_BACKLOG_DISCONNECTED`、`EVENT_BACKLOG_DISCARDED` 与 `REQUEST_DROPPED_AT_SHUTDOWN` 的 `reason` 与字段见 §7.1。
 
-`FRAMEWORK_` 前缀是示例惯例，不是强制格式。`INVALID_ENVELOPE`、`UNKNOWN_METHOD`、`INTERNAL_ERROR`、`TRANSPORT_SEND_FAILED` 没有该前缀；发布后错误码只增不删；改名等于换码，所以这些名字保持不变。
+`FRAMEWORK_` 前缀只是命名习惯，不是分类依据：框架码由显式集合 `isFrameworkCode` 判定，不按前缀。业务码可以合法以 `FRAMEWORK_` 开头。无前缀的框架码完整列出：`TRANSPORT_CLOSED`、`TRANSPORT_SEND_FAILED`、`INVALID_ENVELOPE`、`UNKNOWN_METHOD`、`INTERNAL_ERROR`、`AUTH_REQUIRED`、`FORBIDDEN`。发布后错误码只增不删；改名等于换码。
 
 业务错误码由 Extension 用 `BusinessError` 显式定义，框架原样透传，不改写、不吞掉。只有 `BusinessError` 的 `code` 与框架自身错误码进入 wire：驱动或运行时的偶然 `code`（如 `ENOENT`、`SQLITE_CONSTRAINT_UNIQUE`）不透传，统一降级为 `INTERNAL_ERROR`（INV-014）。
 
 ### 7.3 请求标识与关联
 
-每个 Request 在进入框架时分配请求标识，并在整个生命周期内保持不变——包括跨进程投递与重放。理由：一次重放会产生多条日志，分布在两个进程；若重放时换新标识，就无法回答“这条日志对应玩家哪一次输入”。重放时 SHOULD 额外记录重放次数与原始接收时间（绝对时间戳），用于识别“同一个请求反复失败”的情况，并让分布在两个进程的日志能按原始接收时刻对齐。原始接收时间指连接层把该请求交给执行器的时刻，不是连接层收到帧的时刻：请求可能先在调度器队列与 Session 屏障前等待。
+每个 Request 在进入框架时分配请求标识，并在整个生命周期内保持不变——包括跨进程投递与重放。理由：一次重放会产生多条日志，分布在两个进程；若重放时换新标识，就无法回答“这条日志对应玩家哪一次输入”。重放时 SHOULD 额外记录重放次数与原始接收时间（绝对时间戳），用于识别“同一个请求反复失败”的情况，并让分布在两个进程的日志能按原始接收时刻对齐。原始接收时间指连接层把该请求交给执行器的时刻，不是连接层收到帧的时刻：请求可能先在调度器队列与 Session 屏障前等待。Portal 侧的请求标识由 `ConnectionLayerOptions.createRequestId` 生成，默认 `randomUUID`；该标识随请求跨进程投递，执行器沿用而不重新生成。
 
 ## 8. 变更规则
 
