@@ -168,7 +168,10 @@ describe('ConnectionLayer lifecycle', () => {
     expect(await rejected).toBe(failure);
     expect(await rejectionOf(layer.stop())).toBe(stopError);
     expect(closeCalls()).toBe(1);
-    expect(stops).toBe(0);
+    // The rejection arrived after this layer had already given up waiting, but
+    // a failed start still earns one release attempt for the listeners it may
+    // have registered before failing.
+    expect(stops).toBe(1);
   });
 
   test('stop closes the transport and the dispatcher', async () => {
@@ -255,9 +258,13 @@ describe('ConnectionLayer lifecycle', () => {
   test('closes the executor once when the transport fails to start', async () => {
     const order: string[] = [];
     const { executor, closeCalls } = scriptedExecutor(order);
+    let stopCalls = 0;
     const transport: Transport = {
       start: () => Promise.reject(new Error('port already in use')),
-      stop: () => Promise.resolve(),
+      stop: () => {
+        stopCalls += 1;
+        return Promise.resolve();
+      },
     };
     const layer = new ConnectionLayer({ transport, executor });
 
@@ -266,10 +273,16 @@ describe('ConnectionLayer lifecycle', () => {
     // A Server process started for a layer that never came up has no owner.
     expect(error.message).toMatch(/port already in use/);
     expect(closeCalls()).toBe(1);
+    // A start that rejected may already have registered listeners, so the
+    // failure path releases the transport as well.
+    expect(stopCalls).toBe(1);
     // The failed start already released the executor; a stop must not leak it
     // either, and must not close it a second time.
     await layer.stop();
 
     expect(closeCalls()).toBe(1);
+    // The transport stop is memoised too: one release attempt, not one per
+    // caller.
+    expect(stopCalls).toBe(1);
   });
 });

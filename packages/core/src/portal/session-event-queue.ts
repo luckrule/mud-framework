@@ -1,4 +1,5 @@
 import type { ServerEvent } from '../shared/events.ts';
+import { messageOf } from '../shared/guards.ts';
 import type { ConnectionState } from './connection-state.ts';
 import { BACKLOG_CLOSED_REASON } from './connection-state.ts';
 import type { EventBacklog } from './event-backlog.ts';
@@ -173,6 +174,10 @@ function startSessionPump(
     return;
   }
   queue.pumping = true;
+  // `pumpSession` reports and contains its own failures. This last line of
+  // defence only keeps a failure in that handler itself (a logger that throws,
+  // say) out of the process's unhandled-rejection path; `pumpSession`'s own
+  // `finally` still releases the Session's serial slot and the queue entry.
   void pumpSession(host, queue).catch(() => undefined);
 }
 
@@ -180,6 +185,8 @@ async function pumpSession(
   host: EventDeliveryHost,
   queue: SessionEventQueue,
 ): Promise<void> {
+  /** The entry shifted out of `entries` whose delivery has not settled yet. */
+  let current: SessionQueuedEvent | undefined;
   try {
     while (queue.entries.length > 0) {
       if (!host.acceptingEvents()) {
@@ -189,6 +196,7 @@ async function pumpSession(
       if (entry === undefined) {
         break;
       }
+      current = entry;
       queue.frames -= 1;
       queue.bytes -= entry.bytes;
       host.backlog.sessionFrameRemoved(entry.bytes);
@@ -203,8 +211,40 @@ async function pumpSession(
         await deliverSessionEntry(host, queue.sessionId, entry, inHand);
       } finally {
         queue.inHand = undefined;
+        // Resolves the promise returned when the event was accepted, whether
+        // delivery succeeded, dropped, or threw.
+        entry.done();
+        current = undefined;
       }
+    }
+  } catch (error) {
+    // Nothing in the delivery path is expected to throw: `deliverSessionEntry`
+    // maps every outcome and `EventWrite.run` consumes a write failure. If one
+    // escapes, the Session's serial slot is the only thing that must not stay
+    // held with promises unresolved, so the queue is discarded rather than
+    // retried — events are best-effort (ADR-0008).
+    host.logger.error(
+      {
+        code: 'EVENT_DELIVERY_FAILED',
+        sessionId: queue.sessionId,
+        reason: messageOf(error),
+      },
+      'session event pump stopped unexpectedly',
+    );
+    for (const entry of queue.entries) {
+      queue.frames -= 1;
+      queue.bytes -= entry.bytes;
+      host.backlog.sessionFrameRemoved(entry.bytes);
       entry.done();
+    }
+    queue.entries.length = 0;
+    if (current !== undefined) {
+      // The exception landed before the entry's own `finally` (between the
+      // shift/counting and the delivery attempt). `done` is a resolve, so the
+      // second call from a `finally` that already ran is harmless.
+      queue.inHand = undefined;
+      current.done();
+      current = undefined;
     }
   } finally {
     queue.pumping = false;

@@ -185,6 +185,10 @@ export class ConnectionLayer implements TransportHandlers {
         this.status = 'stopped';
       }
       await this.closeExecutor().catch(() => undefined);
+      // A transport that failed after registering listeners still holds what
+      // `stop` releases; releasing it cannot mask the start failure because
+      // the original error below is the one the caller sees.
+      await this.stopTransport().catch(() => undefined);
       throw error;
     }
     if (this.status !== 'starting') {
@@ -204,13 +208,20 @@ export class ConnectionLayer implements TransportHandlers {
     return this.executorClose;
   }
 
+  /**
+   * Memoised transport stop, whether the start succeeded or failed (SPEC 6.3).
+   * A start that rejected after registering listeners still holds resources,
+   * and `stop` is the only thing that releases them, so the failure branch
+   * calls it too. One memoised promise means the failed-start cleanup and a
+   * later `stop()` release the transport exactly once.
+   */
   private stopTransport(): Promise<void> {
     this.transportStop ??=
       this.transportStart === undefined
         ? Promise.resolve()
         : this.transportStart.then(
             () => this.transport.stop(),
-            () => undefined,
+            () => this.transport.stop(),
           );
     return this.transportStop;
   }
