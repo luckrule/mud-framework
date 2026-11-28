@@ -1,8 +1,8 @@
 import type { EventMessage, ResultMessage } from '../../ipc/protocol.ts';
 import type { SpawnedServer } from '../../ipc/spawn-port.ts';
 import type { Logger } from '../../logging/types.ts';
-import { messageOf } from '../../shared/guards.ts';
 import { effectiveTimeoutMs } from '../../shared/timeout.ts';
+import { messageOf } from '../../shared/validation.ts';
 import { FRAMEWORK_SHUTDOWN, INTERNAL_ERROR } from '../../shared/wire-codes.ts';
 import type { DeliveryLedger } from './delivery-ledger.ts';
 import { onServerMessage } from './ipc-inbound.ts';

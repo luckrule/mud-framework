@@ -5,9 +5,9 @@ import type {
 } from '../ipc/protocol.ts';
 import type { LogFields, Logger } from '../logging/types.ts';
 import type { ExecutorOutcome } from '../shared/executor.ts';
-import { messageOf } from '../shared/guards.ts';
 import { requestLogFields } from '../shared/identity.ts';
 import { elapsedMs, settleWithin } from '../shared/timeout.ts';
+import { messageOf } from '../shared/validation.ts';
 import { FRAMEWORK_SHUTDOWN, INTERNAL_ERROR } from '../shared/wire-codes.ts';
 import { report, resultEnvelope, sendEvents } from './request-result-writer.ts';
 import type { Runtime } from './server-startup.ts';

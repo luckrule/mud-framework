@@ -3,7 +3,7 @@ import type {
   ExecutorHealthState,
   RequestExecutor,
 } from '../shared/executor.ts';
-import { isRecord } from '../shared/guards.ts';
+import { isRecord } from '../shared/validation.ts';
 import type { EventBacklogSnapshot } from './event-backlog.ts';
 
 export type ConnectionHealthState =

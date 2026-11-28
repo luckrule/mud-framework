@@ -8,7 +8,7 @@ import {
 } from 'mud-framework-core';
 
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS } from '../../../packages/core/src/shared/budget.ts';
-import { messageOf } from '../../../packages/core/src/shared/guards.ts';
+import { messageOf } from '../../../packages/core/src/shared/validation.ts';
 
 /**
  * The benchmark Portal: the same assembly as `examples/game-slice/src/portal.ts`

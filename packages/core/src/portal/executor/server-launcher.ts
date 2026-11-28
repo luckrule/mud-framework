@@ -1,8 +1,8 @@
 import type { ServerExitInfo, SpawnedServer } from '../../ipc/spawn-port.ts';
 import type { Logger } from '../../logging/types.ts';
 import { EXIT_WAIT_TIMEOUT_MS } from '../../shared/budget.ts';
-import { messageOf } from '../../shared/guards.ts';
 import { settleWithin } from '../../shared/timeout.ts';
+import { messageOf } from '../../shared/validation.ts';
 import type { ServerState } from './server-slot.ts';
 
 /**

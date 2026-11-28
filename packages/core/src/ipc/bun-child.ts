@@ -1,7 +1,7 @@
 import { createJsonLogger } from '../logging/json-logger.ts';
 import { safeLogger } from '../logging/safe-logger.ts';
 import type { Logger } from '../logging/types.ts';
-import { messageOf } from '../shared/guards.ts';
+import { messageOf } from '../shared/validation.ts';
 import { createEndpointChannel } from './channel-endpoint.ts';
 import type { IpcChannel } from './channel.ts';
 import { DEFAULT_CLOSE_REASON, IpcChannelClosedError } from './channel.ts';

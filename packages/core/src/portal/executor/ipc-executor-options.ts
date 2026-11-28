@@ -1,11 +1,11 @@
 import type { SpawnedServer } from '../../ipc/spawn-port.ts';
 import type { Logger } from '../../logging/types.ts';
 import { DEFAULT_MAX_RESTART_BACKOFF_MS } from '../../shared/budget.ts';
-import { describeValue } from '../../shared/guards.ts';
 import {
+  assertPositiveSafeInteger,
   assertTimerDelay,
   MAX_TIMER_DELAY_MS,
-} from '../connection-layer-options.ts';
+} from '../../shared/validation.ts';
 
 /** The executor's timer options, checked as whole milliseconds at construction. */
 export function assertExecutorTimerMs(
@@ -37,16 +37,10 @@ export function resolveMaxRestartBackoffMs(
   if (value === undefined) {
     return DEFAULT_MAX_RESTART_BACKOFF_MS;
   }
-  if (typeof value !== 'number') {
-    throw new TypeError(
-      `maxRestartBackoffMs must be a safe integer between 1 and ${MAX_TIMER_DELAY_MS} (2^31-1), got ${describeValue(value)}`,
-    );
-  }
-  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_TIMER_DELAY_MS) {
-    throw new RangeError(
-      `maxRestartBackoffMs must be a safe integer between 1 and ${MAX_TIMER_DELAY_MS} (2^31-1), got ${String(value)}`,
-    );
-  }
+  assertPositiveSafeInteger(value, 'maxRestartBackoffMs', {
+    max: MAX_TIMER_DELAY_MS,
+    label: `${MAX_TIMER_DELAY_MS} (2^31-1)`,
+  });
   if (value < baseBackoffMs) {
     throw new RangeError(
       `maxRestartBackoffMs must be at least restartBackoffMs (${String(baseBackoffMs)}), got ${String(value)}`,

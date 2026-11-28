@@ -3,7 +3,7 @@ import { join } from 'node:path';
 
 import { withDeadline } from 'mud-framework-test-support';
 
-import { messageOf } from '../../../packages/core/src/shared/guards.ts';
+import { messageOf } from '../../../packages/core/src/shared/validation.ts';
 import { portalStopFailed } from '../cleanup.ts';
 import { pumpLines, startPortal, write, writeError } from '../support.ts';
 import type { PortalHandle } from '../support.ts';

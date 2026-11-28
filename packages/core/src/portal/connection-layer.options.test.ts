@@ -1,11 +1,11 @@
 import { describe, expect, test } from 'bun:test';
 
+import { MAX_TIMER_DELAY_MS } from '../shared/validation.ts';
 import { scriptedExecutor } from '../testing/connection-layer.ts';
 import { FakeTransport } from '../testing/fake-transport.ts';
 import type { Transport } from '../transport/types.ts';
 import {
   EVENT_SEND_SLACK_MS,
-  MAX_TIMER_DELAY_MS,
   UNDECLARED_EVENT_SEND_TIMEOUT_MS,
 } from './connection-layer-options.ts';
 import type { ConnectionLayerOptions } from './connection-layer-options.ts';
@@ -245,6 +245,6 @@ describe('ConnectionLayer event send bound resolution', () => {
       new FakeTransport({ sendTimeoutMs: 2_147_483_600 }),
     );
 
-    expect(sendTimeoutOf(layer)).toBe(2_147_483_647);
+    expect(sendTimeoutOf(layer)).toBe(MAX_TIMER_DELAY_MS);
   });
 });

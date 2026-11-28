@@ -1,7 +1,7 @@
 import type { Envelope } from '../shared/codec.ts';
 import type { ExecutorOutcome } from '../shared/executor.ts';
-import { messageOf } from '../shared/guards.ts';
 import { elapsedMs } from '../shared/timeout.ts';
+import { messageOf } from '../shared/validation.ts';
 import { TRANSPORT_CLOSED, failureLogLevel } from '../shared/wire-codes.ts';
 import type { TransportConnection } from '../transport/types.ts';
 import type { AdmissionHost } from './connection-admission.ts';

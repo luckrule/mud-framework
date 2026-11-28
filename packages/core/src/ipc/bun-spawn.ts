@@ -3,8 +3,8 @@ import type { Subprocess } from 'bun';
 
 import { safeLogger } from '../logging/safe-logger.ts';
 import type { Logger } from '../logging/types.ts';
-import { messageOf } from '../shared/guards.ts';
 import { settleWithin } from '../shared/timeout.ts';
+import { messageOf } from '../shared/validation.ts';
 import {
   STDERR_DRAIN_GRACE_MS,
   pumpStderr,

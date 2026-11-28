@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
-import { messageOf } from '../../../packages/core/src/shared/guards.ts';
+import { messageOf } from '../../../packages/core/src/shared/validation.ts';
 import { environmentLine } from '../../environment.ts';
 import { shouldRemoveDataDir } from '../cleanup.ts';
 import { integerText, write, writeError } from '../support.ts';

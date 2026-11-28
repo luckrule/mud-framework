@@ -6,6 +6,7 @@ import type { Codec } from '../shared/codec.ts';
 import { JsonCodec } from '../shared/codec.ts';
 import type { ServerEvent } from '../shared/events.ts';
 import type { RequestExecutor } from '../shared/executor.ts';
+import { MAX_TIMER_DELAY_MS } from '../shared/validation.ts';
 import { parseFrame, rejectionOf, sleep } from '../testing/common.ts';
 import {
   fakeConnection,
@@ -13,7 +14,6 @@ import {
   scriptedTransport,
   sessionHarness,
 } from '../testing/connection-layer.ts';
-import { MAX_TIMER_DELAY_MS } from './connection-layer-options.ts';
 import { ConnectionLayer } from './connection-layer.ts';
 
 function connectionEvent(eventId: string, connectionId = 'c1'): ServerEvent {

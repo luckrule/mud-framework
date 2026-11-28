@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 
-import { CLIENT_REQUEST_ID_EMPTY_MESSAGE } from '../shared/client-request-id.ts';
+import { CLIENT_REQUEST_ID_EMPTY_MESSAGE } from '../shared/validation.ts';
 import { rejectionOf } from '../testing/common.ts';
 import { quietDispatcher } from '../testing/dispatcher.ts';
 import { MemoryStorageBackend } from '../testing/memory-backend.ts';

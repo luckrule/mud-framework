@@ -10,7 +10,7 @@ import {
 
 import { GameClient } from '../../examples/game-slice/src/client-lib.ts';
 import type { GameEvent } from '../../examples/game-slice/src/client-lib.ts';
-import { messageOf } from '../../packages/core/src/shared/guards.ts';
+import { messageOf } from '../../packages/core/src/shared/validation.ts';
 import { environmentLine } from '../environment.ts';
 import { portalStopFailed, shouldRemoveDataDir } from './cleanup.ts';
 import {

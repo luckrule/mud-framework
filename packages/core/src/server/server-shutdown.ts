@@ -1,8 +1,8 @@
 import type { IpcChannel } from '../ipc/channel.ts';
 import type { IpcMessage, ShutdownMessage } from '../ipc/protocol.ts';
 import type { Logger } from '../logging/types.ts';
-import { messageOf } from '../shared/guards.ts';
 import { elapsedMs, settleWithin } from '../shared/timeout.ts';
+import { messageOf } from '../shared/validation.ts';
 import type { RequestRunner } from './request-runner.ts';
 import type { Runtime } from './server-startup.ts';
 

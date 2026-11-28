@@ -5,7 +5,7 @@ import {
   DEFAULT_MAX_RESTART_BACKOFF_MS,
   DEFAULT_SHUTDOWN_TIMEOUT_MS,
 } from '../../shared/budget.ts';
-import { MAX_TIMER_DELAY_MS } from '../connection-layer-options.ts';
+import { MAX_TIMER_DELAY_MS } from '../../shared/validation.ts';
 import type { IpcExecutorOptions } from './ipc-executor-options.ts';
 import { resolveMaxRestartBackoffMs } from './ipc-executor-options.ts';
 import { IpcExecutor } from './ipc-executor.ts';

@@ -3,9 +3,12 @@ import { randomUUID } from 'node:crypto';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import { safeLogger } from '../logging/safe-logger.ts';
 import type { Logger } from '../logging/types.ts';
-import { assertClientRequestId } from '../shared/client-request-id.ts';
-import { describeValue, messageOf } from '../shared/guards.ts';
 import { elapsedMs, tightenTimeout } from '../shared/timeout.ts';
+import {
+  assertClientRequestId,
+  describeValue,
+  messageOf,
+} from '../shared/validation.ts';
 import {
   AUTH_REQUIRED,
   AuthenticationRequiredError,

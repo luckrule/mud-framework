@@ -2,7 +2,7 @@ import {
   CONNECTION_LIMIT_CLOSE_CODE,
   EVENT_BACKLOG_CLOSE_CODE,
 } from '../shared/close-codes.ts';
-import { messageOf } from '../shared/guards.ts';
+import { messageOf } from '../shared/validation.ts';
 import {
   FRAMEWORK_QUEUE_FULL,
   FRAMEWORK_SHUTDOWN,

@@ -1,6 +1,6 @@
 import type { Logger } from '../logging/types.ts';
 import type { RequestExecutor } from '../shared/executor.ts';
-import { messageOf } from '../shared/guards.ts';
+import { messageOf } from '../shared/validation.ts';
 import { checkBackendCapabilities } from '../storage/capabilities.ts';
 import { degradations } from '../storage/degradations.ts';
 import { unmetRequirements } from '../storage/requirements.ts';
