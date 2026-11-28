@@ -71,6 +71,7 @@ export function createPortal(options: {
   timeoutMs?: number;
   startTimeoutMs?: number;
   restartBackoffMs?: number;
+  shutdownTimeoutMs?: number;
   /** Forward the captured logger to the transport as well. */
   logTransport?: boolean;
 }): Portal {
@@ -85,6 +86,7 @@ export function createPortal(options: {
     timeoutMs: options.timeoutMs ?? 2000,
     startTimeoutMs: options.startTimeoutMs,
     restartBackoffMs: options.restartBackoffMs,
+    shutdownTimeoutMs: options.shutdownTimeoutMs,
     logger: logs.logger,
   });
   const transport = new WsTransport({
@@ -123,14 +125,48 @@ export function serverCommand(
   ];
 }
 
+/** Options that change how one spawn is observed, not what it runs. */
+export interface SpawnObservationOptions {
+  readonly stderrTailLines?: number;
+  readonly logger?: Logger;
+}
+
+/**
+ * A spawn entry for an arbitrary command. Used where the failure under test is
+ * the spawn itself (a missing binary) or the process is a hand-written stub.
+ */
+export function spawnWithCommand(
+  command: readonly string[],
+  options: SpawnObservationOptions = {},
+): () => SpawnedServer {
+  return () => spawnBunServer({ command: [...command], ...options });
+}
+
 /** A spawn entry the executor can use, including as a `switchTo` replacement. */
 export function spawnFor(
   databasePath: string,
   behavior: Behavior = 'echo',
   startDelayMs = 0,
+  options: SpawnObservationOptions = {},
 ): () => SpawnedServer {
-  const command = serverCommand(databasePath, behavior, startDelayMs);
-  return () => spawnBunServer({ command });
+  return spawnWithCommand(
+    serverCommand(databasePath, behavior, startDelayMs),
+    options,
+  );
+}
+
+/**
+ * A spawn entry that runs `code` as `bun -e`, with no file on disk. The child
+ * must be Bun for the same reason as `serverCommand`. Under `ipc: true` the
+ * stub can use `process.send`/`process.on('message')`, and `process.argv[1]`
+ * is the first entry of `args`.
+ */
+export function spawnInline(
+  code: string,
+  options: SpawnObservationOptions & { args?: readonly string[] } = {},
+): () => SpawnedServer {
+  const { args = [], ...observation } = options;
+  return spawnWithCommand([process.execPath, '-e', code, ...args], observation);
 }
 
 /** One request on an already-open socket, which survives a Server restart. */
@@ -225,14 +261,47 @@ export function replayCounts(logs: LogCapture): number[] {
 }
 
 /**
+ * Every numeric `pid` any log line named, deduplicated. Wider than
+ * `serverPids`: a process the Portal never reported as ready still appears in a
+ * `previous server retired` or a timeout line, and a cleanup must kill it too.
+ */
+export function pidsInLogs(logs: LogCapture): number[] {
+  const pids = new Set<number>();
+  for (const line of logs.lines) {
+    if (typeof line.pid === 'number') {
+      pids.add(line.pid);
+    }
+  }
+  return [...pids];
+}
+
+/** Forcible cleanup for processes no Portal reported as ready (stubs). */
+export function killPids(pids: Iterable<number>): void {
+  for (const pid of pids) {
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch (error) {
+      if (!(isRecord(error) && error.code === 'ESRCH')) {
+        // Anything but "already gone" is a real problem with the audit itself.
+        throw error;
+      }
+    }
+  }
+}
+
+/**
  * Always releases the Portal, then any Server pid it ever reported. A test that
  * fails its assertions must not leave a child behind for the rest of the suite.
  * `stopTimeoutMs` bounds the layer stop when a shutdown that never returns is
- * itself the failure to report.
+ * itself the failure to report. `extraPids` covers processes the Portal never
+ * reported (a stub read from its own evidence file).
  */
 export async function stopQuietly(
   portal: Portal,
-  options: { stopTimeoutMs?: number } = {},
+  options: {
+    stopTimeoutMs?: number;
+    extraPids?: Iterable<number>;
+  } = {},
 ): Promise<void> {
   try {
     const stopping = portal.layer.stop();
@@ -243,7 +312,10 @@ export async function stopQuietly(
     // The failure being reported is the test's own; a shutdown error here would
     // replace it with a less useful one.
   }
-  for (const pid of serverPids(portal.logs)) {
+  for (const pid of [
+    ...serverPids(portal.logs),
+    ...(options.extraPids ?? []),
+  ]) {
     try {
       process.kill(pid, 'SIGKILL');
     } catch {
