@@ -16,7 +16,7 @@ import { createJsonLogger } from '../logging/json-logger.ts';
 import type { Logger } from '../logging/types.ts';
 import type { DispatcherOptions } from '../server/dispatcher.ts';
 import type { Extension, ExtensionRegistrar } from '../server/extension.ts';
-import { runServerProcess } from '../server/server-process.ts';
+import { runServerProcessWithTestOptions } from '../server/server-process.ts';
 import { ServerStartupError } from '../server/server-startup.ts';
 import type { StorageBackend } from '../storage/types.ts';
 import { MemoryStorageBackend } from './memory-backend.ts';
@@ -130,7 +130,7 @@ export function startServer(options: HarnessOptions = {}): Harness {
       },
     });
   const backend = options.backend ?? new MemoryStorageBackend();
-  const done = runServerProcess({
+  const done = runServerProcessWithTestOptions({
     createBackend: () => backend,
     extensions: options.extensions ?? [],
     timeoutMs: options.timeoutMs ?? 1000,

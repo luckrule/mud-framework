@@ -197,4 +197,56 @@ describe('startServer', () => {
     expect(error.message).toContain('disk unavailable');
     expect(received(test1.messages)).toEqual([]);
   });
+
+  test.each([
+    ['zero', 0],
+    ['fractional', 1.5],
+    ['non-number', '2'],
+  ] as const)(
+    'refuses an invalid maxEventsPerRequest (%s) before creating the backend',
+    async (_name, value) => {
+      const test1 = harness();
+      let created = 0;
+
+      const error = await rejectionOf(
+        startServer(
+          test1.deps({
+            createBackend: () => {
+              created += 1;
+              return new MemoryStorageBackend();
+            },
+            maxEventsPerRequest: value as number,
+          }),
+        ),
+      );
+
+      if (!(error instanceof ServerStartupError)) {
+        throw new Error(`expected ServerStartupError, got ${error.name}`);
+      }
+      expect(error.reason).toContain('maxEventsPerRequest');
+      expect(created).toBe(0);
+      expect(received(test1.messages)).toEqual([]);
+      expect(
+        test1.logs().filter((line) => line.code === 'SERVER_STARTUP_FAILED'),
+      ).toHaveLength(1);
+    },
+  );
+
+  test('creates the backend once when maxEventsPerRequest is valid', async () => {
+    const test1 = harness();
+    let created = 0;
+
+    const { runtime } = await startServer(
+      test1.deps({
+        createBackend: () => {
+          created += 1;
+          return new MemoryStorageBackend();
+        },
+        maxEventsPerRequest: 2,
+      }),
+    );
+
+    expect(created).toBe(1);
+    await runtime.executor.close();
+  });
 });
