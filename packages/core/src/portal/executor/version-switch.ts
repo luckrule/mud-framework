@@ -668,17 +668,21 @@ export class VersionSwitch {
     }
     const reason = op.failure === undefined ? 'unknown' : messageOf(op.failure);
     if (op.previousGone || op.previousLost) {
+      // The same count `switchFailure` reports: only an unconfirmed exit blocks
+      // the rollback restart, so an exited process is neither counted nor
+      // re-tracked.
+      const pendingExits = op.exitsPending.filter((server) => !server.exited);
       this.deps.logger.warn(
         {
           reason,
           phase: op.phase,
-          pendingExits: op.exitsPending.length,
+          pendingExits: pendingExits.length,
         },
         op.previousLost
           ? 'server switch failed because the previous server was lost; restarting the previous version'
           : 'server switch failed after the previous server retired; restarting the previous version',
       );
-      this.rollbackToPrevious(op.exitsPending);
+      this.rollbackToPrevious(pendingExits);
     } else {
       this.deps.logger.warn(
         {
@@ -711,8 +715,16 @@ export class VersionSwitch {
   ): ServerSwitchError {
     const previousServing = !(op.previousGone || op.previousLost);
     const failed = abandoned ?? op.staged;
-    const tail = failed?.lastExit()?.stderrTail;
-    return new ServerSwitchError(withStderrTail(cause.message, tail), {
+    // Live first: a process the switch just killed (the `ready` timeout) has no
+    // exit record yet, so its captured stderr is only reachable through the
+    // spawn. The recorded tail covers a process that died on its own.
+    const tail = failed?.stderrTail?.() ?? failed?.lastExit()?.stderrTail;
+    // The spawn shares one live array between every record it reports, and the
+    // stderr pipe can still append to it. A rejection outlives the switch, so it
+    // carries a snapshot rather than a view that keeps changing under the
+    // caller.
+    const snapshot = tail === undefined ? undefined : [...tail];
+    return new ServerSwitchError(withStderrTail(cause.message, snapshot), {
       stage: op.phase,
       // A close-aborted switch leaves the previous Server as the current one,
       // but the executor is shutting down: reporting it as serving would tell a
@@ -721,8 +733,10 @@ export class VersionSwitch {
       rolledBack: !op.closeAborted && !op.promoted && !previousServing,
       promoted: op.promoted,
       closeAborted: op.closeAborted,
-      pendingExits: op.exitsPending.length,
-      ...(tail === undefined ? {} : { stderrTail: tail }),
+      // Only a process whose exit is still unconfirmed blocks a restart; one
+      // that was recorded earlier and has since exited does not.
+      pendingExits: op.exitsPending.filter((server) => !server.exited).length,
+      ...(snapshot === undefined ? {} : { stderrTail: snapshot }),
     });
   }
 

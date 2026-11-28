@@ -14,6 +14,11 @@ export interface ServerState {
   readonly exitPromise: Promise<ServerExitInfo>;
   /** Synchronous view of the exit, for the channel-close path. */
   readonly lastExit: () => ServerExitInfo | undefined;
+  /**
+   * Live captured stderr, readable before the exit is recorded. Needed by a
+   * failure path that kills the process it was waiting on.
+   */
+  readonly stderrTail?: () => readonly string[] | undefined;
   ready: boolean;
   closed: boolean;
   /** True once the child process itself is known to be gone. */

@@ -53,6 +53,9 @@ export function spawnBunServer(options: BunServerSpawnOptions): SpawnedServer {
   const logger =
     options.logger === undefined ? undefined : safeLogger(options.logger);
   const capture = stderrCapture(options.stderrTailLines);
+  // `capture.lines` is `string[] | undefined`; naming it once keeps the
+  // presence check out of the accessor closure below.
+  const liveTail = capture.lines;
 
   let closedLocally = false;
   let subprocess: Subprocess | undefined;
@@ -222,6 +225,9 @@ export function spawnBunServer(options: BunServerSpawnOptions): SpawnedServer {
     // records before it notifies, so this is already populated by the time
     // `onClose` runs even though `exited` has not settled yet.
     lastExit: () => recorded,
+    // The same live array `lastExit()` will carry, readable before the exit is
+    // recorded at all.
+    ...(liveTail === undefined ? {} : { stderrTail: () => liveTail }),
     kill(): void {
       try {
         subprocess?.kill('SIGKILL');

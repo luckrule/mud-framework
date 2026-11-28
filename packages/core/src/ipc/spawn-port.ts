@@ -46,6 +46,13 @@ export interface SpawnedServer {
    * channel-close path.
    */
   lastExit(): ServerExitInfo | undefined;
+  /**
+   * Live captured stderr, available before the exit is recorded. `undefined`
+   * when capture is off. A failure path that kills a process it is still
+   * holding (a switch timing out on `ready`) reads this, because the exit — and
+   * with it `lastExit().stderrTail` — can only be recorded after the kill.
+   */
+  stderrTail?: () => readonly string[] | undefined;
   /** Forcible termination, used when graceful shutdown stalls. */
   kill(): void;
 }

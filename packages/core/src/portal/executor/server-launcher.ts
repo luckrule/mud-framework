@@ -48,6 +48,7 @@ export function buildServer(
     },
     exitPromise: spawned.exited,
     lastExit: () => spawned.lastExit(),
+    stderrTail: () => spawned.stderrTail?.(),
     ready: false,
     closed: false,
     exited: false,
