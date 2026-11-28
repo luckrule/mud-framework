@@ -1,14 +1,16 @@
 import { describe, expect, test } from 'bun:test';
 
+import { MAX_TIMER_DELAY_MS } from '../portal/connection-layer-options.ts';
 import {
   DEFAULT_MAX_PENDING,
   DEFAULT_MAX_REPLAYS,
+  DEFAULT_MAX_RESTART_BACKOFF_MS,
   DEFAULT_RESTART_BACKOFF_MS,
   DEFAULT_SHUTDOWN_TIMEOUT_MS,
   EXIT_WAIT_TIMEOUT_MS,
-  MAX_RESTART_BACKOFF_MS,
   SHUTDOWN_ACK_SLACK_MS,
   closeBudget,
+  resolveStableResetMs,
 } from './budget.ts';
 
 describe('closeBudget', () => {
@@ -54,10 +56,43 @@ describe('budget constants', () => {
   test('restart backoff and replay limits match ADR-0004', () => {
     expect(DEFAULT_MAX_REPLAYS).toBe(3);
     expect(DEFAULT_RESTART_BACKOFF_MS).toBe(100);
-    expect(MAX_RESTART_BACKOFF_MS).toBe(5000);
+    expect(DEFAULT_MAX_RESTART_BACKOFF_MS).toBe(5000);
   });
 
   test('the pending buffer cap matches ADR-0004', () => {
     expect(DEFAULT_MAX_PENDING).toBe(10_000);
+  });
+});
+
+describe('resolveStableResetMs', () => {
+  test('the 30s floor wins when the timeout and cap are smaller', () => {
+    expect(resolveStableResetMs(5000, DEFAULT_MAX_RESTART_BACKOFF_MS)).toBe(
+      30_000,
+    );
+  });
+
+  test('the request timeout raises the window above the floor', () => {
+    expect(resolveStableResetMs(60_000, DEFAULT_MAX_RESTART_BACKOFF_MS)).toBe(
+      60_000,
+    );
+  });
+
+  test('a raised cap raises the window so it still covers the backoff', () => {
+    expect(resolveStableResetMs(5000, 45_000)).toBe(45_000);
+  });
+
+  test('the default window stays within the timer ceiling when the cap does', () => {
+    expect(resolveStableResetMs(5000, MAX_TIMER_DELAY_MS)).toBe(
+      MAX_TIMER_DELAY_MS,
+    );
+    expect(resolveStableResetMs(MAX_TIMER_DELAY_MS, 5000)).toBe(
+      MAX_TIMER_DELAY_MS,
+    );
+  });
+
+  test('only a timeout above the timer ceiling can push the window past it', () => {
+    expect(resolveStableResetMs(MAX_TIMER_DELAY_MS + 1, 5000)).toBe(
+      MAX_TIMER_DELAY_MS + 1,
+    );
   });
 });

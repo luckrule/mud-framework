@@ -41,8 +41,8 @@ export const EVENT_SEND_SLACK_MS = 250;
 /**
  * Largest delay `setTimeout` accepts. Bun clamps anything above it to 1ms, so a
  * derived bound that overflowed this would release the writer almost at once —
- * the opposite of what the bound is for (SPEC 3.8). Exported so the option
- * tests can name the same ceiling rather than hard-code it.
+ * the opposite of what the bound is for (SPEC 3.8). Shared by production
+ * validation and the option tests so both name the same ceiling.
  */
 export const MAX_TIMER_DELAY_MS = 2_147_483_647;
 

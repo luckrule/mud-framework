@@ -244,6 +244,85 @@ describe('IpcExecutor restart', () => {
     await h.executor.close();
   });
 
+  test('caps the restart backoff at maxRestartBackoffMs', async () => {
+    jest.useFakeTimers();
+    try {
+      const h = harness({
+        timeoutMs: 5000,
+        restartBackoffMs: 100,
+        maxRestartBackoffMs: 150,
+      });
+      const first = await started(h);
+
+      first.crash();
+      await flushMicrotasks();
+      jest.advanceTimersByTime(1);
+      await flushMicrotasks();
+      expect(h.servers).toHaveLength(2);
+      serverAt(h, 1).send(readyMessage());
+      await flushMicrotasks();
+
+      serverAt(h, 1).crash();
+      await flushMicrotasks();
+      jest.advanceTimersByTime(100);
+      await flushMicrotasks();
+      expect(h.servers).toHaveLength(3);
+      serverAt(h, 2).send(readyMessage());
+      await flushMicrotasks();
+
+      // Uncapped this restart would wait 200ms; the configured cap is 150ms.
+      serverAt(h, 2).crash();
+      await flushMicrotasks();
+      jest.advanceTimersByTime(149);
+      await flushMicrotasks();
+      expect(h.servers).toHaveLength(3);
+      jest.advanceTimersByTime(1);
+      await flushMicrotasks();
+      expect(h.servers).toHaveLength(4);
+      serverAt(h, 3).send(readyMessage());
+      await flushMicrotasks();
+      await h.executor.close();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('the default stability window covers a raised backoff cap', async () => {
+    jest.useFakeTimers();
+    try {
+      const h = harness({ timeoutMs: 5000, maxRestartBackoffMs: 35_000 });
+      await started(h);
+
+      serverAt(h, 0).crash();
+      await flushMicrotasks();
+      jest.advanceTimersByTime(1);
+      await flushMicrotasks();
+      expect(h.servers).toHaveLength(2);
+      serverAt(h, 1).send(readyMessage());
+      await flushMicrotasks();
+
+      // Past the old 30s floor, still inside the cap-derived 35s window.
+      jest.advanceTimersByTime(30_001);
+      await flushMicrotasks();
+      serverAt(h, 1).crash();
+      await flushMicrotasks();
+
+      // The streak survived, so this restart waits the 100ms base backoff. A
+      // 30s window would have reset it and restarted 1ms later.
+      jest.advanceTimersByTime(1);
+      await flushMicrotasks();
+      expect(h.servers).toHaveLength(2);
+      jest.advanceTimersByTime(99);
+      await flushMicrotasks();
+      expect(h.servers).toHaveLength(3);
+      serverAt(h, 2).send(readyMessage());
+      await flushMicrotasks();
+      await h.executor.close();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   test('a recovery generation stuck before ready fails within its own start timeout', async () => {
     jest.useFakeTimers();
     try {

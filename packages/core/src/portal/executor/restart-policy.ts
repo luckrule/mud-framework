@@ -1,8 +1,8 @@
-import { MAX_RESTART_BACKOFF_MS } from '../../shared/budget.ts';
-
 export interface RestartPolicyOptions {
   /** Base for exponential restart backoff in ms. */
   baseBackoffMs: number;
+  /** Ceiling for the exponential backoff in ms. */
+  maxBackoffMs: number;
   /**
    * How long a Server must stay up before its crash streak is considered over.
    *
@@ -27,6 +27,7 @@ export interface RestartPolicyOptions {
  */
 export class RestartPolicy {
   private readonly baseBackoffMs: number;
+  private readonly maxBackoffMs: number;
   private readonly stableResetMs: number;
   /**
    * Crashes since the last stable run. Reset only by the stability window,
@@ -39,6 +40,7 @@ export class RestartPolicy {
 
   constructor(options: RestartPolicyOptions) {
     this.baseBackoffMs = options.baseBackoffMs;
+    this.maxBackoffMs = options.maxBackoffMs;
     this.stableResetMs = options.stableResetMs;
   }
 
@@ -58,10 +60,7 @@ export class RestartPolicy {
     if (attempt === 0) {
       return 0;
     }
-    return Math.min(
-      this.baseBackoffMs * 2 ** (attempt - 1),
-      MAX_RESTART_BACKOFF_MS,
-    );
+    return Math.min(this.baseBackoffMs * 2 ** (attempt - 1), this.maxBackoffMs);
   }
 
   /**

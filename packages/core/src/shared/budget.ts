@@ -7,10 +7,30 @@
 /** Max replays of one request before it reaches a terminal state. */
 export const DEFAULT_MAX_REPLAYS = 3;
 
-/** Base for exponential restart backoff in ms; the cap is `MAX_RESTART_BACKOFF_MS`. */
+/** Base for exponential restart backoff in ms; the cap is configurable. */
 export const DEFAULT_RESTART_BACKOFF_MS = 100;
 
-export const MAX_RESTART_BACKOFF_MS = 5000;
+/**
+ * Default ceiling for exponential restart backoff. Overridable per executor
+ * through `IpcExecutorOptions.maxRestartBackoffMs`; explicit values are checked
+ * at construction, not on the restart path.
+ */
+export const DEFAULT_MAX_RESTART_BACKOFF_MS = 5000;
+
+/**
+ * The default stability window: long enough to outlast the longest request and
+ * the backoff cap. Deriving it from the cap keeps a raised cap from making the
+ * window shorter than the wait it must cover; an explicit `stableResetMs`
+ * bypasses this formula, so its relation to the cap is the caller's. The cap is
+ * bounded by `MAX_TIMER_DELAY_MS` at construction; `timeoutMs` is not, so a
+ * caller that sets it above that ceiling also pushes this default past it.
+ */
+export function resolveStableResetMs(
+  timeoutMs: number,
+  maxRestartBackoffMs: number,
+): number {
+  return Math.max(30_000, timeoutMs, maxRestartBackoffMs);
+}
 
 /** Grace period for a graceful shutdown before killing. */
 export const DEFAULT_SHUTDOWN_TIMEOUT_MS = 5000;

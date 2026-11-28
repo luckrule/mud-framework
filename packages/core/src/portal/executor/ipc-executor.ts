@@ -10,6 +10,7 @@ import {
   DEFAULT_RESTART_BACKOFF_MS,
   DEFAULT_SHUTDOWN_TIMEOUT_MS,
   closeBudget,
+  resolveStableResetMs,
 } from '../../shared/budget.ts';
 import type { ServerEvent } from '../../shared/events.ts';
 import type {
@@ -31,7 +32,10 @@ import { ipcExecutorHealth } from './executor-health.ts';
 import type { ShutdownHost } from './executor-shutdown.ts';
 import { doClose } from './executor-shutdown.ts';
 import type { IpcExecutorOptions } from './ipc-executor-options.ts';
-import { assertExecutorTimerMs } from './ipc-executor-options.ts';
+import {
+  assertExecutorTimerMs,
+  resolveMaxRestartBackoffMs,
+} from './ipc-executor-options.ts';
 import { PendingBuffer } from './ipc-pending.ts';
 import { RestartPolicy } from './restart-policy.ts';
 import { ServerSlot } from './server-slot.ts';
@@ -98,6 +102,10 @@ export class IpcExecutor implements RequestExecutor {
         `restartBackoffMs must be a positive finite number, got ${restartBackoffMs}`,
       );
     }
+    const maxRestartBackoffMs = resolveMaxRestartBackoffMs(
+      options.maxRestartBackoffMs,
+      restartBackoffMs,
+    );
     if (options.shutdownTimeoutMs !== undefined) {
       assertExecutorTimerMs(options.shutdownTimeoutMs, 'shutdownTimeoutMs');
     }
@@ -120,18 +128,19 @@ export class IpcExecutor implements RequestExecutor {
       options.logger ??
         createJsonLogger({ bindings: { component: 'ipc-executor' } }),
     );
-    // Defaults must be at least the backoff cap (5000ms) and the longest
-    // request, otherwise a Server that dies on its first request would reset
-    // the streak before it crashed and restart with zero backoff every time.
-    // An explicit `stableResetMs` is only range-checked here; that relation
-    // stays the caller's responsibility (ADR-0004).
+    // The default stability window covers the request timeout and the backoff
+    // cap, so raising the cap cannot make the window shorter than the wait it
+    // must outlast. An explicit `stableResetMs` is only range-checked here;
+    // that relation stays the caller's responsibility (ADR-0004).
     if (options.stableResetMs !== undefined) {
       assertExecutorTimerMs(options.stableResetMs, 'stableResetMs');
     }
     const restart = new RestartPolicy({
       baseBackoffMs: restartBackoffMs,
+      maxBackoffMs: maxRestartBackoffMs,
       stableResetMs:
-        options.stableResetMs ?? Math.max(30_000, options.timeoutMs),
+        options.stableResetMs ??
+        resolveStableResetMs(options.timeoutMs, maxRestartBackoffMs),
     });
     // The callbacks read live state when the ledger decides, so a value
     // captured here could not go stale across a status transition.
