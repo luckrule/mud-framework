@@ -27,6 +27,7 @@ import type {
 import {
   assertActive,
   assertSessionChangeAllowed,
+  DEFAULT_MAX_EVENTS_PER_REQUEST,
   EXPIRED_MESSAGE,
   guard,
   logLostCommit,
@@ -65,6 +66,14 @@ export interface DispatcherOptions {
     method: string,
     payload: unknown,
   ) => boolean | Promise<boolean>;
+  /**
+   * How many events one request may buffer across `emit` and `emitToSession`
+   * (SPEC 3.8). Defaults to 1024. Must be a safe integer of at least 1,
+   * validated here at construction rather than per request; the cap is copied
+   * into each request's buffer, so it cannot change while a request is in
+   * flight.
+   */
+  maxEventsPerRequest?: number;
   /** Defaults to `randomUUID`; injectable so tests get deterministic ids. */
   createRequestId?: () => string;
   /** Defaults to the JSON logger; tests inject a sink-backed one. */
@@ -80,9 +89,35 @@ interface HandlerEntry {
   readonly mayChangeSession: boolean;
 }
 
+/**
+ * Constructor-time validation, not a per-request check: a bad value is a
+ * deployment error and must refuse startup. `unknown` because a JavaScript
+ * caller can pass anything the type says it cannot. Messages mirror
+ * `assertPositiveInteger` (`portal/connection-layer-options.ts`) so the same
+ * class of configuration error reads the same everywhere; the two helpers are
+ * kept separate rather than shared across layers.
+ */
+function resolveMaxEventsPerRequest(value: unknown): number {
+  if (value === undefined) {
+    return DEFAULT_MAX_EVENTS_PER_REQUEST;
+  }
+  if (typeof value !== 'number') {
+    throw new TypeError(
+      `maxEventsPerRequest must be a positive integer, got ${describeValue(value)}`,
+    );
+  }
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new RangeError(
+      `maxEventsPerRequest must be a positive integer, got ${String(value)}`,
+    );
+  }
+  return value;
+}
+
 export class Dispatcher {
   private readonly backend: StorageBackend;
   private readonly timeoutMs: number;
+  private readonly maxEventsPerRequest: number;
   private readonly createRequestId: () => string;
   private readonly logger: Logger;
   private readonly authorize: DispatcherOptions['authorize'];
@@ -102,6 +137,9 @@ export class Dispatcher {
     }
     this.backend = options.backend;
     this.timeoutMs = options.timeoutMs;
+    this.maxEventsPerRequest = resolveMaxEventsPerRequest(
+      options.maxEventsPerRequest,
+    );
     this.createRequestId = options.createRequestId ?? randomUUID;
     this.authorize = options.authorize;
     // A child rather than a default-only binding: an injected logger must still
@@ -272,7 +310,10 @@ export class Dispatcher {
     const change: SessionChangeHolder = {};
     // Same rule for events (ADR-0008): buffered here, handed back only with a
     // committed result. A rejected dispatch drops the array with its frame.
-    const eventBuffer: EventBuffer = { events: [] };
+    const eventBuffer: EventBuffer = {
+      events: [],
+      limit: this.maxEventsPerRequest,
+    };
 
     try {
       if (this.authorize !== undefined) {

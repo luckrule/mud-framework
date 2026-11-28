@@ -75,6 +75,8 @@ export interface HarnessOptions {
   extensions?: readonly Extension[];
   backend?: StorageBackend;
   timeoutMs?: number;
+  /** Per-request event cap forwarded to the Server's dispatcher (SPEC 3.8). */
+  maxEventsPerRequest?: number;
   /** Replaces the collecting logger: `logs()` then stays empty. */
   logger?: Logger;
   /** Observes every message Portal receives, for cross-array ordering checks. */
@@ -132,6 +134,7 @@ export function startServer(options: HarnessOptions = {}): Harness {
     createBackend: () => backend,
     extensions: options.extensions ?? [],
     timeoutMs: options.timeoutMs ?? 1000,
+    maxEventsPerRequest: options.maxEventsPerRequest,
     authorize: options.authorize,
     logger,
     channel: serverChannel,
