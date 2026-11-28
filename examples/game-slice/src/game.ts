@@ -44,11 +44,21 @@ export interface ItemEvent {
 }
 
 /**
+ * The build a Server process runs. The hot-switch drill starts one with `v1`
+ * and replaces it with `v2`, so a client can tell which process served it
+ * without reading storage: only `game.say` broadcasts carry the marker.
+ */
+export type GameVersion = 'v1' | 'v2';
+
+/** Prefix v2 puts on every `room.say` broadcast; `v1` has none. */
+export const V2_SAY_PREFIX = '[v2] ';
+
+/**
  * The `game` Extension. No authentication is involved: `game.login` binds the
  * Session named after whatever non-empty name the client sends. That is a
  * demo-only identity rule, not an authentication scheme.
  */
-export function gameExtension(): Extension {
+export function gameExtension(version: GameVersion = 'v1'): Extension {
   return {
     name: 'game',
     requires: { transactions: 'full', uniqueConstraint: true },
@@ -155,7 +165,10 @@ export function gameExtension(): Extension {
           player.room_id,
           player.name,
         );
-        const eventPayload: RoomSayEvent = { from: player.name, text };
+        const eventPayload: RoomSayEvent = {
+          from: player.name,
+          text: version === 'v2' ? `${V2_SAY_PREFIX}${text}` : text,
+        };
         for (const sessionId of listeners) {
           ctx.emitToSession(sessionId, 'room.say', eventPayload);
         }
