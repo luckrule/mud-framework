@@ -1,8 +1,14 @@
 import type { StorageCapabilities } from './types.ts';
 
+export type DegradationCapability =
+  | 'transactions'
+  | 'concurrency'
+  | 'snapshotRead'
+  | 'uniqueConstraint';
+
 export interface Degradation {
   /** The capability that is weaker than its strongest level (SPEC 4.2). */
-  readonly capability: string;
+  readonly capability: DegradationCapability;
   /** What the backend declares. */
   readonly declared: string | boolean;
   /** What the framework therefore does not provide. */
@@ -18,41 +24,52 @@ export function degradations(declared: StorageCapabilities): Degradation[] {
   const found: Degradation[] = [];
   // Fixed order (transactions, concurrency, snapshotRead, uniqueConstraint) so
   // the startup warnings read the same way for every backend.
-  if (declared.transactions === 'limited') {
-    found.push({
-      capability: 'transactions',
-      declared: declared.transactions,
-      consequence:
-        '跨实体写入不保证原子，需要多实体原子性的 Extension 必须声明需求',
-    });
+  switch (declared.transactions) {
+    case 'full':
+      break;
+    case 'limited':
+      found.push({
+        capability: 'transactions',
+        declared: declared.transactions,
+        consequence:
+          'cross-entity writes are not atomic; an Extension that needs multi-entity atomicity must declare the requirement',
+      });
+      break;
+    case 'none':
+      found.push({
+        capability: 'transactions',
+        declared: declared.transactions,
+        consequence:
+          'no rollback: after the first write fails, later writes in the same request are rejected by the framework (reads are unaffected) and writes already made are kept; the Extension must compensate or be idempotent',
+      });
+      break;
   }
-  if (declared.transactions === 'none') {
-    found.push({
-      capability: 'transactions',
-      declared: declared.transactions,
-      consequence:
-        '无回滚，失败时已写入的部分保留，Extension 必须自行补偿或幂等',
-    });
-  }
-  if (declared.concurrency === 'single') {
-    found.push({
-      capability: 'concurrency',
-      declared: declared.concurrency,
-      consequence: '框架层并发调度不转化为存储层并发，长事务会阻塞其他请求',
-    });
+  switch (declared.concurrency) {
+    case 'pooled':
+      break;
+    case 'single':
+      found.push({
+        capability: 'concurrency',
+        declared: declared.concurrency,
+        consequence:
+          'framework-level concurrency does not reach the storage layer; long transactions block other requests',
+      });
+      break;
   }
   if (!declared.snapshotRead) {
     found.push({
       capability: 'snapshotRead',
       declared: declared.snapshotRead,
-      consequence: '事务内重复读不保证一致，Extension 自行处理读到变化数据',
+      consequence:
+        'repeated reads inside one transaction are not guaranteed to agree; the Extension must handle data changing under it',
     });
   }
   if (!declared.uniqueConstraint) {
     found.push({
       capability: 'uniqueConstraint',
       declared: declared.uniqueConstraint,
-      consequence: '不提供"检查再写入"的原子性，唯一性由单写者或业务幂等键保证',
+      consequence:
+        'no atomic check-then-write; uniqueness must be guaranteed by the single writer or a business idempotency key',
     });
   }
   return found;
