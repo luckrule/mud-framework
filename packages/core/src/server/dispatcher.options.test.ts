@@ -21,7 +21,7 @@ describe('Dispatcher maxEventsPerRequest validation', () => {
   ] as const)('rejects a non-number %s with TypeError', (_name, value) => {
     expect(() => dispatcherWith(value)).toThrow(TypeError);
     expect(() => dispatcherWith(value)).toThrow(
-      /maxEventsPerRequest must be a positive integer/,
+      /maxEventsPerRequest must be a safe integer of at least 1/,
     );
   });
 
@@ -36,18 +36,20 @@ describe('Dispatcher maxEventsPerRequest validation', () => {
   ] as const)('rejects %s with RangeError', (_name, value) => {
     expect(() => dispatcherWith(value)).toThrow(RangeError);
     expect(() => dispatcherWith(value)).toThrow(
-      /maxEventsPerRequest must be a positive integer/,
+      /maxEventsPerRequest must be a safe integer of at least 1/,
     );
   });
 
-  // Same text as `assertPositiveInteger` in the connection layer: numbers are
-  // shown bare, non-numbers keep their type and scalar text.
-  test('formats messages like assertPositiveInteger', () => {
+  // Numbers are shown bare, non-numbers keep their type and scalar text.
+  test('names the value and the safe-integer contract in the message', () => {
     expect(() => dispatcherWith(1.5)).toThrow(
-      'maxEventsPerRequest must be a positive integer, got 1.5',
+      'maxEventsPerRequest must be a safe integer of at least 1, got 1.5',
     );
     expect(() => dispatcherWith('2')).toThrow(
-      'maxEventsPerRequest must be a positive integer, got string "2"',
+      'maxEventsPerRequest must be a safe integer of at least 1, got string "2"',
+    );
+    expect(() => dispatcherWith(Number.MAX_SAFE_INTEGER + 1)).toThrow(
+      'maxEventsPerRequest must be a safe integer of at least 1, got 9007199254740992',
     );
   });
 
@@ -83,6 +85,6 @@ describe('Dispatcher maxEventsPerRequest validation', () => {
     const error = await rejectionOf(
       dispatcher.dispatch('two', null, { connectionId: 'conn-1' }),
     );
-    expect(error.message).toBe('a request may emit at most 1 events');
+    expect(error.message).toBe('a request may emit at most 1 event');
   });
 });

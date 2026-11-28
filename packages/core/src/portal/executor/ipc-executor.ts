@@ -31,6 +31,7 @@ import { ipcExecutorHealth } from './executor-health.ts';
 import type { ShutdownHost } from './executor-shutdown.ts';
 import { doClose } from './executor-shutdown.ts';
 import type { IpcExecutorOptions } from './ipc-executor-options.ts';
+import { assertExecutorTimerMs } from './ipc-executor-options.ts';
 import { PendingBuffer } from './ipc-pending.ts';
 import { RestartPolicy } from './restart-policy.ts';
 import { ServerSlot } from './server-slot.ts';
@@ -97,6 +98,9 @@ export class IpcExecutor implements RequestExecutor {
         `restartBackoffMs must be a positive finite number, got ${restartBackoffMs}`,
       );
     }
+    if (options.shutdownTimeoutMs !== undefined) {
+      assertExecutorTimerMs(options.shutdownTimeoutMs, 'shutdownTimeoutMs');
+    }
     this.shutdownTimeoutMs =
       options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
     const startTimeoutMs =
@@ -119,6 +123,11 @@ export class IpcExecutor implements RequestExecutor {
     // Defaults must be at least the backoff cap (5000ms) and the longest
     // request, otherwise a Server that dies on its first request would reset
     // the streak before it crashed and restart with zero backoff every time.
+    // An explicit `stableResetMs` is only range-checked here; that relation
+    // stays the caller's responsibility (ADR-0004).
+    if (options.stableResetMs !== undefined) {
+      assertExecutorTimerMs(options.stableResetMs, 'stableResetMs');
+    }
     const restart = new RestartPolicy({
       baseBackoffMs: restartBackoffMs,
       stableResetMs:

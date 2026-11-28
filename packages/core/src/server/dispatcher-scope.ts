@@ -78,7 +78,8 @@ export function recordEvent(
     throw new Error('emitToSession requires a non-empty session id');
   }
   if (buffer.events.length >= buffer.limit) {
-    throw new Error(`a request may emit at most ${buffer.limit} events`);
+    const noun = buffer.limit === 1 ? 'event' : 'events';
+    throw new Error(`a request may emit at most ${buffer.limit} ${noun}`);
   }
   buffer.events.push({ target, event, payload });
 }

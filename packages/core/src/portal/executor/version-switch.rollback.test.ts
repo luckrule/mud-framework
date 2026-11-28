@@ -2,6 +2,7 @@ import { describe, expect, jest, test } from 'bun:test';
 
 import type { IpcChannel } from '../../ipc/channel.ts';
 import { IpcChannelClosedError } from '../../ipc/channel.ts';
+import type { ServerExitInfo, SpawnedServer } from '../../ipc/spawn-port.ts';
 import { rejectionOf } from '../../testing/common.ts';
 import {
   flushMicrotasks,
@@ -337,6 +338,39 @@ describe('IpcExecutor switchTo', () => {
     // serves, exactly as without a tail.
     expect(messagesTo(old)).toEqual(['hello', 'activate']);
     expect(old.killCount).toBe(0);
+    await h.executor.close();
+  });
+
+  test('waits for the exit promise before snapshotting the stderr tail', async () => {
+    // `exited` is set synchronously when the channel closes, but the real spawn
+    // resolves the exit promise only after the stderr pipe is drained. Returning
+    // early on the flag would snapshot a tail that is still missing its last
+    // lines — exactly the diagnostic this rejection exists to carry.
+    const h = switchable({ startTimeoutMs: 500 });
+    await started(h);
+
+    const tail = ['error: first line'];
+    const base = h.makeServer({
+      silentOnHello: true,
+      closeChannelOnExit: true,
+      stderrTail: tail,
+    });
+    const exit = Promise.withResolvers<ServerExitInfo>();
+    void base.exited.then((info) => {
+      setTimeout(() => {
+        tail.push('error: last line');
+        exit.resolve(info);
+      }, 10);
+      return undefined;
+    });
+    const spawn: SpawnedServer = { ...base, exited: exit.promise };
+
+    const switching = h.executor.switchTo({ spawn: () => spawn });
+    h.servers.at(-1)?.crash(1);
+    const error = await rejectionOf(switching);
+
+    expect(error.message).toContain('error: first line');
+    expect(error.message).toContain('error: last line');
     await h.executor.close();
   });
 
