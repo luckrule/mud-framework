@@ -1,5 +1,5 @@
 import type { ExecutorOutcome, SessionChange } from '../shared/executor.ts';
-import { isRecord, messageOf } from '../shared/guards.ts';
+import { isRecord, messageOf } from '../shared/validation.ts';
 import { INTERNAL_ERROR } from '../shared/wire-codes.ts';
 
 /**

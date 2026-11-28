@@ -4,8 +4,8 @@ import type {
   ServerEventTarget,
 } from '../shared/events.ts';
 import type { SessionChange } from '../shared/executor.ts';
-import { describeValue } from '../shared/guards.ts';
 import { elapsedMs } from '../shared/timeout.ts';
+import { assertPositiveSafeInteger } from '../shared/validation.ts';
 import type { StorageTransaction } from '../storage/types.ts';
 
 /** Abnormal termination, separate from the storage handle's lifetime. */
@@ -64,16 +64,7 @@ export function resolveMaxEventsPerRequest(value: unknown): number {
   if (value === undefined) {
     return DEFAULT_MAX_EVENTS_PER_REQUEST;
   }
-  if (typeof value !== 'number') {
-    throw new TypeError(
-      `maxEventsPerRequest must be a safe integer of at least 1, got ${describeValue(value)}`,
-    );
-  }
-  if (!Number.isSafeInteger(value) || value < 1) {
-    throw new RangeError(
-      `maxEventsPerRequest must be a safe integer of at least 1, got ${String(value)}`,
-    );
-  }
+  assertPositiveSafeInteger(value, 'maxEventsPerRequest');
   return value;
 }
 

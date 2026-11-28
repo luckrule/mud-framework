@@ -1,7 +1,7 @@
 import type { EventMessage, ResultMessage } from '../../ipc/protocol.ts';
 import { parseIpcMessage } from '../../ipc/protocol.ts';
 import type { Logger } from '../../logging/types.ts';
-import { messageOf } from '../../shared/guards.ts';
+import { messageOf } from '../../shared/validation.ts';
 import type { ServerSlot, ServerState } from './server-slot.ts';
 import type { SwitchOperation } from './version-switch.ts';
 

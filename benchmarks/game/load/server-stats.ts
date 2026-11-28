@@ -11,7 +11,7 @@ import type {
 import {
   isRecord,
   messageOf,
-} from '../../../packages/core/src/shared/guards.ts';
+} from '../../../packages/core/src/shared/validation.ts';
 import { Histogram, parseHistogramJson } from './support.ts';
 import type { HistogramJson } from './support.ts';
 

@@ -6,8 +6,14 @@ import type { Logger } from '../logging/types.ts';
 import { JsonCodec } from '../shared/codec.ts';
 import type { Codec } from '../shared/codec.ts';
 import type { RequestExecutor } from '../shared/executor.ts';
-import { messageOf, toError } from '../shared/guards.ts';
 import { settleWithin } from '../shared/timeout.ts';
+import {
+  assertPositiveInteger,
+  assertTimerDelay,
+  clampTimerDelay,
+  messageOf,
+  toError,
+} from '../shared/validation.ts';
 import type {
   Transport,
   TransportConnection,
@@ -28,9 +34,6 @@ import type { LayerHost } from './connection-host.ts';
 import {
   DEFAULT_STOP_TIMEOUT_MS,
   EXECUTOR_CLOSE_SLACK_MS,
-  assertPositiveInteger,
-  assertTimerDelay,
-  clampTimerDelay,
   resolveSendTimeoutMs,
 } from './connection-layer-options.ts';
 import type { ConnectionLayerOptions } from './connection-layer-options.ts';

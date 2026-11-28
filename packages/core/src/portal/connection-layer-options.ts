@@ -1,7 +1,7 @@
 import type { Logger } from '../logging/types.ts';
 import type { Codec } from '../shared/codec.ts';
 import type { RequestExecutor } from '../shared/executor.ts';
-import { describeValue } from '../shared/guards.ts';
+import { assertTimerDelay, clampTimerDelay } from '../shared/validation.ts';
 import type { Transport } from '../transport/types.ts';
 
 /**
@@ -37,19 +37,6 @@ export const EXECUTOR_CLOSE_SLACK_MS = 1000;
  * between the two registrations, negligible against a send bound.
  */
 export const EVENT_SEND_SLACK_MS = 250;
-
-/**
- * Largest delay `setTimeout` accepts. Bun clamps anything above it to 1ms, so a
- * derived bound that overflowed this would release the writer almost at once —
- * the opposite of what the bound is for (SPEC 3.8). Shared by production
- * validation and the option tests so both name the same ceiling.
- */
-export const MAX_TIMER_DELAY_MS = 2_147_483_647;
-
-/** Caps a derived delay where `setTimeout` stops honouring it. */
-export function clampTimerDelay(ms: number): number {
-  return Math.min(ms, MAX_TIMER_DELAY_MS);
-}
 
 /**
  * The bound on one downlink write when neither the caller nor the transport
@@ -199,49 +186,4 @@ export function resolveSendTimeoutMs(options: ConnectionLayerOptions): number {
     return clampTimerDelay(declared + EVENT_SEND_SLACK_MS);
   }
   return UNDECLARED_EVENT_SEND_TIMEOUT_MS;
-}
-
-export function assertPositiveInteger(value: unknown, name: string): void {
-  if (typeof value !== 'number') {
-    throw new TypeError(
-      `${name} must be a positive integer, got ${describeValue(value)}`,
-    );
-  }
-  if (!Number.isInteger(value) || value < 1) {
-    throw new RangeError(
-      `${name} must be a positive integer, got ${String(value)}`,
-    );
-  }
-}
-
-/**
- * A configured delay must also fit `setTimeout`. Above `MAX_TIMER_DELAY_MS` Bun
- * clamps the delay to 1ms, so the longest wait an operator can ask for becomes
- * the shortest: shutdown would drop every queued request, and a send bound would
- * release the writer while the frame may still be on the wire. Rejected rather
- * than capped because the value is the operator's stated intent; silently
- * shortening it is the same inversion, and a delay this far out of range is a
- * configuration error worth reporting rather than quietly repairing.
- *
- * Every caller of this is a timer delay, so the ceiling applies to all of them.
- */
-export function assertTimerDelay(
-  value: unknown,
-  name: string,
-): asserts value is number {
-  if (typeof value !== 'number') {
-    throw new TypeError(
-      `${name} must be a finite number of at least 1, got ${describeValue(value)}`,
-    );
-  }
-  if (!Number.isFinite(value) || value < 1) {
-    throw new RangeError(
-      `${name} must be a finite number of at least 1, got ${String(value)}`,
-    );
-  }
-  if (value > MAX_TIMER_DELAY_MS) {
-    throw new RangeError(
-      `${name} must not exceed ${MAX_TIMER_DELAY_MS}ms (the largest setTimeout delay), got ${String(value)}`,
-    );
-  }
 }

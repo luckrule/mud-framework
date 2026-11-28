@@ -1,6 +1,5 @@
 import { describe, expect, test } from 'bun:test';
 
-import { MAX_TIMER_DELAY_MS } from '../portal/connection-layer-options.ts';
 import {
   DEFAULT_MAX_PENDING,
   DEFAULT_MAX_REPLAYS,
@@ -12,6 +11,7 @@ import {
   closeBudget,
   resolveStableResetMs,
 } from './budget.ts';
+import { MAX_TIMER_DELAY_MS } from './validation.ts';
 
 describe('closeBudget', () => {
   test('the default shutdown timeout gives the ADR-0004 budget', () => {

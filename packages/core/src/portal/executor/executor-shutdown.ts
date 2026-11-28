@@ -1,7 +1,7 @@
 import type { Logger } from '../../logging/types.ts';
 import { SHUTDOWN_ACK_SLACK_MS } from '../../shared/budget.ts';
-import { messageOf } from '../../shared/guards.ts';
 import { settleWithin } from '../../shared/timeout.ts';
+import { messageOf } from '../../shared/validation.ts';
 import { FRAMEWORK_SHUTDOWN } from '../../shared/wire-codes.ts';
 import { ensureExited, killQuietly } from './server-launcher.ts';
 import type { ServerSlot, ServerState } from './server-slot.ts';

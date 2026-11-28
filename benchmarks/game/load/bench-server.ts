@@ -11,7 +11,7 @@ import { SqliteBackend } from 'mud-framework-storage-sqlite';
 
 import { gameExtension } from '../../../examples/game-slice/src/game.ts';
 import { initializeWorld } from '../../../examples/game-slice/src/world.ts';
-import { messageOf } from '../../../packages/core/src/shared/guards.ts';
+import { messageOf } from '../../../packages/core/src/shared/validation.ts';
 import {
   buildServerStats,
   createCountingChannel,

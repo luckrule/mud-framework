@@ -11,7 +11,7 @@ import type { GameEvent } from '../../../examples/game-slice/src/client-lib.ts';
 import {
   isRecord,
   messageOf,
-} from '../../../packages/core/src/shared/guards.ts';
+} from '../../../packages/core/src/shared/validation.ts';
 import { write, writeError } from '../support.ts';
 import {
   recordWindowedEvent,

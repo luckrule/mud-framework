@@ -12,10 +12,6 @@ import {
   closeBudget,
   resolveStableResetMs,
 } from '../../shared/budget.ts';
-import {
-  CLIENT_REQUEST_ID_EMPTY_MESSAGE,
-  isValidClientRequestId,
-} from '../../shared/client-request-id.ts';
 import type { ServerEvent } from '../../shared/events.ts';
 import type {
   ExecutorHealth,
@@ -23,9 +19,13 @@ import type {
   ExecutorRequest,
   RequestExecutor,
 } from '../../shared/executor.ts';
-import { messageOf } from '../../shared/guards.ts';
 import { requestLogFields } from '../../shared/identity.ts';
 import { tightenTimeout } from '../../shared/timeout.ts';
+import {
+  CLIENT_REQUEST_ID_EMPTY_MESSAGE,
+  isValidClientRequestId,
+  messageOf,
+} from '../../shared/validation.ts';
 import {
   FRAMEWORK_QUEUE_FULL,
   FRAMEWORK_SHUTDOWN,

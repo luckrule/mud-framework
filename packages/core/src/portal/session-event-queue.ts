@@ -1,5 +1,5 @@
 import type { ServerEvent } from '../shared/events.ts';
-import { messageOf } from '../shared/guards.ts';
+import { messageOf } from '../shared/validation.ts';
 import type { ConnectionState } from './connection-state.ts';
 import { BACKLOG_CLOSED_REASON } from './connection-state.ts';
 import type { EventBacklog } from './event-backlog.ts';

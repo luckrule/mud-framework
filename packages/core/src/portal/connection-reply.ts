@@ -1,7 +1,7 @@
 import type { Logger } from '../logging/types.ts';
 import type { ResponseEnvelope } from '../shared/codec.ts';
-import { messageOf } from '../shared/guards.ts';
 import { settleWithin } from '../shared/timeout.ts';
+import { messageOf } from '../shared/validation.ts';
 import {
   INTERNAL_ERROR,
   INVALID_ENVELOPE,

@@ -2,8 +2,8 @@ import { failure, requestMessage } from '../../ipc/outbound.ts';
 import type { ResultMessage } from '../../ipc/protocol.ts';
 import type { LogFields, Logger } from '../../logging/types.ts';
 import type { ExecutorOutcome } from '../../shared/executor.ts';
-import { messageOf } from '../../shared/guards.ts';
 import { requestLogFields } from '../../shared/identity.ts';
+import { messageOf } from '../../shared/validation.ts';
 import {
   FRAMEWORK_REPLAY_EXHAUSTED,
   FRAMEWORK_SHUTDOWN,

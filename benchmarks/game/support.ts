@@ -12,7 +12,7 @@ import {
   closeBudget,
   DEFAULT_SHUTDOWN_TIMEOUT_MS,
 } from '../../packages/core/src/shared/budget.ts';
-import { messageOf } from '../../packages/core/src/shared/guards.ts';
+import { messageOf } from '../../packages/core/src/shared/validation.ts';
 
 /** Portal lifecycle, stdout parsing and latency statistics for `index.ts`. */
 

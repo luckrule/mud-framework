@@ -1,6 +1,6 @@
 import { resolve } from 'node:path';
 
-import { isRecord } from '../../../packages/core/src/shared/guards.ts';
+import { isRecord } from '../../../packages/core/src/shared/validation.ts';
 
 /**
  * Configuration, fixed-bucket histograms and result types shared by the

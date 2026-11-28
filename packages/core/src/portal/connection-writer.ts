@@ -1,5 +1,5 @@
 import type { Logger } from '../logging/types.ts';
-import { messageOf } from '../shared/guards.ts';
+import { messageOf } from '../shared/validation.ts';
 import type { EventBacklog } from './event-backlog.ts';
 import type { EventWrite, QueueEventResult } from './event-write.ts';
 

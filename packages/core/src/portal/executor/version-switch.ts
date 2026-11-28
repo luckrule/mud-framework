@@ -1,8 +1,8 @@
 import type { SpawnedServer } from '../../ipc/spawn-port.ts';
 import type { Logger } from '../../logging/types.ts';
 import { SHUTDOWN_ACK_SLACK_MS } from '../../shared/budget.ts';
-import { messageOf, toError } from '../../shared/guards.ts';
 import { settleWithin } from '../../shared/timeout.ts';
+import { messageOf, toError } from '../../shared/validation.ts';
 import {
   buildServer,
   closeChannelQuietly,

@@ -1,7 +1,11 @@
-import { isValidClientRequestId } from '../shared/client-request-id.ts';
 import type { ServerEventTarget } from '../shared/events.ts';
 import type { SessionChange } from '../shared/executor.ts';
-import { describeValue, isRecord, messageOf } from '../shared/guards.ts';
+import {
+  describeValue,
+  isRecord,
+  isValidClientRequestId,
+  messageOf,
+} from '../shared/validation.ts';
 import { checkWireCapabilities } from '../storage/capabilities.ts';
 import type { StorageCapabilities } from '../storage/types.ts';
 import type {
