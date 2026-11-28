@@ -144,13 +144,38 @@ export class GameClient {
     });
   }
 
-  call<T = unknown>(method: string, payload?: unknown): Promise<T> {
+  /**
+   * Sends one request and resolves with its result.
+   *
+   * `clientRequestId` is the wire correlation id; a caller that retries the
+   * same logical command passes the same id so the retry is recognisable as a
+   * repeat (logs, duplicate statistics) instead of a new command. Omitted, a
+   * fresh id is minted per call.
+   */
+  call<T = unknown>(
+    method: string,
+    payload?: unknown,
+    clientRequestId?: string,
+  ): Promise<T> {
     if (this.isClosed) {
       return Promise.reject(
         new GameClientError('CLIENT_CLOSED', 'client is closed'),
       );
     }
-    const id = randomUUID();
+    const id = clientRequestId ?? randomUUID();
+    if (id.length === 0) {
+      return Promise.reject(
+        new GameClientError('CLIENT_BAD_ID', 'request id must not be empty'),
+      );
+    }
+    if (this.pending.has(id)) {
+      return Promise.reject(
+        new GameClientError(
+          'CLIENT_DUPLICATE_ID',
+          `request ${id} is already in flight`,
+        ),
+      );
+    }
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);

@@ -6,6 +6,7 @@ import { runServerProcess } from 'mud-framework-core';
 import { SqliteBackend } from 'mud-framework-storage-sqlite';
 
 import { gameExtension } from './game.ts';
+import type { GameVersion } from './game.ts';
 import { initializeWorld } from './world.ts';
 
 /**
@@ -19,6 +20,25 @@ const DEFAULT_DATA_DIRECTORY = fileURLToPath(
   new URL('../data/', import.meta.url),
 );
 const DATABASE_FILENAME = 'game.sqlite';
+const DEFAULT_VERSION: GameVersion = 'v1';
+
+/**
+ * The version is argv rather than an env var on purpose: the Portal's
+ * `spawnBunServer` passes no env, so an env-selected build could not differ
+ * between the initial Server and a `switchTo` replacement.
+ */
+function readVersion(argv: readonly string[]): GameVersion {
+  const raw = argv[2];
+  if (raw === undefined || raw.length === 0) {
+    return DEFAULT_VERSION;
+  }
+  if (raw === 'v1' || raw === 'v2') {
+    return raw;
+  }
+  throw new Error(
+    `unknown server version ${JSON.stringify(raw)}; expected v1 or v2`,
+  );
+}
 
 function dataDirectory(): string {
   const override = process.env.GAME_SLICE_DATA_DIR;
@@ -51,7 +71,7 @@ function messageOf(error: unknown): string {
 try {
   await runServerProcess({
     createBackend: openBackend,
-    extensions: [gameExtension()],
+    extensions: [gameExtension(readVersion(process.argv))],
     timeoutMs: 5000,
   });
 } catch (error) {

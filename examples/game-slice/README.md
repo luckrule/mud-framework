@@ -49,6 +49,30 @@ PORTAL_PORT=9090 bun run examples/game-slice/src/client.ts --name alice
 
 `Ctrl+C` 或 `SIGTERM` 停止 Portal：连接层按自身关闭预算排空在途请求、关闭 Server 并停止监听，正常关闭退出码为 0。Portal 退出后 Server 也会退出；如果 Portal 被 `SIGKILL`，Server 通过 IPC 断开与父进程存活轮询发现并自行停止。
 
+## 版本与热升级演练
+
+`src/server.ts` 读取 `process.argv[2]` 作为版本，只接受 `v1`/`v2`（缺省 `v1`），两者都使用同一套 SQLite schema 与世界种子。唯一的行为差异是 `game.say` 的广播文本：v2 加 `[v2] ` 前缀，客户端因此能看出是哪一版进程在服务（`say` 的响应仍是 `{said:true}`）。版本走 argv 而不是环境变量：`spawnBunServer` 不传 env，Server 继承 Portal 的环境，env 无法区分初始进程与 `switchTo` 切换出的新进程；新版本进程由 Portal 以 `bun run <serverEntry> <version>` 启动。
+
+Portal 默认**不**开控制端点。设置 `GAME_SLICE_CONTROL=1` 后，它才在 `127.0.0.1` 上开一个由操作系统分配端口的 HTTP 监听（不对外暴露），启动时打印：
+
+```
+portal: control on http://127.0.0.1:<port>/switch
+```
+
+关闭是默认值，避免 `bench:load` 等复用同一 Portal 进程的场景被本机任意进程 `POST /switch`。`POST /switch` 的 body 为 `{"version":"v1"|"v2"}`，同一时刻只允许一个切换（并发请求返回 409）。成功返回 `{ok:true, durationMs, fromPid?, toPid?}`，失败返回 500 与 `error`；`fromPid`/`toPid` 取自 executor 的 `server ready` / `replacement server ready` 日志行。初始 Server 固定为 `v1`，`GAME_SLICE_SERVER_ENTRY` 仍然决定 Server 入口（初始进程与替换进程共用）。
+
+手动演练（自己启动 Portal、20 个客户端和临时数据目录，约 6 秒）：
+
+```sh
+bun run examples/game-slice/hot-switch.ts
+```
+
+脚本让 20 个客户端持续发送 look/say/move，期间做 v1 -> v2 -> v1 两次真实切换，并断言：没有断线；任何 `CLIENT_TIMEOUT`/`FRAMEWORK_TIMEOUT` 直接判失败（成功重试不能抵消首次超时，且失败/超时的完整耗时计入延迟样本）；每条命令最终成功；同一客户端在每个窗口内按 `clientRequestId` 的重复不超过 1 次（这是客户端重试计数，不是服务端重复执行的证据，也不构成独立门禁——超时本身已经判失败）；所有客户端循环正常结束，且每个客户端达到按方法的最低命令数；切换窗口内的请求（含失败尝试）与 `room.say` 事件的 p95 都低于 500ms —— 这是体验上限，不是容量承诺；窗口事件 p95 往往只基于 1–2 条样本（注入 + 普通 anchor say），是健全性上限而不是统计估计；切换前 take 的物品与所在房间跨切换保留；Session 绑定不变；`room.say` 文本在 v2 时带前缀、切回 v1 后不再出现；旧 Server pid 退出、新 pid 服务；Portal 正常退出、control 端点不再应答、临时目录已删除。事件缺口只报告不判失败。失败时以非零退出码结束并打印原因；最终 `result:` 在 cleanup 之后输出。启动窗口内收到 `SIGINT`/`SIGTERM` 或 watchdog 超时会先杀 Portal 与已知 Server、有界等待退出，再删除临时目录；`tests/integration/game-slice-hot-switch.lifecycle.test.ts` 覆盖 25/40/55/70ms 的早信号与 Portal stdout 断管。
+
+负载分配：18 个客户端在 `square`/`market` 之间往返（look/say/move），`anchor` 与 `watcher` 两个客户端留在 `smithy` 只发 look/say —— 它们要固定在同一房间，才能用同一对客户端对账 `room.say` 的送达与版本前缀；如果观察者也移动，房间成员变化会让缺口统计失去意义。每个切换窗口要求两类事件样本：一条注入的 say（`POST /switch` 后数毫秒提交，显式断言窗口版本前缀）和至少一条锚点普通循环 say（脚本在窗口开始时唤醒它的下一次暂停，跳过 look 直接提交），后者证明普通负载也真的提交进了窗口，而不是只靠注入样本。
+
+实现按职责拆在 `hot-switch/` 下（`config`、`types`、`support`、`metrics`、`clients`、`loops`、`portal`、`probes`、`switch`、`scenario`、`report`、`lifecycle`），`hot-switch.ts` 只做入口编排。
+
 ## 命令表
 
 交互式客户端读 stdin，一行一个命令；命令与 Handler 的对应以 `src/game.ts` 为准：
@@ -96,13 +120,13 @@ Handler 契约以 `src/game.ts` 的注册元数据为准：
 
 服务端主动事件只走 `ctx.emitToSession`，没有轮询接口；事件名与 payload 以 `src/game.ts` 为准：
 
-| 事件           | 接收者                       | payload                           |
-| -------------- | ---------------------------- | --------------------------------- |
-| `room.say`     | 同房间其他在线玩家           | `{from, text}`                    |
-| `room.left`    | 旧房间其他在线玩家           | `{player, direction, from, to}`   |
-| `room.entered` | 新房间其他在线玩家           | `{player, direction, from, to}`   |
-| `item.taken`   | 拾取者所在房间的其他在线玩家 | `{player, item: {id,name}, room}` |
-| `item.dropped` | 丢弃者所在房间的其他在线玩家 | `{player, item: {id,name}, room}` |
+| 事件           | 接收者                       | payload                                      |
+| -------------- | ---------------------------- | -------------------------------------------- |
+| `room.say`     | 同房间其他在线玩家           | `{from, text}`；v2 的 `text` 以 `[v2] ` 开头 |
+| `room.left`    | 旧房间其他在线玩家           | `{player, direction, from, to}`              |
+| `room.entered` | 新房间其他在线玩家           | `{player, direction, from, to}`              |
+| `item.taken`   | 拾取者所在房间的其他在线玩家 | `{player, item: {id,name}, room}`            |
+| `item.dropped` | 丢弃者所在房间的其他在线玩家 | `{player, item: {id,name}, room}`            |
 
 投递语义（ADR-0008）：
 
