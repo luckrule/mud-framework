@@ -31,7 +31,12 @@ import {
 import { ResourceSampler } from './resources.ts';
 import { readServerStatsFile } from './server-stats.ts';
 import type { ServerStatsRead } from './server-stats.ts';
-import { effectiveThinkMs, mixText, readMainConfig } from './support.ts';
+import {
+  effectiveThinkMs,
+  mixText,
+  readMainConfig,
+  serverStatsLabel,
+} from './support.ts';
 import type { MainConfig } from './support.ts';
 
 /**
@@ -139,7 +144,7 @@ async function main(): Promise<void> {
   write('mud-framework player-level load benchmark');
   write(environmentLine({ cores: true }));
   write(
-    `config: clients=${integerText(config.clients)} senders=${integerText(config.senders)} listeners=${integerText(config.clients - config.senders)} generators=${config.generators} room-size=${config.shared.roomSize} mode=${config.shared.mode} duration=${config.shared.durationSec}s warmup=${config.shared.warmupSec}s think=${thinkMs}ms mix=${mixText(config.shared.mix)} request-timeout=${config.shared.requestTimeoutMs}ms`,
+    `config: clients=${integerText(config.clients)} senders=${integerText(config.senders)} listeners=${integerText(config.clients - config.senders)} generators=${config.generators} room-size=${config.shared.roomSize} mode=${config.shared.mode} duration=${config.shared.durationSec}s warmup=${config.shared.warmupSec}s think=${thinkMs}ms mix=${mixText(config.shared.mix)} request-timeout=${config.shared.requestTimeoutMs}ms server-stats=${serverStatsLabel(config.shared.externalUrl, config.serverStats)}`,
   );
 
   let portal: PortalHandle | undefined;
@@ -168,11 +173,18 @@ async function main(): Promise<void> {
       if (dirs.dataDir === undefined) {
         throw new Error('internal: spawn path has no data directory');
       }
-      serverStatsFile = join(dirs.resultsDir, 'server-stats.json');
-      portal = await startLoadPortal(dirs.dataDir, config.shared, {
-        serverStatsFile,
-        senderSessions,
-      });
+      if (config.serverStats) {
+        serverStatsFile = join(dirs.resultsDir, 'server-stats.json');
+        portal = await startLoadPortal(dirs.dataDir, config.shared, {
+          serverStats: true,
+          serverStatsFile,
+          senderSessions,
+        });
+      } else {
+        portal = await startLoadPortal(dirs.dataDir, config.shared, {
+          serverStats: false,
+        });
+      }
       url = portal.url;
       write(`portal: spawned pid ${portal.pid}, listening on ${url}`);
     }
@@ -221,12 +233,16 @@ async function main(): Promise<void> {
     if (resources !== undefined) {
       printResources(resources);
     }
-    if (serverStats !== undefined) {
-      printServerStats(serverStats, config.senders);
-    } else if (config.shared.externalUrl !== undefined) {
+    if (config.shared.externalUrl !== undefined) {
       write(
         'server ipc/handler stats: skipped (LOAD_URL reuses an external Portal that does not run the benchmark Server entry)',
       );
+    } else if (!config.serverStats) {
+      write(
+        'server ipc/handler stats: server-stats disabled (the production Server entry ran without the benchmark counting channel)',
+      );
+    } else if (serverStats !== undefined) {
+      printServerStats(serverStats, config.senders);
     }
   }
 

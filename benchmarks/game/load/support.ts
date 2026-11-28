@@ -63,6 +63,49 @@ export interface MainConfig {
   readonly generators: number;
   readonly dataDirectory: string | undefined;
   readonly keep: boolean;
+  /** Spawn the benchmark-local counting Server; off uses the production entry. */
+  readonly serverStats: boolean;
+}
+
+/**
+ * `LOAD_SERVER_STATS` defaults on so existing runs keep the counting Server.
+ * Off prices the production entry without the benchmark's own frame and
+ * handler instrumentation. Any value outside the two sets, including an empty
+ * string, is rejected: a typo must not silently change what a run measures.
+ */
+export function parseServerStatsEnabled(raw: string | undefined): boolean {
+  if (raw === undefined) {
+    return true;
+  }
+  const text = raw.trim().toLowerCase();
+  switch (text) {
+    case 'true':
+    case '1':
+    case 'on': {
+      return true;
+    }
+    case 'false':
+    case '0':
+    case 'off': {
+      return false;
+    }
+    default: {
+      throw new Error(
+        `LOAD_SERVER_STATS must be true/1/on or false/0/off, got ${JSON.stringify(raw)}`,
+      );
+    }
+  }
+}
+
+/** The run header must not claim instrumentation an external Portal lacks. */
+export function serverStatsLabel(
+  externalUrl: string | undefined,
+  enabled: boolean,
+): string {
+  if (externalUrl !== undefined) {
+    return 'n/a (external portal)';
+  }
+  return enabled ? 'on' : 'off';
 }
 
 function parseInteger(name: string, raw: string, minimum: number): number {
@@ -239,6 +282,39 @@ export function measurementWindow(
   return { fromMs, untilMs: fromMs + durationSec * 1000 };
 }
 
+/** Fixed soak bucket for event latency, anchored at the measurement start. */
+export const EVENT_WINDOW_MS = 300_000;
+
+/**
+ * Window index of an event, bucketed by its token send time rather than its
+ * arrival: every generator shares the coordinator's measurement start, so the
+ * same send timestamp lands in the same window across processes. A token sent
+ * exactly on a boundary starts the next window, matching half-open buckets.
+ */
+export function eventWindowIndex(
+  sentAtMs: number,
+  measurementFromMs: number,
+): number {
+  return Math.max(
+    0,
+    Math.floor((sentAtMs - measurementFromMs) / EVENT_WINDOW_MS),
+  );
+}
+
+/**
+ * Highest window index a result may carry: the last bucket that starts inside
+ * its measurement window, plus the endpoint bucket that older half-open
+ * filters could still produce. Anything above it is a corrupt or hand-edited
+ * index and would otherwise drive the report's empty-window fill loop.
+ */
+export function maxEventWindowIndex(
+  measurementFromMs: number,
+  measurementUntilMs: number,
+): number {
+  const durationMs = Math.max(0, measurementUntilMs - measurementFromMs);
+  return Math.ceil(durationMs / EVENT_WINDOW_MS);
+}
+
 function defaultRunTag(): string {
   const random = Math.floor(Math.random() * 36 ** 4)
     .toString(36)
@@ -307,6 +383,7 @@ export function readMainConfig(): MainConfig {
         ? resolve(dataRaw)
         : undefined,
     keep: process.env.LOAD_KEEP === '1',
+    serverStats: parseServerStatsEnabled(process.env.LOAD_SERVER_STATS),
   };
 }
 
@@ -535,6 +612,18 @@ export interface CommandResultJson {
 }
 
 /**
+ * One fixed 5-minute bucket of event latency. Bounds are absolute epoch
+ * milliseconds derived from the generator's measurement start; only windows
+ * with at least one sample are stored, so long quiet stretches stay compact.
+ */
+export interface EventWindowJson {
+  readonly index: number;
+  readonly fromMs: number;
+  readonly untilMs: number;
+  readonly histogram: HistogramJson;
+}
+
+/**
  * Every `say` carries a token. `epoch` increments when the sender changes
  * rooms and `seq` is the sender's next successful-say counter. Failed say
  * attempts do not consume a seq, so a receiver can count missing sequence
@@ -557,6 +646,8 @@ export interface EventResultJson {
   readonly lateEpoch: number;
   readonly unparsed: number;
   readonly histogram: HistogramJson;
+  /** Absent in results written before windowed event latency was added. */
+  readonly windows?: readonly EventWindowJson[];
 }
 
 export interface LoadResultJson {
@@ -602,9 +693,67 @@ function parseCommandResult(value: unknown, label: string): CommandResultJson {
   };
 }
 
-function parseEventResult(value: unknown): EventResultJson {
+function parseEventWindow(
+  value: unknown,
+  label: string,
+  measuredFromMs: number,
+  measuredUntilMs: number,
+): EventWindowJson {
+  if (!isRecord(value)) {
+    throw new Error(`${label} is not an object`);
+  }
+  const index = readIntegerField(value, 'index', label);
+  const maximum = maxEventWindowIndex(measuredFromMs, measuredUntilMs);
+  if (index > maximum) {
+    throw new Error(
+      `${label}.index ${index} exceeds the measurement window (max ${maximum})`,
+    );
+  }
+  const expectedFromMs = measuredFromMs + index * EVENT_WINDOW_MS;
+  const expectedUntilMs = expectedFromMs + EVENT_WINDOW_MS;
+  const fromMs = readNumberField(value, 'fromMs', label);
+  const untilMs = readNumberField(value, 'untilMs', label);
+  if (fromMs !== expectedFromMs || untilMs !== expectedUntilMs) {
+    throw new Error(
+      `${label} spans ${fromMs}-${untilMs} ms, expected ${expectedFromMs}-${expectedUntilMs} ms from the measurement start`,
+    );
+  }
+  return {
+    index,
+    fromMs,
+    untilMs,
+    histogram: parseHistogramJson(value.histogram, `${label}.histogram`),
+  };
+}
+
+function parseEventResult(
+  value: unknown,
+  measuredFromMs: number,
+  measuredUntilMs: number,
+): EventResultJson {
   if (!isRecord(value)) {
     throw new Error('events is not an object');
+  }
+  let windows: readonly EventWindowJson[] | undefined;
+  if (value.windows !== undefined) {
+    if (!Array.isArray(value.windows)) {
+      throw new Error('events.windows is not an array');
+    }
+    windows = value.windows.map((entry, index) =>
+      parseEventWindow(
+        entry,
+        `events.windows[${index}]`,
+        measuredFromMs,
+        measuredUntilMs,
+      ),
+    );
+    const seen = new Set<number>();
+    for (const window of windows) {
+      if (seen.has(window.index)) {
+        throw new Error(`events.windows repeats index ${window.index}`);
+      }
+      seen.add(window.index);
+    }
   }
   return {
     saysAttempted: readIntegerField(value, 'saysAttempted', 'events'),
@@ -617,6 +766,7 @@ function parseEventResult(value: unknown): EventResultJson {
     lateEpoch: readIntegerField(value, 'lateEpoch', 'events'),
     unparsed: readIntegerField(value, 'unparsed', 'events'),
     histogram: parseHistogramJson(value.histogram, 'events.histogram'),
+    windows,
   };
 }
 
@@ -659,7 +809,7 @@ export function parseLoadResultJson(value: unknown): LoadResultJson {
       move: parseCommandResult(commandsRaw.move, 'commands.move'),
       say: parseCommandResult(commandsRaw.say, 'commands.say'),
     },
-    events: parseEventResult(value.events),
+    events: parseEventResult(value.events, measuredFromMs, measuredUntilMs),
     errors: parseCountRecord(value.errors, 'errors'),
     rooms: parseCountRecord(value.rooms, 'rooms'),
   };

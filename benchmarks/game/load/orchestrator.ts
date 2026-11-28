@@ -47,11 +47,38 @@ const GENERATOR_KILL_WAIT_MS = 3000;
 
 type GeneratorProcess = Bun.Subprocess<'pipe', 'pipe', 'inherit'>;
 
-export interface LoadPortalOptions {
-  /** Benchmark-local Server writes its frame/handler counters here. */
-  readonly serverStatsFile: string;
-  /** Session ids of the sender clients, for the handler duration filter. */
-  readonly senderSessions: readonly string[];
+export type LoadPortalOptions =
+  | {
+      readonly serverStats: true;
+      /** Benchmark-local Server writes its frame/handler counters here. */
+      readonly serverStatsFile: string;
+      /** Session ids of the sender clients, for the handler duration filter. */
+      readonly senderSessions: readonly string[];
+    }
+  | { readonly serverStats: false };
+
+/**
+ * The Portal reads `GAME_SLICE_SERVER_ENTRY` for its Server child, so the
+ * counting entry and the two stats variables only travel together. Disabled
+ * runs explicitly blank all three: `startPortal` merges `process.env`, and an
+ * inherited value must not select the counting entry when the run claims the
+ * production one. The Portal treats an empty entry as its default.
+ */
+export function loadPortalExtraEnv(
+  options: LoadPortalOptions,
+): Readonly<Record<string, string>> {
+  if (!options.serverStats) {
+    return {
+      GAME_SLICE_SERVER_ENTRY: '',
+      BENCH_SERVER_STATS: '',
+      BENCH_SENDER_SESSIONS: '',
+    };
+  }
+  return {
+    GAME_SLICE_SERVER_ENTRY: BENCH_SERVER_ENTRY,
+    BENCH_SERVER_STATS: options.serverStatsFile,
+    BENCH_SENDER_SESSIONS: options.senderSessions.join(','),
+  };
 }
 
 export async function startLoadPortal(
@@ -64,11 +91,7 @@ export async function startLoadPortal(
     dataDirectory,
     requestTimeoutMs: shared.requestTimeoutMs,
     readyTimeoutMs: READY_TIMEOUT_MS,
-    extraEnv: {
-      GAME_SLICE_SERVER_ENTRY: BENCH_SERVER_ENTRY,
-      BENCH_SERVER_STATS: options.serverStatsFile,
-      BENCH_SENDER_SESSIONS: options.senderSessions.join(','),
-    },
+    extraEnv: loadPortalExtraEnv(options),
   });
 }
 
