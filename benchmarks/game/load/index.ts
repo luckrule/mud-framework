@@ -1,9 +1,11 @@
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
-import { cpus, release, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { messageOf } from '../../../packages/core/src/shared/guards.ts';
+import { environmentLine } from '../../environment.ts';
 import { shouldRemoveDataDir } from '../cleanup.ts';
-import { integerText, messageOf, write, writeError } from '../support.ts';
+import { integerText, write, writeError } from '../support.ts';
 import type { PortalHandle } from '../support.ts';
 import {
   collectResults,
@@ -41,11 +43,6 @@ import type { MainConfig } from './support.ts';
  * process and generator lifecycle live in `orchestrator.ts`, aggregation and
  * formatting in `report.ts`, sampling in `resources.ts`.
  */
-
-function environmentLine(): string {
-  const cpu = cpus()[0]?.model ?? 'unknown CPU';
-  return `Bun ${process.versions.bun ?? 'unknown'}  ${process.platform} ${process.arch}  kernel ${release()}  ${cpu}  cores ${cpus().length}`;
-}
 
 interface Directories {
   readonly scratchDir: string;
@@ -131,7 +128,7 @@ async function main(): Promise<void> {
   const thinkMs = effectiveThinkMs(config.shared);
 
   write('mud-framework player-level load benchmark');
-  write(environmentLine());
+  write(environmentLine({ cores: true }));
   write(
     `config: clients=${integerText(config.clients)} generators=${config.generators} room-size=${config.shared.roomSize} mode=${config.shared.mode} duration=${config.shared.durationSec}s warmup=${config.shared.warmupSec}s think=${thinkMs}ms mix=${mixText(config.shared.mix)} request-timeout=${config.shared.requestTimeoutMs}ms`,
   );

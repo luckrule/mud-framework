@@ -1,19 +1,18 @@
 import { writeFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 
+import { sleep, withDeadline } from 'mud-framework-test-support';
+
 import {
   GameClient,
   GameClientError,
 } from '../../../examples/game-slice/src/client-lib.ts';
 import type { GameEvent } from '../../../examples/game-slice/src/client-lib.ts';
-
 import {
+  isRecord,
   messageOf,
-  sleep,
-  withDeadline,
-  write,
-  writeError,
-} from '../support.ts';
+} from '../../../packages/core/src/shared/guards.ts';
+import { write, writeError } from '../support.ts';
 import {
   beginSaySequence,
   commitSaySequence,
@@ -138,10 +137,6 @@ const measurement = {
   fromMs: 0,
   untilMs: Number.POSITIVE_INFINITY,
 };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 function roomIdOf(result: unknown): string | undefined {
   if (!isRecord(result) || !isRecord(result.room)) {
@@ -597,7 +592,6 @@ function resultJson(
   config: GeneratorConfig,
   stats: GeneratorStats,
   setupMs: number,
-  startedAtMs: number,
   measuredFromMs: number,
   measuredUntilMs: number,
 ): LoadResultJson {
@@ -606,7 +600,6 @@ function resultJson(
     generator: config.generator,
     clients: config.clients,
     setupMs,
-    startedAtMs,
     measuredFromMs,
     measuredUntilMs,
     commands: {
@@ -626,7 +619,6 @@ async function runGenerator(config: GeneratorConfig): Promise<void> {
   const clients: ClientRuntime[] = [];
   const setupStartedMs = Date.now();
   let setupMs = 0;
-  let startedAtMs = 0;
   let measuredFromMs = 0;
   let measuredUntilMs = 0;
   try {
@@ -640,8 +632,7 @@ async function runGenerator(config: GeneratorConfig): Promise<void> {
 
     // The barrier is the single release point for measurement.
     await waitForGo();
-    startedAtMs = Date.now();
-    measuredFromMs = startedAtMs + config.shared.warmupSec * 1000;
+    measuredFromMs = Date.now() + config.shared.warmupSec * 1000;
     measuredUntilMs = measuredFromMs + config.shared.durationSec * 1000;
     measurement.fromMs = measuredFromMs;
     measurement.untilMs = measuredUntilMs;
@@ -674,14 +665,7 @@ async function runGenerator(config: GeneratorConfig): Promise<void> {
   writeFileSync(
     config.resultFile,
     JSON.stringify(
-      resultJson(
-        config,
-        stats,
-        setupMs,
-        startedAtMs,
-        measuredFromMs,
-        measuredUntilMs,
-      ),
+      resultJson(config, stats, setupMs, measuredFromMs, measuredUntilMs),
     ),
   );
   write('done');

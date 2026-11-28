@@ -1,24 +1,28 @@
 import { rmSync } from 'node:fs';
 import { resolve } from 'node:path';
 
+import {
+  isProcessAlive,
+  sleep,
+  withDeadline,
+} from 'mud-framework-test-support';
+
+import {
+  isRecord,
+  messageOf,
+} from '../../../packages/core/src/shared/guards.ts';
 import { portalStopFailed, shouldRemoveDataDir } from '../cleanup.ts';
 import {
   integerText,
-  isProcessAlive,
   latencyStats,
   latencyText,
-  messageOf,
+  portalStopBudgetMs,
   pumpLines,
-  sleep,
-  withDeadline,
   write,
   writeError,
 } from '../support.ts';
 import type { LatencyStats, PortalStopResult } from '../support.ts';
 import {
-  PORTAL_EXECUTOR_CLOSE_SLACK_MS,
-  PORTAL_SHUTDOWN_TIMEOUT_MS,
-  deriveExternalStopBudget,
   parsePortalCloseBudgetMs,
   resolveExecutorCloseBudget,
 } from './budget.ts';
@@ -113,7 +117,6 @@ export interface SwitchMarkers {
   readonly measureStartNs: number;
   readonly endNs: number;
   triggerNs: number | undefined;
-  resolvedNs: number | undefined;
   windowEndNs: number | undefined;
 }
 
@@ -243,10 +246,6 @@ export interface SwitchReply {
   readonly ok: boolean;
   readonly durationNs: number;
   readonly error: string | undefined;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 export async function requestSwitch(controlUrl: string): Promise<SwitchReply> {
@@ -443,11 +442,7 @@ export async function startSwitchPortal(options: {
       : undefined;
 
   const resolved = resolveExecutorCloseBudget(reportedCloseBudgetMs);
-  const stopBudgetMs = deriveExternalStopBudget({
-    connectionShutdownMs: PORTAL_SHUTDOWN_TIMEOUT_MS,
-    executorCloseBudgetMs: resolved.closeBudgetMs,
-    executorCloseSlackMs: PORTAL_EXECUTOR_CLOSE_SLACK_MS,
-  });
+  const stopBudgetMs = portalStopBudgetMs();
   if (!resolved.reported) {
     writeError(
       `switch benchmark warning: the Portal did not report its executor close budget; falling back to the ${resolved.closeBudgetMs} ms snapshot (stop budget ${stopBudgetMs} ms)`,

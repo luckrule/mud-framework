@@ -7,7 +7,8 @@ import {
   spawnBunServer,
 } from 'mud-framework-core';
 
-import { PORTAL_SHUTDOWN_TIMEOUT_MS } from './budget.ts';
+import { DEFAULT_SHUTDOWN_TIMEOUT_MS } from '../../../packages/core/src/shared/budget.ts';
+import { messageOf } from '../../../packages/core/src/shared/guards.ts';
 
 /**
  * The benchmark Portal: the same assembly as `examples/game-slice/src/portal.ts`
@@ -21,10 +22,6 @@ const SHUTDOWN_SIGNALS = ['SIGINT', 'SIGTERM'] as const;
 const SERVER_ENTRY = fileURLToPath(
   new URL('../../../examples/game-slice/src/server.ts', import.meta.url),
 );
-
-function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
 
 function readPort(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -65,10 +62,10 @@ async function main(): Promise<void> {
       }),
     timeoutMs: 5000,
     startTimeoutMs: 10_000,
-    shutdownTimeoutMs: PORTAL_SHUTDOWN_TIMEOUT_MS,
+    shutdownTimeoutMs: DEFAULT_SHUTDOWN_TIMEOUT_MS,
   });
-  // The coordinator derives its stop budget from this line, so the benchmark
-  // never waits on a stale copy of core's close budget.
+  // The coordinator reports this live budget, so a changed core budget shows
+  // up in the run header instead of hiding behind a copied constant.
   write(`portal: executor close budget ${executor.closeBudgetMs} ms`);
   const transport = new WsTransport({
     port: portalPort,
@@ -77,7 +74,7 @@ async function main(): Promise<void> {
   const layer = new ConnectionLayer({
     transport,
     executor,
-    shutdownTimeoutMs: PORTAL_SHUTDOWN_TIMEOUT_MS,
+    shutdownTimeoutMs: DEFAULT_SHUTDOWN_TIMEOUT_MS,
   });
 
   // One switch at a time: the coordinator only sends one, but a second caller

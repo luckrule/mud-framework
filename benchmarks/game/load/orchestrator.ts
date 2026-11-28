@@ -1,15 +1,11 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { withDeadline } from 'mud-framework-test-support';
+
+import { messageOf } from '../../../packages/core/src/shared/guards.ts';
 import { portalStopFailed } from '../cleanup.ts';
-import {
-  messageOf,
-  pumpLines,
-  startPortal,
-  withDeadline,
-  write,
-  writeError,
-} from '../support.ts';
+import { pumpLines, startPortal, write, writeError } from '../support.ts';
 import type { PortalHandle } from '../support.ts';
 import { mixText, parseLoadResultJson } from './support.ts';
 import type {

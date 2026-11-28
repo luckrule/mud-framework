@@ -1,20 +1,16 @@
 import { mkdtempSync } from 'node:fs';
-import { cpus, release, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+import { sleep, withDeadline } from 'mud-framework-test-support';
 
 import {
   GameClient,
   GameClientError,
 } from '../../../examples/game-slice/src/client-lib.ts';
 import type { GameEvent } from '../../../examples/game-slice/src/client-lib.ts';
-
-import {
-  integerText,
-  sleep,
-  withDeadline,
-  write,
-  writeError,
-} from '../support.ts';
+import { environmentLine } from '../../environment.ts';
+import { integerText, write, writeError } from '../support.ts';
 import {
   BASELINE_MS,
   WINDOW_MARGIN_MS,
@@ -53,11 +49,6 @@ const EVENT_DRAIN_MS = 1000;
 const LOGOUT_TIMEOUT_MS = 1000;
 const EVENT_PREFIX = 'switchevent';
 
-function environmentLine(): string {
-  const cpu = cpus()[0]?.model ?? 'unknown CPU';
-  return `Bun ${process.versions.bun ?? 'unknown'}  ${process.platform} ${process.arch}  kernel ${release()}  ${cpu}`;
-}
-
 function writeSection(heading: string, ...lines: readonly string[]): void {
   write(`\n${heading}\n  ${lines.join('\n  ')}`);
 }
@@ -95,8 +86,6 @@ async function closeClients(clients: readonly GameClient[]): Promise<void> {
 }
 
 interface ClientRun {
-  readonly index: number;
-  readonly requests: number;
   readonly disconnected: boolean;
 }
 
@@ -111,7 +100,6 @@ async function runLookClient(
   endNs: number,
   samples: RequestSample[],
 ): Promise<ClientRun> {
-  let requests = 0;
   let disconnected = false;
   while (Bun.nanoseconds() < endNs) {
     const startNs = Bun.nanoseconds();
@@ -139,14 +127,13 @@ async function runLookClient(
         break;
       }
     }
-    requests += 1;
     const waitNs = startNs + intervalMs * 1e6 - Bun.nanoseconds();
     if (waitNs > 0) {
       // oxlint-disable-next-line eslint/no-await-in-loop -- the interval is the measurement
       await sleep(waitNs / 1e6);
     }
   }
-  return { index, requests, disconnected };
+  return { disconnected };
 }
 
 function emptyPhases(): Record<Phase, number> {
@@ -319,7 +306,6 @@ async function runScenario(
       measureStartNs: runStartNs + config.warmupSec * 1e9,
       endNs: runStartNs + config.durationSec * 1e9,
       triggerNs: undefined,
-      resolvedNs: undefined,
       windowEndNs: undefined,
     };
     const samples: RequestSample[] = [];
@@ -351,8 +337,8 @@ async function runScenario(
       };
     }
     const controlRoundtripNs = Bun.nanoseconds() - roundtripStarted;
-    markers.resolvedNs = Bun.nanoseconds();
-    markers.windowEndNs = markers.resolvedNs + WINDOW_MARGIN_MS * 1e6;
+    const resolvedNs = Bun.nanoseconds();
+    markers.windowEndNs = resolvedNs + WINDOW_MARGIN_MS * 1e6;
 
     await sleepUntil(markers.endNs);
     const runs = await lookRuns;

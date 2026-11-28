@@ -1,8 +1,9 @@
 import { writeSync } from 'node:fs';
-import { cpus, release } from 'node:os';
 
 import { createJsonLogger, safeLogger } from 'mud-framework-core';
 import type { LogFields, Logger } from 'mud-framework-core';
+
+import { environmentLine } from './environment.ts';
 
 /**
  * Per-call cost of `safeLogger` and of JSON serialization, measured with real
@@ -236,11 +237,6 @@ function assertPositive(samples: GroupSamples, label: string): void {
       throw new Error(`${label}: non-positive sample ${String(value)}`);
     }
   }
-}
-
-function environmentLine(): string {
-  const cpu = cpus()[0]?.model ?? 'unknown CPU';
-  return `Bun ${process.versions.bun ?? 'unknown'}  ${process.platform} ${process.arch}  kernel ${release()}  ${cpu}`;
 }
 
 interface GroupLabels {

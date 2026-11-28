@@ -4,94 +4,15 @@ import {
   closeBudget,
   DEFAULT_SHUTDOWN_TIMEOUT_MS,
 } from '../../../packages/core/src/shared/budget.ts';
+import { portalStopBudgetMs } from '../support.ts';
 import {
-  PORTAL_EXECUTOR_CLOSE_BUDGET_MS,
-  PORTAL_SHUTDOWN_TIMEOUT_MS,
-  PORTAL_STOP_BUDGET_MS,
-  STOP_DIAGNOSTIC_MARGIN_MS,
-  deriveExternalStopBudget,
   parsePortalCloseBudgetMs,
   resolveExecutorCloseBudget,
 } from './budget.ts';
 import { phaseLine, summarizePhase } from './support.ts';
 import type { RequestSample, SwitchMarkers } from './support.ts';
 
-const PORTAL_BUDGET = {
-  connectionShutdownMs: 5000,
-  executorCloseBudgetMs: 23_250,
-  executorCloseSlackMs: 1000,
-} as const;
-
-describe('external stop budget (ADR-0004)', () => {
-  test('the benchmark Portal waits above the documented bound', () => {
-    // C + max(C, E + S) + C = 5000 + 24250 + 5000 = 34250.
-    expect(
-      deriveExternalStopBudget({
-        ...PORTAL_BUDGET,
-        diagnosticMarginMs: 0,
-      }),
-    ).toBe(34_250);
-    expect(PORTAL_STOP_BUDGET_MS).toBe(34_250 + STOP_DIAGNOSTIC_MARGIN_MS);
-  });
-
-  test('follows C + max(C, E + S) + C', () => {
-    expect(
-      deriveExternalStopBudget({
-        connectionShutdownMs: 100,
-        executorCloseBudgetMs: 1000,
-        executorCloseSlackMs: 50,
-        diagnosticMarginMs: 0,
-      }),
-    ).toBe(100 + 1050 + 100);
-  });
-
-  test('the connection timeout wins when E + S is smaller', () => {
-    expect(
-      deriveExternalStopBudget({
-        connectionShutdownMs: 5000,
-        executorCloseBudgetMs: 100,
-        executorCloseSlackMs: 0,
-        diagnosticMarginMs: 0,
-      }),
-    ).toBe(15_000);
-  });
-
-  test('an executor that declares no budget falls back to C', () => {
-    expect(
-      deriveExternalStopBudget({
-        connectionShutdownMs: 5000,
-        executorCloseBudgetMs: undefined,
-        executorCloseSlackMs: 1000,
-        diagnosticMarginMs: 0,
-      }),
-    ).toBe(15_000);
-  });
-
-  test('the diagnostic margin defaults and can be overridden', () => {
-    const bound = deriveExternalStopBudget({
-      ...PORTAL_BUDGET,
-      diagnosticMarginMs: 0,
-    });
-    expect(deriveExternalStopBudget(PORTAL_BUDGET)).toBe(
-      bound + STOP_DIAGNOSTIC_MARGIN_MS,
-    );
-    expect(
-      deriveExternalStopBudget({ ...PORTAL_BUDGET, diagnosticMarginMs: 2500 }),
-    ).toBe(bound + 2500);
-  });
-});
-
-describe('executor close budget from the Portal (drift guard)', () => {
-  test('the snapshot matches the core close budget', () => {
-    // The Portal reports its live budget; this copy is the fallback, so it has
-    // to be re-derived here. Asserting against the same constant would stay
-    // green after core changed its formula.
-    expect(PORTAL_EXECUTOR_CLOSE_BUDGET_MS).toBe(
-      closeBudget(DEFAULT_SHUTDOWN_TIMEOUT_MS),
-    );
-    expect(PORTAL_SHUTDOWN_TIMEOUT_MS).toBe(DEFAULT_SHUTDOWN_TIMEOUT_MS);
-  });
-
+describe('executor close budget from the Portal', () => {
   test('reads the live budget the Portal prints', () => {
     expect(
       parsePortalCloseBudgetMs('portal: executor close budget 23250 ms'),
@@ -129,29 +50,21 @@ describe('executor close budget from the Portal (drift guard)', () => {
       reported: true,
     });
     expect(resolveExecutorCloseBudget(undefined)).toEqual({
-      closeBudgetMs: PORTAL_EXECUTOR_CLOSE_BUDGET_MS,
+      closeBudgetMs: closeBudget(DEFAULT_SHUTDOWN_TIMEOUT_MS),
       reported: false,
     });
   });
+});
 
-  test('a reported budget drives the stop budget, not the snapshot', () => {
-    const reported = resolveExecutorCloseBudget(31_000);
-    expect(
-      deriveExternalStopBudget({
-        connectionShutdownMs: 5000,
-        executorCloseBudgetMs: reported.closeBudgetMs,
-        executorCloseSlackMs: 1000,
-        diagnosticMarginMs: 0,
-      }),
-    ).toBe(5000 + 32_000 + 5000);
-  });
+test('the external stop budget covers the ADR-0004 bound', () => {
+  // C=5000 (Portal config), E=closeBudget(5000)=23250, S=1000, margin=1000.
+  expect(portalStopBudgetMs()).toBe(35_250);
 });
 
 const MARKERS: SwitchMarkers = {
   measureStartNs: 0,
   endNs: 1_000_000,
   triggerNs: 100,
-  resolvedNs: 200,
   windowEndNs: 300,
 };
 

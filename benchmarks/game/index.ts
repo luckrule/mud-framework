@@ -1,24 +1,27 @@
 import { mkdtempSync, rmSync } from 'node:fs';
-import { cpus, release, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+import {
+  isProcessAlive,
+  sleep,
+  withDeadline,
+} from 'mud-framework-test-support';
 
 import { GameClient } from '../../examples/game-slice/src/client-lib.ts';
 import type { GameEvent } from '../../examples/game-slice/src/client-lib.ts';
-
+import { messageOf } from '../../packages/core/src/shared/guards.ts';
+import { environmentLine } from '../environment.ts';
 import { portalStopFailed, shouldRemoveDataDir } from './cleanup.ts';
 import {
   envInt,
   envIntList,
   integerText,
-  isProcessAlive,
   latencyStats,
   latencyText,
-  messageOf,
   millisecondsText,
-  sleep,
   startPortal,
   throughputText,
-  withDeadline,
   write,
   writeError,
 } from './support.ts';
@@ -57,11 +60,6 @@ const RESTART_TIMEOUT_MS = 30_000;
  * an earlier run, and the move scenario depends on a fresh player's start room.
  */
 const RUN_TAG = `${process.pid.toString(36)}${Date.now().toString(36).slice(-6)}`;
-
-function environmentLine(): string {
-  const cpu = cpus()[0]?.model ?? 'unknown CPU';
-  return `Bun ${process.versions.bun ?? 'unknown'}  ${process.platform} ${process.arch}  kernel ${release()}  ${cpu}`;
-}
 
 function emptyToUndefined(value: string | undefined): string | undefined {
   return value !== undefined && value.length > 0 ? value : undefined;

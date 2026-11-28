@@ -1,11 +1,46 @@
 import { writeSync } from 'node:fs';
 
+import {
+  isProcessAlive,
+  LineReader,
+  sleep,
+  withDeadline,
+} from 'mud-framework-test-support';
+
+import { EXECUTOR_CLOSE_SLACK_MS } from '../../packages/core/src/portal/connection-layer-options.ts';
+import {
+  closeBudget,
+  DEFAULT_SHUTDOWN_TIMEOUT_MS,
+} from '../../packages/core/src/shared/budget.ts';
+import { messageOf } from '../../packages/core/src/shared/guards.ts';
+
 /** Portal lifecycle, stdout parsing and latency statistics for `index.ts`. */
 
 const POLL_INTERVAL_MS = 25;
-const PORTAL_EXIT_TIMEOUT_MS = 10_000;
 const FORCE_EXIT_TIMEOUT_MS = 5000;
 const SERVER_EXIT_TIMEOUT_MS = 5000;
+
+/** Headroom above the legal bound, so a slow stop is not read as a hang. */
+export const STOP_DIAGNOSTIC_MARGIN_MS = 1000;
+
+/**
+ * ADR-0004 bounds an external `ConnectionLayer.stop()` by
+ * `C + max(C, E + S) + C`: connection-layer drain, executor close (the
+ * executor's declared budget plus slack), then transport close. `C` is the
+ * `shutdownTimeoutMs` both benchmark Portals configure explicitly, which is
+ * `DEFAULT_SHUTDOWN_TIMEOUT_MS` — not the connection layer's option default.
+ * `E` is core's close budget for that same grace, and `S` is
+ * `EXECUTOR_CLOSE_SLACK_MS`. Waiting less than this kills a Server that is
+ * closing legally; a Portal whose configuration changes must change this too.
+ */
+export function portalStopBudgetMs(): number {
+  const connectionMs = DEFAULT_SHUTDOWN_TIMEOUT_MS;
+  const executorMs = Math.max(
+    connectionMs,
+    closeBudget(DEFAULT_SHUTDOWN_TIMEOUT_MS) + EXECUTOR_CLOSE_SLACK_MS,
+  );
+  return connectionMs + executorMs + connectionMs + STOP_DIAGNOSTIC_MARGIN_MS;
+}
 
 export function write(line: string): void {
   writeSync(1, `${line}\n`);
@@ -15,56 +50,19 @@ export function writeError(line: string): void {
   writeSync(2, `${line}\n`);
 }
 
-export function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-export function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-export function withDeadline<T>(
-  promise: Promise<T>,
-  timeoutMs: number,
-  description: string,
-): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => {
-      reject(new Error(`${description} within ${timeoutMs}ms`));
-    }, timeoutMs);
-  });
-  return Promise.race([promise, timeout]).finally(() => {
-    if (timer !== undefined) {
-      clearTimeout(timer);
-    }
-  });
-}
-
 /** Calls `onLine` for every newline-terminated chunk plus the trailing line. */
 export async function pumpLines(
   stream: ReadableStream<Uint8Array<ArrayBuffer>>,
   onLine: (line: string) => void,
 ): Promise<void> {
-  const reader = stream.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
+  const reader = new LineReader(stream);
   for (;;) {
     // oxlint-disable-next-line eslint/no-await-in-loop -- a stream yields chunks over time; reading the next one is the operation itself
-    const chunk = await reader.read();
-    if (chunk.done) {
-      if (buffer.length > 0) {
-        onLine(buffer);
-      }
+    const line = await reader.nextLine();
+    if (line === undefined) {
       return;
     }
-    buffer += decoder.decode(chunk.value, { stream: true });
-    let index = buffer.indexOf('\n');
-    while (index >= 0) {
-      onLine(buffer.slice(0, index));
-      buffer = buffer.slice(index + 1);
-      index = buffer.indexOf('\n');
-    }
+    onLine(line);
   }
 }
 
@@ -139,20 +137,6 @@ export function envIntList(
     return value;
   });
   return [...new Set(values)];
-}
-
-export function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    // ESRCH is the only answer that means "reaped"; EPERM still exists.
-    const code =
-      typeof error === 'object' && error !== null && 'code' in error
-        ? error.code
-        : undefined;
-    return code !== 'ESRCH';
-  }
 }
 
 function killQuietly(pid: number): void {
@@ -294,7 +278,7 @@ export async function startPortal(options: {
   const stop = (): Promise<PortalStopResult> => {
     stopped ??= (async () => {
       child.kill('SIGTERM');
-      let exitCode = await waitForExit(child, PORTAL_EXIT_TIMEOUT_MS);
+      let exitCode = await waitForExit(child, portalStopBudgetMs());
       let forced = false;
       if (exitCode === undefined) {
         forced = true;

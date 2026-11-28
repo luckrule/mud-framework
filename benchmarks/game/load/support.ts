@@ -1,5 +1,7 @@
 import { resolve } from 'node:path';
 
+import { isRecord } from '../../../packages/core/src/shared/guards.ts';
+
 /**
  * Configuration, fixed-bucket histograms and result types shared by the
  * player-level load coordinator and its generator processes.
@@ -8,8 +10,8 @@ import { resolve } from 'node:path';
  * far too many values to serialize. Each accumulator is a logarithmic
  * histogram (5% relative bucket width, 1 us to 60 s plus an overflow bucket);
  * percentiles are reported as the upper edge of the bucket that holds the
- * rank, so they are accurate to within 5%. Exact min, max, count and mean are
- * kept alongside the buckets.
+ * rank, so they are accurate to within 5%. Exact min, max and count are kept
+ * alongside the buckets.
  */
 
 export type LoadMode = 'realistic' | 'saturate';
@@ -69,7 +71,6 @@ function parseInteger(name: string, raw: string, minimum: number): number {
   return value;
 }
 
-/** Unlike `support.envInt`, this accepts zero (warmup, think time, offsets). */
 export function envInteger(
   name: string,
   fallback: number,
@@ -137,12 +138,9 @@ export function mixText(mix: readonly CommandWeight[]): string {
   return mix.map((entry) => `${entry.command}:${entry.weight}`).join(',');
 }
 
-export function pickCommand(
-  mix: readonly CommandWeight[],
-  random: () => number = Math.random,
-): CommandName {
+export function pickCommand(mix: readonly CommandWeight[]): CommandName {
   const total = mix.reduce((sum, entry) => sum + entry.weight, 0);
-  let threshold = random() * total;
+  let threshold = Math.random() * total;
   for (const entry of mix) {
     if (entry.weight === 0) {
       continue;
@@ -275,7 +273,6 @@ function bucketIndex(valueNs: number): number {
 export interface HistogramJson {
   readonly counts: readonly number[];
   readonly count: number;
-  readonly sumNs: number;
   readonly minNs: number;
   readonly maxNs: number;
 }
@@ -287,7 +284,6 @@ export interface LatencySummary {
   readonly p95Ns: number;
   readonly p99Ns: number;
   readonly maxNs: number;
-  readonly meanNs: number;
   /** Samples above the last bucket edge; included in `count`. */
   readonly overflow: number;
 }
@@ -298,7 +294,6 @@ export class Histogram {
     () => 0,
   );
   private totalCount = 0;
-  private totalSumNs = 0;
   private observedMinNs = 0;
   private observedMaxNs = 0;
 
@@ -315,7 +310,6 @@ export class Histogram {
     const index = bucketIndex(valueNs);
     this.counts[index] = (this.counts[index] ?? 0) + 1;
     this.totalCount += 1;
-    this.totalSumNs += valueNs;
     if (this.totalCount === 1) {
       this.observedMinNs = valueNs;
       this.observedMaxNs = valueNs;
@@ -336,7 +330,6 @@ export class Histogram {
       this.counts[index] = (this.counts[index] ?? 0) + value;
     }
     this.totalCount += part.count;
-    this.totalSumNs += part.sumNs;
     if (part.count > 0) {
       if (!hadSamples) {
         this.observedMinNs = part.minNs;
@@ -356,7 +349,6 @@ export class Histogram {
       p95Ns: this.percentileNs(0.95),
       p99Ns: this.percentileNs(0.99),
       maxNs: this.observedMaxNs,
-      meanNs: this.totalCount === 0 ? 0 : this.totalSumNs / this.totalCount,
       overflow: this.counts[HISTOGRAM_BUCKET_COUNT - 1] ?? 0,
     };
   }
@@ -365,7 +357,6 @@ export class Histogram {
     return {
       counts: [...this.counts],
       count: this.totalCount,
-      sumNs: this.totalSumNs,
       minNs: this.observedMinNs,
       maxNs: this.observedMaxNs,
     };
@@ -385,10 +376,6 @@ export class Histogram {
     }
     return LAST_EDGE_NS;
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function readIntegerField(
@@ -460,7 +447,6 @@ export function parseHistogramJson(
   return {
     counts,
     count,
-    sumNs: readNumberField(value, 'sumNs', label),
     minNs,
     maxNs,
   };
@@ -502,7 +488,6 @@ export interface LoadResultJson {
   readonly generator: number;
   readonly clients: number;
   readonly setupMs: number;
-  readonly startedAtMs: number;
   readonly measuredFromMs: number;
   readonly measuredUntilMs: number;
   readonly commands: Readonly<Record<CommandName, CommandResultJson>>;
@@ -579,7 +564,6 @@ export function parseLoadResultJson(value: unknown): LoadResultJson {
     generator: readIntegerField(value, 'generator', 'result'),
     clients: readIntegerField(value, 'clients', 'result', 1),
     setupMs: readNumberField(value, 'setupMs', 'result'),
-    startedAtMs: readNumberField(value, 'startedAtMs', 'result'),
     measuredFromMs,
     measuredUntilMs,
     commands: {

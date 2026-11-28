@@ -37,7 +37,6 @@ export interface AggregateEvents {
 
 export interface Aggregate {
   clients: number;
-  setupMs: number;
   measuredFromMs: number;
   measuredUntilMs: number;
   readonly commands: Record<CommandName, AggregateCommand>;
@@ -69,7 +68,6 @@ export function aggregateResults(
   };
   const aggregate: Aggregate = {
     clients: 0,
-    setupMs: 0,
     measuredFromMs: Number.POSITIVE_INFINITY,
     measuredUntilMs: Number.NEGATIVE_INFINITY,
     commands,
@@ -79,7 +77,6 @@ export function aggregateResults(
   };
   for (const result of results) {
     aggregate.clients += result.clients;
-    aggregate.setupMs = Math.max(aggregate.setupMs, result.setupMs);
     aggregate.measuredFromMs = Math.min(
       aggregate.measuredFromMs,
       result.measuredFromMs,
