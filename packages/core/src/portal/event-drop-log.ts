@@ -36,7 +36,7 @@ interface DropBucket {
   logged: number;
   loggedAt: number;
   first: LogFields;
-  /** Last drop seen, for eviction when the table is full. */
+  /** Last drop seen, which the quiet reset reads before writing the next line. */
   seenAt: number;
 }
 
@@ -67,6 +67,10 @@ interface DropBucket {
 export class EventDropLog {
   private readonly logger: Logger;
   private readonly now: () => number;
+  /**
+   * Keyed by reason and target. The order is the eviction order: a hit moves
+   * its bucket to the tail, so the head is the least recently used.
+   */
   private readonly buckets = new Map<string, DropBucket>();
 
   constructor(options: { logger: Logger; now?: () => number }) {
@@ -81,7 +85,7 @@ export class EventDropLog {
    */
   record(fields: LogFields, reason: string, target: string): void {
     const now = this.now();
-    const bucket = this.bucketFor(reason, target, now);
+    const bucket = this.bucketFor(bucketKey(reason, target), now);
     if (bucket.dropped === bucket.logged) {
       bucket.first = fields;
     }
@@ -96,10 +100,13 @@ export class EventDropLog {
     this.flush(bucket, now);
   }
 
-  private bucketFor(reason: string, target: string, now: number): DropBucket {
-    const key = bucketKey(reason, target);
+  private bucketFor(key: string, now: number): DropBucket {
     const existing = this.buckets.get(key);
     if (existing !== undefined) {
+      // Re-inserting is what makes the key the most recently used one: a plain
+      // `set` on a live key keeps its old position.
+      this.buckets.delete(key);
+      this.buckets.set(key, existing);
       return existing;
     }
     if (this.buckets.size >= MAX_BUCKETS) {
@@ -131,36 +138,21 @@ export class EventDropLog {
   }
 
   /**
-   * Makes room for one new bucket: stale ones go first, and if the table is
-   * still full the least recently seen does. Each removed bucket is flushed, so
-   * eviction loses no drop from the log. This only runs when a new target
-   * arrives at a full table, so the scan is not on the drop path.
+   * Makes room for one new bucket by removing the head of `buckets`, which the
+   * Map's order makes the least recently used entry. That is also the first
+   * quiet one: `seenAt` moves whenever the bucket does, so a bucket quiet for
+   * `QUIET_RESET_MS` can only sit at the front. One removal is all the caller
+   * needs, so this is O(1) — no scan of the table. The bucket is flushed before
+   * it goes, so eviction loses no drop from the log.
    */
   private evict(now: number): void {
-    for (const [key, bucket] of this.buckets) {
-      if (now - bucket.seenAt >= QUIET_RESET_MS) {
-        this.flush(bucket, now);
-        this.buckets.delete(key);
-      }
-    }
-    if (this.buckets.size < MAX_BUCKETS) {
+    const head = this.buckets.entries().next();
+    if (head.done) {
       return;
     }
-    let oldestKey: string | undefined;
-    let oldestSeen = Number.POSITIVE_INFINITY;
-    for (const [key, bucket] of this.buckets) {
-      if (bucket.seenAt < oldestSeen) {
-        oldestSeen = bucket.seenAt;
-        oldestKey = key;
-      }
-    }
-    if (oldestKey !== undefined) {
-      const oldest = this.buckets.get(oldestKey);
-      if (oldest !== undefined) {
-        this.flush(oldest, now);
-      }
-      this.buckets.delete(oldestKey);
-    }
+    const [key, bucket] = head.value;
+    this.flush(bucket, now);
+    this.buckets.delete(key);
   }
 }
 

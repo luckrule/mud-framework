@@ -157,4 +157,43 @@ describe('EventDropLog', () => {
       droppedTotal: 1,
     });
   });
+
+  test('evicts the least recently used bucket when the table is full', () => {
+    const { logger, lines } = recordingLogger();
+    const clock = manualClock();
+    const log = new EventDropLog({ logger, now: clock.now });
+    const reason = 'no connection holds the session';
+    const drop = (target: string, eventId: string): void => {
+      log.record({ eventId }, reason, target);
+    };
+
+    // Filling the table to MAX_BUCKETS (4096) leaves the next new target with
+    // no room, so it has to evict one.
+    for (let i = 0; i < 4096; i += 1) {
+      drop(`c${i}`, `fill:${i}`);
+    }
+    // c0 was the oldest bucket; this drop makes it the most recent, so c1 is
+    // now the least recently used one.
+    drop('c0', 'c0:2');
+    drop('c4096', 'new');
+
+    // c1 lost its bucket: its next drop starts over and is reported at once,
+    // instead of continuing from the count the evicted bucket had.
+    drop('c1', 'c1:again');
+    expect(lines.at(-1)?.fields).toMatchObject({
+      eventId: 'c1:again',
+      count: 1,
+      droppedTotal: 1,
+    });
+
+    // c0 survived, so its bucket keeps accumulating and the next line still
+    // stands for the whole batch.
+    drop('c0', 'c0:3');
+    drop('c0', 'c0:4');
+    expect(lines.at(-1)?.fields).toMatchObject({
+      eventId: 'c0:3',
+      count: 2,
+      droppedTotal: 4,
+    });
+  });
 });
