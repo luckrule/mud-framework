@@ -14,6 +14,11 @@ import {
 } from '../../../packages/core/src/shared/guards.ts';
 import { write, writeError } from '../support.ts';
 import {
+  recordWindowedEvent,
+  serializeEventWindows,
+  withinMeasuredWindow,
+} from './event-windows.ts';
+import {
   beginSaySequence,
   commitSaySequence,
   observeArrival,
@@ -134,6 +139,8 @@ interface EventAccumulator {
   lateEpoch: number;
   unparsed: number;
   readonly histogram: Histogram;
+  /** Sparse 5-minute buckets keyed by send-time offset from the measurement start. */
+  readonly windows: Map<number, Histogram>;
 }
 
 interface GeneratorStats {
@@ -236,10 +243,7 @@ function handleEvent(
   if (!measurement.active) {
     return;
   }
-  if (
-    token.sentAtMs < measurement.fromMs ||
-    token.sentAtMs > measurement.untilMs
-  ) {
+  if (!withinMeasuredWindow(token.sentAtMs, measurement)) {
     return;
   }
   // The Server emits room.say only to sessions in the sender's room at send
@@ -251,8 +255,17 @@ function handleEvent(
     stats.events.staleRoom += 1;
   }
 
+  const latencyNs = Math.max(0, Date.now() - token.sentAtMs) * 1e6;
   stats.events.received += 1;
-  stats.events.histogram.record(Math.max(0, Date.now() - token.sentAtMs) * 1e6);
+  stats.events.histogram.record(latencyNs);
+  // The send timestamp, not the arrival, fixes the window: a late event still
+  // belongs to the 5-minute span it was generated in.
+  recordWindowedEvent(
+    stats.events.windows,
+    token.sentAtMs,
+    measurement.fromMs,
+    latencyNs,
+  );
 
   if (token.room !== runtime.room) {
     // Gap tracking needs a stable receiver room; a queued event that arrived
@@ -371,6 +384,7 @@ function emptyStats(): GeneratorStats {
       lateEpoch: 0,
       unparsed: 0,
       histogram: new Histogram(),
+      windows: new Map(),
     },
     errors: {},
     rooms: {},
@@ -601,7 +615,10 @@ function commandJson(accumulator: CommandAccumulator): CommandResultJson {
   };
 }
 
-function eventJson(accumulator: EventAccumulator): EventResultJson {
+function eventJson(
+  accumulator: EventAccumulator,
+  measuredFromMs: number,
+): EventResultJson {
   return {
     saysAttempted: accumulator.saysAttempted,
     saysSent: accumulator.saysSent,
@@ -613,6 +630,7 @@ function eventJson(accumulator: EventAccumulator): EventResultJson {
     lateEpoch: accumulator.lateEpoch,
     unparsed: accumulator.unparsed,
     histogram: accumulator.histogram.toJson(),
+    windows: serializeEventWindows(accumulator.windows, measuredFromMs),
   };
 }
 
@@ -637,7 +655,7 @@ function resultJson(
       move: commandJson(stats.commands.move),
       say: commandJson(stats.commands.say),
     },
-    events: eventJson(stats.events),
+    events: eventJson(stats.events, measuredFromMs),
     errors: { ...stats.errors },
     rooms: { ...stats.rooms },
   };

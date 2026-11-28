@@ -8,8 +8,14 @@ import {
 import type { PidTraceReport, ResourceReport } from './resources.ts';
 import type { ServerStatsRead } from './server-stats.ts';
 import type { MainConfig } from './support.ts';
-import { COMMAND_NAMES, Histogram, mixText } from './support.ts';
-import type { CommandName, LoadResultJson } from './support.ts';
+import {
+  COMMAND_NAMES,
+  EVENT_WINDOW_MS,
+  Histogram,
+  maxEventWindowIndex,
+  mixText,
+} from './support.ts';
+import type { CommandName, LatencySummary, LoadResultJson } from './support.ts';
 
 /**
  * Result aggregation and console reporting. Command histograms are merged
@@ -23,6 +29,19 @@ export interface AggregateCommand {
   readonly histogram: Histogram;
 }
 
+export interface AggregateEventWindow {
+  readonly index: number;
+  readonly fromMs: number;
+  readonly untilMs: number;
+  readonly histogram: Histogram;
+}
+
+export interface AggregateEventWindows {
+  readonly windows: readonly AggregateEventWindow[];
+  /** Results that carried the window field; older results count as no samples. */
+  readonly resultsWithWindows: number;
+}
+
 export interface AggregateEvents {
   saysAttempted: number;
   saysSent: number;
@@ -34,9 +53,12 @@ export interface AggregateEvents {
   lateEpoch: number;
   unparsed: number;
   readonly histogram: Histogram;
+  /** Undefined when every generator result predates the window field. */
+  eventWindows: AggregateEventWindows | undefined;
 }
 
 export interface Aggregate {
+  generators: number;
   clients: number;
   senders: number;
   measuredFromMs: number;
@@ -67,8 +89,10 @@ export function aggregateResults(
     lateEpoch: 0,
     unparsed: 0,
     histogram: new Histogram(),
+    eventWindows: undefined,
   };
   const aggregate: Aggregate = {
+    generators: 0,
     clients: 0,
     senders: 0,
     measuredFromMs: Number.POSITIVE_INFINITY,
@@ -78,7 +102,10 @@ export function aggregateResults(
     errors: {},
     rooms: {},
   };
+  const eventWindows = new Map<number, AggregateEventWindow>();
+  let windowResults = 0;
   for (const result of results) {
+    aggregate.generators += 1;
     aggregate.clients += result.clients;
     aggregate.senders += result.senders;
     aggregate.measuredFromMs = Math.min(
@@ -107,6 +134,56 @@ export function aggregateResults(
     events.lateEpoch += partEvents.lateEpoch;
     events.unparsed += partEvents.unparsed;
     events.histogram.mergeJson(partEvents.histogram);
+    if (partEvents.windows !== undefined) {
+      windowResults += 1;
+      const maximum = maxEventWindowIndex(
+        result.measuredFromMs,
+        result.measuredUntilMs,
+      );
+      let windowSamples = 0;
+      for (const part of partEvents.windows) {
+        if (part.index > maximum) {
+          throw new Error(
+            `generator ${result.generator} event window ${part.index} exceeds its measurement window (max ${maximum})`,
+          );
+        }
+        const expectedFromMs =
+          result.measuredFromMs + part.index * EVENT_WINDOW_MS;
+        const expectedUntilMs = expectedFromMs + EVENT_WINDOW_MS;
+        if (
+          part.fromMs !== expectedFromMs ||
+          part.untilMs !== expectedUntilMs
+        ) {
+          throw new Error(
+            `generator ${result.generator} event window ${part.index} spans ${part.fromMs}-${part.untilMs} ms, expected ${expectedFromMs}-${expectedUntilMs} ms from its measurement start`,
+          );
+        }
+        windowSamples += part.histogram.count;
+        const known = eventWindows.get(part.index);
+        if (known === undefined) {
+          const histogram = new Histogram();
+          histogram.mergeJson(part.histogram);
+          eventWindows.set(part.index, {
+            index: part.index,
+            fromMs: part.fromMs,
+            untilMs: part.untilMs,
+            histogram,
+          });
+        } else {
+          if (known.fromMs !== part.fromMs || known.untilMs !== part.untilMs) {
+            throw new Error(
+              `event window ${part.index} boundaries differ across generators (${known.fromMs}-${known.untilMs} vs ${part.fromMs}-${part.untilMs} ms)`,
+            );
+          }
+          known.histogram.mergeJson(part.histogram);
+        }
+      }
+      if (windowSamples !== partEvents.received) {
+        throw new Error(
+          `generator ${result.generator} event windows hold ${windowSamples} samples but it reported ${partEvents.received} received events`,
+        );
+      }
+    }
     for (const [code, count] of Object.entries(result.errors)) {
       aggregate.errors[code] = (aggregate.errors[code] ?? 0) + count;
     }
@@ -119,6 +196,31 @@ export function aggregateResults(
     !Number.isFinite(aggregate.measuredUntilMs)
   ) {
     throw new Error('no generator reported a measurement window');
+  }
+  if (windowResults > 0) {
+    let maxIndex = -1;
+    for (const index of eventWindows.keys()) {
+      maxIndex = Math.max(maxIndex, index);
+    }
+    // Fill every window from the measurement start to the last window that
+    // has a sample, so a quiet 5-minute span still occupies its row.
+    const windows: AggregateEventWindow[] = [];
+    for (let index = 0; index <= maxIndex; index += 1) {
+      const fromMs = aggregate.measuredFromMs + index * EVENT_WINDOW_MS;
+      const untilMs = fromMs + EVENT_WINDOW_MS;
+      const known = eventWindows.get(index);
+      if (known === undefined) {
+        windows.push({ index, fromMs, untilMs, histogram: new Histogram() });
+        continue;
+      }
+      if (known.fromMs !== fromMs || known.untilMs !== untilMs) {
+        throw new Error(
+          `event window ${index} boundaries ${known.fromMs}-${known.untilMs} ms do not align with the union measurement start ${aggregate.measuredFromMs} ms`,
+        );
+      }
+      windows.push(known);
+    }
+    events.eventWindows = { windows, resultsWithWindows: windowResults };
   }
   return aggregate;
 }
@@ -202,6 +304,11 @@ export function printAggregate(aggregate: Aggregate, config: MainConfig): void {
   write(
     `  event checks: within-epoch gaps ${integerText(events.gaps)}, duplicates ${integerText(events.duplicates)} (a retried timed-out say, ambiguous with double delivery, not loss), receiver-moved ${integerText(events.staleRoom)}, late-epoch ${integerText(events.lateEpoch)}, unparsed ${integerText(events.unparsed)}`,
   );
+  printEventWindows(
+    events.eventWindows,
+    aggregate.generators,
+    aggregate.measuredFromMs,
+  );
 
   const queueFull = aggregate.errors.FRAMEWORK_QUEUE_FULL ?? 0;
   const timeouts = aggregate.errors.CLIENT_TIMEOUT ?? 0;
@@ -228,6 +335,48 @@ export function printAggregate(aggregate: Aggregate, config: MainConfig): void {
   write(
     `  latency percentiles are histogram bucket upper bounds (5% relative width); room.say times use Date.now (1 ms resolution); mix ${mixText(config.shared.mix)}`,
   );
+}
+
+function windowLatencyText(summary: LatencySummary): string {
+  return summary.count === 0
+    ? 'n/a'
+    : `${millisecondsText(summary.p50Ns)}  ${millisecondsText(summary.p95Ns)}  ${millisecondsText(summary.p99Ns)}  ${millisecondsText(summary.maxNs)}`;
+}
+
+export function printEventWindows(
+  eventWindows: AggregateEventWindows | undefined,
+  generators: number,
+  measuredFromMs: number,
+  emit: (line: string) => void = write,
+): void {
+  if (eventWindows === undefined) {
+    emit(
+      '  event latency windows: skipped (no generator result has the 5-minute window field; it predates windowed soak reporting)',
+    );
+    return;
+  }
+  const coverage =
+    eventWindows.resultsWithWindows < generators
+      ? `; ${eventWindows.resultsWithWindows}/${generators} generator results carry window data, the rest count as no samples`
+      : '';
+  if (eventWindows.windows.length === 0) {
+    emit(`  event latency windows: no room.say samples${coverage}`);
+    return;
+  }
+  emit(
+    `  event latency by fixed 5-minute window (room.say, token send time offset from measurement start${coverage}):`,
+  );
+  emit(
+    '    window  start ms        end ms          offset s        n      p50     p95     p99     max  (ms)',
+  );
+  for (const window of eventWindows.windows) {
+    const summary = window.histogram.summary();
+    const offsetFrom = (window.fromMs - measuredFromMs) / 1000;
+    const offsetUntil = (window.untilMs - measuredFromMs) / 1000;
+    emit(
+      `    ${String(window.index).padStart(6)}  ${String(window.fromMs).padEnd(15)} ${String(window.untilMs).padEnd(15)} ${`${offsetFrom.toFixed(1)}-${offsetUntil.toFixed(1)}`.padEnd(15)} ${integerText(summary.count).padStart(9)}  ${windowLatencyText(summary)}`,
+    );
+  }
 }
 
 function bytesText(bytes: number): string {
