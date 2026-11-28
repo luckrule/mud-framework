@@ -1,16 +1,13 @@
 import type { SpawnedServer } from '../../ipc/spawn-port.ts';
 import type { Logger } from '../../logging/types.ts';
-import {
-  EXIT_WAIT_TIMEOUT_MS,
-  SHUTDOWN_ACK_SLACK_MS,
-} from '../../shared/budget.ts';
+import { SHUTDOWN_ACK_SLACK_MS } from '../../shared/budget.ts';
 import { messageOf, toError } from '../../shared/guards.ts';
 import { settleWithin } from '../../shared/timeout.ts';
 import {
   buildServer,
   closeChannelQuietly,
+  ensureExited,
   killQuietly,
-  waitForExit,
 } from './server-launcher.ts';
 import type { ServerSlot, ServerState } from './server-slot.ts';
 import { ServerSwitchError, withStderrTail } from './switch-failure.ts';
@@ -286,7 +283,6 @@ export class VersionSwitch {
       // hand it to `doClose` when it may hold storage.
       const staged = op.staged;
       if (staged !== undefined && !staged.closed) {
-        staged.staged = false;
         staged.closed = true;
         staged.closedSignal.resolve();
         if (!staged.exited) {
@@ -360,7 +356,6 @@ export class VersionSwitch {
       return false;
     }
     const server = buildServer(spawned, this.deps.slot.nextGeneration());
-    server.staged = true;
     op.staged = server;
     this.deps.attach(server);
     try {
@@ -424,15 +419,9 @@ export class VersionSwitch {
         killQuietly(previous, logger);
       }
     }
-    let exited = await waitForExit(previous, logger);
-    if (!exited) {
-      logger.warn(
-        { pid: previous.pid, timeoutMs: EXIT_WAIT_TIMEOUT_MS },
-        'server process did not exit; killing it before switching',
-      );
-      killQuietly(previous, logger);
-      exited = await waitForExit(previous, logger);
-    }
+    const exited = await ensureExited(previous, logger, {
+      kill: 'server process did not exit; killing it before switching',
+    });
     closeChannelQuietly(previous, 'portal is switching servers', logger);
     if (op.abortError !== undefined) {
       // `close()` took over while the old process was exiting. Its own path
@@ -512,7 +501,6 @@ export class VersionSwitch {
     }
     // Promote: the replacement becomes the current Server and the barrier is
     // the only thing that releases the buffered requests to it.
-    staged.staged = false;
     op.promoted = true;
     this.deps.slot.markReady(staged);
     // A crash after this point restarts the process factory that is now
@@ -761,7 +749,6 @@ export class VersionSwitch {
 
   /** Closes and kills a staged process the switch no longer needs. */
   private abandonStaged(server: ServerState): void {
-    server.staged = false;
     if (server.closed) {
       return;
     }

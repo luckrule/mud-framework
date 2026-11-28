@@ -53,7 +53,6 @@ export function buildServer(
     exited: false,
     shutdownAcknowledged: false,
     pid: undefined,
-    staged: false,
     retiring: false,
     declaredMaxDurationMs: undefined,
     shutdownSent: false,
@@ -155,6 +154,40 @@ export async function waitForExit(
   }
   server.exited = true;
   return true;
+}
+
+/**
+ * Confirms a process is gone with one bounded wait → kill → wait. True only
+ * when an exit was observed; false leaves the caller holding the reference,
+ * because neither a sent kill nor a closed channel proves storage was released
+ * (INV-002). `messages` are the caller's own log texts, so each path keeps the
+ * line it always had. `stuck` is optional: when omitted, the caller reports the
+ * unconfirmed exit structurally (e.g. through a retained process list) instead
+ * of a second warn.
+ */
+export async function ensureExited(
+  server: ServerState,
+  logger: Logger,
+  messages: { kill: string; stuck?: string },
+): Promise<boolean> {
+  if (await waitForExit(server, logger)) {
+    return true;
+  }
+  logger.warn(
+    { pid: server.pid, timeoutMs: EXIT_WAIT_TIMEOUT_MS },
+    messages.kill,
+  );
+  killQuietly(server, logger);
+  if (await waitForExit(server, logger)) {
+    return true;
+  }
+  if (messages.stuck !== undefined) {
+    logger.warn(
+      { pid: server.pid, timeoutMs: EXIT_WAIT_TIMEOUT_MS },
+      messages.stuck,
+    );
+  }
+  return false;
 }
 
 /**

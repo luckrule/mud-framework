@@ -1,12 +1,9 @@
 import type { Logger } from '../../logging/types.ts';
-import {
-  EXIT_WAIT_TIMEOUT_MS,
-  SHUTDOWN_ACK_SLACK_MS,
-} from '../../shared/budget.ts';
+import { SHUTDOWN_ACK_SLACK_MS } from '../../shared/budget.ts';
 import { messageOf } from '../../shared/guards.ts';
 import { settleWithin } from '../../shared/timeout.ts';
 import { FRAMEWORK_SHUTDOWN } from '../../shared/wire-codes.ts';
-import { killQuietly, waitForExit } from './server-launcher.ts';
+import { ensureExited, killQuietly } from './server-launcher.ts';
 import type { ServerSlot, ServerState } from './server-slot.ts';
 import type { SwitchOperation } from './version-switch.ts';
 
@@ -148,26 +145,15 @@ async function confirmAbandonedExits(
   // counts one bounded wait→kill→wait, not one per process.
   const confirmed = await Promise.all(
     pending.map(async (server) => {
-      const exited = await waitForExit(server, host.logger);
+      const exited = await ensureExited(server, host.logger, {
+        kill: 'abandoned replacement did not exit; killing it before close returns',
+        stuck:
+          'abandoned replacement is still running after a kill; close cannot confirm its exit',
+      });
       if (exited) {
         host.slot.confirmExit(server);
-        return true;
       }
-      host.logger.warn(
-        { pid: server.pid, timeoutMs: EXIT_WAIT_TIMEOUT_MS },
-        'abandoned replacement did not exit; killing it before close returns',
-      );
-      killQuietly(server, host.logger);
-      const afterKill = await waitForExit(server, host.logger);
-      if (!afterKill) {
-        host.logger.warn(
-          { pid: server.pid, timeoutMs: EXIT_WAIT_TIMEOUT_MS },
-          'abandoned replacement is still running after a kill; close cannot confirm its exit',
-        );
-      } else {
-        host.slot.confirmExit(server);
-      }
-      return afterKill;
+      return exited;
     }),
   );
   return confirmed.every(Boolean);
@@ -223,25 +209,16 @@ async function shutdownServer(host: ShutdownHost): Promise<boolean> {
   // process is gone; the storage must not be reopened while it lingers
   // (INV-002). This also covers a process that was already killed from the
   // channel-loss path. Waiting is bounded, and a lingering process is logged.
-  let exited = await waitForExit(server, host.logger);
-  if (!exited) {
-    // `close()` must not return while the Server may still be writing: a
-    // caller that then reopens storage gets two writers, which is exactly the
-    // defect this class exists to prevent. The graceful path withheld the kill
-    // on purpose, so it is issued here and the exit is awaited once more.
-    host.logger.warn(
-      { pid: server.pid, timeoutMs: EXIT_WAIT_TIMEOUT_MS },
-      'server process did not exit; killing it before close returns',
-    );
-    killQuietly(server, host.logger);
-    exited = await waitForExit(server, host.logger);
-    if (!exited) {
-      host.logger.warn(
-        { pid: server.pid, timeoutMs: EXIT_WAIT_TIMEOUT_MS },
-        'server is still running after a kill; close cannot confirm its exit',
-      );
-    }
-  }
+  //
+  // `close()` must not return while the Server may still be writing: a caller
+  // that then reopens storage gets two writers, which is exactly the defect
+  // this class exists to prevent. The graceful path withheld the kill on
+  // purpose, so `ensureExited` issues it and awaits the exit once more.
+  const exited = await ensureExited(server, host.logger, {
+    kill: 'server process did not exit; killing it before close returns',
+    stuck:
+      'server is still running after a kill; close cannot confirm its exit',
+  });
   server.closed = true;
   server.closedSignal.resolve();
   try {

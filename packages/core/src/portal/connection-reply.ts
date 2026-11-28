@@ -38,10 +38,11 @@ export function rawLengthOf(payload: string | Uint8Array): number {
  *
  * Failures are warn, not error, for that same reason: an unwritable frame is a
  * degraded channel, not a failed request, and SPEC 7.1 reserves error for
- * request failures. `stage` separates an encode failure from a send failure, the
- * way it does on the event path, and `connectionId` names the connection whose
- * write was lost — a refusal answered here never went through the request
- * scheduler, so no other line carries it.
+ * request failures. `stage: 'encode'` covers both the frame and the fallback
+ * that replaces an unencodable result; only `connection.send` failing is
+ * `stage: 'send'`. `connectionId` names the connection whose write was lost — a
+ * refusal answered here never went through the request scheduler, so no other
+ * line carries it.
  */
 export async function reply(
   host: ReplyHost,
@@ -63,14 +64,29 @@ export async function reply(
         },
         'response could not be encoded',
       );
-      frame = host.codec.encode({
-        id: response.id,
-        ok: false,
-        error: {
-          code: INTERNAL_ERROR,
-          message: 'result could not be encoded',
-        },
-      });
+      try {
+        frame = host.codec.encode({
+          id: response.id,
+          ok: false,
+          error: {
+            code: INTERNAL_ERROR,
+            message: 'result could not be encoded',
+          },
+        });
+      } catch (fallbackError) {
+        // The fallback failed at the same stage as the frame it replaces;
+        // reporting it as a send failure would name the wrong stage.
+        logger.warn(
+          {
+            connectionId: connection.id,
+            code: TRANSPORT_SEND_FAILED,
+            stage: 'encode',
+            reason: messageOf(fallbackError),
+          },
+          'response could not be sent',
+        );
+        return;
+      }
     }
     // `settleWithin` consumes a rejection, so a late failure cannot escape as
     // an unhandled rejection; a synchronous throw still reaches the catch below.

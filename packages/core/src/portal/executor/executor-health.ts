@@ -3,10 +3,11 @@ import type { ExecutorHealth } from '../../shared/executor.ts';
 /**
  * The statuses health classifies; `ServerSlot` remains their writer.
  *
- * `failed` is a terminal state that is not `closed`: the executor gave up
- * because the Server never became ready within `startTimeoutMs`. It is distinct
- * from `closed` so `execute` can report a different message and so a failed
- * start cannot be mistaken for an orderly shutdown.
+ * `failed` is the terminal state the executor enters when the Server never
+ * became ready within `startTimeoutMs`. It stays distinct internally so
+ * `execute` can report a different message and a failed start cannot be
+ * mistaken for an orderly shutdown; the public `ExecutorHealth.state` snapshot
+ * still maps both to `closed`.
  *
  * `switching` is not terminal: a replacement is being prepared or the previous
  * process is being retired. Requests keep arriving and stay buffered; only the
@@ -63,5 +64,8 @@ export function ipcExecutorHealth(facts: IpcHealthFacts): ExecutorHealth {
       // separate failure member.
       return { state: 'closed', ready: false };
   }
+  // Unreachable by type: every IpcHealthStatus is classified above. Returned
+  // rather than thrown because RequestExecutor.health() must not throw
+  // (shared/executor.ts); a future status still fails lint before it lands here.
   return { state: 'unknown', ready: false };
 }
