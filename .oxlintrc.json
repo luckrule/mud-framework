@@ -80,6 +80,46 @@
         "typescript/no-unsafe-return": "off",
         "typescript/prefer-readonly": "off"
       }
+    },
+    {
+      "files": ["packages/*/src/**/*.ts"],
+      "rules": {
+        "eslint/no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "group": ["bun:test"],
+                "message": "生产代码不得 import bun:test；测试请放在 *.test.ts / *.support.ts 中"
+              },
+              {
+                "group": [
+                  "**/testing/*",
+                  "./testing/*",
+                  "../testing/*",
+                  "../../testing/*"
+                ],
+                "message": "生产代码不得 import testing/；测试替身只能在测试文件或 *.support.ts 中使用"
+              },
+              {
+                "group": ["mud-framework-test-support"],
+                "message": "生产代码不得依赖 mud-framework-test-support"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": [
+        "packages/*/src/**/*.test.ts",
+        "packages/*/src/**/*.support.ts",
+        "packages/*/src/testing/**",
+        "packages/test-support/src/**"
+      ],
+      "rules": {
+        "eslint/no-restricted-imports": "off"
+      }
     }
   ],
   "ignorePatterns": ["node_modules"]
