@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 
 import { safeLogger } from 'mud-framework-core';
 import type {
+  LogFields,
   Logger,
   Transport,
   TransportConnection,
@@ -15,62 +16,18 @@ import {
   TRANSPORT_STOPPED_CLOSE_CODE,
   UNKNOWN_CONNECTION_CLOSE_CODE,
 } from './close-codes.ts';
-import {
-  SendQueue,
-  assertPositiveInteger,
-  payloadBytes,
-} from './send-queue.ts';
+import { SendQueue, payloadBytes } from './send-queue.ts';
 import type { SendQueueOverflow } from './send-queue.ts';
+import type {
+  WsTransportOptions,
+  WsTransportSettings,
+} from './ws-transport-options.ts';
+import { resolveWsTransportSettings } from './ws-transport-options.ts';
 
-export interface WsTransportOptions {
-  /**
-   * Listening port; `0` (the default) lets the OS pick one. Must be an
-   * integer between 0 and 65535.
-   */
-  port?: number;
-  /** Must be a non-empty string. */
-  hostname?: string;
-  /**
-   * Only upgrade requests for this path are accepted. Must be a non-empty
-   * string starting with `/`.
-   */
-  path?: string;
-  /** Per-message ceiling for both directions. Must be a positive integer. */
-  maxMessageBytes?: number;
-  /**
-   * Forwarded to Bun's WebSocket `idleTimeout`, in seconds. Must be a
-   * non-negative integer; `0` disables the timeout.
-   */
-  idleTimeoutSeconds?: number;
-  /**
-   * How long a payload may wait behind a full socket buffer before its
-   * `send` rejects and the connection is dropped. `Infinity` disables it.
-   * Must be a positive finite number or `Infinity`.
-   */
-  sendTimeoutMs?: number;
-  /**
-   * Frames that may wait unsettled in one connection's outbound queue before
-   * it is failed. Must be a positive integer; defaults to 1024.
-   */
-  maxQueuedFrames?: number;
-  /**
-   * Unsettled outbound bytes per connection before it is failed. Must be a
-   * positive integer no smaller than `maxMessageBytes`, so one legal
-   * maximum-size frame always fits; defaults to 4 MiB, raised to
-   * `maxMessageBytes` when that is larger.
-   */
-  maxQueuedBytes?: number;
-  /**
-   * Optional: this package depends on core's types and the stateless
-   * `safeLogger` wrapper only, never on a logger implementation; the caller
-   * supplies the implementation. Without it nothing is logged.
-   */
-  logger?: Logger;
-}
+export type { WsTransportOptions } from './ws-transport-options.ts';
 
 interface WsData {
   readonly id: string;
-  readonly connection: TransportConnection;
 }
 
 interface ConnectionState {
@@ -84,21 +41,27 @@ interface ConnectionState {
 
 type Status = 'idle' | 'started' | 'stopped';
 
-const DEFAULT_MAX_MESSAGE_BYTES = 1024 * 1024;
-const DEFAULT_IDLE_TIMEOUT_SECONDS = 30;
-const DEFAULT_SEND_TIMEOUT_MS = 30_000;
-/**
- * The input queue bounds a connection at 1000 waiting requests, so one
- * response per request must fit. 1024 lets a refusal storm finish without
- * letting a client that never reads pin memory without bound.
- */
-const DEFAULT_MAX_QUEUED_FRAMES = 1024;
-/**
- * 4 MiB holds an ordinary burst (1000 refusal frames are ~80 KB) and several
- * maximum-size frames. The effective default is raised to `maxMessageBytes`
- * when a caller allows larger single frames.
- */
-const DEFAULT_MAX_QUEUED_BYTES = 4 * 1024 * 1024;
+/** What one of the drop paths wants recorded and closed. */
+interface DropOptions {
+  /** Absent when the path has no line of its own, as on a transport close. */
+  readonly log?: {
+    readonly level: 'warn' | 'error';
+    readonly fields: LogFields;
+    readonly message: string;
+  };
+  /** Fails every queued write and every later send with this error. */
+  readonly error: Error;
+  /** True terminates; a graceful close would queue behind the frames being dropped. */
+  readonly terminate: boolean;
+  /** Graceful close code; omitted when this path does not close the socket. */
+  readonly code?: number;
+  readonly reason?: string;
+  /**
+   * The socket this path is closing, when it holds one the state does not: an
+   * `error` event can arrive before `open` assigned `state.ws`.
+   */
+  readonly socket?: Bun.ServerWebSocket<WsData>;
+}
 
 /**
  * WebSocket carries binary frames, fragments, ordered delivery and protocol
@@ -108,16 +71,7 @@ const DEFAULT_MAX_QUEUED_BYTES = 4 * 1024 * 1024;
  * rejecting or dropping.
  */
 export class WsTransport implements Transport {
-  private readonly settings: {
-    readonly port: number;
-    readonly hostname: string;
-    readonly path: string;
-    readonly maxMessageBytes: number;
-    readonly idleTimeoutSeconds: number;
-    readonly sendTimeoutMs: number;
-    readonly maxQueuedFrames: number;
-    readonly maxQueuedBytes: number;
-  };
+  private readonly settings: WsTransportSettings;
   private readonly connections = new Map<string, ConnectionState>();
   private readonly pending = new Set<Promise<void>>();
   private readonly logger: Logger | undefined;
@@ -126,44 +80,7 @@ export class WsTransport implements Transport {
   private server: Bun.Server<WsData> | undefined;
 
   constructor(options: WsTransportOptions = {}) {
-    const port = options.port ?? 0;
-    assertIntegerBetween(port, 'port', 0, 65_535);
-    const maxMessageBytes =
-      options.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES;
-    assertPositiveInteger(maxMessageBytes, 'maxMessageBytes');
-    const idleTimeoutSeconds =
-      options.idleTimeoutSeconds ?? DEFAULT_IDLE_TIMEOUT_SECONDS;
-    assertNonNegativeInteger(idleTimeoutSeconds, 'idleTimeoutSeconds');
-    const sendTimeoutMs = options.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS;
-    assertSendTimeout(sendTimeoutMs, 'sendTimeoutMs');
-    const maxQueuedFrames =
-      options.maxQueuedFrames ?? DEFAULT_MAX_QUEUED_FRAMES;
-    assertPositiveInteger(maxQueuedFrames, 'maxQueuedFrames');
-    const maxQueuedBytes =
-      options.maxQueuedBytes ??
-      Math.max(DEFAULT_MAX_QUEUED_BYTES, maxMessageBytes);
-    assertPositiveInteger(maxQueuedBytes, 'maxQueuedBytes');
-    if (maxQueuedBytes < maxMessageBytes) {
-      // A queue smaller than one legal frame would fail that frame on arrival
-      // and drop the connection, so the limit could never be reached legally.
-      throw new RangeError(
-        `maxQueuedBytes (${maxQueuedBytes}) must be at least maxMessageBytes (${maxMessageBytes}), or a maximum-size frame overflows the queue`,
-      );
-    }
-    const hostname = options.hostname ?? '127.0.0.1';
-    assertNonEmptyString(hostname, 'hostname');
-    const path = options.path ?? '/';
-    assertPath(path);
-    this.settings = {
-      port,
-      hostname,
-      path,
-      maxMessageBytes,
-      idleTimeoutSeconds,
-      sendTimeoutMs,
-      maxQueuedFrames,
-      maxQueuedBytes,
-    };
+    this.settings = resolveWsTransportSettings(options);
     this.logger =
       options.logger === undefined
         ? undefined
@@ -281,7 +198,7 @@ export class WsTransport implements Transport {
     };
     this.connections.set(id, state);
     const upgraded = server.upgrade(request, {
-      data: { id, connection: state.connection },
+      data: { id },
     });
     if (!upgraded) {
       this.connections.delete(id);
@@ -328,12 +245,13 @@ export class WsTransport implements Transport {
     if (state === undefined) {
       return undefined;
     }
-    state.open = false;
-    state.queue.fail(
-      new Error(
+    this.dropConnection(state, {
+      error: new Error(
         `connection "${ws.data.id}" closed (${describeClose(code, reason)})`,
+        { cause: { closeCode: code, closeReason: reason } },
       ),
-    );
+      terminate: false,
+    });
     this.connections.delete(ws.data.id);
     if (this.status !== 'started') {
       // Sockets closed by `stop` are not reported: shutdown ordering belongs to
@@ -360,23 +278,23 @@ export class WsTransport implements Transport {
     if (state === undefined) {
       return;
     }
-    state.open = false;
     // warn: the connection is dropped but the transport keeps serving others,
     // which is a degradation rather than a request failure (SPEC 7.1).
-    state.logger?.warn(
-      {
-        sendTimeoutMs: this.settings.sendTimeoutMs,
-        queueDepth: state.queue.depth,
-        reason: cause.message,
+    this.dropConnection(state, {
+      log: {
+        level: 'warn',
+        fields: {
+          sendTimeoutMs: this.settings.sendTimeoutMs,
+          queueDepth: state.queue.depth,
+          reason: cause.message,
+        },
+        message: 'send timed out; terminating connection',
       },
-      'send timed out; terminating connection',
-    );
-    state.queue.fail(
-      new Error(`connection "${id}" closed after a send timeout`, {
+      error: new Error(`connection "${id}" closed after a send timeout`, {
         cause,
       }),
-    );
-    state.ws?.terminate();
+      terminate: true,
+    });
   }
 
   /**
@@ -391,63 +309,102 @@ export class WsTransport implements Transport {
     if (state === undefined) {
       return;
     }
-    state.open = false;
     // warn: one connection is dropped, the transport keeps serving others,
     // which is a degradation rather than a request failure (SPEC 7.1).
-    state.logger?.warn(
-      {
-        limit: info.limit,
-        queuedFrames: info.queuedFrames,
-        queuedBytes: info.queuedBytes,
-        maxQueuedFrames: info.maxQueuedFrames,
-        maxQueuedBytes: info.maxQueuedBytes,
-        incomingBytes: info.incomingBytes,
-        reason: info.error.message,
+    this.dropConnection(state, {
+      log: {
+        level: 'warn',
+        fields: {
+          limit: info.limit,
+          queuedFrames: info.queuedFrames,
+          queuedBytes: info.queuedBytes,
+          maxQueuedFrames: info.maxQueuedFrames,
+          maxQueuedBytes: info.maxQueuedBytes,
+          incomingBytes: info.incomingBytes,
+          reason: info.error.message,
+        },
+        message: 'send queue overflow; closing connection',
       },
-      'send queue overflow; closing connection',
-    );
-    closeQuietly(state.ws, SEND_BACKLOG_CLOSE_CODE, 'send queue full');
+      // The queue failed itself before invoking this sink, so `fail` is a
+      // no-op here; passing its error keeps one drop path.
+      error: info.error,
+      terminate: false,
+      code: SEND_BACKLOG_CLOSE_CODE,
+      reason: 'send queue full',
+    });
   }
 
   private handleError(error: Error, ws: Bun.ServerWebSocket<WsData>): void {
     const state = this.connections.get(ws.data.id);
-    const logger =
-      state?.logger ?? this.logger?.child({ connectionId: ws.data.id });
-    logger?.error(
-      { code: 'TRANSPORT_ERROR', reason: error.message },
-      'websocket handler failed',
-    );
     // Bun reports only exceptions that escaped a socket callback. Escaping
     // again from here would terminate every connection, so the failure is
     // contained to this socket; its `close` callback still runs cleanup.
     if (state !== undefined) {
-      state.open = false;
-      state.queue.fail(
-        new Error(`connection "${ws.data.id}" closed after a websocket error`, {
-          cause: error,
-        }),
-      );
+      this.dropConnection(state, {
+        log: {
+          level: 'error',
+          fields: { code: 'TRANSPORT_ERROR', reason: error.message },
+          message: 'websocket handler failed',
+        },
+        error: new Error(
+          `connection "${ws.data.id}" closed after a websocket error`,
+          { cause: error },
+        ),
+        terminate: false,
+        code: HANDLER_FAILED_CLOSE_CODE,
+        reason: 'websocket handler failed',
+        socket: ws,
+      });
+      return;
     }
+    this.logger
+      ?.child({ connectionId: ws.data.id })
+      .error(
+        { code: 'TRANSPORT_ERROR', reason: error.message },
+        'websocket handler failed',
+      );
     closeQuietly(ws, HANDLER_FAILED_CLOSE_CODE, 'websocket handler failed');
   }
 
   private handleHandlerFailure(state: ConnectionState, error: Error): void {
-    state.open = false;
-    state.logger?.error(
-      {
-        code: 'TRANSPORT_HANDLER_FAILED',
-        connectionId: state.connection.id,
-        reason: error.message,
+    this.dropConnection(state, {
+      log: {
+        level: 'error',
+        fields: {
+          code: 'TRANSPORT_HANDLER_FAILED',
+          connectionId: state.connection.id,
+          reason: error.message,
+        },
+        message: 'transport handler failed; closing connection',
       },
-      'transport handler failed; closing connection',
-    );
-    state.queue.fail(
-      new Error(
+      error: new Error(
         `connection "${state.connection.id}" closed after a handler failure`,
         { cause: error },
       ),
-    );
-    closeQuietly(state.ws, HANDLER_FAILED_CLOSE_CODE, 'handler failed');
+      terminate: false,
+      code: HANDLER_FAILED_CLOSE_CODE,
+      reason: 'handler failed',
+    });
+  }
+
+  /**
+   * The one place a connection is taken out of service: mark it closed, record
+   * why, fail every queued write, then close the socket the path asked for.
+   */
+  private dropConnection(state: ConnectionState, opts: DropOptions): void {
+    state.open = false;
+    if (opts.log !== undefined) {
+      state.logger?.[opts.log.level](opts.log.fields, opts.log.message);
+    }
+    state.queue.fail(opts.error);
+    const socket = opts.socket ?? state.ws;
+    if (opts.terminate) {
+      socket?.terminate();
+      return;
+    }
+    if (opts.code !== undefined) {
+      closeQuietly(socket, opts.code, opts.reason ?? '');
+    }
   }
 
   /**
@@ -549,70 +506,6 @@ export class WsTransport implements Transport {
     } catch (error) {
       this.handleHandlerFailure(state, toError(error));
     }
-  }
-}
-
-function assertIntegerBetween(
-  value: unknown,
-  name: string,
-  min: number,
-  max: number,
-): void {
-  const expected = `an integer between ${min} and ${max}`;
-  if (typeof value !== 'number') {
-    throw new TypeError(`${name} must be ${expected}, got ${String(value)}`);
-  }
-  if (!Number.isInteger(value) || value < min || value > max) {
-    throw new RangeError(`${name} must be ${expected}, got ${String(value)}`);
-  }
-}
-
-function assertNonEmptyString(value: unknown, name: string): string {
-  if (typeof value !== 'string') {
-    throw new TypeError(
-      `${name} must be a non-empty string, got ${String(value)}`,
-    );
-  }
-  if (value.length === 0) {
-    throw new RangeError(`${name} must be a non-empty string, got ""`);
-  }
-  return value;
-}
-
-function assertPath(value: unknown): void {
-  const path = assertNonEmptyString(value, 'path');
-  if (!path.startsWith('/')) {
-    throw new RangeError(
-      `path must start with "/", got ${JSON.stringify(path)}`,
-    );
-  }
-}
-
-function assertSendTimeout(value: unknown, name: string): void {
-  if (typeof value !== 'number') {
-    throw new TypeError(
-      `${name} must be a positive number or Infinity, got ${String(value)}`,
-    );
-  }
-  const valid =
-    value === Number.POSITIVE_INFINITY || (Number.isFinite(value) && value > 0);
-  if (!valid) {
-    throw new RangeError(
-      `${name} must be a positive number or Infinity, got ${String(value)}`,
-    );
-  }
-}
-
-function assertNonNegativeInteger(value: unknown, name: string): void {
-  if (typeof value !== 'number') {
-    throw new TypeError(
-      `${name} must be a non-negative integer, got ${String(value)}`,
-    );
-  }
-  if (!Number.isInteger(value) || value < 0) {
-    throw new RangeError(
-      `${name} must be a non-negative integer, got ${String(value)}`,
-    );
   }
 }
 
