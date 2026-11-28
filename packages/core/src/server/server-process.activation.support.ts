@@ -6,7 +6,7 @@ import { createJsonLogger } from '../logging/json-logger.ts';
 import { MemoryStorageBackend } from '../testing/memory-backend.ts';
 import { parseLine, received } from '../testing/server-process.ts';
 import type { Extension } from './extension.ts';
-import { runServerProcess } from './server-process.ts';
+import { runServerProcessWithTestOptions } from './server-process.ts';
 
 interface ActivationHarnessOptions {
   extensions?: readonly Extension[];
@@ -33,7 +33,7 @@ export function activationHarness(options: ActivationHarnessOptions = {}) {
     },
   });
   let created = 0;
-  const done = runServerProcess({
+  const done = runServerProcessWithTestOptions({
     createBackend: async () => {
       created += 1;
       return options.createBackend?.() ?? new MemoryStorageBackend();

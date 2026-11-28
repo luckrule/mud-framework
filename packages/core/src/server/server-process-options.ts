@@ -4,6 +4,7 @@ import type { StorageBackend } from '../storage/types.ts';
 import type { DispatcherOptions } from './dispatcher.ts';
 import type { Extension } from './extension.ts';
 
+/** The production contract for `runServerProcess`; exported from the package. */
 export interface ServerProcessOptions {
   /** Builds the storage backend. Called once per process start. */
   createBackend: () => Promise<StorageBackend> | StorageBackend;
@@ -38,10 +39,18 @@ export interface ServerProcessOptions {
    * write to storage (INV-002).
    */
   channel?: IpcChannel;
+}
+
+/**
+ * Test-only overrides. Kept out of the package index on purpose: a deployment
+ * has no reason to set them, and the production contract above should not grow
+ * knobs whose only job is to make time observable in a test. The harnesses call
+ * `runServerProcessWithTestOptions`, which is internal to this package.
+ */
+export interface ServerProcessTestOptions extends ServerProcessOptions {
   /**
    * Overrides the budget for each abort step (see `ABORT_TIMEOUT_MS`). Exists
-   * for tests, which would otherwise have to wait the real 5s; a deployment has
-   * no reason to set it.
+   * for tests, which would otherwise have to wait the real 5s.
    */
   abortTimeoutMs?: number;
   /**
