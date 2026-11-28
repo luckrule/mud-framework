@@ -271,6 +271,13 @@ const extensions: Extension[] = [
         dispatcher.register(
           'store-once',
           async (ctx, payload) => {
+            // The wire always supplies an id, but the handler type admits a
+            // direct dispatch with none; fail loudly instead of binding
+            // `undefined` as a SQL parameter.
+            const clientRequestId = ctx.clientRequestId;
+            if (clientRequestId === undefined) {
+              throw new Error('store-once requires a clientRequestId');
+            }
             await ctx.storage.execute(
               'CREATE TABLE IF NOT EXISTS once_notes (client_request_id TEXT PRIMARY KEY, body TEXT NOT NULL)',
             );
@@ -281,7 +288,7 @@ const extensions: Extension[] = [
             );
             await ctx.storage.execute(
               'INSERT INTO once_executions (client_request_id) VALUES (?)',
-              [ctx.clientRequestId],
+              [clientRequestId],
             );
             // `clientRequestId`, not `requestId`, is the business idempotency
             // key: `requestId` is minted per Request and only stable across
@@ -295,7 +302,7 @@ const extensions: Extension[] = [
             // only covers the case a real client retry creates.
             await ctx.storage.execute(
               'INSERT INTO once_notes (client_request_id, body) VALUES (?, ?) ON CONFLICT(client_request_id) DO NOTHING',
-              [ctx.clientRequestId, String(payload)],
+              [clientRequestId, String(payload)],
             );
             const attempt = recordAttempt(
               `${databasePath}.attempts`,

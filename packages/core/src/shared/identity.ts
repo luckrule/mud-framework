@@ -11,9 +11,12 @@ import type { LogFields } from '../logging/types.ts';
  * that starts one declares it through `bindSession`, which takes effect only if
  * the request succeeds (SPEC 2).
  *
- * `connectionId` and `clientRequestId` are empty strings rather than absent when
- * the caller supplied none: a direct `dispatch` has no connection. Only
- * `sessionId` uses absence to mean something ("not bound").
+ * `clientRequestId` is present only when the request carries one: a request
+ * that entered through the client wire format always does (`Envelope.id` is
+ * required non-empty), while a direct `dispatch` or an IPC message may omit it.
+ * An empty string is not a way to say "none" (SPEC 7.3). `connectionId` is an
+ * empty string rather than absent when a direct `dispatch` has no connection,
+ * and `sessionId` uses absence to mean "not bound".
  *
  * `readonly` because two of the five users are already read-only shapes and a
  * field nobody assigns needs no mutable declaration. It is also the whole safety
@@ -23,7 +26,7 @@ import type { LogFields } from '../logging/types.ts';
 export interface RequestIdentity {
   readonly requestId: string;
   readonly connectionId: string;
-  readonly clientRequestId: string;
+  readonly clientRequestId?: string;
   readonly sessionId?: string;
 }
 
@@ -31,16 +34,18 @@ export interface RequestIdentity {
  * `RequestIdentity` as request-level log bindings (SPEC 7.1). Both processes
  * build these fields, so the mapping lives here rather than in either one.
  *
- * `sessionId` is omitted, not written as `undefined` or an empty string, when
- * the connection holds no Session: absence is the contract for "unbound"
- * (SPEC 2).
+ * `clientRequestId` and `sessionId` are omitted, not written as `undefined` or
+ * an empty string, when absent: a request that carries no correlation key and a
+ * connection that holds no Session both mean "not there" (SPEC 2, 7.3).
  */
 export function requestLogFields(identity: RequestIdentity): LogFields {
   const fields: LogFields = {
     requestId: identity.requestId,
     connectionId: identity.connectionId,
-    clientRequestId: identity.clientRequestId,
   };
+  if (identity.clientRequestId !== undefined) {
+    fields.clientRequestId = identity.clientRequestId;
+  }
   if (identity.sessionId !== undefined) {
     fields.sessionId = identity.sessionId;
   }

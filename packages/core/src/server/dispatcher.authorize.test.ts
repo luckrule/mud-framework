@@ -122,6 +122,24 @@ describe('Dispatcher access policy (SPEC 3.7)', () => {
     }
   });
 
+  test('omits an absent client request id from the access context', async () => {
+    let seen: AccessContext | undefined;
+    const { dispatcher } = harness((ctx) => {
+      seen = ctx;
+      return true;
+    });
+    dispatcher.register('look', async () => null, { access: 'public' });
+
+    await dispatcher.dispatch('look', null, { requestId: 'r1' });
+
+    const context = seen;
+    if (context === undefined) {
+      throw new Error('authorize did not receive a context');
+    }
+    expect(context.clientRequestId).toBeUndefined();
+    expect(Object.hasOwn(context, 'clientRequestId')).toBe(false);
+  });
+
   test('the policy receives the caller payload unchanged', async () => {
     const payload = { target: 'rock', nested: [1, 2] };
     let seen: unknown;

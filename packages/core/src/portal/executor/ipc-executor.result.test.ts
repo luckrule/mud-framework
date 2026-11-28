@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 
+import { CLIENT_REQUEST_ID_EMPTY_MESSAGE } from '../../shared/client-request-id.ts';
 import {
   FakeServerProcess,
   failureOf,
@@ -14,6 +15,24 @@ import {
 import { IpcExecutor } from './ipc-executor.ts';
 
 describe('IpcExecutor result', () => {
+  test('rejects an explicitly empty clientRequestId without delivering it', async () => {
+    const h = harness();
+    const server = await started(h);
+
+    const outcome = await h.executor.execute(request({ clientRequestId: '' }));
+
+    expect(failureOf(outcome)).toEqual({
+      code: 'INTERNAL_ERROR',
+      message: CLIENT_REQUEST_ID_EMPTY_MESSAGE,
+    });
+    expect(requestMessages(server)).toHaveLength(0);
+    const rejected = h.logs().find((line) => line.msg === 'request rejected');
+    expect(rejected).toMatchObject({ code: 'INTERNAL_ERROR' });
+    // The invalid value never becomes a correlation key in the log.
+    expect(rejected).not.toHaveProperty('clientRequestId');
+    await h.executor.close();
+  });
+
   test('returns the server result as a success outcome', async () => {
     const h = harness();
     const server = await started(h);

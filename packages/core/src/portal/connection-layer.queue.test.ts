@@ -5,7 +5,7 @@ import { harness, sessionHarness } from '../testing/connection-layer.ts';
 
 describe('ConnectionLayer bounded input queue (SPEC 3.5)', () => {
   test('malformed frames consume the same bounded backlog without changing reply order or session binding', async () => {
-    const { transport, dispatcher, layer } = await harness({
+    const { transport, dispatcher, layer, logs } = await harness({
       maxQueuedPerConnection: 1,
       timeoutMs: 5000,
     });
@@ -45,6 +45,13 @@ describe('ConnectionLayer bounded input queue (SPEC 3.5)', () => {
           },
         },
       ]);
+      // The refused frame had no readable id, so the log must not invent an
+      // empty `clientRequestId`.
+      const refusals = logs().filter(
+        (entry) => entry.code === 'FRAMEWORK_QUEUE_FULL',
+      );
+      expect(refusals).toHaveLength(1);
+      expect(refusals[0]).not.toHaveProperty('clientRequestId');
       release.resolve();
       await Promise.all([slow, accepted, refused]);
       await transport.receive('c1', '{"id":"next","method":"identity"}');

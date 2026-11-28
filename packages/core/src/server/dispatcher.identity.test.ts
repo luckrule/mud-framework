@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
+import { CLIENT_REQUEST_ID_EMPTY_MESSAGE } from '../shared/client-request-id.ts';
+import { rejectionOf } from '../testing/common.ts';
 import { quietDispatcher } from '../testing/dispatcher.ts';
 import { MemoryStorageBackend } from '../testing/memory-backend.ts';
 import { Dispatcher } from './dispatcher.ts';
@@ -98,16 +100,20 @@ describe('Dispatcher.identity', () => {
     });
   });
 
-  test('defaults connection and client ids to empty strings when absent', async () => {
+  test('leaves the client request id absent when the caller supplied none', async () => {
     const backend = new MemoryStorageBackend();
     const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });
     let seen: Record<string, unknown> = {};
+    let hasClientRequestId = true;
     dispatcher.register(
       'inspect',
       async (ctx) => {
+        // Type-level: the handler sees the optional string, never a sentinel.
+        const clientRequestId: string | undefined = ctx.clientRequestId;
+        hasClientRequestId = Object.hasOwn(ctx, 'clientRequestId');
         seen = {
           connectionId: ctx.connectionId,
-          clientRequestId: ctx.clientRequestId,
+          clientRequestId,
           sessionId: ctx.sessionId,
         };
         return null;
@@ -117,11 +123,41 @@ describe('Dispatcher.identity', () => {
 
     await dispatcher.dispatch('inspect', null);
 
+    expect(hasClientRequestId).toBe(false);
     expect(seen).toEqual({
       connectionId: '',
-      clientRequestId: '',
+      clientRequestId: undefined,
       sessionId: undefined,
     });
+  });
+
+  test('rejects an explicitly empty client request id', async () => {
+    const backend = new MemoryStorageBackend();
+    const lines: string[] = [];
+    const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 }, lines);
+    let ran = false;
+    dispatcher.register(
+      'inspect',
+      async () => {
+        ran = true;
+        return null;
+      },
+      { access: 'public' },
+    );
+
+    const error = await rejectionOf(
+      dispatcher.dispatch('inspect', null, {
+        requestId: 'req-empty',
+        clientRequestId: '',
+      }),
+    );
+    expect(error).toBeInstanceOf(TypeError);
+    expect(error.message).toBe(CLIENT_REQUEST_ID_EMPTY_MESSAGE);
+    expect(ran).toBe(false);
+    expect(lines).toEqual([]);
+    // The refusal happens before any in-flight entry exists, so the caller
+    // cannot cancel a request that was never accepted.
+    expect(dispatcher.cancel('req-empty', 'TEST')).toBe(false);
   });
 
   test('binds the request ids onto ctx.logger', async () => {
@@ -151,5 +187,29 @@ describe('Dispatcher.identity', () => {
       clientRequestId: 'client-9',
       detail: 'inside handler',
     });
+  });
+
+  test('omits clientRequestId from the log bindings when absent', async () => {
+    const backend = new MemoryStorageBackend();
+    const lines: string[] = [];
+    const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 }, lines);
+    dispatcher.register(
+      'inspect',
+      async (ctx) => {
+        ctx.logger.info({ detail: 'inside handler' }, 'handler ran');
+        return null;
+      },
+      { access: 'public' },
+    );
+
+    await dispatcher.dispatch('inspect', null, { requestId: 'req-9' });
+
+    const line = JSON.parse(lines[0] ?? '');
+    expect(line).toMatchObject({
+      msg: 'handler ran',
+      requestId: 'req-9',
+      detail: 'inside handler',
+    });
+    expect(line).not.toHaveProperty('clientRequestId');
   });
 });

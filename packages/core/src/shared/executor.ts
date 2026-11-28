@@ -1,7 +1,7 @@
 import type { BufferedServerEvent, ServerEvent } from './events.ts';
 import type { RequestIdentity } from './identity.ts';
 
-/** Everything an executor needs about a request; all ids are already assigned. */
+/** Everything an executor needs about a request; the ids it carries are assigned. */
 export interface ExecutorRequest extends RequestIdentity {
   method: string;
   payload: unknown;

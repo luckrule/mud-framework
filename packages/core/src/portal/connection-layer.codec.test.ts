@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { Buffer } from 'node:buffer';
 
+import type { Codec } from '../shared/codec.ts';
 import { JsonCodec } from '../shared/codec.ts';
 import { parseFrame } from '../testing/common.ts';
 import {
@@ -75,6 +76,50 @@ describe('ConnectionLayer codec', () => {
     expect(frame.id).toBe('');
     expect(frame.ok).toBe(false);
     expect(frame.error).toMatchObject({ code: 'INVALID_ENVELOPE' });
+  });
+
+  test('rejects an empty id from a custom codec as an invalid envelope', async () => {
+    const json = new JsonCodec();
+    const emptyIdCodec: Codec = {
+      encode: (value) => json.encode(value),
+      decode: () => ({ id: '', method: 'echo', payload: null }),
+    };
+    let created = 0;
+    let ran = false;
+    const { transport, dispatcher, logs } = await harness({
+      codec: emptyIdCodec,
+      createRequestId: () => {
+        created += 1;
+        return `req-${created}`;
+      },
+    });
+    dispatcher.register(
+      'echo',
+      async () => {
+        ran = true;
+        return null;
+      },
+      { access: 'public' },
+    );
+    transport.connect('c1');
+
+    await transport.receive('c1', 'custom frame');
+
+    // The empty id is treated like a frame that could not be decoded: it never
+    // mints a request id, never reaches a handler and never becomes a log line
+    // with `clientRequestId: ''`.
+    expect(lastFrame(transport, 'c1')).toMatchObject({
+      id: '',
+      ok: false,
+      error: { code: 'INVALID_ENVELOPE' },
+    });
+    expect(created).toBe(0);
+    expect(ran).toBe(false);
+    const rejected = logs().filter(
+      (entry) => entry.code === 'INVALID_ENVELOPE',
+    );
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]).not.toHaveProperty('clientRequestId');
   });
 
   test('answers a missing id or method with INVALID_ENVELOPE', async () => {

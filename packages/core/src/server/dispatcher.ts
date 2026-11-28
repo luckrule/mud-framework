@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { createJsonLogger } from '../logging/json-logger.ts';
 import { safeLogger } from '../logging/safe-logger.ts';
 import type { Logger } from '../logging/types.ts';
+import { assertClientRequestId } from '../shared/client-request-id.ts';
 import { describeValue, messageOf } from '../shared/guards.ts';
 import { elapsedMs, tightenTimeout } from '../shared/timeout.ts';
 import {
@@ -166,18 +167,21 @@ export class Dispatcher {
     meta: DispatchMeta = {},
   ): Promise<DispatchResult> {
     this.assertOpen();
+    // Absence means "the caller supplied none"; an empty string cannot mean
+    // the same thing without making a present-but-empty id indistinguishable
+    // from a missing one (SPEC 7.3).
+    assertClientRequestId(meta.clientRequestId);
     // The supplied id wins: a replay must keep the id the original request
     // got on entry (SPEC 7.3), and generating a fresh one would split one
     // player input across two unrelated log trails.
     const requestId = meta.requestId ?? this.createRequestId();
     const connectionId = meta.connectionId ?? '';
-    const clientRequestId = meta.clientRequestId ?? '';
+    const clientRequestId = meta.clientRequestId;
     const registered = this.handlers.get(name);
-    const bindings: Record<string, unknown> = {
-      requestId,
-      connectionId,
-      clientRequestId,
-    };
+    const bindings: Record<string, unknown> = { requestId, connectionId };
+    if (clientRequestId !== undefined) {
+      bindings.clientRequestId = clientRequestId;
+    }
     if (meta.sessionId !== undefined) {
       bindings.sessionId = meta.sessionId;
     }
@@ -297,7 +301,7 @@ export class Dispatcher {
           {
             requestId,
             connectionId,
-            clientRequestId,
+            ...(clientRequestId === undefined ? {} : { clientRequestId }),
             sessionId: meta.sessionId,
             extension: registered.extension,
             signal: expiry.controller.signal,
@@ -316,7 +320,7 @@ export class Dispatcher {
         const context: RequestContext = {
           requestId,
           connectionId,
-          clientRequestId,
+          ...(clientRequestId === undefined ? {} : { clientRequestId }),
           sessionId: meta.sessionId,
           signal: expiry.controller.signal,
           extension: registered.extension,

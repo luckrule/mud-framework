@@ -2,6 +2,8 @@ import { describe, expect, test } from 'bun:test';
 
 import { createJsonLogger } from '../logging/json-logger.ts';
 import { closeBudget } from '../shared/budget.ts';
+import type { Codec } from '../shared/codec.ts';
+import { JsonCodec } from '../shared/codec.ts';
 import type { ServerEvent } from '../shared/events.ts';
 import type { RequestExecutor } from '../shared/executor.ts';
 import { parseFrame, rejectionOf, sleep } from '../testing/common.ts';
@@ -151,6 +153,91 @@ describe('ConnectionLayer shutdown (SPEC 6.3)', () => {
         .map(parseFrame)
         .filter((entry) => entry.code === 'FRAMEWORK_SHUTDOWN'),
     ).toHaveLength(1);
+  });
+
+  test('refuses an undecodable frame during shutdown without a clientRequestId log field', async () => {
+    const order: string[] = [];
+    const { executor } = scriptedExecutor(order);
+    const scripted = scriptedTransport(order);
+    const lines: string[] = [];
+    const layer = new ConnectionLayer({
+      transport: scripted.transport,
+      executor,
+      logger: createJsonLogger({
+        sink: (line) => {
+          lines.push(line);
+        },
+      }),
+    });
+    await layer.start();
+    const { connection, sent } = fakeConnection('c1');
+    await layer.onConnect(connection);
+
+    const stopping = layer.stop();
+    await layer.onMessage(connection, 'not json');
+    await stopping;
+
+    // The wire reply keeps the documented empty id; the log must not report an
+    // empty `clientRequestId` for a frame that never had one.
+    expect(parseFrame(sent[0] ?? '{}')).toEqual({
+      id: '',
+      ok: false,
+      error: {
+        code: 'FRAMEWORK_SHUTDOWN',
+        message: 'connection layer is shutting down',
+      },
+    });
+    const refusals = lines
+      .map(parseFrame)
+      .filter((entry) => entry.code === 'FRAMEWORK_SHUTDOWN');
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0]).not.toHaveProperty('clientRequestId');
+  });
+
+  test('treats an empty id from a custom codec as uncorrelated during shutdown', async () => {
+    const order: string[] = [];
+    const { executor } = scriptedExecutor(order);
+    const scripted = scriptedTransport(order);
+    const lines: string[] = [];
+    const json = new JsonCodec();
+    const emptyIdCodec: Codec = {
+      encode: (value) => json.encode(value),
+      decode: () => ({ id: '', method: 'late', payload: null }),
+    };
+    const layer = new ConnectionLayer({
+      transport: scripted.transport,
+      executor,
+      codec: emptyIdCodec,
+      logger: createJsonLogger({
+        sink: (line) => {
+          lines.push(line);
+        },
+      }),
+    });
+    await layer.start();
+    const { connection, sent } = fakeConnection('c1');
+    await layer.onConnect(connection);
+
+    const stopping = layer.stop();
+    await layer.onMessage(connection, 'custom frame');
+    await stopping;
+
+    // Shutdown has no INVALID_ENVELOPE path: an unreadable id becomes "no
+    // correlation", so the reply keeps the documented empty id and the log
+    // omits `clientRequestId` rather than reporting an empty key.
+    expect(parseFrame(sent[0] ?? '{}')).toEqual({
+      id: '',
+      ok: false,
+      error: {
+        code: 'FRAMEWORK_SHUTDOWN',
+        message: 'connection layer is shutting down',
+      },
+    });
+    const refusals = lines
+      .map(parseFrame)
+      .filter((entry) => entry.code === 'FRAMEWORK_SHUTDOWN');
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0]).not.toHaveProperty('clientRequestId');
   });
 
   test('settles after shutdownTimeoutMs when a handler never returns (2c)', async () => {

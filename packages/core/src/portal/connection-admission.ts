@@ -209,7 +209,7 @@ export function closeForBacklog(
 export function refuseQueue(
   host: AdmissionHost,
   state: ConnectionState,
-  id: string,
+  id: string | undefined,
   method?: string,
   requestId?: string,
 ): Promise<void> {
@@ -217,7 +217,7 @@ export function refuseQueue(
     {
       connectionId: state.connection.id,
       ...(requestId === undefined ? {} : { requestId }),
-      clientRequestId: id,
+      ...(id === undefined ? {} : { clientRequestId: id }),
       method,
       code: FRAMEWORK_QUEUE_FULL,
       queued: state.queued,
@@ -229,7 +229,7 @@ export function refuseQueue(
     host,
     state.connection,
     {
-      id,
+      id: id ?? '',
       ok: false,
       error: {
         code: FRAMEWORK_QUEUE_FULL,
@@ -251,12 +251,18 @@ export async function refuseAfterShutdown(
   connection: TransportConnection,
   payload: string | Uint8Array,
 ): Promise<void> {
-  let id: string;
+  let id: string | undefined;
   try {
     id = host.codec.decode(payload).id;
+    // A custom codec may return an empty id. Shutdown has no INVALID_ENVELOPE
+    // path, so treat it like an unreadable frame: answer with an empty id and
+    // omit the field from the log instead of reporting it as a correlation key.
+    if (id.length === 0) {
+      id = undefined;
+    }
   } catch {
     // Unreadable frame during shutdown: still answer, with no correlation.
-    id = '';
+    id = undefined;
   }
   await refuseWithId(host, connection, id);
 }
@@ -264,14 +270,14 @@ export async function refuseAfterShutdown(
 export async function refuseWithId(
   host: AdmissionHost,
   connection: TransportConnection,
-  id: string,
+  id: string | undefined,
   requestId?: string,
 ): Promise<void> {
   host.logger.warn(
     {
       connectionId: connection.id,
       ...(requestId === undefined ? {} : { requestId }),
-      clientRequestId: id,
+      ...(id === undefined ? {} : { clientRequestId: id }),
       code: FRAMEWORK_SHUTDOWN,
       reason: 'request arrived after shutdown started',
     },
@@ -281,7 +287,7 @@ export async function refuseWithId(
     host,
     connection,
     {
-      id,
+      id: id ?? '',
       ok: false,
       error: {
         code: FRAMEWORK_SHUTDOWN,
