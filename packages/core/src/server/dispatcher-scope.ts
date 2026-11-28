@@ -4,6 +4,7 @@ import type {
   ServerEventTarget,
 } from '../shared/events.ts';
 import type { SessionChange } from '../shared/executor.ts';
+import { describeValue } from '../shared/guards.ts';
 import { elapsedMs } from '../shared/timeout.ts';
 import type { StorageTransaction } from '../storage/types.ts';
 
@@ -49,6 +50,32 @@ export interface SessionChangeHolder {
  * handler that emits in a loop is the one that has to decide what to drop.
  */
 export const DEFAULT_MAX_EVENTS_PER_REQUEST = 1024;
+
+/**
+ * Constructor-time validation, not a per-request check: a bad value is a
+ * deployment error and must refuse startup. Called by both `startServer` and
+ * the `Dispatcher` constructor, so a JavaScript caller that bypasses the
+ * startup path still gets the same refusal. `unknown` because a JavaScript
+ * caller can pass anything the type says it cannot. The message names the full
+ * contract — a safe integer, not merely a positive one — because
+ * `MAX_SAFE_INTEGER + 1` is a positive integer but not a usable cap.
+ */
+export function resolveMaxEventsPerRequest(value: unknown): number {
+  if (value === undefined) {
+    return DEFAULT_MAX_EVENTS_PER_REQUEST;
+  }
+  if (typeof value !== 'number') {
+    throw new TypeError(
+      `maxEventsPerRequest must be a safe integer of at least 1, got ${describeValue(value)}`,
+    );
+  }
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new RangeError(
+      `maxEventsPerRequest must be a safe integer of at least 1, got ${String(value)}`,
+    );
+  }
+  return value;
+}
 
 /** Events recorded by one request, in emission order, under one shared cap. */
 export interface EventBuffer {

@@ -27,12 +27,12 @@ import type {
 import {
   assertActive,
   assertSessionChangeAllowed,
-  DEFAULT_MAX_EVENTS_PER_REQUEST,
   EXPIRED_MESSAGE,
   guard,
   logLostCommit,
   recordEvent,
   recordSessionChange,
+  resolveMaxEventsPerRequest,
 } from './dispatcher-scope.ts';
 import type {
   EventBuffer,
@@ -87,30 +87,6 @@ interface HandlerEntry {
   readonly extension?: string;
   readonly access: HandlerAccess;
   readonly mayChangeSession: boolean;
-}
-
-/**
- * Constructor-time validation, not a per-request check: a bad value is a
- * deployment error and must refuse startup. `unknown` because a JavaScript
- * caller can pass anything the type says it cannot. The message names the full
- * contract — a safe integer, not merely a positive one — because
- * `MAX_SAFE_INTEGER + 1` is a positive integer but not a usable cap.
- */
-function resolveMaxEventsPerRequest(value: unknown): number {
-  if (value === undefined) {
-    return DEFAULT_MAX_EVENTS_PER_REQUEST;
-  }
-  if (typeof value !== 'number') {
-    throw new TypeError(
-      `maxEventsPerRequest must be a safe integer of at least 1, got ${describeValue(value)}`,
-    );
-  }
-  if (!Number.isSafeInteger(value) || value < 1) {
-    throw new RangeError(
-      `maxEventsPerRequest must be a safe integer of at least 1, got ${String(value)}`,
-    );
-  }
-  return value;
 }
 
 export class Dispatcher {
