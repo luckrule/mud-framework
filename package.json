@@ -27,8 +27,8 @@
     "mud-framework-core": "workspace:*",
     "mud-framework-storage-sqlite": "workspace:*",
     "mud-framework-test-support": "workspace:*",
-    "oxfmt": "0.79.0",
-    "oxlint": "1.94.0",
+    "oxfmt": "0.80.0",
+    "oxlint": "1.95.0",
     "oxlint-tsgolint": "7.0.2008",
     "typescript": "7.0.2"
   },
