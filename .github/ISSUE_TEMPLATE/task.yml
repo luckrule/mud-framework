@@ -1,0 +1,93 @@
+name: Work package (maintainers)
+description: Maintainer-facing task with explicit scope, acceptance criteria, and verification
+title: "[Task] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One issue, one deliverable. State scope and non-goals up front. If the change touches contracts, error codes, log fields, or storage capabilities, cite SPEC/INVARIANTS first.
+        External suggestions should use Feature request instead of this template.
+  - type: textarea
+    id: context
+    attributes:
+      label: Context and problem
+      description: Why this is needed; the gap between current and expected behavior.
+      placeholder: Cite SPEC/INV/ADR or related issues.
+    validations:
+      required: true
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: The observable fact that will hold when this is done.
+      placeholder: Describe the outcome in one or two sentences; do not prescribe implementation steps.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and non-goals
+      description: What this issue changes and what it explicitly does not change.
+      placeholder: |
+        Scope:
+        - ...
+        Non-goals:
+        - ...
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Conditions that can be checked off one by one.
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification
+      description: Commands to run, metrics to observe, or manual checks.
+      placeholder: bash scripts/ci.sh --skip-install / bun test tests/integration
+    validations:
+      required: true
+  - type: dropdown
+    id: type
+    attributes:
+      label: Type
+      description: Pick the closest type; other is a valid label for work that does not fit.
+      options:
+        - capacity
+        - contract
+        - events
+        - release
+        - other
+    validations:
+      required: true
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: The maintainer applies the P0/P1/P2 label.
+      options:
+        - P0
+        - P1
+        - P2
+    validations:
+      required: true
+  - type: input
+    id: dependencies
+    attributes:
+      label: Dependencies and blockers
+      description: Linked issues/PRs or current blockers; write "None" if there are none.
+    validations:
+      required: false
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional notes
+      description: Risks, rollback plan, or decisions needed from the owner.
+    validations:
+      required: false

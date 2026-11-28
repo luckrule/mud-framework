@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/luckrule/mud-framework/security/advisories/new
+    about: Report privately. See SECURITY.md for scope and disclosure.
+  - name: Discussions
+    url: https://github.com/luckrule/mud-framework/discussions
+    about: Open-ended questions, ideas, and design discussion
+  - name: Contributing guide
+    url: https://github.com/luckrule/mud-framework/blob/main/docs/CONTRIBUTING.md
+    about: Issue/PR conventions, local gates, and verification

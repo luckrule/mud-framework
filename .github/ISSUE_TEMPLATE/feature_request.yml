@@ -1,0 +1,37 @@
+name: Feature request
+description: Suggest a capability or improvement for the framework
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        External suggestions are intake only. Maintainers triage `enhancement` into capacity/contract/events/release and P0/P1/P2.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / use case
+      description: What are you trying to do, and what blocks you today?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: The behavior or API you would like to see.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches or workarounds; write "None" if there are none.
+    validations:
+      required: true
+  - type: textarea
+    id: surface
+    attributes:
+      label: Affected surface
+      description: Public API, client protocol, Portal-Server IPC, event delivery, storage, transport, or documentation.
+    validations:
+      required: true

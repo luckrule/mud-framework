@@ -16,7 +16,7 @@ sh scripts/ci.sh --skip-install   # 完整门禁
 
 ## 文档
 
-契约见 `docs/SPEC.md` 与 `docs/INVARIANTS.md`，装配见 `docs/INTEGRATION.md`。
+契约见 `docs/SPEC.md` 与 `docs/INVARIANTS.md`，装配见 `docs/INTEGRATION.md`。参与方式见 `docs/CONTRIBUTING.md`，issue 分诊与状态见 `docs/TRIAGE.md`，安全策略见 `SECURITY.md`。
 
 ## 许可证
 
