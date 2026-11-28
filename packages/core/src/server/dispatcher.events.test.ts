@@ -293,4 +293,81 @@ describe('Dispatcher server events', () => {
     expect(error.message).toMatch(/at most 1024 events/);
     expect(backend.stats()).toEqual({ committed: 0, rolledBack: 1 });
   });
+
+  test('honours a configured maxEventsPerRequest across both emit paths and requests', async () => {
+    const backend = new MemoryStorageBackend();
+    const { dispatcher } = quietDispatcher({
+      backend,
+      timeoutMs: 1000,
+      maxEventsPerRequest: 2,
+    });
+    let overflow = '';
+
+    dispatcher.register(
+      'two',
+      (ctx) => {
+        ctx.emit('first', 1);
+        ctx.emitToSession('session-2', 'second', 2);
+        return Promise.resolve('ok');
+      },
+      { access: 'public' },
+    );
+    dispatcher.register(
+      'three',
+      (ctx) => {
+        for (let index = 0; index < 3; index += 1) {
+          try {
+            ctx.emit('tick', index);
+          } catch (error) {
+            overflow = error instanceof Error ? error.message : String(error);
+          }
+        }
+        return Promise.resolve('ok');
+      },
+      { access: 'public' },
+    );
+
+    const first = await dispatcher.dispatch('two', null, {
+      connectionId: 'conn-1',
+    });
+    // A second request starts from zero even though the first filled the cap.
+    const second = await dispatcher.dispatch('two', null, {
+      connectionId: 'conn-1',
+    });
+    const caught = await dispatcher.dispatch('three', null, {
+      connectionId: 'conn-1',
+    });
+
+    expect(eventsOf(first)).toHaveLength(2);
+    expect(eventsOf(second)).toHaveLength(2);
+    expect(overflow).toBe('a request may emit at most 2 events');
+    expect(eventsOf(caught)).toHaveLength(2);
+  });
+
+  test('fails a request that exceeds a configured maxEventsPerRequest', async () => {
+    const backend = new MemoryStorageBackend();
+    const { dispatcher } = quietDispatcher({
+      backend,
+      timeoutMs: 1000,
+      maxEventsPerRequest: 2,
+    });
+
+    dispatcher.register(
+      'three',
+      (ctx) => {
+        ctx.emit('one', 1);
+        ctx.emit('two', 2);
+        ctx.emit('three', 3);
+        return Promise.resolve('ok');
+      },
+      { access: 'public' },
+    );
+
+    const error = await rejectionOf(
+      dispatcher.dispatch('three', null, { connectionId: 'conn-1' }),
+    );
+
+    expect(error.message).toBe('a request may emit at most 2 events');
+    expect(backend.stats()).toEqual({ committed: 0, rolledBack: 1 });
+  });
 });

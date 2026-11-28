@@ -74,6 +74,46 @@ describe('runServerProcess requests', () => {
     await harness.stop();
   });
 
+  test('maps an event overflow to INTERNAL_ERROR with the configured limit', async () => {
+    const harness = startServer({
+      maxEventsPerRequest: 2,
+      extensions: [
+        {
+          name: 'events',
+          register: (dispatcher) => {
+            dispatcher.register(
+              'spam',
+              (ctx) => {
+                ctx.emit('one', 1);
+                ctx.emit('two', 2);
+                ctx.emit('three', 3);
+                return Promise.resolve('ok');
+              },
+              { access: 'public' },
+            );
+          },
+        },
+      ],
+    });
+    await tick();
+
+    harness.portal.send(requestMessage({ method: 'spam' }));
+    await tick();
+
+    const [outcome] = results(harness.messages);
+    expect(outcome).toMatchObject({
+      type: 'result',
+      requestId: 'req-1',
+      ok: false,
+      error: { code: 'INTERNAL_ERROR' },
+    });
+    if (outcome === undefined || outcome.ok) {
+      throw new Error('expected a failed result');
+    }
+    expect(outcome.error.message).toContain('at most 2 events');
+    await harness.stop();
+  });
+
   test('maps an unknown method to UNKNOWN_METHOD', async () => {
     const harness = startServer({
       extensions: [{ name: 'echo', register: echoRegistration }],

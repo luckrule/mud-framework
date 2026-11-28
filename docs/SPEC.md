@@ -172,7 +172,8 @@ Handler 可以为一个请求声明要发送的事件（ADR-0008）。`ctx.emit(
 - Handler 抛错、请求超时、被取消或事务回滚时，缓冲的事件 MUST 丢弃，MUST NOT 发送。
 - 请求到达终态后再声明事件 MUST 被拒绝，与事务句柄的失效边界一致。
 - 事件发出后不回滚。投递是 best-effort：可能因目标缺失、连接关闭、编码或写失败而丢失；请求重放可能让同一事件以相同 `eventId` 重复发送。框架不提供投递确认或去重，需要去重的业务可用 `eventId` 自行判断。
-- 每个请求可缓冲的事件数量 MUST 有界；超出时声明事件的调用抛出普通错误，Handler 可以捕获。该错误未逃逸时请求仍可成功，逃逸时按 Handler 失败处理。
+- 每个请求可缓冲的事件数量 MUST 有界，上限由 `ServerProcessOptions.maxEventsPerRequest` 定义，默认 1024；`ctx.emit` 与 `ctx.emitToSession` 计入同一个上限，计数按请求重置。该选项 MUST 是大于等于 1 的安全整数，在启动期校验；不合法时 Server MUST 拒绝启动。
+- 超出上限时声明事件的调用抛出普通错误，错误信息 MUST 带实际配置的上限值；Handler 可以捕获。该错误未逃逸时请求仍可成功，逃逸时按 Handler 失败处理（wire 上为 `INTERNAL_ERROR`）。一次广播可声明的事件数同样受该上限约束：目标 Session/收件人数超过上限时，超出部分由 Handler 自行取舍或分批发送。
 
 投递语义（best-effort）：
 

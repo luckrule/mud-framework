@@ -105,4 +105,26 @@ describe('runServerProcess startup', () => {
     expect(error.reason).toContain('extension refused');
     expect(messageTypes(harness.messages)).toEqual(['prepared']);
   });
+
+  test.each([
+    ['zero', 0],
+    ['negative', -1],
+    ['fractional', 1.5],
+    ['NaN', Number.NaN],
+    ['Infinity', Number.POSITIVE_INFINITY],
+    ['non-number', '2'],
+  ] as const)(
+    'fails without ready when maxEventsPerRequest is %s',
+    async (_name, value) => {
+      const harness = startServer({
+        extensions: [{ name: 'echo', register: echoRegistration }],
+        maxEventsPerRequest: value as number,
+      });
+
+      const error = await startupFailure(harness.done);
+
+      expect(error.reason).toContain('maxEventsPerRequest');
+      expect(messageTypes(harness.messages)).toEqual(['prepared']);
+    },
+  );
 });

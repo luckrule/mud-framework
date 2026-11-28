@@ -40,18 +40,25 @@ export interface SessionChangeHolder {
 }
 
 /**
- * How many events one request may buffer (ADR-0008). Bounded like every other
- * per-request accumulation: an unbounded buffer would let one handler pin
- * memory until the request ends, and a flood of events is far easier to
- * produce than a flood of requests. Exceeding it is a plain handler error
- * (catchable), not a framework terminal state, because the handler that emits
- * in a loop is the one that has to decide what to drop.
+ * Default number of events one request may buffer (ADR-0008), overridable per
+ * Server via `ServerProcessOptions.maxEventsPerRequest`. Buffered events are
+ * bounded like every other per-request accumulation: an unbounded buffer would
+ * let one handler pin memory until the request ends, and a flood of events is
+ * far easier to produce than a flood of requests. Exceeding the bound is a
+ * plain handler error (catchable), not a framework terminal state, because the
+ * handler that emits in a loop is the one that has to decide what to drop.
  */
-export const MAX_EVENTS_PER_REQUEST = 1024;
+export const DEFAULT_MAX_EVENTS_PER_REQUEST = 1024;
 
-/** Events recorded by one request, in emission order. */
+/** Events recorded by one request, in emission order, under one shared cap. */
 export interface EventBuffer {
   readonly events: BufferedServerEvent[];
+  /**
+   * Carried by the buffer rather than read from module state, so the cap is
+   * fixed at request creation and a change of configuration cannot alter a
+   * request already in flight.
+   */
+  readonly limit: number;
 }
 
 export function recordEvent(
@@ -70,10 +77,8 @@ export function recordEvent(
   if (target.kind === 'session' && target.sessionId.length === 0) {
     throw new Error('emitToSession requires a non-empty session id');
   }
-  if (buffer.events.length >= MAX_EVENTS_PER_REQUEST) {
-    throw new Error(
-      `a request may emit at most ${MAX_EVENTS_PER_REQUEST} events`,
-    );
+  if (buffer.events.length >= buffer.limit) {
+    throw new Error(`a request may emit at most ${buffer.limit} events`);
   }
   buffer.events.push({ target, event, payload });
 }
