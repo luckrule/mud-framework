@@ -46,7 +46,7 @@ export function onMessage(
   // frames: retaining uncounted callbacks would make this queue unbounded.
   let envelope: Envelope;
   try {
-    envelope = host.codec.decode(payload);
+    envelope = decodeEnvelope(host, payload);
   } catch (error) {
     if (state.queued >= host.maxQueuedPerConnection) {
       return refuseQueue(host, state, undefined);
@@ -81,13 +81,30 @@ export function onMessage(
       identity: {
         requestId,
         method: envelope.method,
-        ...(envelope.id === '' ? {} : { clientRequestId: envelope.id }),
+        clientRequestId: envelope.id,
       },
       // Shutdown drops the work before it starts, so the release that would
       // have happened inside `startAfterGate` never runs.
       onDropped: () => seat.release(),
     },
   );
+}
+
+/**
+ * The default codec rejects an empty id, but a replacement is outside code and
+ * may not. A frame without an id cannot be correlated, so it takes the same
+ * rejection path as a frame that failed to decode instead of becoming a request
+ * whose log line would carry `clientRequestId: ''` (SPEC 5.4, 7.3).
+ */
+function decodeEnvelope(
+  host: RequestHost,
+  payload: string | Uint8Array,
+): Envelope {
+  const envelope = host.codec.decode(payload);
+  if (envelope.id.length === 0) {
+    throw new Error('envelope "id" must be a non-empty string');
+  }
+  return envelope;
 }
 
 async function startAfterGate(

@@ -1,10 +1,14 @@
 /**
- * Validation for the optional client correlation key (SPEC 7.3).
+ * Validation for the client correlation key (SPEC 7.3).
  *
- * Absence is the only way to say "the caller supplied none": an empty string
- * would make a present-but-empty id indistinguishable from a missing one, so
- * every entry that accepts the field rejects it. The wording lives here so the
- * dispatcher, the IPC executor and the IPC parser refuse it identically.
+ * The field is absent only when a direct `Dispatcher.dispatch` or an IPC
+ * `request` message omitted it; a request that entered through the client wire
+ * format always carries one (`Envelope.id` is required non-empty). Absence is
+ * the only valid way to say "none": an empty string would be indistinguishable
+ * from a missing id, so every entry that accepts the field rejects it. The
+ * wording lives here so the dispatcher and the IPC executor refuse it
+ * identically; the parser uses the same predicate and wraps it in its own
+ * `ShapeError`.
  */
 
 export const CLIENT_REQUEST_ID_EMPTY_MESSAGE =

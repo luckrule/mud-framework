@@ -254,6 +254,12 @@ export async function refuseAfterShutdown(
   let id: string | undefined;
   try {
     id = host.codec.decode(payload).id;
+    // A custom codec may return an empty id. Shutdown has no INVALID_ENVELOPE
+    // path, so treat it like an unreadable frame: answer with an empty id and
+    // omit the field from the log instead of reporting it as a correlation key.
+    if (id.length === 0) {
+      id = undefined;
+    }
   } catch {
     // Unreadable frame during shutdown: still answer, with no correlation.
     id = undefined;

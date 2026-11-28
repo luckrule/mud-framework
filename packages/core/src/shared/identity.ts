@@ -11,11 +11,12 @@ import type { LogFields } from '../logging/types.ts';
  * that starts one declares it through `bindSession`, which takes effect only if
  * the request succeeds (SPEC 2).
  *
- * `clientRequestId` is present only when the caller supplied one: it is the
- * client's own correlation key, not a framework id, and an empty string is not
- * a way to say "none" (SPEC 7.3). `connectionId` is an empty string rather than
- * absent when a direct `dispatch` has no connection, and `sessionId` uses
- * absence to mean "not bound".
+ * `clientRequestId` is present only when the request carries one: a request
+ * that entered through the client wire format always does (`Envelope.id` is
+ * required non-empty), while a direct `dispatch` or an IPC message may omit it.
+ * An empty string is not a way to say "none" (SPEC 7.3). `connectionId` is an
+ * empty string rather than absent when a direct `dispatch` has no connection,
+ * and `sessionId` uses absence to mean "not bound".
  *
  * `readonly` because two of the five users are already read-only shapes and a
  * field nobody assigns needs no mutable declaration. It is also the whole safety

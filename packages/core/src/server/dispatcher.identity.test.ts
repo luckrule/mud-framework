@@ -133,7 +133,8 @@ describe('Dispatcher.identity', () => {
 
   test('rejects an explicitly empty client request id', async () => {
     const backend = new MemoryStorageBackend();
-    const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });
+    const lines: string[] = [];
+    const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 }, lines);
     let ran = false;
     dispatcher.register(
       'inspect',
@@ -145,10 +146,18 @@ describe('Dispatcher.identity', () => {
     );
 
     const error = await rejectionOf(
-      dispatcher.dispatch('inspect', null, { clientRequestId: '' }),
+      dispatcher.dispatch('inspect', null, {
+        requestId: 'req-empty',
+        clientRequestId: '',
+      }),
     );
+    expect(error).toBeInstanceOf(TypeError);
     expect(error.message).toBe(CLIENT_REQUEST_ID_EMPTY_MESSAGE);
     expect(ran).toBe(false);
+    expect(lines).toEqual([]);
+    // The refusal happens before any in-flight entry exists, so the caller
+    // cannot cancel a request that was never accepted.
+    expect(dispatcher.cancel('req-empty', 'TEST')).toBe(false);
   });
 
   test('binds the request ids onto ctx.logger', async () => {
