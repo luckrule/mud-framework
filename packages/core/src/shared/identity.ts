@@ -35,7 +35,7 @@ export interface RequestIdentity {
  * build these fields, so the mapping lives here rather than in either one.
  *
  * `clientRequestId` and `sessionId` are omitted, not written as `undefined` or
- * an empty string, when absent: a client that supplied no correlation key and a
+ * an empty string, when absent: a request that carries no correlation key and a
  * connection that holds no Session both mean "not there" (SPEC 2, 7.3).
  */
 export function requestLogFields(identity: RequestIdentity): LogFields {

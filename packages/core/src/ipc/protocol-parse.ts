@@ -104,8 +104,8 @@ function buildRequest(raw: Record<string, unknown>): RequestMessage {
     type: 'request',
     requestId: readString(raw, 'request', 'requestId', true),
     connectionId: readString(raw, 'request', 'connectionId', true),
-    // Optional correlation key (SPEC 7.3): absent when the client supplied
-    // none, and still rejected when present but empty.
+    // Optional correlation key (SPEC 7.3): an IPC `request` message may omit
+    // it; a present-but-empty value is still rejected.
     clientRequestId: readClientRequestId(raw, 'request', 'clientRequestId'),
     sessionId: readOptionalString(raw, 'request', 'sessionId'),
     method: readString(raw, 'request', 'method', true),
