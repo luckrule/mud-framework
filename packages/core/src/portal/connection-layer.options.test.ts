@@ -38,141 +38,115 @@ function layerWithTransport(transport: Transport): ConnectionLayer {
   });
 }
 
+type InvalidValue = readonly [unknown, typeof RangeError | typeof TypeError];
+
+type NumericOption =
+  | 'maxConnections'
+  | 'maxQueuedPerConnection'
+  | 'maxQueuedEvents'
+  | 'maxQueuedEventBytes'
+  | 'eventBacklogWarnBytes'
+  | 'shutdownTimeoutMs'
+  | 'eventSendTimeoutMs';
+
+function layerWith(option: NumericOption, value: number): ConnectionLayer {
+  return createLayer({ [option]: value });
+}
+
 describe('ConnectionLayer option validation', () => {
-  test('rejects maxConnections that is not a positive integer', () => {
-    const invalid: readonly [unknown, typeof RangeError | typeof TypeError][] =
-      [
+  test.each<{
+    option: NumericOption;
+    invalid: readonly InvalidValue[];
+  }>([
+    {
+      option: 'maxConnections',
+      invalid: [
         [0, RangeError],
         [-1, RangeError],
         [1.5, RangeError],
         [Number.NaN, RangeError],
         [Number.POSITIVE_INFINITY, RangeError],
         ['10', TypeError],
-      ];
-    for (const [value, Expected] of invalid) {
-      const call = () => createLayer({ maxConnections: value as number });
-      expect(call).toThrow(Expected);
-      expect(call).toThrow(/maxConnections/);
-      expect(call).toThrow(new RegExp(String(value)));
-    }
-    expect(() => createLayer({ maxConnections: 1 })).not.toThrow();
-  });
-
-  test('rejects maxQueuedPerConnection that is not a positive integer, and accepts 1', () => {
-    const invalid: readonly [unknown, typeof RangeError | typeof TypeError][] =
-      [
+      ],
+    },
+    {
+      option: 'maxQueuedPerConnection',
+      invalid: [
         [0, RangeError],
         [-1, RangeError],
         [1.5, RangeError],
         [Number.NaN, RangeError],
         [Number.POSITIVE_INFINITY, RangeError],
         ['5', TypeError],
-      ];
-    for (const [value, Expected] of invalid) {
-      const call = () =>
-        createLayer({ maxQueuedPerConnection: value as number });
-      expect(call).toThrow(Expected);
-      expect(call).toThrow(/maxQueuedPerConnection/);
-      expect(call).toThrow(new RegExp(String(value)));
-    }
-    expect(() => createLayer({ maxQueuedPerConnection: 1 })).not.toThrow();
-  });
-
-  test('rejects maxQueuedEvents that is not a positive integer, and accepts 1', () => {
-    const invalid: readonly [unknown, typeof RangeError | typeof TypeError][] =
-      [
+      ],
+    },
+    {
+      option: 'maxQueuedEvents',
+      invalid: [
         [0, RangeError],
         [-1, RangeError],
         [1.5, RangeError],
         [Number.NaN, RangeError],
         [Number.POSITIVE_INFINITY, RangeError],
         ['5', TypeError],
-      ];
-    for (const [value, Expected] of invalid) {
-      const call = () => createLayer({ maxQueuedEvents: value as number });
-      expect(call).toThrow(Expected);
-      expect(call).toThrow(/maxQueuedEvents/);
-      expect(call).toThrow(new RegExp(String(value)));
-    }
-    expect(() => createLayer({ maxQueuedEvents: 1 })).not.toThrow();
-  });
-
-  test('rejects maxQueuedEventBytes that is not a positive integer, and accepts 1', () => {
-    const invalid: readonly [unknown, typeof RangeError | typeof TypeError][] =
-      [
+      ],
+    },
+    {
+      option: 'maxQueuedEventBytes',
+      invalid: [
         [0, RangeError],
         [-1, RangeError],
         [1.5, RangeError],
         [Number.NaN, RangeError],
         [Number.POSITIVE_INFINITY, RangeError],
         ['5', TypeError],
-      ];
-    for (const [value, Expected] of invalid) {
-      const call = () => createLayer({ maxQueuedEventBytes: value as number });
-      expect(call).toThrow(Expected);
-      expect(call).toThrow(/maxQueuedEventBytes/);
-      expect(call).toThrow(new RegExp(String(value)));
-    }
-    expect(() => createLayer({ maxQueuedEventBytes: 1 })).not.toThrow();
-  });
-
-  test('rejects eventBacklogWarnBytes that is not a positive integer, and accepts 1', () => {
-    const invalid: readonly [unknown, typeof RangeError | typeof TypeError][] =
-      [
+      ],
+    },
+    {
+      option: 'eventBacklogWarnBytes',
+      invalid: [
         [0, RangeError],
         [-1, RangeError],
         [1.5, RangeError],
         [Number.NaN, RangeError],
         [Number.POSITIVE_INFINITY, RangeError],
         ['5', TypeError],
-      ];
-    for (const [value, Expected] of invalid) {
-      const call = () =>
-        createLayer({ eventBacklogWarnBytes: value as number });
-      expect(call).toThrow(Expected);
-      expect(call).toThrow(/eventBacklogWarnBytes/);
-      expect(call).toThrow(new RegExp(String(value)));
-    }
-    expect(() => createLayer({ eventBacklogWarnBytes: 1 })).not.toThrow();
-  });
-
-  test('rejects shutdownTimeoutMs below 1, NaN or Infinity, and accepts 1', () => {
-    const invalid: readonly [unknown, typeof RangeError | typeof TypeError][] =
-      [
+      ],
+    },
+    {
+      option: 'shutdownTimeoutMs',
+      invalid: [
         [0, RangeError],
         [-1, RangeError],
         [0.5, RangeError],
         [Number.NaN, RangeError],
         [Number.POSITIVE_INFINITY, RangeError],
         ['100', TypeError],
-      ];
-    for (const [value, Expected] of invalid) {
-      const call = () => createLayer({ shutdownTimeoutMs: value as number });
-      expect(call).toThrow(Expected);
-      expect(call).toThrow(/shutdownTimeoutMs/);
-      expect(call).toThrow(new RegExp(String(value)));
-    }
-    expect(() => createLayer({ shutdownTimeoutMs: 1 })).not.toThrow();
-  });
-
-  test('rejects eventSendTimeoutMs below 1, NaN or Infinity, and accepts 1', () => {
-    const invalid: readonly [unknown, typeof RangeError | typeof TypeError][] =
-      [
+      ],
+    },
+    {
+      option: 'eventSendTimeoutMs',
+      invalid: [
         [0, RangeError],
         [-1, RangeError],
         [0.5, RangeError],
         [Number.NaN, RangeError],
         [Number.POSITIVE_INFINITY, RangeError],
         ['100', TypeError],
-      ];
-    for (const [value, Expected] of invalid) {
-      const call = () => createLayer({ eventSendTimeoutMs: value as number });
-      expect(call).toThrow(Expected);
-      expect(call).toThrow(/eventSendTimeoutMs/);
-      expect(call).toThrow(new RegExp(String(value)));
-    }
-    expect(() => createLayer({ eventSendTimeoutMs: 1 })).not.toThrow();
-  });
+      ],
+    },
+  ])(
+    'rejects an invalid $option and accepts a legal value',
+    ({ option, invalid }) => {
+      for (const [value, Expected] of invalid) {
+        const call = () => layerWith(option, value as number);
+        expect(call).toThrow(Expected);
+        expect(call).toThrow(new RegExp(option));
+        expect(call).toThrow(new RegExp(String(value)));
+      }
+      expect(() => layerWith(option, 1)).not.toThrow();
+    },
+  );
 
   test('rejects shutdownTimeoutMs and eventSendTimeoutMs above the timer ceiling', () => {
     // Bun clamps a delay above 2^31-1 to 1ms, so an operator who asks for a

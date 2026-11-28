@@ -18,7 +18,7 @@ import type { DispatcherOptions } from '../server/dispatcher.ts';
 import type { Extension, ExtensionRegistrar } from '../server/extension.ts';
 import { runServerProcess } from '../server/server-process.ts';
 import { ServerStartupError } from '../server/server-startup.ts';
-import type { StorageBackend, StorageCapabilities } from '../storage/types.ts';
+import type { StorageBackend } from '../storage/types.ts';
 import { MemoryStorageBackend } from './memory-backend.ts';
 
 export function requestMessage(
@@ -195,20 +195,4 @@ export function degradationWarnings(
   logs: readonly Record<string, unknown>[],
 ): Record<string, unknown>[] {
   return logs.filter((line) => line.msg === 'storage capability degraded');
-}
-
-/**
- * A backend whose declaration is deliberately invalid. The cast is the test's
- * only way to hand an unusable declaration to the self-check.
- */
-export function brokenBackend(declared: unknown): StorageBackend {
-  return {
-    capabilities: (): StorageCapabilities => {
-      // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- the self-check is given a declaration no real backend could return
-      return declared as StorageCapabilities;
-    },
-    transaction: <T>(): Promise<T> =>
-      Promise.reject(new Error('broken backend must not run transactions')),
-    close: (): Promise<void> => Promise.resolve(),
-  };
 }

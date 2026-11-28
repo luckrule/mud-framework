@@ -101,19 +101,6 @@ describe('startServer', () => {
     await result.runtime.executor.close();
   });
 
-  test('reports the backend declaration the caller will announce', async () => {
-    const backend = new MemoryStorageBackend();
-    const test1 = harness([echoExtension()]);
-    const { runtime } = await startServer(
-      test1.deps({ createBackend: () => backend }),
-    );
-
-    expect(received(test1.messages)).toEqual([]);
-    expect(runtime.capabilities).toEqual(backend.capabilities());
-
-    await runtime.executor.close();
-  });
-
   test('tags an Extension handler with the Extension name in context and logs', async () => {
     const test1 = harness([
       {

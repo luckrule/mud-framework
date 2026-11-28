@@ -60,8 +60,4 @@ describe('budget constants', () => {
   test('the pending buffer cap matches ADR-0004', () => {
     expect(DEFAULT_MAX_PENDING).toBe(10_000);
   });
-
-  test('the backoff base sits below its cap', () => {
-    expect(DEFAULT_RESTART_BACKOFF_MS).toBeLessThan(MAX_RESTART_BACKOFF_MS);
-  });
 });

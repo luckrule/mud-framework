@@ -8,6 +8,7 @@ import {
   FakeServerProcess,
   failureOf,
   flushMicrotasks,
+  flushUntil,
   harness,
   readyMessage,
   request,
@@ -401,9 +402,12 @@ describe('IpcExecutor multi-generation recovery', () => {
       void executor
         .switchTo({ spawn: () => makeServer({ readyOnActivate: false }) })
         .catch(() => undefined);
-      await flushMicrotasks();
-      jest.advanceTimersByTime(20);
-      await flushMicrotasks();
+      await flushUntil(() =>
+        sent.some(
+          (entry) => entry.generation === 1 && entry.type === 'activate',
+        ),
+      );
+      await advance(20);
 
       const outcome = executor.execute(
         request({ requestId: 'during-rollback' }),

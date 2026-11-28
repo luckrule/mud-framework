@@ -166,7 +166,8 @@ describe('ConnectionLayer request', () => {
       connectionId: 'c1',
       clientRequestId: 'r1',
     });
-    expect(typeof failed[0]?.durationMs).toBe('number');
+    expect(failed[0]?.durationMs).toBeGreaterThanOrEqual(0);
+    expect(Number.isFinite(failed[0]?.durationMs)).toBe(true);
     await layer.stop();
   });
 

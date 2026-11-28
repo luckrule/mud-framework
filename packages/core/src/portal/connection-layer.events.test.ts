@@ -1135,6 +1135,8 @@ describe('deliverServerEvent session re-resolution', () => {
       sessionId: 's1',
       reason: 'no connection holds the session',
     });
+    // The drop released the Session's serial slot, leaving no queue behind.
+    expect(sessionQueuesOf(h.layer).size).toBe(0);
   });
 
   test('clears the queue after a failed write', async () => {
@@ -1154,31 +1156,6 @@ describe('deliverServerEvent session re-resolution', () => {
     await tick();
 
     expect(sendFailures(h.logs())).toHaveLength(1);
-    expect(sessionQueuesOf(h.layer).size).toBe(0);
-  });
-
-  test('clears the queue after a dropped event', async () => {
-    const h = unbindingHarness();
-    await h.layer.start();
-    h.transport.connect('c1');
-    await h.transport.receive('c1', '{"id":"1","method":"bind"}');
-
-    // Same construction as the drop above: the event waits while the running
-    // request removes the route, so its write turn finds no holder.
-    const unbind = h.transport.receive('c1', '{"id":"2","method":"hang"}');
-    await tick();
-    h.controlled.emit(sessionEvent('req-1:0', 'lost'));
-    await tick();
-    expect(sessionQueuesOf(h.layer).size).toBe(1);
-
-    h.controlled.release();
-    await unbind;
-    await tick();
-    await tick();
-
-    expect(dropLines(h.logs())).toHaveLength(1);
-    // The drop must release the Session's serial slot, or every later event
-    // for that Session would wait behind it forever.
     expect(sessionQueuesOf(h.layer).size).toBe(0);
   });
 

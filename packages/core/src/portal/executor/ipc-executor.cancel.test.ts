@@ -38,7 +38,8 @@ describe('IpcExecutor cancel', () => {
       sessionId: 's1',
       code: 'TRANSPORT_CLOSED',
     });
-    expect(typeof cancelled?.durationMs).toBe('number');
+    expect(cancelled?.durationMs).toBeGreaterThanOrEqual(0);
+    expect(Number.isFinite(cancelled?.durationMs)).toBe(true);
     await h.executor.close();
   });
 

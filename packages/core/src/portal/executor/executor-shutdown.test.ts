@@ -42,7 +42,6 @@ function serverState(overrides: Partial<ServerState> = {}): ServerState {
     exited: false,
     shutdownAcknowledged: false,
     pid: 1001,
-    staged: false,
     retiring: false,
     declaredMaxDurationMs: undefined,
     shutdownSent: false,
@@ -96,7 +95,6 @@ describe('executor shutdown', () => {
     const abandoned = serverState({
       exitPromise: abandonedExit.promise,
       pid: 2002,
-      staged: false,
     });
     slot.track(abandoned);
     void abandonedExit.promise.then(() => {
@@ -130,7 +128,6 @@ describe('executor shutdown', () => {
     try {
       await flushMicrotasks();
       observedBeforeExit = [...order];
-      expect(host.listPendingExits()).toEqual([abandoned]);
       expect(host.listPendingExits()).toEqual([abandoned]);
       expect(slot.pendingExits).toEqual([abandoned]);
     } finally {

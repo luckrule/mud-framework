@@ -200,7 +200,8 @@ describe('IpcExecutor close', () => {
       connectionId: 'c1',
       clientRequestId: 'client-1',
     });
-    expect(typeof failed[0]?.durationMs).toBe('number');
+    expect(failed[0]?.durationMs).toBeGreaterThanOrEqual(0);
+    expect(Number.isFinite(failed[0]?.durationMs)).toBe(true);
     expect(failed[0]).not.toHaveProperty('sessionId');
   });
 
@@ -333,7 +334,8 @@ describe('IpcExecutor close', () => {
       clientRequestId: 'client-1',
       sessionId: 's-crash',
     });
-    expect(typeof failed[0]?.durationMs).toBe('number');
+    expect(failed[0]?.durationMs).toBeGreaterThanOrEqual(0);
+    expect(Number.isFinite(failed[0]?.durationMs)).toBe(true);
     // Already gone: killing a corpse would be a no-op at best, and the point
     // is that the shutdown path noticed the exit instead of waiting 5s.
     expect(server.killCount).toBe(0);
@@ -499,6 +501,7 @@ describe('IpcExecutor close', () => {
       connectionId: 'c1',
       clientRequestId: 'client-1',
     });
-    expect(typeof failed[0]?.durationMs).toBe('number');
+    expect(failed[0]?.durationMs).toBeGreaterThanOrEqual(0);
+    expect(Number.isFinite(failed[0]?.durationMs)).toBe(true);
   });
 });

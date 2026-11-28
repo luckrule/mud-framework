@@ -7,7 +7,7 @@ import { EVENT_BACKLOG_CLOSE_CODE } from '../shared/close-codes.ts';
 import type { ServerEvent } from '../shared/events.ts';
 import { parseFrame, sleep, tick } from '../testing/common.ts';
 import { sessionHarness } from '../testing/connection-layer.ts';
-import { BACKLOG_CLOSED_REASON } from './connection-admission.ts';
+import { BACKLOG_CLOSED_REASON } from './connection-state.ts';
 
 function connectionEvent(eventId: string, payload: unknown = 'x'): ServerEvent {
   return {
@@ -62,208 +62,163 @@ function disconnectLines(
   return lines.filter((line) => line.code === 'EVENT_BACKLOG_DISCONNECTED');
 }
 
-describe('ConnectionLayer event backlog bounds', () => {
-  test('closes the connection at the frame bound instead of dropping the event', async () => {
-    const h = sessionHarness({
-      maxQueuedEvents: 2,
-      maxQueuedEventBytes: 1_000_000,
-    });
-    await h.layer.start();
-    h.transport.connect('c1');
-    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+interface BoundCase {
+  readonly bound: 'frame' | 'byte';
+  readonly payload: unknown;
+  readonly bounds: (frameBytes: number) => {
+    readonly maxQueuedEvents: number;
+    readonly maxQueuedEventBytes: number;
+  };
+}
 
-    // The first event is on the wire but not settled (counted until it is);
-    // the second fills the queue, so the third is the one that overflows.
-    const held = h.transport.holdSends('c1');
-    h.controlled.emit(connectionEvent('e:0'));
-    h.controlled.emit(connectionEvent('e:1'));
-    await held.entered;
-    h.controlled.emit(connectionEvent('e:2'));
-    await tick();
-
-    // The frame is not discarded: the connection that could not accept it is
-    // closed with 1013 (Try Again Later) so the client learns and reconnects.
-    expect(h.transport.closedWith('c1')).toEqual({
-      code: EVENT_BACKLOG_CLOSE_CODE,
-      reason: 'server event backlog is full',
-    });
-    const disconnects = disconnectLines(h.logs());
-    expect(disconnects).toHaveLength(1);
-    expect(disconnects[0]).toMatchObject({
-      level: 'warn',
-      connectionId: 'c1',
-      buffer: 'connection',
-      eventId: 'e:2',
-      event: 'note',
-      queuedEvents: 2,
-      maxQueuedEvents: 2,
-      maxQueuedEventBytes: 1_000_000,
-      closeCode: EVENT_BACKLOG_CLOSE_CODE,
-    });
-    expect(typeof disconnects[0]?.queuedEventBytes).toBe('number');
-    expect(h.layer.health().eventBacklog.dropped).toBe(1);
-
-    // The frame already handed to the transport is left to its own outcome; the
-    // queued one is never written, because the connection is gone.
-    held.release();
-    await tick();
-    expect(frameLabels(h.transport.sentTo('c1'))).toEqual(['bind', 'e:0']);
-  });
-
-  test('closes the connection at the byte bound and reports the frame wire size', async () => {
+const connectionBoundCases: readonly BoundCase[] = [
+  {
+    bound: 'frame',
+    payload: 'x',
+    bounds: () => ({ maxQueuedEvents: 2, maxQueuedEventBytes: 1_000_000 }),
+  },
+  {
+    bound: 'byte',
     // Non-ASCII payload: its UTF-8 wire size is larger than its code-unit
     // length, so the charged size must follow the bytes the transport sends.
-    const payload = '洞穴';
-    const frameBytes = Buffer.byteLength(
-      JSON.stringify({
-        kind: 'event',
-        eventId: 'e:0',
-        event: 'note',
-        payload,
-      }),
-      'utf8',
-    );
-    const h = sessionHarness({
+    payload: '洞穴',
+    bounds: (frameBytes) => ({
       maxQueuedEvents: 100,
       maxQueuedEventBytes: frameBytes * 2,
-    });
-    await h.layer.start();
-    h.transport.connect('c1');
-    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+    }),
+  },
+];
 
-    const held = h.transport.holdSends('c1');
-    h.controlled.emit(connectionEvent('e:0', payload));
-    h.controlled.emit(connectionEvent('e:1', payload));
-    await held.entered;
-    h.controlled.emit(connectionEvent('e:2', payload));
-    await tick();
-
-    expect(h.transport.closedWith('c1')).toMatchObject({
-      code: EVENT_BACKLOG_CLOSE_CODE,
-    });
-    const disconnects = disconnectLines(h.logs());
-    expect(disconnects).toHaveLength(1);
-    expect(disconnects[0]).toMatchObject({
-      buffer: 'connection',
-      eventId: 'e:2',
-      queuedEvents: 2,
-      queuedEventBytes: frameBytes * 2,
-      maxQueuedEventBytes: frameBytes * 2,
-    });
-
-    held.release();
-    await tick();
-    expect(frameLabels(h.transport.sentTo('c1'))).toEqual(['bind', 'e:0']);
-  });
-
-  test('closes the Session holder when the Session pending queue overflows', async () => {
-    const payload = { text: 'held' };
-    const frameBytes = Buffer.byteLength(
-      JSON.stringify({
-        kind: 'event',
-        eventId: 'e:1',
-        event: 'note',
-        payload,
-      }),
-      'utf8',
-    );
-    const h = sessionHarness({
-      maxQueuedEvents: 2,
-      maxQueuedEventBytes: 1_000_000,
-    });
-    await h.layer.start();
-    h.transport.connect('c1');
-    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
-
-    // e:0 is handed to c1's connection queue and held there; e:1 and e:2 fill
-    // the Session's own queue, so e:3 is the one the Session bound refuses.
-    const held = h.transport.holdSends('c1');
-    h.controlled.emit(sessionEvent('e:0', payload));
-    await held.entered;
-    h.controlled.emit(sessionEvent('e:1', payload));
-    h.controlled.emit(sessionEvent('e:2', payload));
-    h.controlled.emit(sessionEvent('e:3', payload));
-    await tick();
-
-    // The Session queue has no connection of its own, so the holder is the
-    // connection to close.
-    expect(h.transport.closedWith('c1')).toMatchObject({
-      code: EVENT_BACKLOG_CLOSE_CODE,
-    });
-    const disconnects = disconnectLines(h.logs());
-    expect(disconnects).toHaveLength(1);
-    expect(disconnects[0]).toMatchObject({
-      buffer: 'session',
-      connectionId: 'c1',
-      sessionId: 's1',
-      eventId: 'e:3',
-      queuedEvents: 2,
-      queuedEventBytes: frameBytes * 2,
-      maxQueuedEvents: 2,
-      maxQueuedEventBytes: 1_000_000,
-    });
-    expect(h.layer.health().eventBacklog.dropped).toBe(1);
-
-    held.release();
-    await tick();
-    await tick();
-    // Nothing more is written to the connection that overflowed.
-    expect(frameLabels(h.transport.sentTo('c1'))).toEqual(['bind', 'e:0']);
-  });
-
-  test('closes the Session holder at the Session byte bound', async () => {
+const sessionBoundCases: readonly BoundCase[] = [
+  {
+    bound: 'frame',
+    payload: { text: 'held' },
+    bounds: () => ({ maxQueuedEvents: 2, maxQueuedEventBytes: 1_000_000 }),
+  },
+  {
+    bound: 'byte',
     // CJK payload: the UTF-8 frame is larger than its code-unit length, so only
     // a byte-based bound can be the one that trips here.
-    const payload = { text: '洞窟洞窟' };
-    const frameBytes = Buffer.byteLength(
-      JSON.stringify({
-        kind: 'event',
-        eventId: 'e:1',
+    payload: { text: '洞窟洞窟' },
+    bounds: (frameBytes) => ({
+      maxQueuedEvents: 100,
+      maxQueuedEventBytes: frameBytes * 2,
+    }),
+  },
+];
+
+describe('ConnectionLayer event backlog bounds', () => {
+  test.each(connectionBoundCases)(
+    'closes the connection at the $bound bound instead of dropping the event',
+    async ({ payload, bounds }) => {
+      const frameBytes = Buffer.byteLength(
+        JSON.stringify({
+          kind: 'event',
+          eventId: 'e:0',
+          event: 'note',
+          payload,
+        }),
+        'utf8',
+      );
+      const { maxQueuedEvents, maxQueuedEventBytes } = bounds(frameBytes);
+      const h = sessionHarness({ maxQueuedEvents, maxQueuedEventBytes });
+      await h.layer.start();
+      h.transport.connect('c1');
+      await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+
+      // The first event is on the wire but not settled (counted until it is);
+      // the second fills the queue, so the third is the one that overflows.
+      const held = h.transport.holdSends('c1');
+      h.controlled.emit(connectionEvent('e:0', payload));
+      h.controlled.emit(connectionEvent('e:1', payload));
+      await held.entered;
+      h.controlled.emit(connectionEvent('e:2', payload));
+      await tick();
+
+      // The frame is not discarded: the connection that could not accept it is
+      // closed with 1013 (Try Again Later) so the client learns and reconnects.
+      expect(h.transport.closedWith('c1')).toEqual({
+        code: EVENT_BACKLOG_CLOSE_CODE,
+        reason: 'server event backlog is full',
+      });
+      const disconnects = disconnectLines(h.logs());
+      expect(disconnects).toHaveLength(1);
+      expect(disconnects[0]).toMatchObject({
+        level: 'warn',
+        connectionId: 'c1',
+        buffer: 'connection',
+        eventId: 'e:2',
         event: 'note',
-        payload,
-      }),
-      'utf8',
-    );
-    const h = sessionHarness({
-      maxQueuedEvents: 100,
-      maxQueuedEventBytes: frameBytes * 2,
-    });
-    await h.layer.start();
-    h.transport.connect('c1');
-    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+        queuedEvents: 2,
+        queuedEventBytes: frameBytes * 2,
+        maxQueuedEvents,
+        maxQueuedEventBytes,
+        closeCode: EVENT_BACKLOG_CLOSE_CODE,
+      });
+      expect(h.layer.health().eventBacklog.dropped).toBe(1);
 
-    // e:0 is held on c1's connection queue; e:1 and e:2 fill the Session queue
-    // to its byte bound, so e:3 is refused by bytes, not by frame count.
-    const held = h.transport.holdSends('c1');
-    h.controlled.emit(sessionEvent('e:0', payload));
-    await held.entered;
-    h.controlled.emit(sessionEvent('e:1', payload));
-    h.controlled.emit(sessionEvent('e:2', payload));
-    h.controlled.emit(sessionEvent('e:3', payload));
-    await tick();
+      // The frame already handed to the transport is left to its own outcome;
+      // the queued one is never written, because the connection is gone.
+      held.release();
+      await tick();
+      expect(frameLabels(h.transport.sentTo('c1'))).toEqual(['bind', 'e:0']);
+    },
+  );
 
-    expect(h.transport.closedWith('c1')).toMatchObject({
-      code: EVENT_BACKLOG_CLOSE_CODE,
-    });
-    const disconnects = disconnectLines(h.logs());
-    expect(disconnects).toHaveLength(1);
-    expect(disconnects[0]).toMatchObject({
-      buffer: 'session',
-      connectionId: 'c1',
-      sessionId: 's1',
-      eventId: 'e:3',
-      queuedEvents: 2,
-      queuedEventBytes: frameBytes * 2,
-      maxQueuedEvents: 100,
-      maxQueuedEventBytes: frameBytes * 2,
-    });
-    expect(h.layer.health().eventBacklog.dropped).toBe(1);
+  test.each(sessionBoundCases)(
+    'closes the Session holder at the Session $bound bound',
+    async ({ payload, bounds }) => {
+      const frameBytes = Buffer.byteLength(
+        JSON.stringify({
+          kind: 'event',
+          eventId: 'e:1',
+          event: 'note',
+          payload,
+        }),
+        'utf8',
+      );
+      const { maxQueuedEvents, maxQueuedEventBytes } = bounds(frameBytes);
+      const h = sessionHarness({ maxQueuedEvents, maxQueuedEventBytes });
+      await h.layer.start();
+      h.transport.connect('c1');
+      await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
 
-    held.release();
-    await tick();
-    await tick();
-    expect(frameLabels(h.transport.sentTo('c1'))).toEqual(['bind', 'e:0']);
-  });
+      // e:0 is handed to c1's connection queue and held there; e:1 and e:2 fill
+      // the Session's own queue, so e:3 is the one the Session bound refuses.
+      const held = h.transport.holdSends('c1');
+      h.controlled.emit(sessionEvent('e:0', payload));
+      await held.entered;
+      h.controlled.emit(sessionEvent('e:1', payload));
+      h.controlled.emit(sessionEvent('e:2', payload));
+      h.controlled.emit(sessionEvent('e:3', payload));
+      await tick();
+
+      // The Session queue has no connection of its own, so the holder is the
+      // connection to close.
+      expect(h.transport.closedWith('c1')).toMatchObject({
+        code: EVENT_BACKLOG_CLOSE_CODE,
+      });
+      const disconnects = disconnectLines(h.logs());
+      expect(disconnects).toHaveLength(1);
+      expect(disconnects[0]).toMatchObject({
+        buffer: 'session',
+        connectionId: 'c1',
+        sessionId: 's1',
+        eventId: 'e:3',
+        queuedEvents: 2,
+        queuedEventBytes: frameBytes * 2,
+        maxQueuedEvents,
+        maxQueuedEventBytes,
+      });
+      expect(h.layer.health().eventBacklog.dropped).toBe(1);
+
+      held.release();
+      await tick();
+      await tick();
+      // Nothing more is written to the connection that overflowed.
+      expect(frameLabels(h.transport.sentTo('c1'))).toEqual(['bind', 'e:0']);
+    },
+  );
 
   test('drops a Session event with no holder instead of closing anything', async () => {
     const h = sessionHarness({ maxQueuedEvents: 1 });
@@ -281,6 +236,44 @@ describe('ConnectionLayer event backlog bounds', () => {
     expect(disconnectLines(h.logs())).toEqual([]);
     expect(dropLines(h.logs()).map((line) => line.eventId)).toContain('e:1');
     expect(h.layer.health().eventBacklog.dropped).toBe(0);
+  });
+
+  test('logs an overflowed Session event when no holder exists', async () => {
+    const h = sessionHarness({
+      maxQueuedEvents: 1,
+      maxQueuedEventBytes: 1_000_000,
+    });
+    await h.layer.start();
+    h.transport.connect('c1');
+    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+
+    // e:0 occupies the connection writer, so e:1 stays in the Session queue and
+    // makes it full. The disconnect then removes the holder while the pump is
+    // still blocked on e:0, which is the state the overflow branch handles.
+    const held = h.transport.holdSends('c1');
+    h.controlled.emit(sessionEvent('e:0', 'x'));
+    await held.entered;
+    h.controlled.emit(sessionEvent('e:1', 'x'));
+    await h.transport.disconnect('c1');
+    h.controlled.emit(sessionEvent('e:2', 'x'));
+
+    // e:2 is refused by the full queue, not delivered, and the refusal is a
+    // target-missing drop: there is no holder left to close.
+    expect(dropLines(h.logs())).toMatchObject([
+      {
+        eventId: 'e:2',
+        targetKind: 'session',
+        sessionId: 's1',
+        reason: 'no connection holds the session',
+        count: 1,
+      },
+    ]);
+    expect(h.transport.closedWith('c1')).toBeUndefined();
+    expect(h.layer.health().eventBacklog.dropped).toBe(0);
+
+    held.release();
+    await tick();
+    await tick();
   });
 
   test('lets a request already executing settle instead of cancelling it', async () => {
@@ -1009,67 +1002,47 @@ describe('ConnectionLayer aggregate backlog warning', () => {
     await tick();
   });
 
-  test('a backlog that stays above the threshold logs once across many frames', async () => {
-    const bytes = eventBytes('e:0');
-    const h = sessionHarness({
-      maxQueuedEvents: 100,
-      maxQueuedEventBytes: 1_000_000,
-      eventBacklogWarnBytes: bytes * 3,
-    });
-    await h.layer.start();
-    h.transport.connect('c1');
-    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
+  test.each([
+    { frames: 20, thresholdFrames: 3 },
+    // One frame is the whole backlog: it crosses the threshold on entry, then
+    // leaves the Session queue for the connection queue in two calls.
+    { frames: 1, thresholdFrames: 1 },
+  ] as const)(
+    'a backlog that stays above the threshold logs once across $frames frame(s)',
+    async ({ frames, thresholdFrames }) => {
+      const bytes = eventBytes('e:0');
+      const h = sessionHarness({
+        maxQueuedEvents: 100,
+        maxQueuedEventBytes: 1_000_000,
+        eventBacklogWarnBytes: bytes * thresholdFrames,
+      });
+      await h.layer.start();
+      h.transport.connect('c1');
+      await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
 
-    // Every Session frame is charged to the Session queue and then to the
-    // connection queue, so the total dips by one between the two calls. With a
-    // rearm rule of "below the threshold" that dip would re-arm and the next add
-    // would warn again, once per frame. Only draining to empty may re-arm.
-    const held = h.transport.holdSends('c1');
-    for (let i = 0; i < 20; i += 1) {
-      h.controlled.emit(sessionEvent(`e:${i}`, 'x'));
-    }
-    await held.entered;
-    await tick();
-    expect(highLines(h.logs())).toHaveLength(1);
+      // Every Session frame is charged to the Session queue and then to the
+      // connection queue, so the total dips by one between the two calls. With a
+      // rearm rule of "below the threshold" that dip would re-arm and the next add
+      // would warn again, once per frame. Only draining to empty may re-arm.
+      const held = h.transport.holdSends('c1');
+      for (let i = 0; i < frames; i += 1) {
+        h.controlled.emit(sessionEvent(`e:${i}`, 'x'));
+      }
+      await held.entered;
+      await tick();
+      expect(highLines(h.logs())).toHaveLength(1);
 
-    held.release();
-    await tick();
-    await tick();
-    await tick();
-    await tick();
-    // The frames were all written: the warning never blocked a delivery.
-    expect(h.layer.health().eventBacklog.frames).toBe(0);
-    expect(highLines(h.logs())).toHaveLength(1);
-    expect(dropLines(h.logs())).toEqual([]);
-  });
-
-  test('a handoff between buffers does not rearm, so one frame logs once', async () => {
-    const bytes = eventBytes('e:0');
-    const h = sessionHarness({
-      maxQueuedEvents: 100,
-      maxQueuedEventBytes: 1_000_000,
-      eventBacklogWarnBytes: bytes,
-    });
-    await h.layer.start();
-    h.transport.connect('c1');
-    await h.transport.receive('c1', '{"id":"bind","method":"bind"}');
-
-    // One Session frame is the whole backlog. The pump shifts it out of the
-    // Session queue (total drops to zero) and queues it on the connection
-    // (total back to one) in two calls; rearming on the dip would fire again
-    // for every single frame.
-    const held = h.transport.holdSends('c1');
-    h.controlled.emit(sessionEvent('e:0', 'x'));
-    await held.entered;
-    await tick();
-    expect(highLines(h.logs())).toHaveLength(1);
-
-    held.release();
-    await tick();
-    await tick();
-    await tick();
-    expect(highLines(h.logs())).toHaveLength(1);
-  });
+      held.release();
+      await tick();
+      await tick();
+      await tick();
+      await tick();
+      // The frames were all written: the warning never blocked a delivery.
+      expect(h.layer.health().eventBacklog.frames).toBe(0);
+      expect(highLines(h.logs())).toHaveLength(1);
+      expect(dropLines(h.logs())).toEqual([]);
+    },
+  );
 
   test('does not warn while the aggregate stays below the threshold', async () => {
     const bytes = eventBytes('e:0');

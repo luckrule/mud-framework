@@ -29,7 +29,6 @@ function fakeServer(overrides: Partial<ServerState> = {}): ServerState {
     exited: false,
     shutdownAcknowledged: false,
     pid: 1001,
-    staged: false,
     retiring: false,
     declaredMaxDurationMs: undefined,
     shutdownSent: false,

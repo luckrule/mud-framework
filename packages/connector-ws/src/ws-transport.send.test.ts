@@ -221,7 +221,9 @@ describe('WsTransport sends', () => {
         connectionId,
         sendTimeoutMs: 250,
       });
-      expect(typeof warnings[0]?.queueDepth).toBe('number');
+      // Socket-dependent, but a timed-out write must report a real count.
+      expect(warnings[0]?.queueDepth).toBeGreaterThanOrEqual(0);
+      expect(Number.isInteger(warnings[0]?.queueDepth)).toBe(true);
     } finally {
       socket.destroy();
       await safeStop(transport);
@@ -285,9 +287,10 @@ describe('WsTransport sends', () => {
         limit: 'maxQueuedBytes',
         maxQueuedBytes: 1024 * 1024,
         incomingBytes: 900_000,
+        // Only the blocked head is queued; the frame behind it is refused.
+        queuedFrames: 1,
+        queuedBytes: 900_000,
       });
-      expect(typeof warnings[0]?.queuedFrames).toBe('number');
-      expect(typeof warnings[0]?.queuedBytes).toBe('number');
 
       const after = await rejectionOf(connection.send('later'));
       expect(after.message).toMatch(/not open|overflow|closed/);
@@ -390,9 +393,9 @@ describe('WsTransport sends', () => {
         connectionId: connection.id,
         limit: 'maxQueuedFrames',
         maxQueuedFrames: 1,
+        queuedFrames: 1,
+        queuedBytes: 900_000,
       });
-      expect(typeof warnings[0]?.queuedFrames).toBe('number');
-      expect(typeof warnings[0]?.queuedBytes).toBe('number');
 
       const after = await rejectionOf(connection.send('later'));
       expect(after.message).toMatch(/not open|overflow|closed/);

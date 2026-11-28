@@ -7,6 +7,7 @@ import type {
   SendQueueSink,
   WriteStatus,
 } from './send-queue.ts';
+import { tracked } from './ws-transport.support.ts';
 
 /** Scripted `ws.send`: pops one status per write and records the payloads. */
 function fakeSink(statuses: readonly WriteStatus[]): {
@@ -54,33 +55,6 @@ async function settle(): Promise<void> {
   await new Promise<void>((resolve) => {
     setTimeout(resolve, 0);
   });
-}
-
-interface Tracked {
-  readonly promise: Promise<void>;
-  state: () => 'pending' | 'resolved' | 'rejected';
-  error: () => Error | undefined;
-}
-
-/** Observes a promise without letting its rejection go unhandled. */
-function tracked(promise: Promise<void>): Tracked {
-  let state: 'pending' | 'resolved' | 'rejected' = 'pending';
-  let error: Error | undefined;
-  void promise.then(
-    () => {
-      state = 'resolved';
-      return undefined;
-    },
-    (rejection: unknown) => {
-      state = 'rejected';
-      error =
-        rejection instanceof Error
-          ? rejection
-          : new Error(`non-Error rejection: ${String(rejection)}`);
-      return undefined;
-    },
-  );
-  return { promise, state: () => state, error: () => error };
 }
 
 describe('SendQueue', () => {

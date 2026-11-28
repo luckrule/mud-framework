@@ -8,190 +8,113 @@ import type {
 } from '../transport/types.ts';
 import { FakeTransport } from './fake-transport.ts';
 
-interface Recorded {
-  connected: TransportConnection[];
-  messages: { connection: TransportConnection; payload: string | Uint8Array }[];
-  disconnected: { connection: TransportConnection; reason: string }[];
-}
-
-function recorder(): { handlers: TransportHandlers; recorded: Recorded } {
-  const recorded: Recorded = { connected: [], messages: [], disconnected: [] };
-  return {
-    recorded,
-    handlers: {
-      onConnect: (connection) => {
-        recorded.connected.push(connection);
-      },
-      onMessage: (connection, payload) => {
-        recorded.messages.push({ connection, payload });
-      },
-      onDisconnect: (connection, reason) => {
-        recorded.disconnected.push({ connection, reason });
-      },
+function recorder() {
+  const connected: TransportConnection[] = [];
+  const messages: {
+    connection: TransportConnection;
+    payload: string | Uint8Array;
+  }[] = [];
+  const disconnected: {
+    connection: TransportConnection;
+    reason: string;
+  }[] = [];
+  const handlers: TransportHandlers = {
+    onConnect: (connection) => {
+      connected.push(connection);
+    },
+    onMessage: (connection, payload) => {
+      messages.push({ connection, payload });
+    },
+    onDisconnect: (connection, reason) => {
+      disconnected.push({ connection, reason });
     },
   };
+  return { handlers, connected, messages, disconnected };
 }
 
 describe('FakeTransport', () => {
-  test('reports a connection to onConnect after start', async () => {
+  test('reports connections, payloads, disconnects and closes to the handlers', async () => {
     const transport = new FakeTransport();
-    const { handlers, recorded } = recorder();
-
+    const { handlers, connected, messages, disconnected } = recorder();
     await transport.start(handlers);
+
     const connection = transport.connect('c1');
-
     expect(connection.id).toBe('c1');
-    expect(recorded.connected).toEqual([connection]);
-  });
+    expect(connected).toEqual([connection]);
 
-  test('delivers string payloads unchanged to onMessage', async () => {
-    const transport = new FakeTransport();
-    const { handlers, recorded } = recorder();
-    await transport.start(handlers);
-    transport.connect('c1');
-
+    const binary = new Uint8Array([0, 1, 255]);
     await transport.receive('c1', 'look');
-
-    expect(recorded.messages).toHaveLength(1);
-    expect(recorded.messages[0]?.payload).toBe('look');
-    expect(recorded.messages[0]?.connection.id).toBe('c1');
-  });
-
-  test('delivers binary payloads by identity to onMessage', async () => {
-    const transport = new FakeTransport();
-    const { handlers, recorded } = recorder();
-    await transport.start(handlers);
-    transport.connect('c1');
-    const payload = new Uint8Array([0, 1, 255]);
-
-    await transport.receive('c1', payload);
-
-    expect(recorded.messages[0]?.payload).toBe(payload);
-  });
-
-  test('awaits an async onMessage handler', async () => {
-    const transport = new FakeTransport();
-    const seen: string[] = [];
-    await transport.start({
-      onConnect: () => undefined,
-      onMessage: async (_connection, payload) => {
-        await Promise.resolve();
-        seen.push(String(payload));
-      },
-      onDisconnect: () => undefined,
-    });
-    transport.connect('c1');
-
-    await transport.receive('c1', 'north');
-
-    expect(seen).toEqual(['north']);
-  });
-
-  test('reports the disconnect reason to onDisconnect', async () => {
-    const transport = new FakeTransport();
-    const { handlers, recorded } = recorder();
-    await transport.start(handlers);
-    transport.connect('c1');
+    await transport.receive('c1', binary);
+    expect(messages.map((entry) => entry.payload)).toEqual(['look', binary]);
+    // Binary payloads are handed over by identity, not copied.
+    expect(messages[1]?.payload).toBe(binary);
 
     await transport.disconnect('c1', 'client quit');
+    expect(disconnected).toEqual([{ connection, reason: 'client quit' }]);
 
-    expect(recorded.disconnected).toHaveLength(1);
-    expect(recorded.disconnected[0]?.reason).toBe('client quit');
+    const closing = transport.connect('c2');
+    await closing.close(1000, 'normal');
+    expect(transport.closedWith('c2')).toEqual({
+      code: 1000,
+      reason: 'normal',
+    });
+    expect(disconnected[1]).toEqual({ connection: closing, reason: 'normal' });
   });
 
-  test('connection.close routes to onDisconnect', async () => {
-    const transport = new FakeTransport();
-    const { handlers, recorded } = recorder();
-    await transport.start(handlers);
-    const connection = transport.connect('c1');
-
-    await connection.close(1000, 'normal');
-
-    expect(recorded.disconnected[0]?.reason).toBe('normal');
-  });
-
-  test('records what the framework sends', async () => {
+  test('records what the framework sends and holds one write in flight', async () => {
     const transport = new FakeTransport();
     await transport.start(recorder().handlers);
     const connection = transport.connect('c1');
     const frame = new Uint8Array([1, 2]);
 
     await connection.send('hello');
-    await connection.send(frame);
+    const held = transport.holdSends('c1');
+    const sending = connection.send(frame);
+    await held.entered;
 
+    // The frame is recorded on entry, so "write started" is observable while
+    // the send is still pending.
     expect(transport.sentTo('c1')).toEqual(['hello', frame]);
+    let settled = false;
+    void sending.then(() => {
+      settled = true;
+      return undefined;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    held.release();
+    await sending;
+    expect(settled).toBe(true);
   });
 
-  test('rejects helper calls before start', () => {
+  test('enforces the start/stop state machine and one id per connection', async () => {
     const transport = new FakeTransport();
+    const { handlers } = recorder();
 
     expect(() => transport.connect('c1')).toThrow(/not started/);
     expect(() => transport.receive('c1', 'x')).toThrow(/not started/);
     expect(() => transport.disconnect('c1')).toThrow(/not started/);
     expect(() => transport.sentTo('c1')).toThrow(/not started/);
-  });
+    expect((await rejectionOf(transport.stop())).message).toMatch(
+      /cannot stop/,
+    );
 
-  test('rejects helper calls after stop', async () => {
-    const transport = new FakeTransport();
-    await transport.start(recorder().handlers);
+    await transport.start(handlers);
+    expect((await rejectionOf(transport.start(handlers))).message).toMatch(
+      /cannot start/,
+    );
+
     const connection = transport.connect('c1');
-    await transport.stop();
+    expect(() => transport.connect('c1')).toThrow(/already exists/);
+    expect(() => transport.receive('nope', 'x')).toThrow(/unknown connection/);
 
+    await transport.stop();
     expect(() => transport.connect('c2')).toThrow(/stopped/);
     expect(() => transport.receive('c1', 'x')).toThrow(/stopped/);
     expect(() => transport.disconnect('c1')).toThrow(/stopped/);
     const sendError = await rejectionOf(connection.send('x'));
     expect(sendError.message).toMatch(/stopped/);
-  });
-
-  test('refuses to start twice or stop before start', async () => {
-    const transport = new FakeTransport();
-
-    const stopError = await rejectionOf(transport.stop());
-    expect(stopError.message).toMatch(/cannot stop/);
-    await transport.start(recorder().handlers);
-
-    const startError = await rejectionOf(transport.start(recorder().handlers));
-    expect(startError.message).toMatch(/cannot start/);
-  });
-
-  test('rejects unknown or duplicate connection ids', async () => {
-    const transport = new FakeTransport();
-    await transport.start(recorder().handlers);
-    transport.connect('c1');
-
-    expect(() => transport.connect('c1')).toThrow(/already exists/);
-    expect(() => transport.receive('nope', 'x')).toThrow(/unknown connection/);
-  });
-
-  test('propagates a synchronous handler throw to the caller', async () => {
-    const transport = new FakeTransport();
-    await transport.start({
-      onConnect: () => undefined,
-      onMessage: () => {
-        throw new Error('handler exploded');
-      },
-      onDisconnect: () => undefined,
-    });
-    transport.connect('c1');
-
-    expect(() => transport.receive('c1', 'boom')).toThrow(/handler exploded/);
-  });
-
-  test('propagates an async handler rejection to the caller', async () => {
-    const transport = new FakeTransport();
-    await transport.start({
-      onConnect: () => undefined,
-      onMessage: async () => {
-        throw new Error('async exploded');
-      },
-      onDisconnect: () => undefined,
-    });
-    transport.connect('c1');
-
-    const error = await rejectionOf(transport.receive('c1', 'boom'));
-
-    expect(error.message).toBe('async exploded');
   });
 
   test('waits for in-flight handler work on stop', async () => {
@@ -211,5 +134,33 @@ describe('FakeTransport', () => {
     await transport.stop();
 
     expect(seen).toEqual(['done']);
+  });
+
+  test('propagates a handler throw or rejection to the caller', async () => {
+    const throwing = new FakeTransport();
+    await throwing.start({
+      onConnect: () => undefined,
+      onMessage: () => {
+        throw new Error('handler exploded');
+      },
+      onDisconnect: () => undefined,
+    });
+    throwing.connect('c1');
+
+    expect(() => throwing.receive('c1', 'boom')).toThrow(/handler exploded/);
+
+    const rejecting = new FakeTransport();
+    await rejecting.start({
+      onConnect: () => undefined,
+      onMessage: async () => {
+        throw new Error('async exploded');
+      },
+      onDisconnect: () => undefined,
+    });
+    rejecting.connect('c1');
+
+    const error = await rejectionOf(rejecting.receive('c1', 'boom'));
+
+    expect(error.message).toBe('async exploded');
   });
 });

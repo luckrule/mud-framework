@@ -117,8 +117,6 @@ describe('switchTo failure details', () => {
   });
 
   test('guards a structured failure by shape as well as class', () => {
-    // A consumer may receive the rejection through a bundler boundary where the
-    // class identity differs; the shape still has to be recognised.
     const error = new ServerSwitchError('failed', {
       stage: 'preparing',
       previousServing: true,
@@ -127,8 +125,13 @@ describe('switchTo failure details', () => {
       closeAborted: false,
       pendingExits: 0,
     });
+    const lookalike = Object.assign(new Error('failed'), {
+      name: 'ServerSwitchError',
+      details: error.details,
+    });
 
     expect(isServerSwitchError(error)).toBe(true);
+    expect(isServerSwitchError(lookalike)).toBe(true);
     expect(isServerSwitchError(new Error('failed'))).toBe(false);
     expect(isServerSwitchError('failed')).toBe(false);
   });

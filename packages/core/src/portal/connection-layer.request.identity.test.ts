@@ -69,6 +69,7 @@ describe('ConnectionLayer request', () => {
       clientRequestId: 'client-1',
       method: 'explode',
     });
-    expect(typeof failed[0]?.durationMs).toBe('number');
+    expect(failed[0]?.durationMs).toBeGreaterThanOrEqual(0);
+    expect(Number.isFinite(failed[0]?.durationMs)).toBe(true);
   });
 });

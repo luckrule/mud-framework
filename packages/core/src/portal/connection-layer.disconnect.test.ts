@@ -97,7 +97,8 @@ describe('ConnectionLayer disconnect', () => {
       code: 'TRANSPORT_CLOSED',
       connectionId: 'c1',
     });
-    expect(typeof ended[0]?.durationMs).toBe('number');
+    expect(ended[0]?.durationMs).toBeGreaterThanOrEqual(0);
+    expect(Number.isFinite(ended[0]?.durationMs)).toBe(true);
   });
 
   test('logs a send failure at warn while the connection is tracked', async () => {

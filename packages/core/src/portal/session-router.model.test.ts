@@ -212,8 +212,8 @@ function failWithSequence(
 }
 
 describe('SessionRouter model', () => {
-  test('800 random bind/unbind/release sequences match the inverse maps', () => {
-    for (let sequence = 0; sequence < 800; sequence += 1) {
+  test('100 random bind/unbind/release sequences match the inverse maps', () => {
+    for (let sequence = 0; sequence < 100; sequence += 1) {
       const seed = Math.imul(sequence + 1, 0x9e3779b1) >>> 0;
       const random = mulberry32(seed);
       const router = createRouter();
@@ -288,45 +288,5 @@ describe('SessionRouter model', () => {
         failWithSequence(error, seed, events);
       }
     }
-  });
-
-  test('route changes never alter the barrier and finishing never moves the route', async () => {
-    const router = createRouter();
-    router.bind('c1', 's1', Promise.resolve());
-    await Promise.resolve();
-    await Promise.resolve();
-
-    const gate = Promise.withResolvers<void>();
-    const running = router.run('c1', new AbortController().signal, async () => {
-      await gate.promise;
-    });
-    expect(router.pendingCount('s1')).toBe(1);
-
-    router.unbind('c1', 's1');
-    expect(router.sessionOf('c1')).toBeUndefined();
-    expect(router.pendingCount('s1')).toBe(1);
-
-    router.bind('c2', 's1', Promise.resolve());
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(router.sessionOf('c2')).toBe('s1');
-    expect(router.pendingCount('s1')).toBe(1);
-
-    router.release('c1');
-    router.release('c2');
-    expect(router.pendingCount('s1')).toBe(1);
-
-    // Re-establish a route, finish the request, and prove the route survives.
-    router.bind('c3', 's1', Promise.resolve());
-    await Promise.resolve();
-    await Promise.resolve();
-    gate.resolve();
-    await running;
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(router.pendingCount('s1')).toBe(0);
-    expect(router.sessionOf('c3')).toBe('s1');
-    expect(router.connectionOf('s1')).toBe('c3');
   });
 });

@@ -69,41 +69,30 @@ describe('Dispatcher.session', () => {
     expect(outcome.sessionChange).toBeUndefined();
   });
 
-  test('does not report the bind when the handler throws', async () => {
-    const backend = new MemoryStorageBackend();
-    const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });
-    dispatcher.register(
-      'login',
-      async (ctx) => {
-        ctx.bindSession('half-made');
-        throw new Error('login refused');
-      },
-      LOGIN,
-    );
+  test.each(['bind', 'unbind'] as const)(
+    'does not report the %s when the handler throws',
+    async (change) => {
+      const backend = new MemoryStorageBackend();
+      const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });
+      dispatcher.register(
+        'change',
+        async (ctx) => {
+          if (change === 'bind') {
+            ctx.bindSession('half-made');
+          } else {
+            ctx.unbindSession();
+          }
+          throw new Error(`${change} refused`);
+        },
+        LOGIN,
+      );
 
-    const error = await rejectionOf(dispatcher.dispatch('login', null));
+      const error = await rejectionOf(dispatcher.dispatch('change', null));
 
-    expect(error.message).toBe('login refused');
-    expect(backend.stats()).toEqual({ committed: 0, rolledBack: 1 });
-  });
-
-  test('does not report the unbind when the handler throws', async () => {
-    const backend = new MemoryStorageBackend();
-    const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });
-    dispatcher.register(
-      'logout',
-      async (ctx) => {
-        ctx.unbindSession();
-        throw new Error('logout failed');
-      },
-      LOGIN,
-    );
-
-    const error = await rejectionOf(dispatcher.dispatch('logout', null));
-
-    expect(error.message).toBe('logout failed');
-    expect(backend.stats()).toEqual({ committed: 0, rolledBack: 1 });
-  });
+      expect(error.message).toBe(`${change} refused`);
+      expect(backend.stats()).toEqual({ committed: 0, rolledBack: 1 });
+    },
+  );
 
   test('does not report the bind when the request times out', async () => {
     const backend = new MemoryStorageBackend();
@@ -129,43 +118,36 @@ describe('Dispatcher.session', () => {
     expect(backend.stats()).toEqual({ committed: 0, rolledBack: 1 });
   });
 
-  test('rejects a bind when the handler did not declare mayChangeSession', async () => {
-    const backend = new MemoryStorageBackend();
-    const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });
-    dispatcher.register(
-      'login',
-      async (ctx) => {
-        ctx.bindSession('s1');
-        return null;
-      },
-      { access: 'public' },
-    );
+  test.each(['bind', 'unbind'] as const)(
+    'rejects a %s when the handler did not declare mayChangeSession',
+    async (change) => {
+      const backend = new MemoryStorageBackend();
+      const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });
+      dispatcher.register(
+        'change',
+        async (ctx) => {
+          if (change === 'bind') {
+            ctx.bindSession('s1');
+          } else {
+            ctx.unbindSession();
+          }
+          return null;
+        },
+        { access: 'public' },
+      );
 
-    const error = await rejectionOf(dispatcher.dispatch('login', null));
+      const error = await rejectionOf(
+        dispatcher.dispatch(
+          'change',
+          null,
+          change === 'unbind' ? { sessionId: 's1' } : undefined,
+        ),
+      );
 
-    expect(error.message).toMatch(/mayChangeSession/);
-    expect(backend.stats()).toEqual({ committed: 0, rolledBack: 1 });
-  });
-
-  test('rejects an unbind when the handler did not declare mayChangeSession', async () => {
-    const backend = new MemoryStorageBackend();
-    const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });
-    dispatcher.register(
-      'logout',
-      async (ctx) => {
-        ctx.unbindSession();
-        return null;
-      },
-      { access: 'public' },
-    );
-
-    const error = await rejectionOf(
-      dispatcher.dispatch('logout', null, { sessionId: 's1' }),
-    );
-
-    expect(error.message).toMatch(/mayChangeSession/);
-    expect(backend.stats()).toEqual({ committed: 0, rolledBack: 1 });
-  });
+      expect(error.message).toMatch(/mayChangeSession/);
+      expect(backend.stats()).toEqual({ committed: 0, rolledBack: 1 });
+    },
+  );
 
   test('rejects an empty session id', async () => {
     const backend = new MemoryStorageBackend();
@@ -246,104 +228,81 @@ describe('Dispatcher.session', () => {
     },
   );
 
-  test('rejects a bind after an unbind in the same request', async () => {
-    const backend = new MemoryStorageBackend();
-    const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });
-    dispatcher.register(
-      'switch',
-      async (ctx) => {
-        ctx.unbindSession();
-        ctx.bindSession('late');
-        return null;
-      },
-      LOGIN,
-    );
+  test.each(['bind', 'unbind'] as const)(
+    'rejects a %s after the other change in the same request',
+    async (second) => {
+      const backend = new MemoryStorageBackend();
+      const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });
+      dispatcher.register(
+        'switch',
+        async (ctx) => {
+          if (second === 'bind') {
+            ctx.unbindSession();
+            ctx.bindSession('late');
+          } else {
+            ctx.bindSession('next');
+            ctx.unbindSession();
+          }
+          return null;
+        },
+        LOGIN,
+      );
 
-    const error = await rejectionOf(
-      dispatcher.dispatch('switch', null, { sessionId: 's1' }),
-    );
+      const error = await rejectionOf(
+        dispatcher.dispatch(
+          'switch',
+          null,
+          second === 'bind' ? { sessionId: 's1' } : undefined,
+        ),
+      );
 
-    expect(error.message).toMatch(/at most once/);
-    expect(error.message).toContain('unbindSession()');
-    expect(backend.stats()).toEqual({ committed: 0, rolledBack: 1 });
-  });
+      expect(error.message).toMatch(/at most once/);
+      expect(error.message).toContain(
+        second === 'bind' ? 'unbindSession()' : 'bindSession("next")',
+      );
+      expect(backend.stats()).toEqual({ committed: 0, rolledBack: 1 });
+    },
+  );
 
-  test('rejects an unbind after a bind in the same request', async () => {
-    const backend = new MemoryStorageBackend();
-    const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });
-    dispatcher.register(
-      'switch',
-      async (ctx) => {
-        ctx.bindSession('next');
-        ctx.unbindSession();
-        return null;
-      },
-      LOGIN,
-    );
+  test.each(['bind', 'unbind'] as const)(
+    'does not report a %s when the request is cancelled',
+    async (change) => {
+      const backend = new MemoryStorageBackend();
+      const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });
+      const entered = deferred<void>();
+      const release = deferred<void>();
+      dispatcher.register(
+        'change',
+        async (ctx) => {
+          if (change === 'bind') {
+            ctx.bindSession('s1');
+          } else {
+            ctx.unbindSession();
+          }
+          entered.resolve();
+          await release.promise;
+          return 'late';
+        },
+        LOGIN,
+      );
 
-    const error = await rejectionOf(dispatcher.dispatch('switch', null));
+      const pending = dispatcher.dispatch(
+        'change',
+        null,
+        change === 'unbind'
+          ? { requestId: 'r1', sessionId: 's1' }
+          : { requestId: 'r1' },
+      );
+      await entered.promise;
+      expect(dispatcher.cancel('r1', 'TRANSPORT_CLOSED')).toBe(true);
+      const error = await rejectionOf(pending);
+      release.resolve();
+      await sleep(5);
 
-    expect(error.message).toMatch(/at most once/);
-    expect(error.message).toContain('bindSession("next")');
-    expect(backend.stats()).toEqual({ committed: 0, rolledBack: 1 });
-  });
-
-  test('does not report a bind when the request is cancelled', async () => {
-    const backend = new MemoryStorageBackend();
-    const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });
-    const entered = deferred<void>();
-    const release = deferred<void>();
-    dispatcher.register(
-      'login',
-      async (ctx) => {
-        ctx.bindSession('s1');
-        entered.resolve();
-        await release.promise;
-        return 'late';
-      },
-      LOGIN,
-    );
-
-    const pending = dispatcher.dispatch('login', null, { requestId: 'r1' });
-    await entered.promise;
-    expect(dispatcher.cancel('r1', 'TRANSPORT_CLOSED')).toBe(true);
-    const error = await rejectionOf(pending);
-    release.resolve();
-    await sleep(5);
-
-    expect(error).toBeInstanceOf(RequestCancelledError);
-    expect(backend.stats()).toEqual({ committed: 0, rolledBack: 1 });
-  });
-
-  test('does not report an unbind when the request is cancelled', async () => {
-    const backend = new MemoryStorageBackend();
-    const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });
-    const entered = deferred<void>();
-    const release = deferred<void>();
-    dispatcher.register(
-      'logout',
-      async (ctx) => {
-        ctx.unbindSession();
-        entered.resolve();
-        await release.promise;
-        return 'late';
-      },
-      LOGIN,
-    );
-
-    const pending = dispatcher.dispatch('logout', null, {
-      requestId: 'r2',
-      sessionId: 's1',
-    });
-    await entered.promise;
-    expect(dispatcher.cancel('r2', 'TRANSPORT_CLOSED')).toBe(true);
-    const error = await rejectionOf(pending);
-    release.resolve();
-    await sleep(5);
-
-    expect(error).toBeInstanceOf(RequestCancelledError);
-    expect(backend.stats()).toEqual({ committed: 0, rolledBack: 1 });
-  });
+      expect(error).toBeInstanceOf(RequestCancelledError);
+      expect(backend.stats()).toEqual({ committed: 0, rolledBack: 1 });
+    },
+  );
 
   test('rejects a bind after the request already timed out', async () => {
     const backend = new MemoryStorageBackend();
@@ -372,80 +331,63 @@ describe('Dispatcher.session', () => {
     expect(bindError).toMatch(/expired/);
   });
 
-  test('logs the recorded bind as a sessionChange', async () => {
-    const lines: string[] = [];
-    const logger: Logger = createJsonLogger({
-      level: 'debug',
-      sink: (line) => {
-        lines.push(line);
-      },
-    });
-    const dispatcher = new Dispatcher({
-      backend: new MemoryStorageBackend(),
-      timeoutMs: 1000,
-      logger,
-    });
-    dispatcher.register(
-      'login',
-      async (ctx) => {
-        ctx.bindSession('session-9');
-        return null;
-      },
-      LOGIN,
-    );
+  test.each(['bind', 'unbind'] as const)(
+    'logs a recorded %s as a sessionChange',
+    async (change) => {
+      const lines: string[] = [];
+      const logger: Logger = createJsonLogger({
+        level: 'debug',
+        sink: (line) => {
+          lines.push(line);
+        },
+      });
+      const dispatcher = new Dispatcher({
+        backend: new MemoryStorageBackend(),
+        timeoutMs: 1000,
+        logger,
+      });
+      dispatcher.register(
+        'change',
+        async (ctx) => {
+          if (change === 'bind') {
+            ctx.bindSession('session-9');
+          } else {
+            ctx.unbindSession();
+          }
+          return null;
+        },
+        LOGIN,
+      );
 
-    await dispatcher.dispatch('login', null, { requestId: 'req-9' });
+      await dispatcher.dispatch(
+        'change',
+        null,
+        change === 'unbind'
+          ? { requestId: 'req-9', sessionId: 'session-9' }
+          : { requestId: 'req-9' },
+      );
 
-    const recorded = parseLines(lines).filter(
-      (entry) => entry.msg === 'session change recorded',
-    );
-    expect(recorded).toHaveLength(1);
-    expect(recorded[0]).toMatchObject({
-      level: 'debug',
-      requestId: 'req-9',
-      sessionChange: { type: 'bind', sessionId: 'session-9' },
-    });
-    // No entry Session, so the log names none; the change is the only place
-    // the new id appears.
-    expect(recorded[0]).not.toHaveProperty('sessionId');
-  });
-
-  test('logs a recorded unbind as a sessionChange', async () => {
-    const lines: string[] = [];
-    const logger: Logger = createJsonLogger({
-      level: 'debug',
-      sink: (line) => {
-        lines.push(line);
-      },
-    });
-    const dispatcher = new Dispatcher({
-      backend: new MemoryStorageBackend(),
-      timeoutMs: 1000,
-      logger,
-    });
-    dispatcher.register(
-      'logout',
-      async (ctx) => {
-        ctx.unbindSession();
-        return null;
-      },
-      LOGIN,
-    );
-
-    await dispatcher.dispatch('logout', null, {
-      requestId: 'req-10',
-      sessionId: 'session-9',
-    });
-
-    const recorded = parseLines(lines).filter(
-      (entry) => entry.msg === 'session change recorded',
-    );
-    expect(recorded).toHaveLength(1);
-    expect(recorded[0]).toMatchObject({
-      level: 'debug',
-      requestId: 'req-10',
-      sessionId: 'session-9',
-      sessionChange: { type: 'unbind' },
-    });
-  });
+      const recorded = parseLines(lines).filter(
+        (entry) => entry.msg === 'session change recorded',
+      );
+      expect(recorded).toHaveLength(1);
+      if (change === 'bind') {
+        expect(recorded[0]).toMatchObject({
+          level: 'debug',
+          requestId: 'req-9',
+          sessionChange: { type: 'bind', sessionId: 'session-9' },
+        });
+        // No entry Session, so the log names none; the change is the only place
+        // the new id appears.
+        expect(recorded[0]).not.toHaveProperty('sessionId');
+      } else {
+        expect(recorded[0]).toMatchObject({
+          level: 'debug',
+          requestId: 'req-9',
+          sessionId: 'session-9',
+          sessionChange: { type: 'unbind' },
+        });
+      }
+    },
+  );
 });

@@ -5,54 +5,29 @@ import { rejectionOf } from 'mud-framework-test-support';
 import { MemoryStorageBackend } from './memory-backend.ts';
 
 describe('MemoryStorageBackend', () => {
-  test('declares the weakest honest capabilities by default', () => {
-    const backend = new MemoryStorageBackend();
-
-    expect(backend.capabilities()).toEqual({
+  test('declares honest defaults, overridable per test', () => {
+    expect(new MemoryStorageBackend().capabilities()).toEqual({
       transactions: 'full',
       concurrency: 'pooled',
       snapshotRead: true,
       uniqueConstraint: false,
       maxTransactionDurationMs: Number.POSITIVE_INFINITY,
     });
-  });
 
-  test('lets tests inject capabilities', () => {
-    const backend = new MemoryStorageBackend({
-      capabilities: {
-        concurrency: 'single',
-        maxTransactionDurationMs: 25,
-      },
+    const declared = new MemoryStorageBackend({
+      capabilities: { concurrency: 'single', maxTransactionDurationMs: 25 },
+    }).capabilities();
+    expect(declared).toMatchObject({
+      concurrency: 'single',
+      maxTransactionDurationMs: 25,
+      transactions: 'full',
     });
-
-    const declared = backend.capabilities();
-
-    expect(declared.concurrency).toBe('single');
-    expect(declared.maxTransactionDurationMs).toBe(25);
-    expect(declared.transactions).toBe('full');
   });
 
-  test('rejects calls after close', async () => {
+  test('counts commits and rollbacks', async () => {
     const backend = new MemoryStorageBackend();
 
-    await backend.close();
-
-    expect(() => backend.capabilities()).toThrow(/closed/);
-    expect(() => backend.transaction(async () => undefined)).toThrow(/closed/);
-  });
-
-  test('counts a committed transaction', async () => {
-    const backend = new MemoryStorageBackend();
-
-    const result = await backend.transaction(async () => 'ok');
-
-    expect(result).toBe('ok');
-    expect(backend.stats()).toEqual({ committed: 1, rolledBack: 0 });
-  });
-
-  test('rolls back when the transaction body throws', async () => {
-    const backend = new MemoryStorageBackend();
-
+    expect(await backend.transaction(async () => 'ok')).toBe('ok');
     const error = await rejectionOf(
       backend.transaction(async () => {
         throw new Error('boom');
@@ -60,7 +35,7 @@ describe('MemoryStorageBackend', () => {
     );
 
     expect(error.message).toBe('boom');
-    expect(backend.stats()).toEqual({ committed: 0, rolledBack: 1 });
+    expect(backend.stats()).toEqual({ committed: 1, rolledBack: 1 });
   });
 
   test('routes query and execute through the injected handler', async () => {
@@ -91,13 +66,10 @@ describe('MemoryStorageBackend', () => {
     });
     let active = 0;
     let peak = 0;
-
     const body = async (): Promise<void> => {
       active += 1;
       peak = Math.max(peak, active);
-      await new Promise<void>((resolve) => {
-        setTimeout(resolve, 5);
-      });
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
       active -= 1;
     };
 

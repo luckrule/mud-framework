@@ -109,116 +109,97 @@ describe('Dispatcher.timeout', () => {
     expect(backend.stats()).toEqual({ committed: 0, rolledBack: 1 });
   });
 
-  test('does not start a queued handler after the request already timed out', async () => {
-    const writes: string[] = [];
-    const backend = new MemoryStorageBackend({
-      capabilities: { concurrency: 'single' },
-      handler: (sql) => {
-        writes.push(sql);
-        return [];
-      },
-    });
-    const { dispatcher, lines } = quietDispatcher({ backend, timeoutMs: 1000 });
-    const entered = deferred<void>();
-    const release = deferred<void>();
-    const calls: string[] = [];
+  test.each(['timed out', 'cancelled'] as const)(
+    'does not start a queued handler after the request was %s',
+    async (terminal) => {
+      const writes: string[] = [];
+      const backend = new MemoryStorageBackend({
+        capabilities: { concurrency: 'single' },
+        handler: (sql) => {
+          writes.push(sql);
+          return [];
+        },
+      });
+      const { dispatcher, lines } = quietDispatcher({
+        backend,
+        timeoutMs: 1000,
+      });
+      const entered = deferred<void>();
+      const release = deferred<void>();
+      const calls: string[] = [];
 
-    dispatcher.register(
-      'first',
-      async (ctx) => {
-        calls.push('first');
-        await ctx.storage.execute('first write');
-        entered.resolve();
-        await release.promise;
-        return 'first result';
-      },
-      { access: 'public' },
-    );
-    dispatcher.register(
-      'second',
-      async (ctx) => {
-        calls.push('second');
-        await ctx.storage.execute('second write');
-        return 'second result';
-      },
-      { access: 'public' },
-    );
+      dispatcher.register(
+        'first',
+        async (ctx) => {
+          calls.push('first');
+          await ctx.storage.execute('first write');
+          entered.resolve();
+          await release.promise;
+          return 'first result';
+        },
+        { access: 'public' },
+      );
+      dispatcher.register(
+        'second',
+        async (ctx) => {
+          calls.push('second');
+          await ctx.storage.execute('second write');
+          return 'second result';
+        },
+        { access: 'public' },
+      );
 
-    const first = dispatcher.dispatch('first', null);
-    await entered.promise;
-    // Accepted while the backend slot is held; its deadline runs regardless.
-    const second = rejectionOf(
-      dispatcher.dispatch('second', null, { timeoutMs: 10 }),
-    );
-    await sleep(25);
-    release.resolve();
-    expect(await first).toEqual({ result: 'first result' });
-    const error = await second;
+      const first = dispatcher.dispatch('first', null);
+      await entered.promise;
+      // Accepted while the backend slot is held; its terminal state is reached
+      // before the slot frees up.
+      const second = rejectionOf(
+        terminal === 'timed out'
+          ? dispatcher.dispatch('second', null, { timeoutMs: 10 })
+          : dispatcher.dispatch('second', null, { requestId: 'queued' }),
+      );
+      if (terminal === 'timed out') {
+        await sleep(25);
+      } else {
+        // A disconnect for the queued request: its transaction callback has not
+        // run yet, so it must not start the handler when the slot frees up.
+        expect(dispatcher.cancel('queued', 'TRANSPORT_CLOSED')).toBe(true);
+      }
+      release.resolve();
+      expect(await first).toEqual({ result: 'first result' });
+      const error = await second;
+      if (terminal === 'cancelled') {
+        await sleep(0);
+      }
 
-    // The handler must not start after its terminal state; the queued
-    // transaction still rolls back instead of committing.
-    expect(calls).toEqual(['first']);
-    expect(writes).toEqual(['first write']);
-    expect(error).toBeInstanceOf(FrameworkTimeoutError);
-    expect(backend.stats()).toEqual({ committed: 1, rolledBack: 1 });
-    expect(
-      parseLines(lines).filter((entry) => entry.msg === 'request timed out'),
-    ).toHaveLength(1);
+      // The handler must not start after its terminal state; the queued
+      // transaction still rolls back instead of committing.
+      expect(calls).toEqual(['first']);
+      expect(writes).toEqual(['first write']);
+      expect(error).toBeInstanceOf(
+        terminal === 'timed out'
+          ? FrameworkTimeoutError
+          : RequestCancelledError,
+      );
+      expect(backend.stats()).toEqual({ committed: 1, rolledBack: 1 });
+      if (terminal === 'timed out') {
+        expect(
+          parseLines(lines).filter(
+            (entry) => entry.msg === 'request timed out',
+          ),
+        ).toHaveLength(1);
 
-    // The slot is free again and the dispatcher keeps working.
-    dispatcher.register('third', async () => 'third result', {
-      access: 'public',
-    });
-    expect(await dispatcher.dispatch('third', null)).toEqual({
-      result: 'third result',
-    });
-    expect(backend.stats()).toEqual({ committed: 2, rolledBack: 1 });
-  });
-
-  test('does not start a queued handler after the request was cancelled', async () => {
-    const backend = new MemoryStorageBackend({
-      capabilities: { concurrency: 'single' },
-    });
-    const { dispatcher } = quietDispatcher({ backend, timeoutMs: 1000 });
-    const entered = deferred<void>();
-    const release = deferred<void>();
-    let secondStarted = false;
-
-    dispatcher.register(
-      'first',
-      async () => {
-        entered.resolve();
-        await release.promise;
-        return 'first result';
-      },
-      { access: 'public' },
-    );
-    dispatcher.register(
-      'second',
-      async () => {
-        secondStarted = true;
-        return 'second result';
-      },
-      { access: 'public' },
-    );
-
-    const first = dispatcher.dispatch('first', null);
-    await entered.promise;
-    const second = rejectionOf(
-      dispatcher.dispatch('second', null, { requestId: 'queued' }),
-    );
-    // A disconnect for the queued request: its transaction callback has not
-    // run yet, so it must not start the handler when the slot frees up.
-    expect(dispatcher.cancel('queued', 'TRANSPORT_CLOSED')).toBe(true);
-    release.resolve();
-    await first;
-    const error = await second;
-    await sleep(0);
-
-    expect(error).toBeInstanceOf(RequestCancelledError);
-    expect(secondStarted).toBe(false);
-    expect(backend.stats()).toEqual({ committed: 1, rolledBack: 1 });
-  });
+        // The slot is free again and the dispatcher keeps working.
+        dispatcher.register('third', async () => 'third result', {
+          access: 'public',
+        });
+        expect(await dispatcher.dispatch('third', null)).toEqual({
+          result: 'third result',
+        });
+        expect(backend.stats()).toEqual({ committed: 2, rolledBack: 1 });
+      }
+    },
+  );
 
   test('rolls back when synchronous handler work outlives the timeout', async () => {
     const backend = new MemoryStorageBackend();

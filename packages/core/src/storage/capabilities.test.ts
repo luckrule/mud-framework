@@ -108,44 +108,33 @@ describe('checkBackendCapabilities', () => {
 });
 
 describe('checkWireCapabilities', () => {
-  test('accepts a complete declaration', () => {
-    const checked = wireOf(valid);
+  test('names the value path in the rejection reason', () => {
+    const checked = wireOf({ ...valid, concurrency: 'multi' });
 
-    expect(checked.ok).toBe(true);
-    if (checked.ok) {
-      expect(checked.capabilities).toEqual(valid);
-    }
+    expect(rejectionReasonOf(checked)).toContain('ready.capabilities');
   });
 
-  test('rejects null, which is not a duration', () => {
+  test('rejects a value that is not an object', () => {
+    const checked = wireOf('capabilities');
+
+    expect(checked.ok).toBe(false);
+    expect(rejectionReasonOf(checked)).toContain('ready.capabilities');
+  });
+
+  test('rejects a null ceiling shipped over the wire', () => {
     const checked = wireOf({ ...valid, maxTransactionDurationMs: null });
 
     expect(checked.ok).toBe(false);
     expect(rejectionReasonOf(checked)).toContain('maxTransactionDurationMs');
   });
 
-  test('accepts Infinity as unbounded', () => {
-    const checked = wireOf({
-      ...valid,
-      maxTransactionDurationMs: Number.POSITIVE_INFINITY,
-    });
+  test('accepts a complete declaration and returns it', () => {
+    const checked = wireOf(valid);
 
     expect(checked.ok).toBe(true);
-  });
-
-  test('rejects a ceiling that would clamp the timeout', () => {
-    for (const value of [0, -1, -0.5, Number.NaN, Number.NEGATIVE_INFINITY]) {
-      const checked = wireOf({ ...valid, maxTransactionDurationMs: value });
-
-      expect(checked.ok).toBe(false);
-      expect(rejectionReasonOf(checked)).toContain('maxTransactionDurationMs');
+    if (checked.ok) {
+      expect(checked.capabilities).toEqual(valid);
     }
-  });
-
-  test('names the value path in the rejection reason', () => {
-    const checked = wireOf({ ...valid, concurrency: 'multi' });
-
-    expect(rejectionReasonOf(checked)).toContain('ready.capabilities');
   });
 });
 

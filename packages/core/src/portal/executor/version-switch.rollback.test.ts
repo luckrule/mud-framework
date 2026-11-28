@@ -6,6 +6,7 @@ import { rejectionOf } from '../../testing/common.ts';
 import {
   flushMicrotasks,
   flushTicks,
+  flushUntil,
   readyMessage,
   request,
   requestIds,
@@ -185,7 +186,7 @@ describe('IpcExecutor switchTo', () => {
       const switching = h.executor.switchTo({
         spawn: () => labelledServer(h, 'new', { readyOnActivate: false }),
       });
-      await flushMicrotasks();
+      await flushUntil(() => h.timeline.includes('new:recv:activate'));
       jest.advanceTimersByTime(41);
       await flushMicrotasks();
       expect((await rejectionOf(switching)).message).toMatch(

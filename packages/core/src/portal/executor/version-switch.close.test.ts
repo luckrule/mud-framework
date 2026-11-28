@@ -4,6 +4,7 @@ import { rejectionOf } from '../../testing/common.ts';
 import {
   failureOf,
   flushMicrotasks,
+  flushUntil,
   request,
   serverAt,
   started,
@@ -48,119 +49,109 @@ describe('IpcExecutor switchTo', () => {
     }
   });
 
-  test('close waits for an activated replacement it abandons', async () => {
-    // `close()` during `activating`: the replacement received `activate`, so it
-    // may hold storage. `doClose` must not return while it could still write
-    // (INV-002); it confirms the exit with the same wait → kill → wait flow it
-    // uses for the current Server.
-    jest.useFakeTimers();
-    try {
-      const h = switchable({
-        startTimeoutMs: 5000,
-        shutdownTimeoutMs: 30,
-        killExits: false,
-      });
-      await started(h);
+  test.each([
+    {
+      state: 'activating',
+      startTimeoutMs: 5000,
+      // Past the exit wait: close gives up on the still-running replacement and
+      // kills it again.
+      closingTimersMs: 2000 + 30 + 250,
+    },
+    {
+      state: 'rolling back',
+      startTimeoutMs: 40,
+      closingTimersMs: 2000,
+    },
+  ] as const)(
+    'close waits for a replacement it abandons while $state',
+    async ({ state, startTimeoutMs, closingTimersMs }) => {
+      // The replacement received `activate`, so it may hold storage. `doClose`
+      // must not return while it could still write (INV-002); it confirms the
+      // exit with the same wait → kill → wait flow it uses for the current
+      // Server.
+      jest.useFakeTimers();
+      try {
+        const h = switchable({
+          startTimeoutMs,
+          shutdownTimeoutMs: 30,
+          killExits: false,
+        });
+        await started(h);
 
-      const switching = h.executor.switchTo({
-        // Prepares but never answers `activate`: the switch is stuck waiting
-        // for `ready` when `close()` arrives.
-        spawn: () => labelledServer(h, 'new', { readyOnActivate: false }),
-      });
-      await flushMicrotasks();
-      const replacement = serverAt(h, 1);
-      expect(h.timeline).toContain('new:recv:activate');
+        const switching = h.executor.switchTo({
+          // Prepares but never answers `activate`, so the replacement can only
+          // be abandoned: by the in-flight switch, or by the rollback after its
+          // start wait expires.
+          spawn: () => labelledServer(h, 'new', { readyOnActivate: false }),
+        });
+        await flushUntil(() => h.timeline.includes('new:recv:activate'));
 
-      const closing = h.executor.close();
-      const rejected = await rejectionOf(switching);
-      expect(rejected.message).toMatch(/closing/);
+        if (state === 'activating') {
+          // `close()` lands while the switch waits for `ready`.
+          expect(h.timeline).toContain('new:recv:activate');
+        } else {
+          // The start wait expires first: the switch fails, and close then lands
+          // while its rollback is already waiting on the replacement's exit.
+          jest.advanceTimersByTime(startTimeoutMs + 1);
+          await flushMicrotasks();
+          const failure = await rejectionOf(switching);
+          expect(failure.message).toMatch(/did not become ready/);
+        }
 
-      // The replacement survives the abort's kill (killExits: false), so close
-      // is still waiting on it.
-      await flushMicrotasks();
-      expect(replacement.killCount).toBeGreaterThanOrEqual(1);
-      expect(h.timeline).not.toContain('new:exit');
+        const replacement = serverAt(h, 1);
+        const killsBeforeClose = replacement.killCount;
+        if (state === 'rolling back') {
+          // The rollback killed it and it survived (killExits: false), so the
+          // rollback is still waiting.
+          expect(killsBeforeClose).toBeGreaterThanOrEqual(1);
+        }
+        expect(h.timeline).not.toContain('new:exit');
 
-      // Let the bounded exit wait run out; close kills again and the process
-      // is then observed gone. Close returns only after that.
-      jest.advanceTimersByTime(2000 + 30 + 250);
-      await flushMicrotasks();
-      replacement.crash(0);
-      await flushMicrotasks();
-      await closing;
+        const closing = h.executor.close();
+        let settled = false;
+        void closing.then(() => {
+          settled = true;
+          return undefined;
+        });
+        if (state === 'activating') {
+          const rejected = await rejectionOf(switching);
+          expect(rejected.message).toMatch(/closing/);
+        }
 
-      expect(h.timeline).toContain('new:exit');
-      expect(
-        h
-          .logs()
-          .some(
-            (line) =>
-              line.msg ===
-              'abandoned replacement did not exit; killing it before close returns',
-          ),
-      ).toBe(true);
-    } finally {
-      jest.useRealTimers();
-    }
-  });
+        // The abort's kill does not free close(): the replacement is still
+        // running and may still write.
+        await flushMicrotasks();
+        expect(replacement.killCount).toBeGreaterThanOrEqual(1);
+        expect(settled).toBe(false);
+        expect(h.timeline).not.toContain('new:exit');
 
-  test('close waits for the replacement a rollback is already waiting on', async () => {
-    // The rollback's exit wait is a floating promise, so a `close()` landing in
-    // that window cannot join it. `close()` must confirm the abandoned
-    // replacement itself before returning (INV-002), not return while it may
-    // still be writing.
-    jest.useFakeTimers();
-    try {
-      const h = switchable({
-        startTimeoutMs: 40,
-        shutdownTimeoutMs: 30,
-        killExits: false,
-      });
-      await started(h);
+        // Close runs its own bounded wait → kill for the process the abort or
+        // the rollback left behind.
+        jest.advanceTimersByTime(closingTimersMs);
+        await flushMicrotasks();
+        expect(replacement.killCount).toBeGreaterThan(killsBeforeClose);
+        expect(settled).toBe(false);
 
-      const switching = h.executor.switchTo({
-        spawn: () => labelledServer(h, 'new', { readyOnActivate: false }),
-      });
-      await flushMicrotasks();
-      jest.advanceTimersByTime(40 + 1);
-      await flushMicrotasks();
-      const error = await rejectionOf(switching);
-      expect(error.message).toMatch(/did not become ready/);
+        // Once the process is observed gone, close can finish.
+        replacement.crash(0);
+        await flushMicrotasks();
+        await closing;
 
-      // The activated replacement survived its kill: the rollback is waiting.
-      const replacement = serverAt(h, 1);
-      const killsBeforeClose = replacement.killCount;
-      expect(killsBeforeClose).toBeGreaterThanOrEqual(1);
-      expect(h.timeline).not.toContain('new:exit');
-
-      const closing = h.executor.close();
-      let settled = false;
-      void closing.then(() => {
-        settled = true;
-        return undefined;
-      });
-      await flushMicrotasks();
-      // Still alive: close must not have returned yet.
-      expect(settled).toBe(false);
-      expect(h.timeline).not.toContain('new:exit');
-
-      // Close runs its own bounded wait → kill → wait for the process the
-      // rollback left behind, instead of trusting the rollback's floating wait.
-      jest.advanceTimersByTime(2000);
-      await flushMicrotasks();
-      expect(replacement.killCount).toBeGreaterThan(killsBeforeClose);
-      expect(settled).toBe(false);
-
-      // Once the process is observed gone, close can finish.
-      replacement.crash(0);
-      await flushMicrotasks();
-      await closing;
-
-      expect(settled).toBe(true);
-      expect(h.timeline).toContain('new:exit');
-      expect(h.servers).toHaveLength(2);
-    } finally {
-      jest.useRealTimers();
-    }
-  });
+        expect(settled).toBe(true);
+        expect(h.timeline).toContain('new:exit');
+        expect(h.servers).toHaveLength(2);
+        expect(
+          h
+            .logs()
+            .some(
+              (line) =>
+                line.msg ===
+                'abandoned replacement did not exit; killing it before close returns',
+            ),
+        ).toBe(true);
+      } finally {
+        jest.useRealTimers();
+      }
+    },
+  );
 });

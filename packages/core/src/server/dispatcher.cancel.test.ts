@@ -89,7 +89,8 @@ describe('Dispatcher.cancel', () => {
       requestId: 'r2',
       code: 'FRAMEWORK_TIMEOUT',
     });
-    expect(typeof cancelled[0]?.durationMs).toBe('number');
+    expect(cancelled[0]?.durationMs).toBeGreaterThanOrEqual(0);
+    expect(Number.isFinite(cancelled[0]?.durationMs)).toBe(true);
   });
 
   test('cancel returns false for a request that already finished', async () => {
@@ -177,7 +178,8 @@ describe('Dispatcher.cancel', () => {
       msg: 'transaction committed after the request reached a terminal state',
       requestId: 'r-commit',
     });
-    expect(typeof lost[0]?.durationMs).toBe('number');
+    expect(lost[0]?.durationMs).toBeGreaterThanOrEqual(0);
+    expect(Number.isFinite(lost[0]?.durationMs)).toBe(true);
   });
 
   test('logs nothing when the transaction commits before any cancel', async () => {

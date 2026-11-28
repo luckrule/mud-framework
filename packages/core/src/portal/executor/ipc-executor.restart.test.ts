@@ -303,8 +303,11 @@ describe('IpcExecutor restart', () => {
         (line) =>
           line.msg === 'server did not become ready before the start timeout',
       );
-    expect(logged).toMatchObject({ level: 'error', timeoutMs: 50 });
-    expect(typeof logged?.attempts).toBe('number');
+    expect(logged).toMatchObject({
+      level: 'error',
+      timeoutMs: 50,
+      attempts: 0,
+    });
     await h.executor.close();
   });
 
@@ -351,7 +354,8 @@ describe('IpcExecutor restart', () => {
       clientRequestId: 'client-1',
       sessionId: 's-queued',
     });
-    expect(typeof failed[0]?.durationMs).toBe('number');
+    expect(failed[0]?.durationMs).toBeGreaterThanOrEqual(0);
+    expect(Number.isFinite(failed[0]?.durationMs)).toBe(true);
     await h.executor.close();
   });
 

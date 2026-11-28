@@ -7,84 +7,119 @@ function createTransport(options: WsTransportOptions = {}): WsTransport {
   return new WsTransport(options);
 }
 
+type InvalidOption = readonly [
+  value: unknown,
+  Expected: typeof RangeError | typeof TypeError,
+];
+
+type FieldCase = readonly [
+  name: string,
+  invalid: readonly InvalidOption[],
+  accepted: readonly unknown[],
+  options: (value: unknown) => WsTransportOptions,
+];
+
+/**
+ * One row per numeric option: the accepted values are the boundaries the field
+ * allows, and every rejected value keeps its own error type.
+ */
+const FIELD_CASES: readonly FieldCase[] = [
+  [
+    'port',
+    [
+      [-1, RangeError],
+      [65_536, RangeError],
+      [1.5, RangeError],
+      [Number.NaN, RangeError],
+      [Number.POSITIVE_INFINITY, RangeError],
+      ['80', TypeError],
+    ],
+    [0],
+    (value) => ({ port: value as number }),
+  ],
+  [
+    'maxMessageBytes',
+    [
+      [0, RangeError],
+      [-1, RangeError],
+      [1.5, RangeError],
+      [Number.NaN, RangeError],
+      [Number.POSITIVE_INFINITY, RangeError],
+      ['8', TypeError],
+    ],
+    [1],
+    (value) => ({ maxMessageBytes: value as number }),
+  ],
+  [
+    'idleTimeoutSeconds',
+    [
+      [-1, RangeError],
+      [1.5, RangeError],
+      [Number.NaN, RangeError],
+      [Number.POSITIVE_INFINITY, RangeError],
+      ['30', TypeError],
+    ],
+    [0],
+    (value) => ({ idleTimeoutSeconds: value as number }),
+  ],
+  [
+    'sendTimeoutMs',
+    [
+      [0, RangeError],
+      [-1, RangeError],
+      [Number.NaN, RangeError],
+      [Number.NEGATIVE_INFINITY, RangeError],
+      ['1000', TypeError],
+    ],
+    [Number.POSITIVE_INFINITY, 1],
+    (value) => ({ sendTimeoutMs: value as number }),
+  ],
+  [
+    'maxQueuedFrames',
+    [
+      [0, RangeError],
+      [-1, RangeError],
+      [1.5, RangeError],
+      [Number.NaN, RangeError],
+      [Number.POSITIVE_INFINITY, RangeError],
+      [Number.NEGATIVE_INFINITY, RangeError],
+      ['1', TypeError],
+    ],
+    [1],
+    (value) => ({ maxQueuedFrames: value as number }),
+  ],
+  [
+    'maxQueuedBytes',
+    [
+      [0, RangeError],
+      [-1, RangeError],
+      [1.5, RangeError],
+      [Number.NaN, RangeError],
+      [Number.POSITIVE_INFINITY, RangeError],
+      [Number.NEGATIVE_INFINITY, RangeError],
+      ['1', TypeError],
+    ],
+    // At least maxMessageBytes: a smaller queue cannot hold one frame.
+    [1024 * 1024],
+    (value) => ({ maxQueuedBytes: value as number }),
+  ],
+];
+
 describe('WsTransport option validation', () => {
-  test('rejects port outside an integer 0..65535, and accepts 0', () => {
-    const invalid: readonly [unknown, typeof RangeError | typeof TypeError][] =
-      [
-        [-1, RangeError],
-        [65_536, RangeError],
-        [1.5, RangeError],
-        [Number.NaN, RangeError],
-        [Number.POSITIVE_INFINITY, RangeError],
-        ['80', TypeError],
-      ];
-    for (const [value, Expected] of invalid) {
-      const call = () => createTransport({ port: value as number });
-      expect(call).toThrow(Expected);
-      expect(call).toThrow(/port/);
-      expect(call).toThrow(new RegExp(String(value)));
-    }
-    expect(() => createTransport({ port: 0 })).not.toThrow();
-  });
-
-  test('rejects maxMessageBytes that is not a positive integer', () => {
-    const invalid: readonly [unknown, typeof RangeError | typeof TypeError][] =
-      [
-        [0, RangeError],
-        [-1, RangeError],
-        [1.5, RangeError],
-        [Number.NaN, RangeError],
-        [Number.POSITIVE_INFINITY, RangeError],
-        ['8', TypeError],
-      ];
-    for (const [value, Expected] of invalid) {
-      const call = () => createTransport({ maxMessageBytes: value as number });
-      expect(call).toThrow(Expected);
-      expect(call).toThrow(/maxMessageBytes/);
-      expect(call).toThrow(new RegExp(String(value)));
-    }
-    expect(() => createTransport({ maxMessageBytes: 1 })).not.toThrow();
-  });
-
-  test('rejects idleTimeoutSeconds that is not a non-negative integer, and accepts 0', () => {
-    const invalid: readonly [unknown, typeof RangeError | typeof TypeError][] =
-      [
-        [-1, RangeError],
-        [1.5, RangeError],
-        [Number.NaN, RangeError],
-        [Number.POSITIVE_INFINITY, RangeError],
-        ['30', TypeError],
-      ];
-    for (const [value, Expected] of invalid) {
-      const call = () =>
-        createTransport({ idleTimeoutSeconds: value as number });
-      expect(call).toThrow(Expected);
-      expect(call).toThrow(/idleTimeoutSeconds/);
-      expect(call).toThrow(new RegExp(String(value)));
-    }
-    expect(() => createTransport({ idleTimeoutSeconds: 0 })).not.toThrow();
-  });
-
-  test('rejects sendTimeoutMs that is not positive or Infinity, and accepts Infinity', () => {
-    const invalid: readonly [unknown, typeof RangeError | typeof TypeError][] =
-      [
-        [0, RangeError],
-        [-1, RangeError],
-        [Number.NaN, RangeError],
-        [Number.NEGATIVE_INFINITY, RangeError],
-        ['1000', TypeError],
-      ];
-    for (const [value, Expected] of invalid) {
-      const call = () => createTransport({ sendTimeoutMs: value as number });
-      expect(call).toThrow(Expected);
-      expect(call).toThrow(/sendTimeoutMs/);
-      expect(call).toThrow(new RegExp(String(value)));
-    }
-    expect(() =>
-      createTransport({ sendTimeoutMs: Number.POSITIVE_INFINITY }),
-    ).not.toThrow();
-    expect(() => createTransport({ sendTimeoutMs: 1 })).not.toThrow();
-  });
+  test.each(FIELD_CASES)(
+    'rejects an invalid %s and accepts a legal value',
+    (name, invalid, accepted, options) => {
+      for (const [value, Expected] of invalid) {
+        const call = () => createTransport(options(value));
+        expect(call).toThrow(Expected);
+        expect(call).toThrow(new RegExp(name));
+        expect(call).toThrow(new RegExp(String(value)));
+      }
+      for (const value of accepted) {
+        expect(() => createTransport(options(value))).not.toThrow();
+      }
+    },
+  );
 
   test('exposes the validated send bound so the layer can honour it', () => {
     // SPEC 3.8: the connection layer holds a Session's serial slot at least as
@@ -98,37 +133,6 @@ describe('WsTransport option validation', () => {
         .sendTimeoutMs,
     ).toBe(Number.POSITIVE_INFINITY);
     expect(createTransport().sendTimeoutMs).toBe(30_000);
-  });
-
-  test('rejects maxQueuedFrames and maxQueuedBytes that are not positive integers', () => {
-    const invalid: readonly [unknown, typeof RangeError | typeof TypeError][] =
-      [
-        [0, RangeError],
-        [-1, RangeError],
-        [1.5, RangeError],
-        [Number.NaN, RangeError],
-        [Number.POSITIVE_INFINITY, RangeError],
-        [Number.NEGATIVE_INFINITY, RangeError],
-        ['1', TypeError],
-      ];
-    for (const name of ['maxQueuedFrames', 'maxQueuedBytes'] as const) {
-      for (const [value, Expected] of invalid) {
-        const options =
-          name === 'maxQueuedFrames'
-            ? { maxQueuedFrames: value as number }
-            : { maxQueuedBytes: value as number };
-        const call = () => createTransport(options);
-        expect(call).toThrow(Expected);
-        expect(call).toThrow(new RegExp(name));
-        expect(call).toThrow(new RegExp(String(value)));
-      }
-      const options =
-        name === 'maxQueuedFrames'
-          ? { maxQueuedFrames: 1 }
-          : // At least maxMessageBytes: a smaller queue cannot hold one frame.
-            { maxQueuedBytes: 1024 * 1024 };
-      expect(() => createTransport(options)).not.toThrow();
-    }
   });
 
   test('rejects a queue smaller than one legal maximum-size frame', () => {
